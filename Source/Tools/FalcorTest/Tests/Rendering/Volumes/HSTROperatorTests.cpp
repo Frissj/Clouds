@@ -208,6 +208,19 @@ CPU_TEST(HSTRLocalizedLeafRepair)
     EXPECT_GT(change, 0.f);
 }
 
+CPU_TEST(HSTRDynamicUpdateSolversMatchRefactorization)
+{
+    const DenseMatrix clear = makeLeafTransport(float3(0.2f), 0.98f, 0.8f, 0.6f);
+    const DenseMatrix dense = makeLeafTransport(float3(0.35f), 0.98f, 0.8f, 0.6f);
+    const Hierarchy reference = Hierarchy::compile(uint3(2, 1, 1), {dense, clear});
+    for (UpdateStrategy strategy : {UpdateStrategy::Woodbury, UpdateStrategy::WoodburyKrylov, UpdateStrategy::SubtreeRepair})
+    {
+        Hierarchy updated = Hierarchy::compile(uint3(2, 1, 1), {clear, clear});
+        updated.updateLeaf(0, dense, strategy);
+        expectMatrixNear(ctx, updated.getNodes()[updated.getRoot()].transport, reference.getNodes()[reference.getRoot()].transport, 2e-4f);
+    }
+}
+
 CPU_TEST(HSTRMatrixFreeCompression)
 {
     const DenseMatrix left(4, 2, {1.f, 0.f, 0.f, 2.f, 1.f, 1.f, -1.f, 0.5f});
@@ -331,6 +344,26 @@ CPU_TEST(HSTRPersistentAdjointGoalsPropagateLinearly)
             EXPECT_EQ(combined[leaf](row, 0), firstLeaves[leaf](row, 0));
             EXPECT_EQ(combined[leaf](row, 1), secondLeaves[leaf](row, 0));
         }
+}
+
+CPU_TEST(HSTRLeafSourceToRootIsReciprocal)
+{
+    const DenseMatrix leaf = makeLeafTransport(float3(0.4f), 0.98f, 0.8f, 0.6f);
+    const Hierarchy hierarchy = Hierarchy::compile(uint3(2, 1, 1), {leaf, leaf});
+    const auto down = hierarchy.getLeafTransferMatrices();
+    const auto up = hierarchy.getLeafSourceToRootMatrices();
+    DenseMatrix rootField(6, 1);
+    DenseMatrix leafSource(6, 1);
+    rootField(0, 0) = 0.7f;
+    rootField(3, 0) = 0.2f;
+    leafSource(1, 0) = 0.4f;
+    leafSource(5, 0) = 0.6f;
+    for (size_t i = 0; i < down.size(); ++i)
+    {
+        const DenseMatrix lhs = multiply(transpose(leafSource), multiply(down[i], rootField));
+        const DenseMatrix rhs = multiply(transpose(multiply(up[i], leafSource)), rootField);
+        EXPECT_LE(std::abs(lhs(0, 0) - rhs(0, 0)), 1e-6f);
+    }
 }
 
 CPU_TEST(HSTRHigherOrderFaceModes)

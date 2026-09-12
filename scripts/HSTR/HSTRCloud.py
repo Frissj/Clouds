@@ -14,6 +14,13 @@ def render_graph_HSTRCloud():
         "traceSpatialOrder": 2,
         "correctionBudget": 262144,
         "correctionFadeFrames": 8,
+        "ballisticBudget": 24,
+        "nearScatterBudget": 120,
+        "diffuseRankBudget": 4,
+        "schurWindowRadius": 8,
+        "localSourceRadiance": float3(0.0),
+        "mixedFidelityThreshold": 0.15,
+        "operatorDictionaryTolerance": 1e-4,
     }), "HSTRCloud")
     graph.addPass(createPass("ToneMapper", {
         "autoExposure": False,

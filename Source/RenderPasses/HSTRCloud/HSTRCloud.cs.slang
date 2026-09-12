@@ -22,7 +22,11 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<float4> hstrRadiance;
     StructuredBuffer<float> hstrLeafBasisLeft;
     StructuredBuffer<float> hstrLeafBasisRight;
-    StructuredBuffer<float> hstrLeafTransport;
+    StructuredBuffer<float> hstrLeafBallistic;
+    StructuredBuffer<float> hstrLeafNearScatter;
+    StructuredBuffer<float> hstrLeafDiffuseLeft;
+    StructuredBuffer<float> hstrLeafDiffuseRight;
+    StructuredBuffer<uint> hstrLeafDiffuseRanks;
     StructuredBuffer<float> hstrLeafResidualBounds;
     StructuredBuffer<float4> hstrRootIncident;
     StructuredBuffer<float> hstrLeafAdjointResponses;
@@ -176,7 +180,10 @@ struct HSTRCloudRenderer
             const float alpha = 1.f - exp(-extinction * stepLength);
             const float3 indexPosition = mul(volume.data.invTransform, float4(position, 1.f)).xyz;
             const float3 base = hstrLighting(indexPosition, ray.dir);
-            const float3 correction = deterministicResidual(volume, grid, indexPosition, ray.dir, accessor);
+            const int3 leafPosition = int3((indexPosition - float3(params.hstrGridMin)) / float(params.hstrCellWidth));
+            const int3 windowOffset = abs(leafPosition - int3(params.schurWindowCenter));
+            const bool insideWindow = all(windowOffset <= int(params.schurWindowRadius));
+            const float3 correction = insideWindow ? deterministicResidual(volume, grid, indexPosition, ray.dir, accessor) : 0.f;
             const float3 source = volume.data.albedo * (0.72f * base + params.residualBlend * correction);
             radiance += transmittance * alpha * source;
             residualError += transmittance * alpha * hstrResidualBound(indexPosition);
@@ -233,7 +240,6 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
         incident[dof] = 0.f;
     float omittedError = 0.f;
     const uint matrixSize = params.hstrTraceDofs * params.hstrStorageRank;
-    const uint transportSize = params.hstrTraceDofs * params.hstrTraceDofs;
     for (uint mode = 0; mode < params.hstrStorageRank; ++mode)
     {
         float3 coefficient = 0.f;
@@ -255,12 +261,29 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
     float3 outgoing[kMaxTraceDofs];
     for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
-    {
         outgoing[outputDof] = 0.f;
-        for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
-            outgoing[outputDof] += gHSTRCloud.hstrLeafTransport[
-                transportSize * leaf + params.hstrTraceDofs * outputDof + inputDof
+    for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
+    {
+        const uint inputFace = inputDof / params.hstrFaceDofs;
+        const uint spatialMode = inputDof % params.hstrFaceDofs;
+        const uint ballisticOutput = (inputFace ^ 1u) * params.hstrFaceDofs + spatialMode;
+        outgoing[ballisticOutput] += gHSTRCloud.hstrLeafBallistic[leaf * params.hstrTraceDofs + inputDof] * incident[inputDof];
+        for (uint outputFace = 0; outputFace < 6; ++outputFace)
+            outgoing[outputFace * params.hstrFaceDofs + spatialMode] += gHSTRCloud.hstrLeafNearScatter[
+                (leaf * params.hstrTraceDofs + inputDof) * 6 + outputFace
             ] * incident[inputDof];
+    }
+    for (uint mode = 0; mode < gHSTRCloud.hstrLeafDiffuseRanks[leaf]; ++mode)
+    {
+        float3 coefficient = 0.f;
+        for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
+            coefficient += gHSTRCloud.hstrLeafDiffuseRight[
+                params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * inputDof + mode
+            ] * incident[inputDof];
+        for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
+            outgoing[outputDof] += gHSTRCloud.hstrLeafDiffuseLeft[
+                params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * outputDof + mode
+            ] * coefficient;
     }
     const float correctionFade = saturate(float(params.frameIndex + 1) / max(1.f, float(params.correctionFadeFrames)));
     const uint2 correctionRange = gHSTRCloud.hstrCorrectionRanges[leaf];
@@ -271,6 +294,17 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
         outgoing[atom.row] += correctionFade * atom.value * incident[atom.col];
         admittedError += correctionFade * atom.goalError;
     }
+    float3 incidentFlux = 0.f;
+    float3 outgoingFlux = 0.f;
+    for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
+    {
+        incidentFlux += max(0.f, incident[dof]);
+        outgoing[dof] = max(0.f, outgoing[dof]);
+        outgoingFlux += outgoing[dof];
+    }
+    const float3 passiveScale = min(1.f, incidentFlux / max(float3(1e-8f), outgoingFlux));
+    for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
+        outgoing[dof] *= passiveScale;
     const float omittedCorrectionError = max(0.f, gHSTRCloud.hstrLeafResidualBounds[leaf] - admittedError);
     for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
         gHSTRCloud.hstrRadiance[params.hstrTraceDofs * leaf + outputDof] =

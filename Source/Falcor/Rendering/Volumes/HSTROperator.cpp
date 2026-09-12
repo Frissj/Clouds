@@ -254,9 +254,34 @@ LowRankOperator compressPassive(const DenseMatrix& transport, float relativeTole
     require(certifyPassivity(transport).valid, "Cannot passivity-compress an operator that creates energy or negative radiance.");
     const size_t fullRank = std::min(transport.rows(), transport.cols());
     require(initialRank > 0 && initialRank <= fullRank, "Initial passive compression rank is out of range.");
-    for (size_t rank = initialRank; rank <= fullRank; ++rank)
+    const LowRankOperator decomposition = compress(transport, 0.f, fullRank);
+    if (decomposition.rank() == 0)
+        return decomposition;
+    size_t toleranceRank = 1;
+    float firstSigmaSquared = 0.f;
+    for (size_t row = 0; row < transport.rows(); ++row)
+        firstSigmaSquared += decomposition.left(row, 0) * decomposition.left(row, 0);
+    const float firstSigma = std::sqrt(firstSigmaSquared);
+    while (toleranceRank < decomposition.rank())
     {
-        LowRankOperator candidate = compress(transport, relativeTolerance, rank);
+        float sigma = 0.f;
+        for (size_t row = 0; row < transport.rows(); ++row)
+            sigma += decomposition.left(row, toleranceRank) * decomposition.left(row, toleranceRank);
+        if (std::sqrt(sigma) <= relativeTolerance * firstSigma)
+            break;
+        ++toleranceRank;
+    }
+    for (size_t rank = std::max(initialRank, toleranceRank); rank <= decomposition.rank(); ++rank)
+    {
+        LowRankOperator candidate;
+        candidate.left = DenseMatrix(transport.rows(), rank);
+        candidate.right = DenseMatrix(transport.cols(), rank);
+        for (size_t row = 0; row < transport.rows(); ++row)
+            for (size_t mode = 0; mode < rank; ++mode)
+                candidate.left(row, mode) = decomposition.left(row, mode);
+        for (size_t row = 0; row < transport.cols(); ++row)
+            for (size_t mode = 0; mode < rank; ++mode)
+                candidate.right(row, mode) = decomposition.right(row, mode);
         if (certifyPassivity(candidate.reconstruct()).valid)
             return candidate;
     }

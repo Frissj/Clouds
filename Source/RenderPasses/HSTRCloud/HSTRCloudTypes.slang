@@ -30,6 +30,19 @@ struct HSTRCloudParams
     uint adjointGoalCount = 0;
     uint padHSTR1 = 0;
 
+    uint ballisticBudget = 24;
+    uint nearScatterBudget = 120;
+    uint diffuseRankBudget = 4;
+    uint maximumDiffuseRank = 0;
+
+    uint3 schurWindowCenter = {0, 0, 0};
+    uint schurWindowRadius = 8;
+
+    uint operatorDictionarySize = 0;
+    uint padHSTR4 = 0;
+    uint padHSTR5 = 0;
+    uint padHSTR6 = 0;
+
     float residualBlend = 1.f;
     float densityScale = 1.f;
     float padHSTR2 = 0.f;
@@ -43,6 +56,14 @@ struct HSTRCloudParams
 
     float3 skyRadiance = float3(0.25f, 0.4f, 0.8f);
     float pad1 = 0.f;
+
+    float3 localSourceRadiance = float3(0.f);
+    float pad2 = 0.f;
+
+    float mixedFidelityThreshold = 0.15f;
+    float operatorDictionaryTolerance = 1e-4f;
+    float pad3 = 0.f;
+    float pad4 = 0.f;
 };
 
 END_NAMESPACE_FALCOR

@@ -13,7 +13,7 @@ namespace Falcor::hstr
 namespace
 {
 constexpr uint32_t kFaceCount = 6;
-constexpr uint32_t kFileVersion = 4;
+constexpr uint32_t kFileVersion = 5;
 constexpr uint32_t kMagic = 0x52545348; // HSTR
 
 void require(bool condition, const char* message)
@@ -115,7 +115,14 @@ void makeChildTraceTransfer(
     }
 }
 
-HierarchyNode compose(const HierarchyNode& a, const HierarchyNode& b, uint32_t axis, uint32_t spatialOrder)
+HierarchyNode compose(
+    const HierarchyNode& a,
+    const HierarchyNode& b,
+    uint32_t axis,
+    uint32_t spatialOrder,
+    const DenseMatrix* pPreviousSystem = nullptr,
+    UpdateStrategy strategy = UpdateStrategy::FullRefactorization
+)
 {
     require(a.transport.rows() == b.transport.rows(), "HST-R child trace dimensions must match.");
     const size_t dofsPerFace = faceDofs(a.transport);
@@ -151,7 +158,35 @@ HierarchyNode compose(const HierarchyNode& a, const HierarchyNode& b, uint32_t a
             interfaceRhs(dofsPerFace + row, col) = aExternal(positiveOffset + row, col);
         }
     }
-    const DenseMatrix interfaceInput = solve(interfaceSystem, interfaceRhs);
+    DenseMatrix interfaceInput;
+    if (pPreviousSystem && strategy == UpdateStrategy::Woodbury)
+    {
+        const DenseMatrix delta = subtract(interfaceSystem, *pPreviousSystem);
+        const LowRankOperator update = compress(delta, 0.f, delta.rows());
+        interfaceInput = woodburySolve(*pPreviousSystem, update.left, update.right, interfaceRhs);
+    }
+    else if (pPreviousSystem && strategy == UpdateStrategy::WoodburyKrylov)
+    {
+        interfaceInput = DenseMatrix(interfaceRhs.rows(), interfaceRhs.cols());
+        for (size_t col = 0; col < interfaceRhs.cols(); ++col)
+        {
+            DenseMatrix rhs(interfaceRhs.rows(), 1);
+            for (size_t row = 0; row < interfaceRhs.rows(); ++row)
+                rhs(row, 0) = interfaceRhs(row, col);
+            const KrylovResult solution = gmres(
+                interfaceSystem.rows(),
+                [&interfaceSystem](const DenseMatrix& x) { return multiply(interfaceSystem, x); },
+                [pPreviousSystem](const DenseMatrix& x) { return solve(*pPreviousSystem, x); },
+                rhs,
+                uint32_t(interfaceSystem.rows()),
+                1e-5f
+            );
+            for (size_t row = 0; row < interfaceRhs.rows(); ++row)
+                interfaceInput(row, col) = solution.solution(row, 0);
+        }
+    }
+    else
+        interfaceInput = solve(interfaceSystem, interfaceRhs);
 
     DenseMatrix inputA = prolongA;
     DenseMatrix inputB = prolongB;
@@ -173,6 +208,7 @@ HierarchyNode compose(const HierarchyNode& a, const HierarchyNode& b, uint32_t a
     result.transport = exact;
     result.leftInput = inputA;
     result.rightInput = inputB;
+    result.interfaceSystem = interfaceSystem;
     result.residual = subtract(exact, baseline);
     result.residualNorm = frobeniusNorm(result.residual);
     result.conservationError = conservationError(exact);
@@ -395,6 +431,14 @@ std::vector<DenseMatrix> Hierarchy::getLeafTransferMatrices() const
     return result;
 }
 
+std::vector<DenseMatrix> Hierarchy::getLeafSourceToRootMatrices() const
+{
+    std::vector<DenseMatrix> result = getLeafTransferMatrices();
+    for (DenseMatrix& transfer : result)
+        transfer = transpose(transfer);
+    return result;
+}
+
 std::vector<DenseMatrix> Hierarchy::getLeafAdjointGoalMatrices(const DenseMatrix& rootGoals) const
 {
     require(mRoot != HierarchyNode::kInvalid, "HST-R hierarchy is empty.");
@@ -519,7 +563,7 @@ std::vector<float> Hierarchy::getLeafResidualBounds() const
     return result;
 }
 
-uint32_t Hierarchy::updateLeaf(uint32_t leafIndex, const DenseMatrix& transport)
+uint32_t Hierarchy::updateLeaf(uint32_t leafIndex, const DenseMatrix& transport, UpdateStrategy strategy)
 {
     require(leafIndex < mLeafNodes.size(), "HST-R leaf update index is out of range.");
     require(transport.rows() == mNodes[mLeafNodes[leafIndex]].transport.rows() && transport.cols() == transport.rows(), "HST-R leaf update dimensions do not match the retained trace.");
@@ -530,7 +574,14 @@ uint32_t Hierarchy::updateLeaf(uint32_t leafIndex, const DenseMatrix& transport)
     {
         const uint32_t parentID = mNodes[nodeID].parent;
         const HierarchyNode oldParent = mNodes[parentID];
-        HierarchyNode updated = compose(mNodes[oldParent.left], mNodes[oldParent.right], oldParent.splitAxis, mFaceSpatialOrder);
+        HierarchyNode updated = compose(
+            mNodes[oldParent.left],
+            mNodes[oldParent.right],
+            oldParent.splitAxis,
+            mFaceSpatialOrder,
+            oldParent.interfaceSystem.rows() > 0 ? &oldParent.interfaceSystem : nullptr,
+            strategy
+        );
         updated.left = oldParent.left;
         updated.right = oldParent.right;
         updated.parent = oldParent.parent;
@@ -566,6 +617,7 @@ void Hierarchy::save(const std::filesystem::path& path) const
         writeMatrix(stream, node.transport);
         writeMatrix(stream, node.leftInput);
         writeMatrix(stream, node.rightInput);
+        writeMatrix(stream, node.interfaceSystem);
         writeMatrix(stream, node.residual);
     }
 }
@@ -602,6 +654,7 @@ Hierarchy Hierarchy::load(const std::filesystem::path& path)
         node.transport = readMatrix(stream);
         node.leftInput = readMatrix(stream);
         node.rightInput = readMatrix(stream);
+        node.interfaceSystem = readMatrix(stream);
         node.residual = readMatrix(stream);
     }
     require(bool(stream), "HST-R hierarchy file is truncated.");

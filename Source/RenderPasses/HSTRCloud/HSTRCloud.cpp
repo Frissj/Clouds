@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
 
 namespace
 {
@@ -27,6 +28,13 @@ const char kGoalFace[] = "goalFace";
 const char kTraceSpatialOrder[] = "traceSpatialOrder";
 const char kCorrectionBudget[] = "correctionBudget";
 const char kCorrectionFadeFrames[] = "correctionFadeFrames";
+const char kBallisticBudget[] = "ballisticBudget";
+const char kNearScatterBudget[] = "nearScatterBudget";
+const char kDiffuseRankBudget[] = "diffuseRankBudget";
+const char kSchurWindowRadius[] = "schurWindowRadius";
+const char kLocalSourceRadiance[] = "localSourceRadiance";
+const char kMixedFidelityThreshold[] = "mixedFidelityThreshold";
+const char kOperatorDictionaryTolerance[] = "operatorDictionaryTolerance";
 
 uint32_t nextPowerOfTwo(uint32_t value)
 {
@@ -34,6 +42,11 @@ uint32_t nextPowerOfTwo(uint32_t value)
     while (result < value)
         result <<= 1;
     return result;
+}
+
+bool insideWindow(uint3 leaf, uint3 center, uint32_t radius)
+{
+    return all(abs(int3(leaf) - int3(center)) <= int(radius));
 }
 } // namespace
 
@@ -74,6 +87,20 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.correctionBudget = value;
         else if (key == kCorrectionFadeFrames)
             mParams.correctionFadeFrames = value;
+        else if (key == kBallisticBudget)
+            mParams.ballisticBudget = value;
+        else if (key == kNearScatterBudget)
+            mParams.nearScatterBudget = value;
+        else if (key == kDiffuseRankBudget)
+            mParams.diffuseRankBudget = value;
+        else if (key == kSchurWindowRadius)
+            mParams.schurWindowRadius = value;
+        else if (key == kLocalSourceRadiance)
+            mParams.localSourceRadiance = value;
+        else if (key == kMixedFidelityThreshold)
+            mParams.mixedFidelityThreshold = value;
+        else if (key == kOperatorDictionaryTolerance)
+            mParams.operatorDictionaryTolerance = value;
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
     }
@@ -96,6 +123,13 @@ Properties HSTRCloud::getProperties() const
     props[kTraceSpatialOrder] = mParams.traceSpatialOrder;
     props[kCorrectionBudget] = mParams.correctionBudget;
     props[kCorrectionFadeFrames] = mParams.correctionFadeFrames;
+    props[kBallisticBudget] = mParams.ballisticBudget;
+    props[kNearScatterBudget] = mParams.nearScatterBudget;
+    props[kDiffuseRankBudget] = mParams.diffuseRankBudget;
+    props[kSchurWindowRadius] = mParams.schurWindowRadius;
+    props[kLocalSourceRadiance] = mParams.localSourceRadiance;
+    props[kMixedFidelityThreshold] = mParams.mixedFidelityThreshold;
+    props[kOperatorDictionaryTolerance] = mParams.operatorDictionaryTolerance;
     return props;
 }
 
@@ -173,15 +207,57 @@ void HSTRCloud::buildHierarchy()
     mParams.hstrTraceDofs = 6 * mParams.hstrFaceDofs;
     mParams.hstrStorageRank = mParams.hstrTraceDofs;
     mParams.activeRank = std::clamp(mParams.activeRank, 1u, mParams.hstrStorageRank);
+    const float3 windowPosition = clamp(
+        (mpScene->getCamera()->getPosition() - volume->getBounds().minPoint) / volume->getBounds().extent(),
+        float3(0.f),
+        float3(0.999999f)
+    );
+    mParams.schurWindowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
     mLeafDensity = sampleLeafDensities();
     std::vector<hstr::DenseMatrix> leafTransport;
     leafTransport.reserve(leafCount);
+    mOperatorDictionary.clear();
+    mLeafOperatorIDs.resize(leafCount);
+    mDictionaryCorrections.assign(leafCount, hstr::DenseMatrix(mParams.hstrTraceDofs, mParams.hstrTraceDofs));
+    std::unordered_map<size_t, std::vector<uint32_t>> dictionaryBuckets;
+    const float dictionaryTolerance = std::max(1e-7f, mParams.operatorDictionaryTolerance);
     for (uint32_t leaf = 0; leaf < leafCount; ++leaf)
-        leafTransport.push_back(makeNestedLeafTransport(leaf));
+    {
+        hstr::DenseMatrix candidate = makeNestedLeafTransport(leaf);
+        size_t hash = 1469598103934665603ull;
+        for (float value : candidate.data())
+        {
+            hash ^= size_t(std::llround(value / dictionaryTolerance));
+            hash *= 1099511628211ull;
+        }
+        uint32_t dictionaryID = ~0u;
+        for (uint32_t id : dictionaryBuckets[hash])
+        {
+            bool matches = true;
+            for (size_t i = 0; i < candidate.data().size(); ++i)
+                matches &= std::abs(candidate.data()[i] - mOperatorDictionary[id].data()[i]) <= dictionaryTolerance;
+            if (matches)
+            {
+                dictionaryID = id;
+                mDictionaryCorrections[leaf] = hstr::subtract(candidate, mOperatorDictionary[id]);
+                break;
+            }
+        }
+        if (dictionaryID == ~0u)
+        {
+            dictionaryID = uint32_t(mOperatorDictionary.size());
+            dictionaryBuckets[hash].push_back(dictionaryID);
+            mOperatorDictionary.push_back(std::move(candidate));
+        }
+        mLeafOperatorIDs[leaf] = dictionaryID;
+        leafTransport.push_back(mOperatorDictionary[dictionaryID]);
+    }
+    mParams.operatorDictionarySize = uint32_t(mOperatorDictionary.size());
 
     mHierarchy = hstr::Hierarchy::compile(leafDims, leafTransport, mParams.traceSpatialOrder);
     const float milliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - startTime).count();
     logInfo("HSTRCloud: compiled {} leaves and {} Schur nodes in {:.1f} ms.", leafCount, mHierarchy.getNodes().size(), milliseconds);
+    logInfo("HSTRCloud: operator dictionary contains {} prototypes for {} leaves.", mOperatorDictionary.size(), leafCount);
 
     uploadHierarchy();
     solveLighting();
@@ -198,26 +274,110 @@ void HSTRCloud::uploadHierarchy()
     const size_t matrixSize = traceDofs * traceDofs;
     std::vector<float> packedLeft(matrixSize * leafCount, 0.f);
     std::vector<float> packedRight(matrixSize * leafCount, 0.f);
-    std::vector<float> packedTransport(matrixSize * leafCount);
+    std::vector<float> packedBallistic(traceDofs * leafCount, 0.f);
+    std::vector<float> packedNearScatter(6 * traceDofs * leafCount, 0.f);
+    std::vector<float> packedDiffuseLeft(matrixSize * leafCount, 0.f);
+    std::vector<float> packedDiffuseRight(matrixSize * leafCount, 0.f);
+    std::vector<uint32_t> packedDiffuseRanks(leafCount, 0u);
     mLeafCorrections.assign(leafCount, hstr::DenseMatrix(traceDofs, traceDofs));
+    mLeafBaseTransport.assign(leafCount, hstr::DenseMatrix(traceDofs, traceDofs));
     const hstr::TraceTransfer spatialTransfer = hstr::makeConservativeTraceTransfer(6, mParams.hstrFaceDofs);
+    mParams.ballisticBudget = std::min<uint32_t>(mParams.ballisticBudget, uint32_t(traceDofs));
+    mParams.nearScatterBudget = std::min<uint32_t>(mParams.nearScatterBudget, uint32_t(5 * traceDofs));
+    mParams.diffuseRankBudget = std::clamp<uint32_t>(mParams.diffuseRankBudget, 1u, uint32_t(traceDofs));
+    mParams.maximumDiffuseRank = 0;
+    auto retainLargest = [](const hstr::DenseMatrix& source, size_t budget)
+    {
+        struct Entry { size_t row; size_t col; float value; };
+        std::vector<Entry> entries;
+        for (size_t row = 0; row < source.rows(); ++row)
+            for (size_t col = 0; col < source.cols(); ++col)
+                if (source(row, col) > 0.f)
+                    entries.push_back({row, col, source(row, col)});
+        if (entries.size() > budget)
+        {
+            std::nth_element(entries.begin(), entries.begin() + budget, entries.end(), [](const Entry& a, const Entry& b) { return a.value > b.value; });
+            entries.resize(budget);
+        }
+        hstr::DenseMatrix result(source.rows(), source.cols());
+        for (const Entry& entry : entries)
+            result(entry.row, entry.col) = entry.value;
+        return result;
+    };
     for (size_t leaf = 0; leaf < leafCount; ++leaf)
     {
-        hstr::DenseMatrix storedTransport = transports[leaf];
+        hstr::DenseMatrix targetBase = transports[leaf];
         if (mParams.traceSpatialOrder > 1)
         {
             const hstr::DenseMatrix coarse = hstr::multiply(
                 spatialTransfer.restriction,
                 hstr::multiply(transports[leaf], spatialTransfer.prolongation)
             );
-            storedTransport = hstr::multiply(
+            targetBase = hstr::multiply(
                 spatialTransfer.prolongation,
                 hstr::multiply(coarse, spatialTransfer.restriction)
             );
-            mLeafCorrections[leaf] = hstr::subtract(transports[leaf], storedTransport);
         }
-        for (size_t i = 0; i < matrixSize; ++i)
-            packedTransport[matrixSize * leaf + i] = storedTransport.data()[i];
+        const hstr::TransportCharacterSplit split = hstr::splitTransportCharacters(targetBase, mParams.hstrFaceDofs);
+        const hstr::DenseMatrix ballistic = retainLargest(split.ballistic, mParams.ballisticBudget);
+        const hstr::DenseMatrix nearScatter = retainLargest(split.nearScatter, mParams.nearScatterBudget);
+        struct DiffuseColumn { size_t col; float flux; };
+        std::vector<DiffuseColumn> diffuseColumns;
+        for (size_t col = 0; col < traceDofs; ++col)
+        {
+            float flux = 0.f;
+            for (size_t row = 0; row < traceDofs; ++row)
+                flux += split.diffuse(row, col);
+            if (flux > 0.f)
+                diffuseColumns.push_back({col, flux});
+        }
+        if (diffuseColumns.size() > mParams.diffuseRankBudget)
+        {
+            std::nth_element(
+                diffuseColumns.begin(),
+                diffuseColumns.begin() + mParams.diffuseRankBudget,
+                diffuseColumns.end(),
+                [](const DiffuseColumn& a, const DiffuseColumn& b) { return a.flux > b.flux; }
+            );
+            diffuseColumns.resize(mParams.diffuseRankBudget);
+        }
+        hstr::LowRankOperator diffuse;
+        diffuse.left = hstr::DenseMatrix(traceDofs, diffuseColumns.size());
+        diffuse.right = hstr::DenseMatrix(traceDofs, diffuseColumns.size());
+        for (size_t mode = 0; mode < diffuseColumns.size(); ++mode)
+        {
+            diffuse.right(diffuseColumns[mode].col, mode) = 1.f;
+            for (size_t row = 0; row < traceDofs; ++row)
+                diffuse.left(row, mode) = split.diffuse(row, diffuseColumns[mode].col);
+        }
+        hstr::DenseMatrix diffuseMatrix = diffuse.reconstruct();
+        hstr::DenseMatrix base(traceDofs, traceDofs);
+        for (size_t row = 0; row < traceDofs; ++row)
+            for (size_t col = 0; col < traceDofs; ++col)
+                base(row, col) = ballistic(row, col) + nearScatter(row, col) + diffuseMatrix(row, col);
+        FALCOR_ASSERT(hstr::certifyPassivity(base).valid);
+        mParams.maximumDiffuseRank = std::max(mParams.maximumDiffuseRank, uint32_t(diffuse.rank()));
+        mLeafBaseTransport[leaf] = base;
+        mLeafCorrections[leaf] = hstr::subtract(transports[leaf], base);
+        if (leaf < mDictionaryCorrections.size())
+            for (size_t row = 0; row < traceDofs; ++row)
+                for (size_t col = 0; col < traceDofs; ++col)
+                    mLeafCorrections[leaf](row, col) += mDictionaryCorrections[leaf](row, col);
+        for (size_t col = 0; col < traceDofs; ++col)
+        {
+            const size_t inputFace = col / mParams.hstrFaceDofs;
+            const size_t mode = col % mParams.hstrFaceDofs;
+            packedBallistic[traceDofs * leaf + col] = ballistic((inputFace ^ 1u) * mParams.hstrFaceDofs + mode, col);
+            for (size_t outputFace = 0; outputFace < 6; ++outputFace)
+                packedNearScatter[(traceDofs * leaf + col) * 6 + outputFace] = nearScatter(outputFace * mParams.hstrFaceDofs + mode, col);
+        }
+        packedDiffuseRanks[leaf] = uint32_t(diffuse.rank());
+        for (size_t row = 0; row < traceDofs; ++row)
+            for (size_t mode = 0; mode < diffuse.rank(); ++mode)
+            {
+                packedDiffuseLeft[matrixSize * leaf + traceDofs * row + mode] = diffuse.left(row, mode);
+                packedDiffuseRight[matrixSize * leaf + traceDofs * row + mode] = diffuse.right(row, mode);
+            }
         if (mParams.traceSpatialOrder > 1)
         {
             for (size_t row = 0; row < traceDofs; ++row)
@@ -243,9 +403,11 @@ void HSTRCloud::uploadHierarchy()
     mpLeafBasisRight = mpDevice->createStructuredBuffer(
         sizeof(float), packedRight.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedRight.data(), false
     );
-    mpLeafTransport = mpDevice->createStructuredBuffer(
-        sizeof(float), packedTransport.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedTransport.data(), false
-    );
+    mpLeafBallistic = mpDevice->createStructuredBuffer(sizeof(float), packedBallistic.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedBallistic.data(), false);
+    mpLeafNearScatter = mpDevice->createStructuredBuffer(sizeof(float), packedNearScatter.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedNearScatter.data(), false);
+    mpLeafDiffuseLeft = mpDevice->createStructuredBuffer(sizeof(float), packedDiffuseLeft.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseLeft.data(), false);
+    mpLeafDiffuseRight = mpDevice->createStructuredBuffer(sizeof(float), packedDiffuseRight.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseRight.data(), false);
+    mpLeafDiffuseRanks = mpDevice->createStructuredBuffer(sizeof(uint32_t), packedDiffuseRanks.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseRanks.data(), false);
     mpLeafRadiance = mpDevice->createStructuredBuffer(
         sizeof(float4),
         traceDofs * leafCount,
@@ -254,6 +416,7 @@ void HSTRCloud::uploadHierarchy()
         nullptr,
         false
     );
+    logInfo("HSTRCloud: split transport budgets ballistic={} near={} diffuse={} (certified max rank {}).", mParams.ballisticBudget, mParams.nearScatterBudget, mParams.diffuseRankBudget, mParams.maximumDiffuseRank);
 }
 
 void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
@@ -282,11 +445,9 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
         rootGoals(dof, mParams.hstrFaceDofs + 1) = 1.f / float(mParams.hstrTraceDofs);
     const auto goals = mHierarchy.getLeafAdjointGoalMatrices(rootGoals);
     const size_t leafCount = transfers.size();
-    const auto transports = mHierarchy.getLeafTransportMatrices();
     std::vector<float> packedResponses(leafCount * mParams.hstrStorageRank, 0.f);
     for (size_t leaf = 0; leaf < leafCount; ++leaf)
     {
-        const hstr::DenseMatrix storedTransport = hstr::subtract(transports[leaf], mLeafCorrections[leaf]);
         hstr::DenseMatrix basis = transfers[leaf];
         if (mParams.traceSpatialOrder == 1)
         {
@@ -296,7 +457,7 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
                 for (size_t mode = 0; mode < compressed.cols(); ++mode)
                     basis(row, mode) = compressed(row, mode);
         }
-        const hstr::DenseMatrix responses = hstr::multiply(hstr::transpose(goals[leaf]), hstr::multiply(storedTransport, basis));
+        const hstr::DenseMatrix responses = hstr::multiply(hstr::transpose(goals[leaf]), hstr::multiply(mLeafBaseTransport[leaf], basis));
         for (uint32_t mode = 0; mode < mParams.hstrStorageRank; ++mode)
             for (uint32_t goal = 0; goal < mParams.adjointGoalCount; ++goal)
                 packedResponses[leaf * mParams.hstrStorageRank + mode] =
@@ -431,7 +592,9 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
     const float3 albedo = volume->getAlbedo();
     const float meanAlbedo = (albedo.x + albedo.y + albedo.z) / 3.f;
     std::vector<hstr::DenseMatrix> subcellTransport;
+    std::vector<float> subcellDensity;
     subcellTransport.reserve(kSubcellsPerAxis * kSubcellsPerAxis * kSubcellsPerAxis);
+    subcellDensity.reserve(kSubcellsPerAxis * kSubcellsPerAxis * kSubcellsPerAxis);
     for (uint32_t z = 0; z < kSubcellsPerAxis; ++z)
         for (uint32_t y = 0; y < kSubcellsPerAxis; ++y)
             for (uint32_t x = 0; x < kSubcellsPerAxis; ++x)
@@ -439,10 +602,24 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
                 const float3 u = (float3(x, y, z) + 0.5f) / float(kSubcellsPerAxis);
                 const int3 p = min(end - 1, begin + int3(u * float3(end - begin)));
                 const float density = std::max(0.f, grid->getValue(p)) * volume->getDensityScale() * mParams.densityScale;
+                subcellDensity.push_back(density);
                 subcellTransport.push_back(hstr::makeLeafTransport(density * subcellSize, meanAlbedo, mParams.anisotropy, 0.65f));
             }
     if (mParams.traceSpatialOrder > 1)
+    {
+        if (insideWindow(cell, mParams.schurWindowCenter, mParams.schurWindowRadius))
+            return hstr::makeGridBoundaryTransport(kSubcellsPerAxis, subcellTransport);
+        const auto [minimumDensity, maximumDensity] = std::minmax_element(subcellDensity.begin(), subcellDensity.end());
+        const float relativeVariation = (*maximumDensity - *minimumDensity) / std::max(1e-4f, *maximumDensity);
+        if (relativeVariation <= mParams.mixedFidelityThreshold)
+        {
+            const hstr::Hierarchy local = hstr::Hierarchy::compile(uint3(kSubcellsPerAxis), subcellTransport);
+            const hstr::DenseMatrix p0 = local.getNodes()[local.getRoot()].transport;
+            const hstr::TraceTransfer lift = hstr::makeConservativeTraceTransfer(6, mParams.hstrFaceDofs);
+            return hstr::multiply(lift.prolongation, hstr::multiply(p0, lift.restriction));
+        }
         return hstr::makeGridBoundaryTransport(kSubcellsPerAxis, subcellTransport);
+    }
     const hstr::Hierarchy local = hstr::Hierarchy::compile(uint3(kSubcellsPerAxis), subcellTransport);
     return local.getNodes()[local.getRoot()].transport;
 }
@@ -457,24 +634,52 @@ void HSTRCloud::updateHierarchy()
     if (changed.empty())
         return;
 
-    // Broad changes deliberately rebuild. Sparse changes use exact local
-    // Schur repair and touch only each leaf-to-root ancestor chain.
-    if (changed.size() > updatedDensity.size() / 10)
+    const auto oldTransport = mHierarchy.getLeafTransportMatrices();
+    std::vector<hstr::DenseMatrix> newTransport;
+    newTransport.reserve(changed.size());
+    size_t maximumUpdateRank = 0;
+    for (uint32_t leaf : changed)
+    {
+        newTransport.push_back(makeNestedLeafTransport(leaf));
+        const hstr::DenseMatrix delta = hstr::subtract(newTransport.back(), oldTransport[leaf]);
+        maximumUpdateRank = std::max(maximumUpdateRank, hstr::compress(delta, 1e-4f, mParams.hstrTraceDofs).rank());
+    }
+
+    hstr::UpdateStrategy strategy = hstr::UpdateStrategy::SubtreeRepair;
+    if (changed.size() * 4 >= updatedDensity.size())
+        strategy = hstr::UpdateStrategy::FullRefactorization;
+    else if (maximumUpdateRank <= 2 && changed.size() <= 32)
+        strategy = hstr::UpdateStrategy::Woodbury;
+    else if (maximumUpdateRank <= 8 && changed.size() <= 128)
+        strategy = hstr::UpdateStrategy::WoodburyKrylov;
+
+    if (strategy == hstr::UpdateStrategy::FullRefactorization)
     {
         buildHierarchy();
+        logInfo("HSTRCloud: full refactorization for {} changed leaves (measured update rank {}).", changed.size(), maximumUpdateRank);
         return;
     }
 
     uint32_t repairedNodes = 0;
-    for (uint32_t leaf : changed)
+    for (size_t i = 0; i < changed.size(); ++i)
     {
-        repairedNodes += mHierarchy.updateLeaf(leaf, makeNestedLeafTransport(leaf));
-        mLeafDensity[leaf] = updatedDensity[leaf];
+        repairedNodes += mHierarchy.updateLeaf(changed[i], newTransport[i], strategy);
+        mDictionaryCorrections[changed[i]] = hstr::DenseMatrix(mParams.hstrTraceDofs, mParams.hstrTraceDofs);
+        mLeafDensity[changed[i]] = updatedDensity[changed[i]];
     }
     uploadHierarchy();
     solveLighting();
     mOptionsChanged = true;
-    logInfo("HSTRCloud: repaired {} changed leaves across {} ancestor updates.", changed.size(), repairedNodes);
+    const char* strategyName = strategy == hstr::UpdateStrategy::Woodbury
+        ? "Woodbury"
+        : strategy == hstr::UpdateStrategy::WoodburyKrylov ? "Woodbury-plus-Krylov" : "subtree";
+    logInfo(
+        "HSTRCloud: {} repair of {} changed leaves at measured rank {} across {} ancestor updates.",
+        strategyName,
+        changed.size(),
+        maximumUpdateRank,
+        repairedNodes
+    );
 }
 
 void HSTRCloud::solveLighting()
@@ -499,6 +704,26 @@ void HSTRCloud::solveLighting()
             incident(sunFace * mParams.hstrFaceDofs + mode, channel) +=
                 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
 
+    const auto bounds = mpScene->getGridVolume(0)->getBounds();
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    const float3 windowPosition = clamp((cameraPosition - bounds.minPoint) / bounds.extent(), float3(0.f), float3(0.999999f));
+    mParams.schurWindowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
+    if (any(mParams.localSourceRadiance > 0.f))
+    {
+        const auto sourceToRoot = mHierarchy.getLeafSourceToRootMatrices();
+        const uint3 leafDims = mHierarchy.getLeafDims();
+        const size_t sourceLeaf = size_t(mParams.schurWindowCenter.x) + size_t(leafDims.x) *
+            (size_t(mParams.schurWindowCenter.y) + size_t(leafDims.y) * mParams.schurWindowCenter.z);
+        hstr::DenseMatrix localSource(mParams.hstrTraceDofs, 3);
+        for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
+            for (uint32_t channel = 0; channel < 3; ++channel)
+                localSource(dof, channel) = mParams.localSourceRadiance[channel] / float(mParams.hstrTraceDofs);
+        const hstr::DenseMatrix rootSource = hstr::multiply(sourceToRoot[sourceLeaf], localSource);
+        for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
+            for (uint32_t channel = 0; channel < 3; ++channel)
+                incident(dof, channel) += rootSource(dof, channel);
+    }
+
     std::vector<float4> rootIncident(mParams.hstrTraceDofs);
     for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
         rootIncident[dof] = float4(incident(dof, 0), incident(dof, 1), incident(dof, 2), 0.f);
@@ -519,7 +744,11 @@ void HSTRCloud::dispatchLightingSolve()
     var["hstrRadiance"] = mpLeafRadiance;
     var["hstrLeafBasisLeft"] = mpLeafBasisLeft;
     var["hstrLeafBasisRight"] = mpLeafBasisRight;
-    var["hstrLeafTransport"] = mpLeafTransport;
+    var["hstrLeafBallistic"] = mpLeafBallistic;
+    var["hstrLeafNearScatter"] = mpLeafNearScatter;
+    var["hstrLeafDiffuseLeft"] = mpLeafDiffuseLeft;
+    var["hstrLeafDiffuseRight"] = mpLeafDiffuseRight;
+    var["hstrLeafDiffuseRanks"] = mpLeafDiffuseRanks;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["hstrRootIncident"] = mpRootIncident;
     var["hstrLeafAdjointResponses"] = mpLeafAdjointResponses;
@@ -531,6 +760,46 @@ void HSTRCloud::dispatchLightingSolve()
 
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    if (mpScene && !mpScene->getGridVolumes().empty())
+    {
+        const auto bounds = mpScene->getGridVolume(0)->getBounds();
+        const float3 windowPosition = clamp(
+            (mpScene->getCamera()->getPosition() - bounds.minPoint) / bounds.extent(),
+            float3(0.f),
+            float3(0.999999f)
+        );
+        const uint3 windowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
+        if (any(windowCenter != mParams.schurWindowCenter))
+        {
+            const uint3 previousCenter = mParams.schurWindowCenter;
+            mParams.schurWindowCenter = windowCenter;
+            uint32_t repairedNodes = 0;
+            uint32_t changedLeaves = 0;
+            const uint3 leafDims = mHierarchy.getLeafDims();
+            for (uint32_t z = 0; z < mActualLeafDims.z; ++z)
+                for (uint32_t y = 0; y < mActualLeafDims.y; ++y)
+                    for (uint32_t x = 0; x < mActualLeafDims.x; ++x)
+                    {
+                        const uint3 leaf(x, y, z);
+                        if (insideWindow(leaf, previousCenter, mParams.schurWindowRadius) ==
+                            insideWindow(leaf, windowCenter, mParams.schurWindowRadius))
+                            continue;
+                        const uint32_t index = x + leafDims.x * (y + leafDims.y * z);
+                        repairedNodes += mHierarchy.updateLeaf(index, makeNestedLeafTransport(index), hstr::UpdateStrategy::SubtreeRepair);
+                        mDictionaryCorrections[index] = hstr::DenseMatrix(mParams.hstrTraceDofs, mParams.hstrTraceDofs);
+                        ++changedLeaves;
+                    }
+            if (changedLeaves > 0)
+            {
+                uploadHierarchy();
+                solveLighting();
+                logInfo("HSTRCloud: moved exact Schur window across {} leaves with {} ancestor repairs.", changedLeaves, repairedNodes);
+            }
+            else if (any(mParams.localSourceRadiance > 0.f))
+                solveLighting();
+            mOptionsChanged = true;
+        }
+    }
     if (!mFirstFrame && mpScene)
     {
         const auto updates = mpScene->getUpdates();
@@ -594,6 +863,13 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     lightingChanged |= widget.var("Adjoint goal face", mParams.goalFace, 0u, 5u, 1u);
     lightingChanged |= widget.var("Correction atom budget", mParams.correctionBudget, 0u, 1048576u, 4096u);
     renderChanged |= widget.var("Correction fade frames", mParams.correctionFadeFrames, 1u, 64u, 1u);
+    operatorChanged |= widget.var("Ballistic entries per leaf", mParams.ballisticBudget, 0u, mParams.hstrTraceDofs, 1u);
+    operatorChanged |= widget.var("Near-scatter entries per leaf", mParams.nearScatterBudget, 0u, 5u * mParams.hstrTraceDofs, 4u);
+    operatorChanged |= widget.var("Diffuse rank budget", mParams.diffuseRankBudget, 1u, mParams.hstrTraceDofs, 1u);
+    operatorChanged |= widget.var("Mixed-fidelity variation", mParams.mixedFidelityThreshold, 0.f, 1.f, 0.01f);
+    operatorChanged |= widget.var("Operator dictionary tolerance", mParams.operatorDictionaryTolerance, 1e-7f, 1e-2f, 1e-5f);
+    lightingChanged |= widget.var("Moving Schur window radius", mParams.schurWindowRadius, 0u, 64u, 1u);
+    lightingChanged |= widget.rgbColor("Local source radiance", mParams.localSourceRadiance);
     const uint32_t previousTraceOrder = mParams.traceSpatialOrder;
     operatorChanged |= widget.var("Face spatial order", mParams.traceSpatialOrder, 1u, 2u, 1u);
     if (mParams.traceSpatialOrder != previousTraceOrder)
@@ -612,4 +888,5 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         "Lighting is reconstructed from a persistent six-face spatial-angular Schur hierarchy. NanoVDB is queried only for primary "
         "visibility and the deterministic near-field residual."
     );
+    widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
 }

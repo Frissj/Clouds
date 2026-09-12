@@ -20,11 +20,20 @@ struct FALCOR_API HierarchyNode
     DenseMatrix transport;
     DenseMatrix leftInput;
     DenseMatrix rightInput;
+    DenseMatrix interfaceSystem;
     DenseMatrix residual;
     float residualNorm = 0.f;
     float conservationError = 0.f;
 
     bool isLeaf() const { return left == kInvalid; }
+};
+
+enum class UpdateStrategy
+{
+    Woodbury,
+    WoodburyKrylov,
+    SubtreeRepair,
+    FullRefactorization,
 };
 
 struct FALCOR_API RankedCorrection
@@ -53,12 +62,13 @@ public:
     std::vector<float3> solveFaces(const DenseMatrix& rootIncident) const;
     std::vector<float3> solve(const DenseMatrix& rootIncident) const;
     std::vector<DenseMatrix> getLeafTransferMatrices() const;
+    std::vector<DenseMatrix> getLeafSourceToRootMatrices() const;
     std::vector<DenseMatrix> getLeafAdjointGoalMatrices(const DenseMatrix& rootGoals) const;
     std::vector<DenseMatrix> getLeafTransportMatrices() const;
     DenseMatrix solveAdjoint(const DenseMatrix& rootGoal) const;
     std::vector<RankedCorrection> rankResidualAtoms(const DenseMatrix& rootIncident, const DenseMatrix& rootGoal) const;
     std::vector<float> getLeafResidualBounds() const;
-    uint32_t updateLeaf(uint32_t leafIndex, const DenseMatrix& transport);
+    uint32_t updateLeaf(uint32_t leafIndex, const DenseMatrix& transport, UpdateStrategy strategy = UpdateStrategy::SubtreeRepair);
 
     void save(const std::filesystem::path& path) const;
     static Hierarchy load(const std::filesystem::path& path);

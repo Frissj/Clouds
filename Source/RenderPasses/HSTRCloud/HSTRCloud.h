@@ -55,7 +55,11 @@ private:
     ref<Buffer> mpLeafRadiance;
     ref<Buffer> mpLeafBasisLeft;
     ref<Buffer> mpLeafBasisRight;
-    ref<Buffer> mpLeafTransport;
+    ref<Buffer> mpLeafBallistic;
+    ref<Buffer> mpLeafNearScatter;
+    ref<Buffer> mpLeafDiffuseLeft;
+    ref<Buffer> mpLeafDiffuseRight;
+    ref<Buffer> mpLeafDiffuseRanks;
     ref<Buffer> mpLeafResidualBounds;
     ref<Buffer> mpRootIncident;
     ref<Buffer> mpLeafAdjointResponses;
@@ -70,6 +74,10 @@ private:
     std::vector<float> mLeafDensity;
     std::vector<float> mHierarchyResidualBounds;
     std::vector<hstr::DenseMatrix> mLeafCorrections;
+    std::vector<hstr::DenseMatrix> mLeafBaseTransport;
+    std::vector<hstr::DenseMatrix> mOperatorDictionary;
+    std::vector<uint32_t> mLeafOperatorIDs;
+    std::vector<hstr::DenseMatrix> mDictionaryCorrections;
     bool mOptionsChanged = false;
     bool mFirstFrame = true;
 };
