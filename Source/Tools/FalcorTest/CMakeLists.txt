@@ -57,6 +57,8 @@ target_sources(FalcorTest PRIVATE
     Tests/Rendering/Materials/MicrofacetTests.cpp
     Tests/Rendering/Materials/MicrofacetTests.cs.slang
 
+    Tests/Rendering/Volumes/HSTROperatorTests.cpp
+
     Tests/Sampling/AliasTableTests.cpp
     Tests/Sampling/AliasTableTests.cs.slang
     Tests/Sampling/LowDiscrepancyTests.cpp

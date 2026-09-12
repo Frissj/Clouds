@@ -1,0 +1,23 @@
+from falcor import *
+from pathlib import Path
+
+
+cloud_path = Path.home() / "Downloads" / "wdas_cloud" / "wdas_cloud" / "wdas_cloud_eighth.vdb"
+if not cloud_path.is_file():
+    raise RuntimeError(f"WDAS cloud not found at {cloud_path}")
+
+cloud = GridVolume("WDAS Cloud")
+cloud.loadGrid(GridVolume.GridSlot.Density, str(cloud_path), "density")
+cloud.densityScale = 4.0
+cloud.albedo = float3(0.99)
+cloud.anisotropy = 0.85
+sceneBuilder.addGridVolume(cloud)
+
+camera = Camera()
+# Mitsuba normalizes this VDB into a cube before applying its published camera.
+# Falcor retains the VDB's native transform, so use a camera fitted to that space.
+camera.position = float3(500.0, 60.0, -43.0)
+camera.target = float3(-10.0, 73.0, -43.0)
+camera.up = float3(0.0, 1.0, 0.0)
+camera.focalLength = 50.0
+sceneBuilder.addCamera(camera)

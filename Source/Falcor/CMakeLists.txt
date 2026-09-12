@@ -310,6 +310,10 @@ target_sources(Falcor PRIVATE
     Rendering/Volumes/GridVolumeSampler.h
     Rendering/Volumes/GridVolumeSampler.slang
     Rendering/Volumes/GridVolumeSamplerParams.slang
+    Rendering/Volumes/HSTROperator.cpp
+    Rendering/Volumes/HSTROperator.h
+    Rendering/Volumes/HSTRHierarchy.cpp
+    Rendering/Volumes/HSTRHierarchy.h
 
     RenderPasses/ResolvePass.cpp
     RenderPasses/ResolvePass.h

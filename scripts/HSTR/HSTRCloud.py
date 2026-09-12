@@ -1,0 +1,35 @@
+from falcor import *
+
+
+def render_graph_HSTRCloud():
+    graph = RenderGraph("HSTRCloud")
+    graph.addPass(createPass("HSTRCloud", {
+        "baseSteps": 96,
+        "refinementLevel": 1,
+        "densityScale": 1.0,
+        "residualBlend": 1.0,
+        "activeRank": 6,
+        "activeThreshold": 0.0,
+        "goalFace": 1,
+    }), "HSTRCloud")
+    graph.addPass(createPass("ToneMapper", {
+        "autoExposure": False,
+        "exposureCompensation": 0.0,
+    }), "ToneMapper")
+    graph.addPass(createPass("AccumulatePass", {
+        "enabled": True,
+        "autoReset": True,
+    }), "Accumulate")
+    graph.addEdge("HSTRCloud.color", "Accumulate.input")
+    graph.addEdge("Accumulate.output", "ToneMapper.src")
+    graph.markOutput("HSTRCloud.color")
+    graph.markOutput("ToneMapper.dst")
+    graph.markOutput("HSTRCloud.transportError")
+    return graph
+
+
+HSTRCloud = render_graph_HSTRCloud()
+try:
+    m.addGraph(HSTRCloud)
+except NameError:
+    pass
