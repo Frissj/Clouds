@@ -229,6 +229,72 @@ LowRankOperator compress(const DenseMatrix& matrix, float relativeTolerance, siz
     );
 }
 
+PassivityCertificate certifyPassivity(const DenseMatrix& transport, float tolerance)
+{
+    require(transport.rows() > 0 && transport.cols() > 0, "Passivity certification requires a non-empty operator.");
+    require(tolerance >= 0.f, "Passivity tolerance must be non-negative.");
+    PassivityCertificate result;
+    result.minimumEntry = std::numeric_limits<float>::infinity();
+    for (size_t col = 0; col < transport.cols(); ++col)
+    {
+        float fluxGain = 0.f;
+        for (size_t row = 0; row < transport.rows(); ++row)
+        {
+            result.minimumEntry = std::min(result.minimumEntry, transport(row, col));
+            fluxGain += transport(row, col);
+        }
+        result.maximumFluxGain = std::max(result.maximumFluxGain, fluxGain);
+    }
+    result.valid = result.minimumEntry >= -tolerance && result.maximumFluxGain <= 1.f + tolerance;
+    return result;
+}
+
+LowRankOperator compressPassive(const DenseMatrix& transport, float relativeTolerance, size_t initialRank)
+{
+    require(certifyPassivity(transport).valid, "Cannot passivity-compress an operator that creates energy or negative radiance.");
+    const size_t fullRank = std::min(transport.rows(), transport.cols());
+    require(initialRank > 0 && initialRank <= fullRank, "Initial passive compression rank is out of range.");
+    for (size_t rank = initialRank; rank <= fullRank; ++rank)
+    {
+        LowRankOperator candidate = compress(transport, relativeTolerance, rank);
+        if (certifyPassivity(candidate.reconstruct()).valid)
+            return candidate;
+    }
+
+    LowRankOperator exact;
+    exact.left = transport;
+    exact.right = DenseMatrix::identity(transport.cols());
+    exact.residualNorm = 0.f;
+    return exact;
+}
+
+TransportCharacterSplit splitTransportCharacters(const DenseMatrix& transport, size_t faceDofs)
+{
+    require(faceDofs > 0 && transport.rows() == transport.cols() && transport.rows() == 6 * faceDofs, "Transport split dimensions do not match six equal faces.");
+    TransportCharacterSplit result{
+        DenseMatrix(transport.rows(), transport.cols()),
+        DenseMatrix(transport.rows(), transport.cols()),
+        DenseMatrix(transport.rows(), transport.cols()),
+    };
+    for (size_t col = 0; col < transport.cols(); ++col)
+    {
+        const size_t inputFace = col / faceDofs;
+        const size_t inputMode = col % faceDofs;
+        for (size_t row = 0; row < transport.rows(); ++row)
+        {
+            const size_t outputFace = row / faceDofs;
+            const size_t outputMode = row % faceDofs;
+            if (outputFace == (inputFace ^ 1u) && outputMode == inputMode)
+                result.ballistic(row, col) = transport(row, col);
+            else if (outputMode == inputMode)
+                result.nearScatter(row, col) = transport(row, col);
+            else
+                result.diffuse(row, col) = transport(row, col);
+        }
+    }
+    return result;
+}
+
 KrylovResult gmres(
     size_t dimension,
     const MatrixApply& apply,

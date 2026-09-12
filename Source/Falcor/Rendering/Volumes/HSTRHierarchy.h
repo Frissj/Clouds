@@ -53,6 +53,7 @@ public:
     std::vector<float3> solveFaces(const DenseMatrix& rootIncident) const;
     std::vector<float3> solve(const DenseMatrix& rootIncident) const;
     std::vector<DenseMatrix> getLeafTransferMatrices() const;
+    std::vector<DenseMatrix> getLeafAdjointGoalMatrices(const DenseMatrix& rootGoals) const;
     std::vector<DenseMatrix> getLeafTransportMatrices() const;
     DenseMatrix solveAdjoint(const DenseMatrix& rootGoal) const;
     std::vector<RankedCorrection> rankResidualAtoms(const DenseMatrix& rootIncident, const DenseMatrix& rootGoal) const;

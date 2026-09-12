@@ -23,6 +23,11 @@ struct HSTRCloudParams
     uint hstrFaceDofs = 4;
     uint hstrTraceDofs = 24;
     uint hstrStorageRank = 24;
+    uint correctionBudget = 262144;
+
+    uint correctionAtomCount = 0;
+    uint correctionFadeFrames = 8;
+    uint adjointGoalCount = 0;
     uint padHSTR1 = 0;
 
     float residualBlend = 1.f;

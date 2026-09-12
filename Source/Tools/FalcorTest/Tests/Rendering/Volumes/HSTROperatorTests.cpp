@@ -120,6 +120,25 @@ CPU_TEST(HSTRGoalOrderedProgressiveTransport)
     EXPECT_EQ(selected[1], 2);
 }
 
+CPU_TEST(HSTRResidualAdmissionErrorIsMonotone)
+{
+    const std::vector<ResidualAtom> atoms = {
+        {0, 1.f, 16, 1.f},
+        {1, 4.f, 16, 1.f},
+        {2, 2.f, 16, 1.f},
+    };
+    float previousOmitted = 7.f;
+    for (uint64_t budget : {uint64_t(0), uint64_t(16), uint64_t(32), uint64_t(48)})
+    {
+        const auto selected = selectResidualAtoms(atoms, budget, 3.f);
+        float omitted = 7.f;
+        for (uint32_t index : selected)
+            omitted -= atoms[index].goalErrorReduction;
+        EXPECT_LE(omitted, previousOmitted);
+        previousOmitted = omitted;
+    }
+}
+
 CPU_TEST(HSTRHierarchyCompositionAndSerialization)
 {
     const DenseMatrix leaf = makeLeafTransport(float3(0.4f, 0.6f, 0.8f), 0.98f, 0.75f, 0.4f);
@@ -206,6 +225,40 @@ CPU_TEST(HSTRMatrixFreeCompression)
     expectMatrixNear(ctx, compressed.reconstruct(), matrix, 2e-4f);
 }
 
+CPU_TEST(HSTRPassivityCertifiedCompressionEscalatesRank)
+{
+    const DenseMatrix transport(2, 2, {0.5f, 0.f, 0.f, 0.5f});
+    const LowRankOperator compressed = compressPassive(transport, 0.f, 1);
+    const PassivityCertificate certificate = certifyPassivity(compressed.reconstruct());
+    EXPECT_TRUE(certificate.valid);
+    EXPECT_GE(certificate.minimumEntry, 0.f);
+    EXPECT_LE(certificate.maximumFluxGain, 1.f);
+    EXPECT_EQ(compressed.rank(), 2);
+}
+
+CPU_TEST(HSTRPassivityRejectsNegativeOrAmplifyingTransport)
+{
+    EXPECT_FALSE(certifyPassivity(DenseMatrix(2, 2, {0.8f, -0.1f, 0.1f, 0.2f})).valid);
+    EXPECT_FALSE(certifyPassivity(DenseMatrix(2, 2, {0.8f, 0.2f, 0.4f, 0.1f})).valid);
+}
+
+CPU_TEST(HSTRTransportCharacterSplitIsExactAndPassive)
+{
+    std::vector<DenseMatrix> cells;
+    for (uint32_t i = 0; i < 8; ++i)
+        cells.push_back(makeLeafTransport(float3(0.2f + 0.1f * i), 0.98f, 0.85f, 0.65f));
+    const DenseMatrix transport = makeGridBoundaryTransport(2, cells);
+    const TransportCharacterSplit split = splitTransportCharacters(transport, 4);
+    DenseMatrix reconstructed(transport.rows(), transport.cols());
+    for (size_t row = 0; row < reconstructed.rows(); ++row)
+        for (size_t col = 0; col < reconstructed.cols(); ++col)
+            reconstructed(row, col) = split.ballistic(row, col) + split.nearScatter(row, col) + split.diffuse(row, col);
+    expectMatrixNear(ctx, reconstructed, transport);
+    EXPECT_TRUE(certifyPassivity(split.ballistic).valid);
+    EXPECT_TRUE(certifyPassivity(split.nearScatter).valid);
+    EXPECT_TRUE(certifyPassivity(split.diffuse).valid);
+}
+
 CPU_TEST(HSTRStaleFactorKrylovFallback)
 {
     const DenseMatrix oldSystem(3, 3, {4.f, 1.f, 0.f, 1.f, 3.f, 1.f, 0.f, 1.f, 2.f});
@@ -250,6 +303,34 @@ CPU_TEST(HSTRPackedLeafSubstitutionMatchesSolve)
             for (size_t channel = 0; channel < 3; ++channel)
                 EXPECT_LE(std::abs(outgoing(face, channel) - expected[6 * leaf + face][channel]), 1e-5f);
     }
+}
+
+CPU_TEST(HSTRPersistentAdjointGoalsPropagateLinearly)
+{
+    const DenseMatrix a = makeLeafTransport(float3(0.2f, 0.5f, 0.9f), 0.98f, 0.8f, 0.6f);
+    const DenseMatrix b = makeLeafTransport(float3(1.2f, 0.4f, 0.3f), 0.98f, 0.8f, 0.6f);
+    const Hierarchy hierarchy = Hierarchy::compile(uint3(2, 1, 1), {a, b});
+    DenseMatrix goals(6, 2);
+    goals(1, 0) = 1.f;
+    goals(4, 1) = 0.75f;
+    goals(5, 1) = 0.25f;
+    const auto combined = hierarchy.getLeafAdjointGoalMatrices(goals);
+    DenseMatrix first(6, 1);
+    DenseMatrix second(6, 1);
+    for (size_t row = 0; row < 6; ++row)
+    {
+        first(row, 0) = goals(row, 0);
+        second(row, 0) = goals(row, 1);
+    }
+    const auto firstLeaves = hierarchy.getLeafAdjointGoalMatrices(first);
+    const auto secondLeaves = hierarchy.getLeafAdjointGoalMatrices(second);
+    EXPECT_EQ(combined.size(), 2);
+    for (size_t leaf = 0; leaf < combined.size(); ++leaf)
+        for (size_t row = 0; row < 6; ++row)
+        {
+            EXPECT_EQ(combined[leaf](row, 0), firstLeaves[leaf](row, 0));
+            EXPECT_EQ(combined[leaf](row, 1), secondLeaves[leaf](row, 0));
+        }
 }
 
 CPU_TEST(HSTRHigherOrderFaceModes)
@@ -305,6 +386,25 @@ CPU_TEST(HSTRExactMicrocellBoundaryTransport)
             flux += boundary(row, col);
         EXPECT_LE(flux, 1.f + 1e-4f);
     }
+}
+
+CPU_TEST(HSTRSpatialResidualReconstructsExactTransport)
+{
+    std::vector<DenseMatrix> cells;
+    for (uint32_t i = 0; i < 8; ++i)
+        cells.push_back(makeLeafTransport(float3(0.15f + 0.2f * i), 0.98f, 0.8f, 0.6f));
+    const DenseMatrix fine = makeGridBoundaryTransport(2, cells);
+    const TraceTransfer trace = makeConservativeTraceTransfer(6, 4);
+    const DenseMatrix coarse = multiply(trace.restriction, multiply(fine, trace.prolongation));
+    const DenseMatrix detail = residual(fine, coarse, trace.prolongation, trace.restriction);
+    const DenseMatrix reconstructed = subtract(fine, detail);
+    expectMatrixNear(ctx, reconstructed, multiply(trace.prolongation, multiply(coarse, trace.restriction)));
+
+    DenseMatrix exact = reconstructed;
+    for (size_t row = 0; row < exact.rows(); ++row)
+        for (size_t col = 0; col < exact.cols(); ++col)
+            exact(row, col) += detail(row, col);
+    expectMatrixNear(ctx, exact, fine);
 }
 
 CPU_TEST(HSTRThickLeafUsesDiffusionLimit)

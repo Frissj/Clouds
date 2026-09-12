@@ -31,10 +31,21 @@ public:
     void renderUI(Gui::Widgets& widget) override;
 
 private:
+    struct CorrectionAtom
+    {
+        uint32_t row = 0;
+        uint32_t col = 0;
+        float value = 0.f;
+        float goalError = 0.f;
+    };
+    static_assert(sizeof(CorrectionAtom) == 16);
+
     void buildHierarchy();
     void updateHierarchy();
     void uploadHierarchy();
+    void uploadCorrectionPool(const hstr::DenseMatrix& rootIncident);
     void solveLighting();
+    void dispatchLightingSolve();
     std::vector<float> sampleLeafDensities() const;
     hstr::DenseMatrix makeNestedLeafTransport(uint32_t leafIndex) const;
 
@@ -47,6 +58,9 @@ private:
     ref<Buffer> mpLeafTransport;
     ref<Buffer> mpLeafResidualBounds;
     ref<Buffer> mpRootIncident;
+    ref<Buffer> mpLeafAdjointResponses;
+    ref<Buffer> mpCorrectionRanges;
+    ref<Buffer> mpCorrectionAtoms;
     hstr::Hierarchy mHierarchy;
     HSTRCloudParams mParams;
     uint3 mActualLeafDims = uint3(0);
@@ -54,6 +68,8 @@ private:
     int3 mGridMax = int3(0);
     float3 mVoxelSize = float3(0.f);
     std::vector<float> mLeafDensity;
+    std::vector<float> mHierarchyResidualBounds;
+    std::vector<hstr::DenseMatrix> mLeafCorrections;
     bool mOptionsChanged = false;
     bool mFirstFrame = true;
 };

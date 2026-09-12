@@ -25,6 +25,8 @@ const char kActiveRank[] = "activeRank";
 const char kActiveThreshold[] = "activeThreshold";
 const char kGoalFace[] = "goalFace";
 const char kTraceSpatialOrder[] = "traceSpatialOrder";
+const char kCorrectionBudget[] = "correctionBudget";
+const char kCorrectionFadeFrames[] = "correctionFadeFrames";
 
 uint32_t nextPowerOfTwo(uint32_t value)
 {
@@ -68,6 +70,10 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.goalFace = value;
         else if (key == kTraceSpatialOrder)
             mParams.traceSpatialOrder = value;
+        else if (key == kCorrectionBudget)
+            mParams.correctionBudget = value;
+        else if (key == kCorrectionFadeFrames)
+            mParams.correctionFadeFrames = value;
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
     }
@@ -88,6 +94,8 @@ Properties HSTRCloud::getProperties() const
     props[kActiveThreshold] = mParams.activeThreshold;
     props[kGoalFace] = mParams.goalFace;
     props[kTraceSpatialOrder] = mParams.traceSpatialOrder;
+    props[kCorrectionBudget] = mParams.correctionBudget;
+    props[kCorrectionFadeFrames] = mParams.correctionFadeFrames;
     return props;
 }
 
@@ -185,16 +193,31 @@ void HSTRCloud::uploadHierarchy()
     const size_t leafCount = size_t(leafDims.x) * leafDims.y * leafDims.z;
     const auto transfers = mHierarchy.getLeafTransferMatrices();
     const auto transports = mHierarchy.getLeafTransportMatrices();
-    const auto residualBounds = mHierarchy.getLeafResidualBounds();
+    mHierarchyResidualBounds = mHierarchy.getLeafResidualBounds();
     const size_t traceDofs = mParams.hstrTraceDofs;
     const size_t matrixSize = traceDofs * traceDofs;
     std::vector<float> packedLeft(matrixSize * leafCount, 0.f);
     std::vector<float> packedRight(matrixSize * leafCount, 0.f);
     std::vector<float> packedTransport(matrixSize * leafCount);
+    mLeafCorrections.assign(leafCount, hstr::DenseMatrix(traceDofs, traceDofs));
+    const hstr::TraceTransfer spatialTransfer = hstr::makeConservativeTraceTransfer(6, mParams.hstrFaceDofs);
     for (size_t leaf = 0; leaf < leafCount; ++leaf)
     {
+        hstr::DenseMatrix storedTransport = transports[leaf];
+        if (mParams.traceSpatialOrder > 1)
+        {
+            const hstr::DenseMatrix coarse = hstr::multiply(
+                spatialTransfer.restriction,
+                hstr::multiply(transports[leaf], spatialTransfer.prolongation)
+            );
+            storedTransport = hstr::multiply(
+                spatialTransfer.prolongation,
+                hstr::multiply(coarse, spatialTransfer.restriction)
+            );
+            mLeafCorrections[leaf] = hstr::subtract(transports[leaf], storedTransport);
+        }
         for (size_t i = 0; i < matrixSize; ++i)
-            packedTransport[matrixSize * leaf + i] = transports[leaf].data()[i];
+            packedTransport[matrixSize * leaf + i] = storedTransport.data()[i];
         if (mParams.traceSpatialOrder > 1)
         {
             for (size_t row = 0; row < traceDofs; ++row)
@@ -223,9 +246,6 @@ void HSTRCloud::uploadHierarchy()
     mpLeafTransport = mpDevice->createStructuredBuffer(
         sizeof(float), packedTransport.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedTransport.data(), false
     );
-    mpLeafResidualBounds = mpDevice->createStructuredBuffer(
-        sizeof(float), residualBounds.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, residualBounds.data(), false
-    );
     mpLeafRadiance = mpDevice->createStructuredBuffer(
         sizeof(float4),
         traceDofs * leafCount,
@@ -233,6 +253,129 @@ void HSTRCloud::uploadHierarchy()
         MemoryType::DeviceLocal,
         nullptr,
         false
+    );
+}
+
+void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
+{
+    struct Candidate
+    {
+        uint32_t leaf;
+        CorrectionAtom atom;
+    };
+    const auto transfers = mHierarchy.getLeafTransferMatrices();
+    const float3 sun = normalize(mParams.sunDirection);
+    uint32_t sunAxis = 0;
+    if (std::abs(sun.y) > std::abs(sun.x))
+        sunAxis = 1;
+    if (std::abs(sun.z) > std::abs(sun[sunAxis]))
+        sunAxis = 2;
+    const uint32_t sunFace = 2 * sunAxis + (sun[sunAxis] >= 0.f ? 1u : 0u);
+    mParams.adjointGoalCount = mParams.hstrFaceDofs + 2;
+    hstr::DenseMatrix rootGoals(mParams.hstrTraceDofs, mParams.adjointGoalCount);
+    for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
+    {
+        rootGoals(mParams.goalFace * mParams.hstrFaceDofs + mode, mode) = 1.f;
+        rootGoals(sunFace * mParams.hstrFaceDofs + mode, mParams.hstrFaceDofs) = 1.f / float(mParams.hstrFaceDofs);
+    }
+    for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
+        rootGoals(dof, mParams.hstrFaceDofs + 1) = 1.f / float(mParams.hstrTraceDofs);
+    const auto goals = mHierarchy.getLeafAdjointGoalMatrices(rootGoals);
+    const size_t leafCount = transfers.size();
+    const auto transports = mHierarchy.getLeafTransportMatrices();
+    std::vector<float> packedResponses(leafCount * mParams.hstrStorageRank, 0.f);
+    for (size_t leaf = 0; leaf < leafCount; ++leaf)
+    {
+        const hstr::DenseMatrix storedTransport = hstr::subtract(transports[leaf], mLeafCorrections[leaf]);
+        hstr::DenseMatrix basis = transfers[leaf];
+        if (mParams.traceSpatialOrder == 1)
+        {
+            const hstr::DenseMatrix compressed = hstr::compress(transfers[leaf], 1e-6f, mParams.hstrTraceDofs).left;
+            basis = hstr::DenseMatrix(mParams.hstrTraceDofs, mParams.hstrStorageRank);
+            for (size_t row = 0; row < compressed.rows(); ++row)
+                for (size_t mode = 0; mode < compressed.cols(); ++mode)
+                    basis(row, mode) = compressed(row, mode);
+        }
+        const hstr::DenseMatrix responses = hstr::multiply(hstr::transpose(goals[leaf]), hstr::multiply(storedTransport, basis));
+        for (uint32_t mode = 0; mode < mParams.hstrStorageRank; ++mode)
+            for (uint32_t goal = 0; goal < mParams.adjointGoalCount; ++goal)
+                packedResponses[leaf * mParams.hstrStorageRank + mode] =
+                    std::max(packedResponses[leaf * mParams.hstrStorageRank + mode], std::abs(responses(goal, mode)));
+    }
+    mpLeafAdjointResponses = mpDevice->createStructuredBuffer(
+        sizeof(float), packedResponses.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedResponses.data(), false
+    );
+    std::vector<float> omitted = mHierarchyResidualBounds;
+    std::vector<Candidate> candidates;
+    if (mParams.traceSpatialOrder > 1)
+        candidates.reserve(leafCount * mParams.hstrTraceDofs * mParams.hstrTraceDofs / 2);
+    for (uint32_t leaf = 0; leaf < leafCount; ++leaf)
+    {
+        const hstr::DenseMatrix incident = hstr::multiply(transfers[leaf], rootIncident);
+        const hstr::DenseMatrix& detail = mLeafCorrections[leaf];
+        for (uint32_t row = 0; row < mParams.hstrTraceDofs; ++row)
+            for (uint32_t col = 0; col < mParams.hstrTraceDofs; ++col)
+            {
+                const float value = detail(row, col);
+                float incidentMagnitude = 0.f;
+                for (uint32_t channel = 0; channel < 3; ++channel)
+                    incidentMagnitude += std::abs(incident(col, channel));
+                float goalError = 0.f;
+                for (uint32_t goal = 0; goal < mParams.adjointGoalCount; ++goal)
+                    goalError += std::abs(goals[leaf](row, goal) * value) * incidentMagnitude;
+                if (goalError <= 1e-12f)
+                    continue;
+                omitted[leaf] += goalError;
+                candidates.push_back({leaf, {row, col, value, goalError}});
+            }
+    }
+
+    const size_t candidateCount = candidates.size();
+    const size_t admittedCount = std::min<size_t>(mParams.correctionBudget, candidateCount);
+    if (admittedCount < candidates.size())
+    {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + admittedCount,
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.atom.goalError > b.atom.goalError; }
+        );
+        candidates.resize(admittedCount);
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.leaf < b.leaf; });
+
+    std::vector<uint2> ranges(leafCount, uint2(0));
+    std::vector<CorrectionAtom> atoms;
+    atoms.reserve(candidates.size());
+    for (const Candidate& candidate : candidates)
+    {
+        uint2& range = ranges[candidate.leaf];
+        if (range.y == 0)
+            range.x = uint32_t(atoms.size());
+        ++range.y;
+        atoms.push_back(candidate.atom);
+    }
+    mParams.correctionAtomCount = uint32_t(atoms.size());
+    const CorrectionAtom dummy;
+    mpCorrectionAtoms = mpDevice->createStructuredBuffer(
+        sizeof(CorrectionAtom),
+        std::max<size_t>(1, atoms.size()),
+        ResourceBindFlags::ShaderResource,
+        MemoryType::DeviceLocal,
+        atoms.empty() ? &dummy : atoms.data(),
+        false
+    );
+    mpCorrectionRanges = mpDevice->createStructuredBuffer(
+        sizeof(uint2), ranges.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, ranges.data(), false
+    );
+    mpLeafResidualBounds = mpDevice->createStructuredBuffer(
+        sizeof(float), omitted.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, omitted.data(), false
+    );
+    logInfo(
+        "HSTRCloud: admitted {} of {} residual atoms against {} persistent adjoint goals.",
+        atoms.size(),
+        candidateCount,
+        mParams.adjointGoalCount
     );
 }
 
@@ -362,7 +505,15 @@ void HSTRCloud::solveLighting()
     mpRootIncident = mpDevice->createStructuredBuffer(
         sizeof(float4), rootIncident.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, rootIncident.data(), false
     );
+    uploadCorrectionPool(incident);
 
+    dispatchLightingSolve();
+}
+
+void HSTRCloud::dispatchLightingSolve()
+{
+    if (!mpSolvePass || !mpLeafRadiance)
+        return;
     ShaderVar var = mpSolvePass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
     var["hstrRadiance"] = mpLeafRadiance;
@@ -371,6 +522,9 @@ void HSTRCloud::solveLighting()
     var["hstrLeafTransport"] = mpLeafTransport;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["hstrRootIncident"] = mpRootIncident;
+    var["hstrLeafAdjointResponses"] = mpLeafAdjointResponses;
+    var["hstrCorrectionRanges"] = mpCorrectionRanges;
+    var["hstrCorrectionAtoms"] = mpCorrectionAtoms;
     const uint3 leafDims = mHierarchy.getLeafDims();
     mpSolvePass->execute(mpDevice->getRenderContext(), uint3(leafDims.x * leafDims.y * leafDims.z, 1, 1));
 }
@@ -414,6 +568,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         return;
     }
 
+    if (mParams.frameIndex < mParams.correctionFadeFrames)
+        dispatchLightingSolve();
+
     mpScene->bindShaderDataForRaytracing(pRenderContext, mpPass->getRootVar()["gScene"]);
     ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
@@ -435,6 +592,8 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
     lightingChanged |= widget.var("Active-mode threshold", mParams.activeThreshold, 0.f, 1.f, 0.0001f);
     lightingChanged |= widget.var("Adjoint goal face", mParams.goalFace, 0u, 5u, 1u);
+    lightingChanged |= widget.var("Correction atom budget", mParams.correctionBudget, 0u, 1048576u, 4096u);
+    renderChanged |= widget.var("Correction fade frames", mParams.correctionFadeFrames, 1u, 64u, 1u);
     const uint32_t previousTraceOrder = mParams.traceSpatialOrder;
     operatorChanged |= widget.var("Face spatial order", mParams.traceSpatialOrder, 1u, 2u, 1u);
     if (mParams.traceSpatialOrder != previousTraceOrder)

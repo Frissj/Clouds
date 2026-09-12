@@ -12,6 +12,8 @@ def render_graph_HSTRCloud():
         "activeThreshold": 0.0,
         "goalFace": 1,
         "traceSpatialOrder": 2,
+        "correctionBudget": 262144,
+        "correctionFadeFrames": 8,
     }), "HSTRCloud")
     graph.addPass(createPass("ToneMapper", {
         "autoExposure": False,

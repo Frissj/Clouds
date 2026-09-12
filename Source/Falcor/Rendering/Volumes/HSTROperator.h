@@ -53,6 +53,13 @@ struct FALCOR_API LowRankOperator
     DenseMatrix reconstruct() const;
 };
 
+struct FALCOR_API PassivityCertificate
+{
+    bool valid = false;
+    float minimumEntry = 0.f;
+    float maximumFluxGain = 0.f;
+};
+
 using MatrixApply = std::function<DenseMatrix(const DenseMatrix&)>;
 
 /** Randomized matrix-free compression using only A*x and A^T*x products. */
@@ -65,6 +72,22 @@ FALCOR_API LowRankOperator compressOperator(
     size_t maxRank
 );
 FALCOR_API LowRankOperator compress(const DenseMatrix& matrix, float relativeTolerance, size_t maxRank);
+
+/** Checks positivity and unit column-flux gain for a radiance transport operator. */
+FALCOR_API PassivityCertificate certifyPassivity(const DenseMatrix& transport, float tolerance = 0.f);
+
+/** Compresses a passive transport, escalating rank and falling back to exact factors if needed. */
+FALCOR_API LowRankOperator compressPassive(const DenseMatrix& transport, float relativeTolerance, size_t initialRank);
+
+struct FALCOR_API TransportCharacterSplit
+{
+    DenseMatrix ballistic;
+    DenseMatrix nearScatter;
+    DenseMatrix diffuse;
+};
+
+/** Separates straight-through, spatially local directional, and non-local diffuse transport. */
+FALCOR_API TransportCharacterSplit splitTransportCharacters(const DenseMatrix& transport, size_t faceDofs);
 
 struct FALCOR_API KrylovResult
 {

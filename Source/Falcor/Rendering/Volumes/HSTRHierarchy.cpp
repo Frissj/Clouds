@@ -395,6 +395,39 @@ std::vector<DenseMatrix> Hierarchy::getLeafTransferMatrices() const
     return result;
 }
 
+std::vector<DenseMatrix> Hierarchy::getLeafAdjointGoalMatrices(const DenseMatrix& rootGoals) const
+{
+    require(mRoot != HierarchyNode::kInvalid, "HST-R hierarchy is empty.");
+    require(rootGoals.rows() == mNodes[mRoot].transport.rows(), "HST-R root goal dimensions do not match the retained trace.");
+    std::vector<DenseMatrix> goals(mNodes.size());
+    goals[mRoot] = rootGoals;
+    std::vector<uint32_t> stack{mRoot};
+    while (!stack.empty())
+    {
+        const uint32_t id = stack.back();
+        stack.pop_back();
+        const HierarchyNode& node = mNodes[id];
+        if (node.isLeaf())
+            continue;
+
+        DenseMatrix leftProlongation;
+        DenseMatrix rightProlongation;
+        DenseMatrix leftRestriction;
+        DenseMatrix rightRestriction;
+        makeChildTraceTransfer(node.splitAxis, 0, mFaceSpatialOrder, leftProlongation, leftRestriction);
+        makeChildTraceTransfer(node.splitAxis, 1, mFaceSpatialOrder, rightProlongation, rightRestriction);
+        goals[node.left] = multiply(transpose(leftRestriction), goals[id]);
+        goals[node.right] = multiply(transpose(rightRestriction), goals[id]);
+        stack.push_back(node.left);
+        stack.push_back(node.right);
+    }
+
+    std::vector<DenseMatrix> result(mLeafNodes.size());
+    for (size_t leaf = 0; leaf < mLeafNodes.size(); ++leaf)
+        result[leaf] = std::move(goals[mLeafNodes[leaf]]);
+    return result;
+}
+
 std::vector<DenseMatrix> Hierarchy::getLeafTransportMatrices() const
 {
     std::vector<DenseMatrix> result(mLeafNodes.size());

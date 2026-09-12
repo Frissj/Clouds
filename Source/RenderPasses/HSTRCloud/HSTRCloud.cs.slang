@@ -8,6 +8,14 @@ import HSTRCloudTypes;
 
 static const uint kMaxTraceDofs = 24;
 
+struct HSTRCorrectionAtom
+{
+    uint row;
+    uint col;
+    float value;
+    float goalError;
+};
+
 struct HSTRCloudRenderer
 {
     HSTRCloudParams params;
@@ -17,6 +25,9 @@ struct HSTRCloudRenderer
     StructuredBuffer<float> hstrLeafTransport;
     StructuredBuffer<float> hstrLeafResidualBounds;
     StructuredBuffer<float4> hstrRootIncident;
+    StructuredBuffer<float> hstrLeafAdjointResponses;
+    StructuredBuffer<uint2> hstrCorrectionRanges;
+    StructuredBuffer<HSTRCorrectionAtom> hstrCorrectionAtoms;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
 
@@ -231,15 +242,8 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
                 matrixSize * leaf + params.hstrStorageRank * rootDof + mode
             ] * gHSTRCloud.hstrRootIncident[rootDof].rgb;
 
-        float adjointResponse = 0.f;
-        for (uint goalMode = 0; goalMode < params.hstrFaceDofs; ++goalMode)
-            for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
-                adjointResponse += gHSTRCloud.hstrLeafTransport[
-                    transportSize * leaf + params.hstrTraceDofs * (params.hstrFaceDofs * params.goalFace + goalMode) + inputDof
-                ] * gHSTRCloud.hstrLeafBasisLeft[
-                    matrixSize * leaf + params.hstrStorageRank * inputDof + mode
-                ] / params.hstrFaceDofs;
-        const float importance = abs(adjointResponse) * length(coefficient);
+        const float adjointResponse = gHSTRCloud.hstrLeafAdjointResponses[leaf * params.hstrStorageRank + mode];
+        const float importance = adjointResponse * length(coefficient);
         const bool active = mode < params.activeRank && importance >= params.activeThreshold;
         if (active)
             for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
@@ -249,14 +253,26 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
         else
             omittedError += importance;
     }
+    float3 outgoing[kMaxTraceDofs];
     for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
     {
-        float3 outgoing = 0.f;
+        outgoing[outputDof] = 0.f;
         for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
-            outgoing += gHSTRCloud.hstrLeafTransport[
+            outgoing[outputDof] += gHSTRCloud.hstrLeafTransport[
                 transportSize * leaf + params.hstrTraceDofs * outputDof + inputDof
             ] * incident[inputDof];
-        gHSTRCloud.hstrRadiance[params.hstrTraceDofs * leaf + outputDof] =
-            float4(outgoing, gHSTRCloud.hstrLeafResidualBounds[leaf] + omittedError);
     }
+    const float correctionFade = saturate(float(params.frameIndex + 1) / max(1.f, float(params.correctionFadeFrames)));
+    const uint2 correctionRange = gHSTRCloud.hstrCorrectionRanges[leaf];
+    float admittedError = 0.f;
+    for (uint i = 0; i < correctionRange.y; ++i)
+    {
+        const HSTRCorrectionAtom atom = gHSTRCloud.hstrCorrectionAtoms[correctionRange.x + i];
+        outgoing[atom.row] += correctionFade * atom.value * incident[atom.col];
+        admittedError += correctionFade * atom.goalError;
+    }
+    const float omittedCorrectionError = max(0.f, gHSTRCloud.hstrLeafResidualBounds[leaf] - admittedError);
+    for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
+        gHSTRCloud.hstrRadiance[params.hstrTraceDofs * leaf + outputDof] =
+            float4(outgoing[outputDof], omittedCorrectionError + omittedError);
 }
