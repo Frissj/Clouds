@@ -8,9 +8,10 @@ def render_graph_HSTRCloud():
         "refinementLevel": 1,
         "densityScale": 1.0,
         "residualBlend": 1.0,
-        "activeRank": 6,
+        "activeRank": 24,
         "activeThreshold": 0.0,
         "goalFace": 1,
+        "traceSpatialOrder": 2,
     }), "HSTRCloud")
     graph.addPass(createPass("ToneMapper", {
         "autoExposure": False,

@@ -102,6 +102,18 @@ struct FALCOR_API TraceTransfer
 /** Piecewise-constant conservative trace transfer with R P = I. */
 FALCOR_API TraceTransfer makeConservativeTraceTransfer(size_t coarseDofs, size_t refinement);
 
+/** Conservative weighted transfer between nested trace samples.
+ *
+ * fineToCoarse assigns every fine sample to one coarse sample. The supplied
+ * quadrature weights must give each coarse sample the same total weight as its
+ * assigned fine samples. This preserves both constants (R P = I) and flux.
+ */
+FALCOR_API TraceTransfer makeConservativeTraceTransfer(
+    const std::vector<float>& coarseWeights,
+    const std::vector<float>& fineWeights,
+    const std::vector<uint32_t>& fineToCoarse
+);
+
 struct FALCOR_API ResidualAtom
 {
     uint32_t index = 0;

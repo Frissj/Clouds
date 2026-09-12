@@ -71,6 +71,25 @@ CPU_TEST(HSTRResidualAndConservativeTrace)
     expectMatrixNear(ctx, reconstructed, multiply(multiply(transfer.prolongation, parent), transfer.restriction));
 }
 
+CPU_TEST(HSTRWeightedMixedFidelityTrace)
+{
+    const std::vector<float> coarseWeights = {0.25f, 0.75f};
+    const std::vector<float> fineWeights = {0.10f, 0.15f, 0.20f, 0.25f, 0.30f};
+    const TraceTransfer transfer = makeConservativeTraceTransfer(coarseWeights, fineWeights, {0, 0, 1, 1, 1});
+    expectMatrixNear(ctx, multiply(transfer.restriction, transfer.prolongation), DenseMatrix::identity(2));
+
+    const DenseMatrix coarse(2, 1, {3.f, 7.f});
+    const DenseMatrix fine = multiply(transfer.prolongation, coarse);
+    float coarseFlux = 0.f;
+    float fineFlux = 0.f;
+    for (size_t i = 0; i < coarseWeights.size(); ++i)
+        coarseFlux += coarseWeights[i] * coarse(i, 0);
+    for (size_t i = 0; i < fineWeights.size(); ++i)
+        fineFlux += fineWeights[i] * fine(i, 0);
+    EXPECT_LE(std::abs(coarseFlux - fineFlux), 1e-6f);
+    expectMatrixNear(ctx, multiply(transfer.restriction, fine), coarse);
+}
+
 CPU_TEST(HSTRExactLowRankUpdate)
 {
     const DenseMatrix base(3, 3, {4.f, 1.f, 0.f, 1.f, 3.f, 1.f, 0.f, 1.f, 2.f});
@@ -121,6 +140,7 @@ CPU_TEST(HSTRHierarchyCompositionAndSerialization)
     hierarchy.save(path);
     const Hierarchy restored = Hierarchy::load(path);
     std::filesystem::remove(path);
+    EXPECT_EQ(restored.getFaceSpatialOrder(), 1);
     expectMatrixNear(ctx, restored.getNodes()[restored.getRoot()].transport, hierarchy.getNodes()[hierarchy.getRoot()].transport);
     const auto restoredRadiance = restored.solve(incident);
     EXPECT_LE(length(restoredRadiance[0] - radiance[0]), 1e-5f);
@@ -229,6 +249,61 @@ CPU_TEST(HSTRPackedLeafSubstitutionMatchesSolve)
         for (size_t face = 0; face < 6; ++face)
             for (size_t channel = 0; channel < 3; ++channel)
                 EXPECT_LE(std::abs(outgoing(face, channel) - expected[6 * leaf + face][channel]), 1e-5f);
+    }
+}
+
+CPU_TEST(HSTRHigherOrderFaceModes)
+{
+    const DenseMatrix p0 = makeLeafTransport(float3(0.4f, 0.7f, 1.f), 0.98f, 0.8f, 0.6f);
+    DenseMatrix higherOrder(24, 24);
+    for (size_t outputFace = 0; outputFace < 6; ++outputFace)
+        for (size_t inputFace = 0; inputFace < 6; ++inputFace)
+            for (size_t mode = 0; mode < 4; ++mode)
+                higherOrder(4 * outputFace + mode, 4 * inputFace + mode) = p0(outputFace, inputFace);
+
+    const Hierarchy hierarchy = Hierarchy::compile(uint3(2, 1, 1), {higherOrder, higherOrder}, 2);
+    EXPECT_EQ(hierarchy.getNodes()[hierarchy.getRoot()].transport.rows(), 24);
+    DenseMatrix incident(24, 3);
+    incident(8, 0) = 1.f;
+    incident(9, 0) = 2.f;
+    incident(10, 0) = 3.f;
+    incident(11, 0) = 4.f;
+    const HierarchyNode& root = hierarchy.getNodes()[hierarchy.getRoot()];
+    const DenseMatrix leftIncident = multiply(root.leftInput, incident);
+    const DenseMatrix rightIncident = multiply(root.rightInput, incident);
+    EXPECT_EQ(leftIncident(8, 0), 1.f);
+    EXPECT_EQ(leftIncident(9, 0), 1.f);
+    EXPECT_EQ(leftIncident(10, 0), 3.f);
+    EXPECT_EQ(leftIncident(11, 0), 3.f);
+    EXPECT_EQ(rightIncident(8, 0), 2.f);
+    EXPECT_EQ(rightIncident(9, 0), 2.f);
+    EXPECT_EQ(rightIncident(10, 0), 4.f);
+    EXPECT_EQ(rightIncident(11, 0), 4.f);
+
+    const auto outgoing = hierarchy.solveFaces(incident);
+    EXPECT_EQ(outgoing.size(), 48);
+    float energy = 0.f;
+    for (size_t leaf = 0; leaf < 2; ++leaf)
+        for (size_t face = 0; face < 6; ++face)
+            for (size_t mode = 0; mode < 4; ++mode)
+                energy += std::abs(outgoing[24 * leaf + 4 * face + mode].x);
+    EXPECT_GT(energy, 0.f);
+}
+
+CPU_TEST(HSTRExactMicrocellBoundaryTransport)
+{
+    const DenseMatrix cell = makeLeafTransport(float3(0.3f, 0.5f, 0.7f), 0.98f, 0.8f, 0.6f);
+    expectMatrixNear(ctx, makeGridBoundaryTransport(1, {cell}), cell);
+
+    const DenseMatrix boundary = makeGridBoundaryTransport(2, std::vector<DenseMatrix>(8, cell));
+    EXPECT_EQ(boundary.rows(), 24);
+    EXPECT_EQ(boundary.cols(), 24);
+    for (size_t col = 0; col < boundary.cols(); ++col)
+    {
+        float flux = 0.f;
+        for (size_t row = 0; row < boundary.rows(); ++row)
+            flux += boundary(row, col);
+        EXPECT_LE(flux, 1.f + 1e-4f);
     }
 }
 

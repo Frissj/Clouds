@@ -15,9 +15,14 @@ struct HSTRCloudParams
     int3 hstrGridMin = {0, 0, 0};
     uint frameIndex = 0;
 
-    uint activeRank = 6;
+    uint activeRank = 24;
     float activeThreshold = 0.f;
     uint goalFace = 1;
+    uint traceSpatialOrder = 2;
+
+    uint hstrFaceDofs = 4;
+    uint hstrTraceDofs = 24;
+    uint hstrStorageRank = 24;
     uint padHSTR1 = 0;
 
     float residualBlend = 1.f;

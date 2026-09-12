@@ -11,8 +11,8 @@ using namespace Falcor;
 
 /** Hierarchical Schur transport renderer for heterogeneous cloud volumes.
  *
- * Lighting is solved through persistent six-face boundary operators. NanoVDB
- * supplies primary visibility and the deterministic unresolved residual only.
+ * Lighting is solved through persistent spatial-angular six-face boundary
+ * operators. NanoVDB supplies visibility and unresolved residual detail only.
  */
 class HSTRCloud : public RenderPass
 {

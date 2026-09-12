@@ -6,6 +6,8 @@ import Utils.Math.Ray;
 import Scene.Scene;
 import HSTRCloudTypes;
 
+static const uint kMaxTraceDofs = 24;
+
 struct HSTRCloudRenderer
 {
     HSTRCloudParams params;
@@ -36,7 +38,31 @@ struct HSTRCloudRenderer
         return p.x + params.hstrLeafDims.x * (p.y + params.hstrLeafDims.y * p.z);
     }
 
-    float3 hstrField(float3 p, uint field)
+    float3 sampleLeafFace(uint leaf, uint face, float3 localPosition)
+    {
+        const uint order = params.traceSpatialOrder;
+        const uint faceDofs = params.hstrFaceDofs;
+        const uint base = params.hstrTraceDofs * leaf + faceDofs * face;
+        if (order == 1) return hstrRadiance[base].rgb;
+
+        const uint faceAxis = face / 2;
+        const uint tangent0 = faceAxis == 0 ? 1 : 0;
+        const uint tangent1 = faceAxis == 2 ? 1 : 2;
+        const float2 samplePosition = saturate(float2(localPosition[tangent0], localPosition[tangent1])) * order - 0.5f;
+        const int2 sampleBase = int2(floor(samplePosition));
+        const float2 f = frac(samplePosition);
+        float3 result = 0.f;
+        for (uint v = 0; v < 2; ++v)
+            for (uint u = 0; u < 2; ++u)
+            {
+                const uint2 q = uint2(clamp(sampleBase + int2(u, v), int2(0), int2(order) - 1));
+                const float2 w = select(uint2(u, v) == 0, 1.f - f, f);
+                result += hstrRadiance[base + q.x + order * q.y].rgb * w.x * w.y;
+            }
+        return result;
+    }
+
+    float3 hstrField(float3 p, uint face)
     {
         const int3 base = int3(floor(p));
         const float3 f = frac(p);
@@ -47,7 +73,8 @@ struct HSTRCloudRenderer
                 {
                     const int3 q = clamp(base + int3(x, y, z), int3(0), int3(params.hstrLeafDims) - 1);
                     const float3 w = select(uint3(x, y, z) == 0, 1.f - f, f);
-                    result += hstrRadiance[6 * leafIndex(uint3(q)) + field].rgb * w.x * w.y * w.z;
+                    const float3 localPosition = p - float3(q) + 0.5f;
+                    result += sampleLeafFace(leafIndex(uint3(q)), face, localPosition) * w.x * w.y * w.z;
                 }
         return result;
     }
@@ -64,7 +91,7 @@ struct HSTRCloudRenderer
                 {
                     const int3 q = clamp(base + int3(x, y, z), int3(0), int3(params.hstrLeafDims) - 1);
                     const float3 w = select(uint3(x, y, z) == 0, 1.f - f, f);
-                    result += hstrRadiance[6 * leafIndex(uint3(q))].a * w.x * w.y * w.z;
+                    result += hstrRadiance[params.hstrTraceDofs * leafIndex(uint3(q))].a * w.x * w.y * w.z;
                 }
         return result;
     }
@@ -188,33 +215,48 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
     const uint leaf = dispatchThreadId.x;
     const uint leafCount = gHSTRCloud.params.hstrLeafDims.x * gHSTRCloud.params.hstrLeafDims.y * gHSTRCloud.params.hstrLeafDims.z;
     if (leaf >= leafCount) return;
+    const HSTRCloudParams params = gHSTRCloud.params;
 
-    float3 incident[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float3 incident[kMaxTraceDofs];
+    for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
+        incident[dof] = 0.f;
     float omittedError = 0.f;
-    for (uint mode = 0; mode < 6; ++mode)
+    const uint matrixSize = params.hstrTraceDofs * params.hstrStorageRank;
+    const uint transportSize = params.hstrTraceDofs * params.hstrTraceDofs;
+    for (uint mode = 0; mode < params.hstrStorageRank; ++mode)
     {
         float3 coefficient = 0.f;
-        for (uint rootFace = 0; rootFace < 6; ++rootFace)
-            coefficient += gHSTRCloud.hstrLeafBasisRight[36 * leaf + 6 * rootFace + mode] * gHSTRCloud.hstrRootIncident[rootFace].rgb;
+        for (uint rootDof = 0; rootDof < params.hstrTraceDofs; ++rootDof)
+            coefficient += gHSTRCloud.hstrLeafBasisRight[
+                matrixSize * leaf + params.hstrStorageRank * rootDof + mode
+            ] * gHSTRCloud.hstrRootIncident[rootDof].rgb;
 
         float adjointResponse = 0.f;
-        for (uint inputFace = 0; inputFace < 6; ++inputFace)
-            adjointResponse += gHSTRCloud.hstrLeafTransport[
-                36 * leaf + 6 * gHSTRCloud.params.goalFace + inputFace
-            ] * gHSTRCloud.hstrLeafBasisLeft[36 * leaf + 6 * inputFace + mode];
+        for (uint goalMode = 0; goalMode < params.hstrFaceDofs; ++goalMode)
+            for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
+                adjointResponse += gHSTRCloud.hstrLeafTransport[
+                    transportSize * leaf + params.hstrTraceDofs * (params.hstrFaceDofs * params.goalFace + goalMode) + inputDof
+                ] * gHSTRCloud.hstrLeafBasisLeft[
+                    matrixSize * leaf + params.hstrStorageRank * inputDof + mode
+                ] / params.hstrFaceDofs;
         const float importance = abs(adjointResponse) * length(coefficient);
-        const bool active = mode < gHSTRCloud.params.activeRank && importance >= gHSTRCloud.params.activeThreshold;
+        const bool active = mode < params.activeRank && importance >= params.activeThreshold;
         if (active)
-            for (uint face = 0; face < 6; ++face)
-                incident[face] += gHSTRCloud.hstrLeafBasisLeft[36 * leaf + 6 * face + mode] * coefficient;
+            for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
+                incident[dof] += gHSTRCloud.hstrLeafBasisLeft[
+                    matrixSize * leaf + params.hstrStorageRank * dof + mode
+                ] * coefficient;
         else
             omittedError += importance;
     }
-    for (uint outputFace = 0; outputFace < 6; ++outputFace)
+    for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
     {
         float3 outgoing = 0.f;
-        for (uint inputFace = 0; inputFace < 6; ++inputFace)
-            outgoing += gHSTRCloud.hstrLeafTransport[36 * leaf + 6 * outputFace + inputFace] * incident[inputFace];
-        gHSTRCloud.hstrRadiance[6 * leaf + outputFace] = float4(outgoing, gHSTRCloud.hstrLeafResidualBounds[leaf] + omittedError);
+        for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
+            outgoing += gHSTRCloud.hstrLeafTransport[
+                transportSize * leaf + params.hstrTraceDofs * outputDof + inputDof
+            ] * incident[inputDof];
+        gHSTRCloud.hstrRadiance[params.hstrTraceDofs * leaf + outputDof] =
+            float4(outgoing, gHSTRCloud.hstrLeafResidualBounds[leaf] + omittedError);
     }
 }

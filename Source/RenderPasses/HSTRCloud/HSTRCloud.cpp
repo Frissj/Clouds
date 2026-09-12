@@ -24,6 +24,7 @@ const char kAnisotropy[] = "anisotropy";
 const char kActiveRank[] = "activeRank";
 const char kActiveThreshold[] = "activeThreshold";
 const char kGoalFace[] = "goalFace";
+const char kTraceSpatialOrder[] = "traceSpatialOrder";
 
 uint32_t nextPowerOfTwo(uint32_t value)
 {
@@ -65,6 +66,8 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.activeThreshold = value;
         else if (key == kGoalFace)
             mParams.goalFace = value;
+        else if (key == kTraceSpatialOrder)
+            mParams.traceSpatialOrder = value;
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
     }
@@ -84,6 +87,7 @@ Properties HSTRCloud::getProperties() const
     props[kActiveRank] = mParams.activeRank;
     props[kActiveThreshold] = mParams.activeThreshold;
     props[kGoalFace] = mParams.goalFace;
+    props[kTraceSpatialOrder] = mParams.traceSpatialOrder;
     return props;
 }
 
@@ -156,13 +160,18 @@ void HSTRCloud::buildHierarchy()
     mParams.hstrLeafDims = leafDims;
     mParams.hstrGridMin = mGridMin;
     mParams.hstrCellWidth = kCellWidth;
+    mParams.traceSpatialOrder = std::clamp(mParams.traceSpatialOrder, 1u, 2u);
+    mParams.hstrFaceDofs = mParams.traceSpatialOrder * mParams.traceSpatialOrder;
+    mParams.hstrTraceDofs = 6 * mParams.hstrFaceDofs;
+    mParams.hstrStorageRank = mParams.hstrTraceDofs;
+    mParams.activeRank = std::clamp(mParams.activeRank, 1u, mParams.hstrStorageRank);
     mLeafDensity = sampleLeafDensities();
     std::vector<hstr::DenseMatrix> leafTransport;
     leafTransport.reserve(leafCount);
     for (uint32_t leaf = 0; leaf < leafCount; ++leaf)
         leafTransport.push_back(makeNestedLeafTransport(leaf));
 
-    mHierarchy = hstr::Hierarchy::compile(leafDims, leafTransport);
+    mHierarchy = hstr::Hierarchy::compile(leafDims, leafTransport, mParams.traceSpatialOrder);
     const float milliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - startTime).count();
     logInfo("HSTRCloud: compiled {} leaves and {} Schur nodes in {:.1f} ms.", leafCount, mHierarchy.getNodes().size(), milliseconds);
 
@@ -177,20 +186,33 @@ void HSTRCloud::uploadHierarchy()
     const auto transfers = mHierarchy.getLeafTransferMatrices();
     const auto transports = mHierarchy.getLeafTransportMatrices();
     const auto residualBounds = mHierarchy.getLeafResidualBounds();
-    std::vector<float> packedLeft(36 * leafCount, 0.f);
-    std::vector<float> packedRight(36 * leafCount, 0.f);
-    std::vector<float> packedTransport(36 * leafCount);
+    const size_t traceDofs = mParams.hstrTraceDofs;
+    const size_t matrixSize = traceDofs * traceDofs;
+    std::vector<float> packedLeft(matrixSize * leafCount, 0.f);
+    std::vector<float> packedRight(matrixSize * leafCount, 0.f);
+    std::vector<float> packedTransport(matrixSize * leafCount);
     for (size_t leaf = 0; leaf < leafCount; ++leaf)
     {
-        const hstr::LowRankOperator compressed = hstr::compress(transfers[leaf], 1e-6f, 6);
-        for (size_t i = 0; i < 36; ++i)
-            packedTransport[36 * leaf + i] = transports[leaf].data()[i];
-        for (size_t row = 0; row < 6; ++row)
-            for (size_t mode = 0; mode < compressed.rank(); ++mode)
-            {
-                packedLeft[36 * leaf + 6 * row + mode] = compressed.left(row, mode);
-                packedRight[36 * leaf + 6 * row + mode] = compressed.right(row, mode);
-            }
+        for (size_t i = 0; i < matrixSize; ++i)
+            packedTransport[matrixSize * leaf + i] = transports[leaf].data()[i];
+        if (mParams.traceSpatialOrder > 1)
+        {
+            for (size_t row = 0; row < traceDofs; ++row)
+                for (size_t mode = 0; mode < traceDofs; ++mode)
+                    packedLeft[matrixSize * leaf + traceDofs * row + mode] = transfers[leaf](row, mode);
+            for (size_t mode = 0; mode < traceDofs; ++mode)
+                packedRight[matrixSize * leaf + traceDofs * mode + mode] = 1.f;
+        }
+        else
+        {
+            const hstr::LowRankOperator compressed = hstr::compress(transfers[leaf], 1e-6f, traceDofs);
+            for (size_t row = 0; row < traceDofs; ++row)
+                for (size_t mode = 0; mode < compressed.rank(); ++mode)
+                {
+                    packedLeft[matrixSize * leaf + traceDofs * row + mode] = compressed.left(row, mode);
+                    packedRight[matrixSize * leaf + traceDofs * row + mode] = compressed.right(row, mode);
+                }
+        }
     }
     mpLeafBasisLeft = mpDevice->createStructuredBuffer(
         sizeof(float), packedLeft.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedLeft.data(), false
@@ -206,7 +228,7 @@ void HSTRCloud::uploadHierarchy()
     );
     mpLeafRadiance = mpDevice->createStructuredBuffer(
         sizeof(float4),
-        6 * leafCount,
+        traceDofs * leafCount,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
         MemoryType::DeviceLocal,
         nullptr,
@@ -251,7 +273,12 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
     const uint3 leafDims = mParams.hstrLeafDims;
     const uint3 cell(leafIndex % leafDims.x, (leafIndex / leafDims.x) % leafDims.y, leafIndex / (leafDims.x * leafDims.y));
     if (!all(cell < mActualLeafDims))
-        return hstr::makeLeafTransport(float3(0.f), 0.f, mParams.anisotropy, 0.65f);
+    {
+        const hstr::DenseMatrix clear = hstr::makeLeafTransport(float3(0.f), 0.f, mParams.anisotropy, 0.65f);
+        return mParams.traceSpatialOrder == 1
+            ? clear
+            : hstr::makeGridBoundaryTransport(kSubcellsPerAxis, std::vector<hstr::DenseMatrix>(8, clear));
+    }
 
     const auto& volume = mpScene->getGridVolume(0);
     const auto& grid = volume->getDensityGrid();
@@ -271,6 +298,8 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
                 const float density = std::max(0.f, grid->getValue(p)) * volume->getDensityScale() * mParams.densityScale;
                 subcellTransport.push_back(hstr::makeLeafTransport(density * subcellSize, meanAlbedo, mParams.anisotropy, 0.65f));
             }
+    if (mParams.traceSpatialOrder > 1)
+        return hstr::makeGridBoundaryTransport(kSubcellsPerAxis, subcellTransport);
     const hstr::Hierarchy local = hstr::Hierarchy::compile(uint3(kSubcellsPerAxis), subcellTransport);
     return local.getNodes()[local.getRoot()].transport;
 }
@@ -310,10 +339,11 @@ void HSTRCloud::solveLighting()
     if (mHierarchy.getRoot() == hstr::HierarchyNode::kInvalid)
         return;
 
-    hstr::DenseMatrix incident(6, 3);
+    hstr::DenseMatrix incident(mParams.hstrTraceDofs, 3);
     for (uint32_t face = 0; face < 6; ++face)
-        for (uint32_t channel = 0; channel < 3; ++channel)
-            incident(face, channel) = mParams.skyRadiance[channel];
+        for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
+            for (uint32_t channel = 0; channel < 3; ++channel)
+                incident(face * mParams.hstrFaceDofs + mode, channel) = mParams.skyRadiance[channel];
     const float3 sun = normalize(mParams.sunDirection);
     uint32_t sunAxis = 0;
     if (std::abs(sun.y) > std::abs(sun.x))
@@ -321,12 +351,14 @@ void HSTRCloud::solveLighting()
     if (std::abs(sun.z) > std::abs(sun[sunAxis]))
         sunAxis = 2;
     const uint32_t sunFace = 2 * sunAxis + (sun[sunAxis] >= 0.f ? 1u : 0u);
-    for (uint32_t channel = 0; channel < 3; ++channel)
-        incident(sunFace, channel) += 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
+    for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            incident(sunFace * mParams.hstrFaceDofs + mode, channel) +=
+                0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
 
-    std::vector<float4> rootIncident(6);
-    for (uint32_t face = 0; face < 6; ++face)
-        rootIncident[face] = float4(incident(face, 0), incident(face, 1), incident(face, 2), 0.f);
+    std::vector<float4> rootIncident(mParams.hstrTraceDofs);
+    for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
+        rootIncident[dof] = float4(incident(dof, 0), incident(dof, 1), incident(dof, 2), 0.f);
     mpRootIncident = mpDevice->createStructuredBuffer(
         sizeof(float4), rootIncident.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, rootIncident.data(), false
     );
@@ -400,9 +432,13 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     renderChanged |= widget.var("Base view steps", mParams.baseSteps, 8u, 128u, 8u);
     renderChanged |= widget.var("Refinement level", mParams.refinementLevel, 0u, 3u, 1u);
     renderChanged |= widget.var("Residual blend", mParams.residualBlend, 0.f, 1.f, 0.01f);
-    lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, 6u, 1u);
+    lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
     lightingChanged |= widget.var("Active-mode threshold", mParams.activeThreshold, 0.f, 1.f, 0.0001f);
     lightingChanged |= widget.var("Adjoint goal face", mParams.goalFace, 0u, 5u, 1u);
+    const uint32_t previousTraceOrder = mParams.traceSpatialOrder;
+    operatorChanged |= widget.var("Face spatial order", mParams.traceSpatialOrder, 1u, 2u, 1u);
+    if (mParams.traceSpatialOrder != previousTraceOrder)
+        mParams.activeRank = 6 * mParams.traceSpatialOrder * mParams.traceSpatialOrder;
     operatorChanged |= widget.var("Density scale", mParams.densityScale, 0.f, 100.f, 0.01f);
     lightingChanged |= widget.direction("Sun direction", mParams.sunDirection);
     lightingChanged |= widget.rgbColor("Sun radiance", mParams.sunRadiance);
@@ -414,7 +450,7 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         solveLighting();
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged;
     widget.textWrapped(
-        "Lighting is reconstructed from the persistent six-face Schur hierarchy. NanoVDB is queried only for primary visibility and the "
-        "deterministic near-field residual."
+        "Lighting is reconstructed from a persistent six-face spatial-angular Schur hierarchy. NanoVDB is queried only for primary "
+        "visibility and the deterministic near-field residual."
     );
 }

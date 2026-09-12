@@ -365,18 +365,48 @@ DenseMatrix woodburySolve(const DenseMatrix& base, const DenseMatrix& u, const D
 TraceTransfer makeConservativeTraceTransfer(size_t coarseDofs, size_t refinement)
 {
     require(coarseDofs > 0 && refinement > 0, "Trace transfer dimensions must be non-zero.");
-    TraceTransfer result{
-        DenseMatrix(coarseDofs * refinement, coarseDofs),
-        DenseMatrix(coarseDofs, coarseDofs * refinement),
-    };
-    const float weight = 1.f / float(refinement);
+    std::vector<float> coarseWeights(coarseDofs, 1.f);
+    std::vector<float> fineWeights(coarseDofs * refinement, 1.f / float(refinement));
+    std::vector<uint32_t> fineToCoarse(coarseDofs * refinement);
     for (size_t coarse = 0; coarse < coarseDofs; ++coarse)
         for (size_t child = 0; child < refinement; ++child)
-        {
-            const size_t fine = coarse * refinement + child;
-            result.prolongation(fine, coarse) = 1.f;
-            result.restriction(coarse, fine) = weight;
-        }
+            fineToCoarse[coarse * refinement + child] = uint32_t(coarse);
+    return makeConservativeTraceTransfer(coarseWeights, fineWeights, fineToCoarse);
+}
+
+TraceTransfer makeConservativeTraceTransfer(
+    const std::vector<float>& coarseWeights,
+    const std::vector<float>& fineWeights,
+    const std::vector<uint32_t>& fineToCoarse
+)
+{
+    require(!coarseWeights.empty() && !fineWeights.empty(), "Trace transfer dimensions must be non-zero.");
+    require(fineWeights.size() == fineToCoarse.size(), "Fine trace weights and assignments must have equal size.");
+
+    TraceTransfer result{
+        DenseMatrix(fineWeights.size(), coarseWeights.size()),
+        DenseMatrix(coarseWeights.size(), fineWeights.size()),
+    };
+    std::vector<float> assignedWeights(coarseWeights.size(), 0.f);
+    for (size_t fine = 0; fine < fineWeights.size(); ++fine)
+    {
+        const uint32_t coarse = fineToCoarse[fine];
+        require(coarse < coarseWeights.size(), "Fine trace assignment is out of range.");
+        require(fineWeights[fine] > 0.f, "Fine trace quadrature weights must be positive.");
+        result.prolongation(fine, coarse) = 1.f;
+        assignedWeights[coarse] += fineWeights[fine];
+    }
+    for (size_t coarse = 0; coarse < coarseWeights.size(); ++coarse)
+    {
+        require(coarseWeights[coarse] > 0.f, "Coarse trace quadrature weights must be positive.");
+        const float tolerance = 1e-5f * std::max(coarseWeights[coarse], assignedWeights[coarse]);
+        require(std::abs(coarseWeights[coarse] - assignedWeights[coarse]) <= tolerance, "Nested trace quadrature weights do not preserve flux.");
+    }
+    for (size_t fine = 0; fine < fineWeights.size(); ++fine)
+    {
+        const uint32_t coarse = fineToCoarse[fine];
+        result.restriction(coarse, fine) = fineWeights[fine] / coarseWeights[coarse];
+    }
     return result;
 }
 

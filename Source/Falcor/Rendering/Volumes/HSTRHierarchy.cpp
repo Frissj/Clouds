@@ -13,7 +13,7 @@ namespace Falcor::hstr
 namespace
 {
 constexpr uint32_t kFaceCount = 6;
-constexpr uint32_t kFileVersion = 3;
+constexpr uint32_t kFileVersion = 4;
 constexpr uint32_t kMagic = 0x52545348; // HSTR
 
 void require(bool condition, const char* message)
@@ -53,59 +53,119 @@ float conservationError(const DenseMatrix& transport)
     return error;
 }
 
-HierarchyNode compose(const HierarchyNode& a, const HierarchyNode& b, uint32_t axis)
+size_t faceDofs(const DenseMatrix& transport)
 {
+    require(transport.rows() == transport.cols() && transport.rows() % kFaceCount == 0, "HST-R operators must be square with equal per-face dimensions.");
+    return transport.rows() / kFaceCount;
+}
+
+size_t faceOffset(uint32_t face, size_t dofsPerFace)
+{
+    return size_t(face) * dofsPerFace;
+}
+
+void makeChildTraceTransfer(
+    uint32_t splitAxis,
+    uint32_t childSide,
+    uint32_t spatialOrder,
+    DenseMatrix& prolongation,
+    DenseMatrix& restriction
+)
+{
+    const size_t dofsPerFace = size_t(spatialOrder) * spatialOrder;
+    const size_t traceDofs = kFaceCount * dofsPerFace;
+    prolongation = DenseMatrix(traceDofs, traceDofs);
+    restriction = DenseMatrix(traceDofs, traceDofs);
+    for (uint32_t face = 0; face < kFaceCount; ++face)
+    {
+        const uint32_t faceAxis = face / 2;
+        if (faceAxis == splitAxis)
+        {
+            if ((face & 1u) != childSide)
+                continue;
+            for (size_t mode = 0; mode < dofsPerFace; ++mode)
+            {
+                const size_t dof = faceOffset(face, dofsPerFace) + mode;
+                prolongation(dof, dof) = 1.f;
+                restriction(dof, dof) = 1.f;
+            }
+            continue;
+        }
+
+        uint32_t tangents[2];
+        uint32_t tangentCount = 0;
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            if (axis != faceAxis)
+                tangents[tangentCount++] = axis;
+        const uint32_t splitCoordinate = tangents[0] == splitAxis ? 0u : 1u;
+        for (uint32_t v = 0; v < spatialOrder; ++v)
+            for (uint32_t u = 0; u < spatialOrder; ++u)
+            {
+                uint32_t parentU = u;
+                uint32_t parentV = v;
+                if (splitCoordinate == 0)
+                    parentU = (childSide * spatialOrder + u) / 2;
+                else
+                    parentV = (childSide * spatialOrder + v) / 2;
+                const size_t childDof = faceOffset(face, dofsPerFace) + size_t(v) * spatialOrder + u;
+                const size_t parentDof = faceOffset(face, dofsPerFace) + size_t(parentV) * spatialOrder + parentU;
+                prolongation(childDof, parentDof) = 1.f;
+                restriction(parentDof, childDof) = 0.5f;
+            }
+    }
+}
+
+HierarchyNode compose(const HierarchyNode& a, const HierarchyNode& b, uint32_t axis, uint32_t spatialOrder)
+{
+    require(a.transport.rows() == b.transport.rows(), "HST-R child trace dimensions must match.");
+    const size_t dofsPerFace = faceDofs(a.transport);
+    const size_t traceDofs = kFaceCount * dofsPerFace;
     const uint32_t negativeFace = 2 * axis;
     const uint32_t positiveFace = negativeFace + 1;
-    DenseMatrix prolongA(kFaceCount, kFaceCount);
-    DenseMatrix prolongB(kFaceCount, kFaceCount);
-    DenseMatrix restrictA(kFaceCount, kFaceCount);
-    DenseMatrix restrictB(kFaceCount, kFaceCount);
+    require(dofsPerFace == size_t(spatialOrder) * spatialOrder, "HST-R trace dimensions do not match the face spatial order.");
+    DenseMatrix prolongA;
+    DenseMatrix prolongB;
+    DenseMatrix restrictA;
+    DenseMatrix restrictB;
+    makeChildTraceTransfer(axis, 0, spatialOrder, prolongA, restrictA);
+    makeChildTraceTransfer(axis, 1, spatialOrder, prolongB, restrictB);
 
-    for (uint32_t face = 0; face < kFaceCount; ++face)
-    {
-        if (face == negativeFace)
-        {
-            prolongA(face, face) = 1.f;
-            restrictA(face, face) = 1.f;
-        }
-        else if (face == positiveFace)
-        {
-            prolongB(face, face) = 1.f;
-            restrictB(face, face) = 1.f;
-        }
-        else
-        {
-            prolongA(face, face) = 1.f;
-            prolongB(face, face) = 1.f;
-            restrictA(face, face) = 0.5f;
-            restrictB(face, face) = 0.5f;
-        }
-    }
-
-    DenseMatrix interfaceSystem(2, 2, {1.f, -b.transport(negativeFace, negativeFace), -a.transport(positiveFace, positiveFace), 1.f});
-    DenseMatrix interfaceRhs(2, kFaceCount);
+    DenseMatrix interfaceSystem(2 * dofsPerFace, 2 * dofsPerFace);
+    DenseMatrix interfaceRhs(2 * dofsPerFace, traceDofs);
     const DenseMatrix bExternal = multiply(b.transport, prolongB);
     const DenseMatrix aExternal = multiply(a.transport, prolongA);
-    for (uint32_t face = 0; face < kFaceCount; ++face)
+    const size_t negativeOffset = faceOffset(negativeFace, dofsPerFace);
+    const size_t positiveOffset = faceOffset(positiveFace, dofsPerFace);
+    for (size_t row = 0; row < dofsPerFace; ++row)
     {
-        interfaceRhs(0, face) = bExternal(negativeFace, face);
-        interfaceRhs(1, face) = aExternal(positiveFace, face);
+        interfaceSystem(row, row) = 1.f;
+        interfaceSystem(dofsPerFace + row, dofsPerFace + row) = 1.f;
+        for (size_t col = 0; col < dofsPerFace; ++col)
+        {
+            interfaceSystem(row, dofsPerFace + col) = -b.transport(negativeOffset + row, negativeOffset + col);
+            interfaceSystem(dofsPerFace + row, col) = -a.transport(positiveOffset + row, positiveOffset + col);
+        }
+        for (size_t col = 0; col < traceDofs; ++col)
+        {
+            interfaceRhs(row, col) = bExternal(negativeOffset + row, col);
+            interfaceRhs(dofsPerFace + row, col) = aExternal(positiveOffset + row, col);
+        }
     }
     const DenseMatrix interfaceInput = solve(interfaceSystem, interfaceRhs);
 
     DenseMatrix inputA = prolongA;
     DenseMatrix inputB = prolongB;
-    for (uint32_t face = 0; face < kFaceCount; ++face)
-    {
-        inputA(positiveFace, face) = interfaceInput(0, face);
-        inputB(negativeFace, face) = interfaceInput(1, face);
-    }
+    for (size_t row = 0; row < dofsPerFace; ++row)
+        for (size_t col = 0; col < traceDofs; ++col)
+        {
+            inputA(positiveOffset + row, col) = interfaceInput(row, col);
+            inputB(negativeOffset + row, col) = interfaceInput(dofsPerFace + row, col);
+        }
 
     const DenseMatrix exact = add(multiply(restrictA, multiply(a.transport, inputA)), multiply(restrictB, multiply(b.transport, inputB)));
-    DenseMatrix baseline(kFaceCount, kFaceCount);
-    for (uint32_t row = 0; row < kFaceCount; ++row)
-        for (uint32_t col = 0; col < kFaceCount; ++col)
+    DenseMatrix baseline(traceDofs, traceDofs);
+    for (size_t row = 0; row < traceDofs; ++row)
+        for (size_t col = 0; col < traceDofs; ++col)
             baseline(row, col) = 0.5f * (a.transport(row, col) + b.transport(row, col));
 
     HierarchyNode result;
@@ -148,7 +208,20 @@ uint32_t chooseSplitAxis(uint3 dims, const std::vector<uint32_t>& active, const 
                     ++(&q.x)[axis];
                     const auto& a = nodes[active[linearIndex(p, dims)]].transport;
                     const auto& b = nodes[active[linearIndex(q, dims)]].transport;
-                    coupling += std::abs(a(positiveFace, positiveFace) * b(negativeFace, negativeFace));
+                    const size_t aDofs = faceDofs(a);
+                    const size_t bDofs = faceDofs(b);
+                    require(aDofs == bDofs, "HST-R neighboring trace dimensions must match.");
+                    const size_t positiveOffset = faceOffset(positiveFace, aDofs);
+                    const size_t negativeOffset = faceOffset(negativeFace, aDofs);
+                    float blockCoupling = 0.f;
+                    for (size_t row = 0; row < aDofs; ++row)
+                        for (size_t k = 0; k < aDofs; ++k)
+                            for (size_t col = 0; col < aDofs; ++col)
+                            {
+                                const float value = a(positiveOffset + row, positiveOffset + k) * b(negativeOffset + k, negativeOffset + col);
+                                blockCoupling += value * value;
+                            }
+                    coupling += std::sqrt(blockCoupling);
                     ++pairs;
                 }
         // Transport-aware nested dissection: prefer weak separators, while a
@@ -186,22 +259,29 @@ DenseMatrix readMatrix(std::ifstream& stream)
 }
 } // namespace
 
-Hierarchy Hierarchy::compile(uint3 leafDims, const std::vector<DenseMatrix>& leafTransport)
+Hierarchy Hierarchy::compile(uint3 leafDims, const std::vector<DenseMatrix>& leafTransport, uint32_t faceSpatialOrder)
 {
     const size_t leafCount = size_t(leafDims.x) * leafDims.y * leafDims.z;
     require(leafDims.x > 0 && leafDims.y > 0 && leafDims.z > 0, "HST-R leaf dimensions must be non-zero.");
     require(leafTransport.size() == leafCount, "HST-R leaf transport count does not match dimensions.");
     require(isPowerOf2(leafDims.x) && isPowerOf2(leafDims.y) && isPowerOf2(leafDims.z), "HST-R leaf dimensions must be powers of two.");
+    require(faceSpatialOrder > 0, "HST-R face spatial order must be non-zero.");
 
     Hierarchy hierarchy;
     hierarchy.mLeafDims = leafDims;
+    hierarchy.mFaceSpatialOrder = faceSpatialOrder;
     hierarchy.mNodes.reserve(2 * leafCount);
     hierarchy.mLeafNodes.reserve(leafCount);
     std::vector<uint32_t> active;
     active.reserve(leafCount);
+    const size_t traceDofs = leafTransport.front().rows();
     for (const DenseMatrix& transport : leafTransport)
     {
-        require(transport.rows() == kFaceCount && transport.cols() == kFaceCount, "HST-R leaf operators must be 6x6.");
+        require(
+            traceDofs > 0 && transport.rows() == traceDofs && transport.cols() == traceDofs && traceDofs % kFaceCount == 0,
+            "HST-R leaf operators must be non-empty, square, and have matching equal per-face dimensions."
+        );
+        require(traceDofs / kFaceCount == size_t(faceSpatialOrder) * faceSpatialOrder, "HST-R leaf trace dimensions do not match the face spatial order.");
         HierarchyNode node;
         node.transport = transport;
         node.conservationError = conservationError(transport);
@@ -229,7 +309,7 @@ Hierarchy Hierarchy::compile(uint3 leafDims, const std::vector<DenseMatrix>& lea
                     ++(&bPos.x)[axis];
                     const uint32_t left = active[linearIndex(aPos, dims)];
                     const uint32_t right = active[linearIndex(bPos, dims)];
-                    HierarchyNode parent = compose(hierarchy.mNodes[left], hierarchy.mNodes[right], axis);
+                    HierarchyNode parent = compose(hierarchy.mNodes[left], hierarchy.mNodes[right], axis, faceSpatialOrder);
                     parent.left = left;
                     parent.right = right;
                     const uint32_t parentID = uint32_t(hierarchy.mNodes.size());
@@ -247,8 +327,9 @@ Hierarchy Hierarchy::compile(uint3 leafDims, const std::vector<DenseMatrix>& lea
 
 std::vector<float3> Hierarchy::solveFaces(const DenseMatrix& rootIncident) const
 {
-    require(rootIncident.rows() == kFaceCount && rootIncident.cols() == 3, "HST-R root incident field must be 6x3 RGB.");
     require(mRoot != HierarchyNode::kInvalid, "HST-R hierarchy is empty.");
+    const size_t traceDofs = mNodes[mRoot].transport.rows();
+    require(rootIncident.rows() == traceDofs && rootIncident.cols() == 3, "HST-R root incident field dimensions do not match the retained trace.");
     std::vector<DenseMatrix> incident(mNodes.size());
     incident[mRoot] = rootIncident;
     std::vector<uint32_t> stack{mRoot};
@@ -265,14 +346,14 @@ std::vector<float3> Hierarchy::solveFaces(const DenseMatrix& rootIncident) const
         stack.push_back(node.right);
     }
 
-    std::vector<float3> result(mLeafNodes.size() * kFaceCount);
+    std::vector<float3> result(mLeafNodes.size() * traceDofs);
     for (size_t leaf = 0; leaf < mLeafNodes.size(); ++leaf)
     {
         const uint32_t id = mLeafNodes[leaf];
         const DenseMatrix outgoing = multiply(mNodes[id].transport, incident[id]);
-        for (uint32_t face = 0; face < kFaceCount; ++face)
+        for (size_t dof = 0; dof < traceDofs; ++dof)
             for (uint32_t channel = 0; channel < 3; ++channel)
-                result[leaf * kFaceCount + face][channel] = outgoing(face, channel);
+                result[leaf * traceDofs + dof][channel] = outgoing(dof, channel);
     }
     return result;
 }
@@ -280,10 +361,13 @@ std::vector<float3> Hierarchy::solveFaces(const DenseMatrix& rootIncident) const
 std::vector<float3> Hierarchy::solve(const DenseMatrix& rootIncident) const
 {
     const std::vector<float3> faces = solveFaces(rootIncident);
+    const size_t dofsPerFace = faceDofs(mNodes[mRoot].transport);
+    const size_t traceDofs = kFaceCount * dofsPerFace;
     std::vector<float3> result(mLeafNodes.size());
     for (size_t leaf = 0; leaf < mLeafNodes.size(); ++leaf)
         for (uint32_t face = 0; face < kFaceCount; ++face)
-            result[leaf] += faces[leaf * kFaceCount + face] / float(kFaceCount);
+            for (size_t mode = 0; mode < dofsPerFace; ++mode)
+                result[leaf] += faces[leaf * traceDofs + faceOffset(face, dofsPerFace) + mode] / float(traceDofs);
     return result;
 }
 
@@ -291,7 +375,7 @@ std::vector<DenseMatrix> Hierarchy::getLeafTransferMatrices() const
 {
     require(mRoot != HierarchyNode::kInvalid, "HST-R hierarchy is empty.");
     std::vector<DenseMatrix> transfer(mNodes.size());
-    transfer[mRoot] = DenseMatrix::identity(kFaceCount);
+    transfer[mRoot] = DenseMatrix::identity(mNodes[mRoot].transport.rows());
     std::vector<uint32_t> stack{mRoot};
     while (!stack.empty())
     {
@@ -321,14 +405,15 @@ std::vector<DenseMatrix> Hierarchy::getLeafTransportMatrices() const
 
 DenseMatrix Hierarchy::solveAdjoint(const DenseMatrix& rootGoal) const
 {
-    require(rootGoal.rows() == kFaceCount, "HST-R adjoint goal must have six face rows.");
+    require(rootGoal.rows() == mNodes[mRoot].transport.rows(), "HST-R adjoint goal dimensions do not match the retained trace.");
     return multiply(transpose(mNodes[mRoot].transport), rootGoal);
 }
 
 std::vector<RankedCorrection> Hierarchy::rankResidualAtoms(const DenseMatrix& rootIncident, const DenseMatrix& rootGoal) const
 {
-    require(rootIncident.rows() == kFaceCount, "HST-R root incident field must have six face rows.");
-    require(rootGoal.rows() == kFaceCount && rootGoal.cols() == rootIncident.cols(), "HST-R root goal dimensions do not match.");
+    const size_t traceDofs = mNodes[mRoot].transport.rows();
+    require(rootIncident.rows() == traceDofs, "HST-R root incident field dimensions do not match the retained trace.");
+    require(rootGoal.rows() == traceDofs && rootGoal.cols() == rootIncident.cols(), "HST-R root goal dimensions do not match.");
 
     std::vector<RankedCorrection> atoms;
     struct Work
@@ -358,22 +443,12 @@ std::vector<RankedCorrection> Hierarchy::rankResidualAtoms(const DenseMatrix& ro
                     atoms.push_back({work.node, row, col, value, goalError, goalError / sizeof(RankedCorrection)});
             }
 
-        DenseMatrix leftRestriction(kFaceCount, kFaceCount);
-        DenseMatrix rightRestriction(kFaceCount, kFaceCount);
-        const uint32_t negativeFace = 2 * node.splitAxis;
-        const uint32_t positiveFace = negativeFace + 1;
-        for (uint32_t face = 0; face < kFaceCount; ++face)
-        {
-            if (face == negativeFace)
-                leftRestriction(face, face) = 1.f;
-            else if (face == positiveFace)
-                rightRestriction(face, face) = 1.f;
-            else
-            {
-                leftRestriction(face, face) = 0.5f;
-                rightRestriction(face, face) = 0.5f;
-            }
-        }
+        DenseMatrix leftProlongation;
+        DenseMatrix rightProlongation;
+        DenseMatrix leftRestriction;
+        DenseMatrix rightRestriction;
+        makeChildTraceTransfer(node.splitAxis, 0, mFaceSpatialOrder, leftProlongation, leftRestriction);
+        makeChildTraceTransfer(node.splitAxis, 1, mFaceSpatialOrder, rightProlongation, rightRestriction);
         stack.push_back({
             node.left,
             multiply(node.leftInput, work.incident),
@@ -414,7 +489,7 @@ std::vector<float> Hierarchy::getLeafResidualBounds() const
 uint32_t Hierarchy::updateLeaf(uint32_t leafIndex, const DenseMatrix& transport)
 {
     require(leafIndex < mLeafNodes.size(), "HST-R leaf update index is out of range.");
-    require(transport.rows() == kFaceCount && transport.cols() == kFaceCount, "HST-R leaf update must be 6x6.");
+    require(transport.rows() == mNodes[mLeafNodes[leafIndex]].transport.rows() && transport.cols() == transport.rows(), "HST-R leaf update dimensions do not match the retained trace.");
     uint32_t nodeID = mLeafNodes[leafIndex];
     mNodes[nodeID].transport = transport;
     uint32_t repaired = 0;
@@ -422,7 +497,7 @@ uint32_t Hierarchy::updateLeaf(uint32_t leafIndex, const DenseMatrix& transport)
     {
         const uint32_t parentID = mNodes[nodeID].parent;
         const HierarchyNode oldParent = mNodes[parentID];
-        HierarchyNode updated = compose(mNodes[oldParent.left], mNodes[oldParent.right], oldParent.splitAxis);
+        HierarchyNode updated = compose(mNodes[oldParent.left], mNodes[oldParent.right], oldParent.splitAxis, mFaceSpatialOrder);
         updated.left = oldParent.left;
         updated.right = oldParent.right;
         updated.parent = oldParent.parent;
@@ -441,6 +516,7 @@ void Hierarchy::save(const std::filesystem::path& path) const
     stream.write(reinterpret_cast<const char*>(&kFileVersion), sizeof(kFileVersion));
     stream.write(reinterpret_cast<const char*>(&mLeafDims), sizeof(mLeafDims));
     stream.write(reinterpret_cast<const char*>(&mRoot), sizeof(mRoot));
+    stream.write(reinterpret_cast<const char*>(&mFaceSpatialOrder), sizeof(mFaceSpatialOrder));
     const uint32_t leafCount = uint32_t(mLeafNodes.size());
     const uint32_t nodeCount = uint32_t(mNodes.size());
     stream.write(reinterpret_cast<const char*>(&leafCount), sizeof(leafCount));
@@ -474,6 +550,7 @@ Hierarchy Hierarchy::load(const std::filesystem::path& path)
     Hierarchy hierarchy;
     stream.read(reinterpret_cast<char*>(&hierarchy.mLeafDims), sizeof(hierarchy.mLeafDims));
     stream.read(reinterpret_cast<char*>(&hierarchy.mRoot), sizeof(hierarchy.mRoot));
+    stream.read(reinterpret_cast<char*>(&hierarchy.mFaceSpatialOrder), sizeof(hierarchy.mFaceSpatialOrder));
     uint32_t leafCount = 0;
     uint32_t nodeCount = 0;
     stream.read(reinterpret_cast<char*>(&leafCount), sizeof(leafCount));
@@ -496,6 +573,96 @@ Hierarchy Hierarchy::load(const std::filesystem::path& path)
     }
     require(bool(stream), "HST-R hierarchy file is truncated.");
     return hierarchy;
+}
+
+DenseMatrix makeGridBoundaryTransport(uint32_t cellsPerAxis, const std::vector<DenseMatrix>& cellTransport)
+{
+    require(cellsPerAxis > 0, "HST-R transport grid dimensions must be non-zero.");
+    const uint3 dims(cellsPerAxis);
+    const size_t cellCount = size_t(cellsPerAxis) * cellsPerAxis * cellsPerAxis;
+    require(cellTransport.size() == cellCount, "HST-R transport grid operator count does not match its dimensions.");
+    for (const DenseMatrix& transport : cellTransport)
+        require(transport.rows() == kFaceCount && transport.cols() == kFaceCount, "HST-R transport grid cells must use six-direction operators.");
+
+    std::vector<int32_t> externalPort(cellCount * kFaceCount, -1);
+    uint32_t externalCount = 0;
+    for (uint32_t face = 0; face < kFaceCount; ++face)
+    {
+        const uint32_t faceAxis = face / 2;
+        uint32_t tangents[2];
+        uint32_t tangentCount = 0;
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            if (axis != faceAxis)
+                tangents[tangentCount++] = axis;
+        for (uint32_t v = 0; v < cellsPerAxis; ++v)
+            for (uint32_t u = 0; u < cellsPerAxis; ++u)
+            {
+                uint3 p(0);
+                (&p.x)[faceAxis] = (face & 1u) ? cellsPerAxis - 1 : 0;
+                (&p.x)[tangents[0]] = u;
+                (&p.x)[tangents[1]] = v;
+                externalPort[kFaceCount * linearIndex(p, dims) + face] = int32_t(externalCount++);
+            }
+    }
+
+    std::vector<int32_t> internalPort(cellCount * kFaceCount, -1);
+    uint32_t internalCount = 0;
+    for (size_t port = 0; port < internalPort.size(); ++port)
+        if (externalPort[port] < 0)
+            internalPort[port] = int32_t(internalCount++);
+
+    DenseMatrix system(internalCount, internalCount);
+    DenseMatrix rhs(internalCount, externalCount);
+    for (uint32_t z = 0; z < cellsPerAxis; ++z)
+        for (uint32_t y = 0; y < cellsPerAxis; ++y)
+            for (uint32_t x = 0; x < cellsPerAxis; ++x)
+            {
+                const uint3 p(x, y, z);
+                const size_t cell = linearIndex(p, dims);
+                for (uint32_t face = 0; face < kFaceCount; ++face)
+                {
+                    const size_t port = kFaceCount * cell + face;
+                    if (internalPort[port] < 0)
+                        continue;
+                    const uint32_t row = uint32_t(internalPort[port]);
+                    system(row, row) = 1.f;
+                    uint3 neighborPosition = p;
+                    (&neighborPosition.x)[face / 2] += (face & 1u) ? 1 : -1;
+                    const size_t neighbor = linearIndex(neighborPosition, dims);
+                    const uint32_t outgoingFace = face ^ 1u;
+                    for (uint32_t inputFace = 0; inputFace < kFaceCount; ++inputFace)
+                    {
+                        const float value = cellTransport[neighbor](outgoingFace, inputFace);
+                        const size_t inputPort = kFaceCount * neighbor + inputFace;
+                        if (internalPort[inputPort] >= 0)
+                            system(row, uint32_t(internalPort[inputPort])) -= value;
+                        else
+                            rhs(row, uint32_t(externalPort[inputPort])) += value;
+                    }
+                }
+            }
+    const DenseMatrix internalResponse = internalCount > 0 ? solve(system, rhs) : DenseMatrix(0, externalCount);
+
+    DenseMatrix result(externalCount, externalCount);
+    for (size_t cell = 0; cell < cellCount; ++cell)
+        for (uint32_t face = 0; face < kFaceCount; ++face)
+        {
+            const size_t port = kFaceCount * cell + face;
+            if (externalPort[port] < 0)
+                continue;
+            const uint32_t row = uint32_t(externalPort[port]);
+            for (uint32_t inputFace = 0; inputFace < kFaceCount; ++inputFace)
+            {
+                const float value = cellTransport[cell](face, inputFace);
+                const size_t inputPort = kFaceCount * cell + inputFace;
+                if (externalPort[inputPort] >= 0)
+                    result(row, uint32_t(externalPort[inputPort])) += value;
+                else
+                    for (uint32_t col = 0; col < externalCount; ++col)
+                        result(row, col) += value * internalResponse(uint32_t(internalPort[inputPort]), col);
+            }
+        }
+    return result;
 }
 
 DenseMatrix makeLeafTransport(float3 opticalDepth, float albedo, float anisotropy, float forwardFraction)
