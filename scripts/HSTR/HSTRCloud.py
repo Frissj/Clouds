@@ -16,7 +16,7 @@ def render_graph_HSTRCloud():
         "correctionFadeFrames": 8,
         "ballisticBudget": 24,
         "nearScatterBudget": 120,
-        "diffuseRankBudget": 4,
+        "diffuseRankBudget": 24,
         "schurWindowRadius": 8,
         "localSourceRadiance": float3(0.0),
         "mixedFidelityThreshold": 0.15,

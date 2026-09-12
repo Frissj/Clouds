@@ -421,10 +421,12 @@ void HSTRCloud::uploadHierarchy()
 
 void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
 {
-    struct Candidate
+    struct CandidateColumn
     {
         uint32_t leaf;
-        CorrectionAtom atom;
+        uint32_t col;
+        float goalError = 0.f;
+        std::vector<CorrectionAtom> atoms;
     };
     const auto transfers = mHierarchy.getLeafTransferMatrices();
     const float3 sun = normalize(mParams.sunDirection);
@@ -467,54 +469,75 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
         sizeof(float), packedResponses.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedResponses.data(), false
     );
     std::vector<float> omitted = mHierarchyResidualBounds;
-    std::vector<Candidate> candidates;
+    std::vector<CandidateColumn> candidates;
     if (mParams.traceSpatialOrder > 1)
-        candidates.reserve(leafCount * mParams.hstrTraceDofs * mParams.hstrTraceDofs / 2);
+        candidates.reserve(leafCount * mParams.hstrTraceDofs);
     for (uint32_t leaf = 0; leaf < leafCount; ++leaf)
     {
         const hstr::DenseMatrix incident = hstr::multiply(transfers[leaf], rootIncident);
         const hstr::DenseMatrix& detail = mLeafCorrections[leaf];
-        for (uint32_t row = 0; row < mParams.hstrTraceDofs; ++row)
-            for (uint32_t col = 0; col < mParams.hstrTraceDofs; ++col)
+        for (uint32_t col = 0; col < mParams.hstrTraceDofs; ++col)
+        {
+            CandidateColumn candidate{leaf, col};
+            float incidentMagnitude = 0.f;
+            for (uint32_t channel = 0; channel < 3; ++channel)
+                incidentMagnitude += std::abs(incident(col, channel));
+            for (uint32_t row = 0; row < mParams.hstrTraceDofs; ++row)
             {
                 const float value = detail(row, col);
-                float incidentMagnitude = 0.f;
-                for (uint32_t channel = 0; channel < 3; ++channel)
-                    incidentMagnitude += std::abs(incident(col, channel));
+                if (std::abs(value) <= 1e-12f)
+                    continue;
                 float goalError = 0.f;
                 for (uint32_t goal = 0; goal < mParams.adjointGoalCount; ++goal)
                     goalError += std::abs(goals[leaf](row, goal) * value) * incidentMagnitude;
-                if (goalError <= 1e-12f)
-                    continue;
-                omitted[leaf] += goalError;
-                candidates.push_back({leaf, {row, col, value, goalError}});
+                candidate.goalError += goalError;
+                candidate.atoms.push_back({row, col, value, goalError});
             }
+            if (candidate.goalError <= 1e-12f)
+                continue;
+            omitted[leaf] += candidate.goalError;
+            candidates.push_back(std::move(candidate));
+        }
     }
 
-    const size_t candidateCount = candidates.size();
-    const size_t admittedCount = std::min<size_t>(mParams.correctionBudget, candidateCount);
-    if (admittedCount < candidates.size())
+    const size_t candidateColumnCount = candidates.size();
+    size_t candidateAtomCount = 0;
+    for (const CandidateColumn& candidate : candidates)
+        candidateAtomCount += candidate.atoms.size();
+    std::stable_sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const CandidateColumn& a, const CandidateColumn& b)
+        {
+            return a.goalError / float(a.atoms.size()) > b.goalError / float(b.atoms.size());
+        }
+    );
+    size_t admittedAtomCount = 0;
+    std::vector<CandidateColumn> admitted;
+    admitted.reserve(candidates.size());
+    for (CandidateColumn& candidate : candidates)
     {
-        std::nth_element(
-            candidates.begin(),
-            candidates.begin() + admittedCount,
-            candidates.end(),
-            [](const Candidate& a, const Candidate& b) { return a.atom.goalError > b.atom.goalError; }
-        );
-        candidates.resize(admittedCount);
+        if (candidate.atoms.size() > size_t(mParams.correctionBudget) - admittedAtomCount)
+            continue;
+        admittedAtomCount += candidate.atoms.size();
+        admitted.push_back(std::move(candidate));
     }
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.leaf < b.leaf; });
+    std::sort(
+        admitted.begin(),
+        admitted.end(),
+        [](const CandidateColumn& a, const CandidateColumn& b) { return a.leaf != b.leaf ? a.leaf < b.leaf : a.col < b.col; }
+    );
 
     std::vector<uint2> ranges(leafCount, uint2(0));
     std::vector<CorrectionAtom> atoms;
-    atoms.reserve(candidates.size());
-    for (const Candidate& candidate : candidates)
+    atoms.reserve(admittedAtomCount);
+    for (const CandidateColumn& candidate : admitted)
     {
         uint2& range = ranges[candidate.leaf];
         if (range.y == 0)
             range.x = uint32_t(atoms.size());
-        ++range.y;
-        atoms.push_back(candidate.atom);
+        range.y += uint32_t(candidate.atoms.size());
+        atoms.insert(atoms.end(), candidate.atoms.begin(), candidate.atoms.end());
     }
     mParams.correctionAtomCount = uint32_t(atoms.size());
     const CorrectionAtom dummy;
@@ -533,9 +556,11 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
         sizeof(float), omitted.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, omitted.data(), false
     );
     logInfo(
-        "HSTRCloud: admitted {} of {} residual atoms against {} persistent adjoint goals.",
+        "HSTRCloud: admitted {} of {} residual atoms in {} of {} complete columns against {} persistent adjoint goals.",
         atoms.size(),
-        candidateCount,
+        candidateAtomCount,
+        admitted.size(),
+        candidateColumnCount,
         mParams.adjointGoalCount
     );
 }

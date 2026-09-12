@@ -32,7 +32,7 @@ struct HSTRCloudParams
 
     uint ballisticBudget = 24;
     uint nearScatterBudget = 120;
-    uint diffuseRankBudget = 4;
+    uint diffuseRankBudget = 24;
     uint maximumDiffuseRank = 0;
 
     uint3 schurWindowCenter = {0, 0, 0};
