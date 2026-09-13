@@ -4,9 +4,13 @@
 #include "HSTRHierarchy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <limits>
+#include <mutex>
+#include <thread>
 
 namespace Falcor::hstr
 {
@@ -20,6 +24,39 @@ void require(bool condition, const char* message)
 {
     if (!condition)
         FALCOR_THROW(message);
+}
+
+/// Runs f(i) for i in [0, count) on all hardware threads and rethrows the first worker exception.
+template<typename F>
+void parallelFor(size_t count, F&& f)
+{
+    const size_t threadCount = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), count);
+    std::atomic<size_t> next{0};
+    std::exception_ptr error;
+    std::mutex errorMutex;
+    auto worker = [&]()
+    {
+        try
+        {
+            for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1))
+                f(i);
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(errorMutex);
+            if (!error)
+                error = std::current_exception();
+            next = count;
+        }
+    };
+    std::vector<std::thread> threads;
+    for (size_t t = 1; t < threadCount; ++t)
+        threads.emplace_back(worker);
+    worker();
+    for (auto& thread : threads)
+        thread.join();
+    if (error)
+        std::rethrow_exception(error);
 }
 
 DenseMatrix add(const DenseMatrix& a, const DenseMatrix& b)
@@ -220,6 +257,33 @@ size_t linearIndex(uint3 p, uint3 dims)
     return size_t(p.x) + size_t(dims.x) * (size_t(p.y) + size_t(dims.y) * size_t(p.z));
 }
 
+/// Top-down traversal that visits every internal node after its parent; nodes on one level run concurrently.
+template<typename F>
+void forEachLevel(const std::vector<HierarchyNode>& nodes, uint32_t root, F&& visit)
+{
+    std::vector<uint32_t> level{root};
+    while (!level.empty())
+    {
+        parallelFor(
+            level.size(),
+            [&](size_t i)
+            {
+                if (!nodes[level[i]].isLeaf())
+                    visit(nodes[level[i]], level[i]);
+            }
+        );
+        std::vector<uint32_t> next;
+        next.reserve(2 * level.size());
+        for (uint32_t id : level)
+            if (!nodes[id].isLeaf())
+            {
+                next.push_back(nodes[id].left);
+                next.push_back(nodes[id].right);
+            }
+        level = std::move(next);
+    }
+}
+
 uint32_t chooseSplitAxis(uint3 dims, const std::vector<uint32_t>& active, const std::vector<HierarchyNode>& nodes)
 {
     float bestScore = std::numeric_limits<float>::infinity();
@@ -333,27 +397,34 @@ Hierarchy Hierarchy::compile(uint3 leafDims, const std::vector<DenseMatrix>& lea
         const uint32_t axis = chooseSplitAxis(dims, active, hierarchy.mNodes);
         uint3 nextDims = dims;
         (&nextDims.x)[axis] /= 2;
-        std::vector<uint32_t> next(size_t(nextDims.x) * nextDims.y * nextDims.z);
-        for (uint32_t z = 0; z < nextDims.z; ++z)
-            for (uint32_t y = 0; y < nextDims.y; ++y)
-                for (uint32_t x = 0; x < nextDims.x; ++x)
-                {
-                    uint3 p(x, y, z);
-                    uint3 aPos = p;
-                    (&aPos.x)[axis] *= 2;
-                    uint3 bPos = aPos;
-                    ++(&bPos.x)[axis];
-                    const uint32_t left = active[linearIndex(aPos, dims)];
-                    const uint32_t right = active[linearIndex(bPos, dims)];
-                    HierarchyNode parent = compose(hierarchy.mNodes[left], hierarchy.mNodes[right], axis, faceSpatialOrder);
-                    parent.left = left;
-                    parent.right = right;
-                    const uint32_t parentID = uint32_t(hierarchy.mNodes.size());
-                    hierarchy.mNodes.push_back(std::move(parent));
-                    hierarchy.mNodes[left].parent = parentID;
-                    hierarchy.mNodes[right].parent = parentID;
-                    next[linearIndex(p, nextDims)] = parentID;
-                }
+        const size_t nextCount = size_t(nextDims.x) * nextDims.y * nextDims.z;
+        std::vector<uint32_t> next(nextCount);
+        // Parents on one level are independent; compose them concurrently, then append in the serial order.
+        std::vector<HierarchyNode> parents(nextCount);
+        parallelFor(
+            nextCount,
+            [&](size_t i)
+            {
+                const uint3 p(uint32_t(i % nextDims.x), uint32_t((i / nextDims.x) % nextDims.y), uint32_t(i / (nextDims.x * nextDims.y)));
+                uint3 aPos = p;
+                (&aPos.x)[axis] *= 2;
+                uint3 bPos = aPos;
+                ++(&bPos.x)[axis];
+                const uint32_t left = active[linearIndex(aPos, dims)];
+                const uint32_t right = active[linearIndex(bPos, dims)];
+                parents[i] = compose(hierarchy.mNodes[left], hierarchy.mNodes[right], axis, faceSpatialOrder);
+                parents[i].left = left;
+                parents[i].right = right;
+            }
+        );
+        for (size_t i = 0; i < nextCount; ++i)
+        {
+            const uint32_t parentID = uint32_t(hierarchy.mNodes.size());
+            hierarchy.mNodes[parents[i].left].parent = parentID;
+            hierarchy.mNodes[parents[i].right].parent = parentID;
+            hierarchy.mNodes.push_back(std::move(parents[i]));
+            next[i] = parentID;
+        }
         active = std::move(next);
         dims = nextDims;
     }
@@ -412,19 +483,15 @@ std::vector<DenseMatrix> Hierarchy::getLeafTransferMatrices() const
     require(mRoot != HierarchyNode::kInvalid, "HST-R hierarchy is empty.");
     std::vector<DenseMatrix> transfer(mNodes.size());
     transfer[mRoot] = DenseMatrix::identity(mNodes[mRoot].transport.rows());
-    std::vector<uint32_t> stack{mRoot};
-    while (!stack.empty())
-    {
-        const uint32_t id = stack.back();
-        stack.pop_back();
-        const HierarchyNode& node = mNodes[id];
-        if (node.isLeaf())
-            continue;
-        transfer[node.left] = multiply(node.leftInput, transfer[id]);
-        transfer[node.right] = multiply(node.rightInput, transfer[id]);
-        stack.push_back(node.left);
-        stack.push_back(node.right);
-    }
+    forEachLevel(
+        mNodes,
+        mRoot,
+        [&](const HierarchyNode& node, uint32_t id)
+        {
+            transfer[node.left] = multiply(node.leftInput, transfer[id]);
+            transfer[node.right] = multiply(node.rightInput, transfer[id]);
+        }
+    );
     std::vector<DenseMatrix> result(mLeafNodes.size());
     for (size_t leaf = 0; leaf < mLeafNodes.size(); ++leaf)
         result[leaf] = std::move(transfer[mLeafNodes[leaf]]);
@@ -445,26 +512,21 @@ std::vector<DenseMatrix> Hierarchy::getLeafAdjointGoalMatrices(const DenseMatrix
     require(rootGoals.rows() == mNodes[mRoot].transport.rows(), "HST-R root goal dimensions do not match the retained trace.");
     std::vector<DenseMatrix> goals(mNodes.size());
     goals[mRoot] = rootGoals;
-    std::vector<uint32_t> stack{mRoot};
-    while (!stack.empty())
-    {
-        const uint32_t id = stack.back();
-        stack.pop_back();
-        const HierarchyNode& node = mNodes[id];
-        if (node.isLeaf())
-            continue;
-
-        DenseMatrix leftProlongation;
-        DenseMatrix rightProlongation;
-        DenseMatrix leftRestriction;
-        DenseMatrix rightRestriction;
-        makeChildTraceTransfer(node.splitAxis, 0, mFaceSpatialOrder, leftProlongation, leftRestriction);
-        makeChildTraceTransfer(node.splitAxis, 1, mFaceSpatialOrder, rightProlongation, rightRestriction);
-        goals[node.left] = multiply(transpose(leftRestriction), goals[id]);
-        goals[node.right] = multiply(transpose(rightRestriction), goals[id]);
-        stack.push_back(node.left);
-        stack.push_back(node.right);
-    }
+    forEachLevel(
+        mNodes,
+        mRoot,
+        [&](const HierarchyNode& node, uint32_t id)
+        {
+            DenseMatrix leftProlongation;
+            DenseMatrix rightProlongation;
+            DenseMatrix leftRestriction;
+            DenseMatrix rightRestriction;
+            makeChildTraceTransfer(node.splitAxis, 0, mFaceSpatialOrder, leftProlongation, leftRestriction);
+            makeChildTraceTransfer(node.splitAxis, 1, mFaceSpatialOrder, rightProlongation, rightRestriction);
+            goals[node.left] = multiply(transpose(leftRestriction), goals[id]);
+            goals[node.right] = multiply(transpose(rightRestriction), goals[id]);
+        }
+    );
 
     std::vector<DenseMatrix> result(mLeafNodes.size());
     for (size_t leaf = 0; leaf < mLeafNodes.size(); ++leaf)

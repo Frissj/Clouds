@@ -90,6 +90,7 @@ private:
     float3 mVoxelSize = float3(0.f);
     std::vector<float> mLeafDensity;
     std::vector<float> mHierarchyResidualBounds;
+    std::vector<hstr::DenseMatrix> mLeafTransfers; ///< Root-to-leaf incident maps, reused by every lighting solve.
     std::vector<hstr::DenseMatrix> mLeafCorrections;
     std::vector<hstr::DenseMatrix> mLeafBaseTransport;
     std::vector<hstr::DenseMatrix> mOperatorDictionary;
