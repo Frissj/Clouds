@@ -24,7 +24,6 @@ const char kSkyRadiance[] = "skyRadiance";
 const char kAnisotropy[] = "anisotropy";
 const char kActiveRank[] = "activeRank";
 const char kActiveThreshold[] = "activeThreshold";
-const char kGoalFace[] = "goalFace";
 const char kTraceSpatialOrder[] = "traceSpatialOrder";
 const char kCorrectionBudget[] = "correctionBudget";
 const char kCorrectionFadeFrames[] = "correctionFadeFrames";
@@ -47,6 +46,16 @@ uint32_t nextPowerOfTwo(uint32_t value)
 bool insideWindow(uint3 leaf, uint3 center, uint32_t radius)
 {
     return all(abs(int3(leaf) - int3(center)) <= int(radius));
+}
+
+uint32_t dominantFace(float3 direction)
+{
+    uint32_t axis = 0;
+    if (std::abs(direction.y) > std::abs(direction.x))
+        axis = 1;
+    if (std::abs(direction.z) > std::abs(direction[axis]))
+        axis = 2;
+    return 2 * axis + (direction[axis] >= 0.f ? 1u : 0u);
 }
 } // namespace
 
@@ -79,8 +88,6 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.activeRank = value;
         else if (key == kActiveThreshold)
             mParams.activeThreshold = value;
-        else if (key == kGoalFace)
-            mParams.goalFace = value;
         else if (key == kTraceSpatialOrder)
             mParams.traceSpatialOrder = value;
         else if (key == kCorrectionBudget)
@@ -119,7 +126,6 @@ Properties HSTRCloud::getProperties() const
     props[kAnisotropy] = mParams.anisotropy;
     props[kActiveRank] = mParams.activeRank;
     props[kActiveThreshold] = mParams.activeThreshold;
-    props[kGoalFace] = mParams.goalFace;
     props[kTraceSpatialOrder] = mParams.traceSpatialOrder;
     props[kCorrectionBudget] = mParams.correctionBudget;
     props[kCorrectionFadeFrames] = mParams.correctionFadeFrames;
@@ -208,9 +214,7 @@ void HSTRCloud::buildHierarchy()
     mParams.hstrStorageRank = mParams.hstrTraceDofs;
     mParams.activeRank = std::clamp(mParams.activeRank, 1u, mParams.hstrStorageRank);
     const float3 windowPosition = clamp(
-        (mpScene->getCamera()->getPosition() - volume->getBounds().minPoint) / volume->getBounds().extent(),
-        float3(0.f),
-        float3(0.999999f)
+        (mpScene->getCamera()->getPosition() - volume->getBounds().minPoint) / volume->getBounds().extent(), float3(0.f), float3(0.999999f)
     );
     mParams.schurWindowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
     mLeafDensity = sampleLeafDensities();
@@ -288,7 +292,12 @@ void HSTRCloud::uploadHierarchy()
     mParams.maximumDiffuseRank = 0;
     auto retainLargest = [](const hstr::DenseMatrix& source, size_t budget)
     {
-        struct Entry { size_t row; size_t col; float value; };
+        struct Entry
+        {
+            size_t row;
+            size_t col;
+            float value;
+        };
         std::vector<Entry> entries;
         for (size_t row = 0; row < source.rows(); ++row)
             for (size_t col = 0; col < source.cols(); ++col)
@@ -296,7 +305,9 @@ void HSTRCloud::uploadHierarchy()
                     entries.push_back({row, col, source(row, col)});
         if (entries.size() > budget)
         {
-            std::nth_element(entries.begin(), entries.begin() + budget, entries.end(), [](const Entry& a, const Entry& b) { return a.value > b.value; });
+            std::nth_element(
+                entries.begin(), entries.begin() + budget, entries.end(), [](const Entry& a, const Entry& b) { return a.value > b.value; }
+            );
             entries.resize(budget);
         }
         hstr::DenseMatrix result(source.rows(), source.cols());
@@ -309,19 +320,18 @@ void HSTRCloud::uploadHierarchy()
         hstr::DenseMatrix targetBase = transports[leaf];
         if (mParams.traceSpatialOrder > 1)
         {
-            const hstr::DenseMatrix coarse = hstr::multiply(
-                spatialTransfer.restriction,
-                hstr::multiply(transports[leaf], spatialTransfer.prolongation)
-            );
-            targetBase = hstr::multiply(
-                spatialTransfer.prolongation,
-                hstr::multiply(coarse, spatialTransfer.restriction)
-            );
+            const hstr::DenseMatrix coarse =
+                hstr::multiply(spatialTransfer.restriction, hstr::multiply(transports[leaf], spatialTransfer.prolongation));
+            targetBase = hstr::multiply(spatialTransfer.prolongation, hstr::multiply(coarse, spatialTransfer.restriction));
         }
         const hstr::TransportCharacterSplit split = hstr::splitTransportCharacters(targetBase, mParams.hstrFaceDofs);
         const hstr::DenseMatrix ballistic = retainLargest(split.ballistic, mParams.ballisticBudget);
         const hstr::DenseMatrix nearScatter = retainLargest(split.nearScatter, mParams.nearScatterBudget);
-        struct DiffuseColumn { size_t col; float flux; };
+        struct DiffuseColumn
+        {
+            size_t col;
+            float flux;
+        };
         std::vector<DiffuseColumn> diffuseColumns;
         for (size_t col = 0; col < traceDofs; ++col)
         {
@@ -403,11 +413,31 @@ void HSTRCloud::uploadHierarchy()
     mpLeafBasisRight = mpDevice->createStructuredBuffer(
         sizeof(float), packedRight.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedRight.data(), false
     );
-    mpLeafBallistic = mpDevice->createStructuredBuffer(sizeof(float), packedBallistic.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedBallistic.data(), false);
-    mpLeafNearScatter = mpDevice->createStructuredBuffer(sizeof(float), packedNearScatter.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedNearScatter.data(), false);
-    mpLeafDiffuseLeft = mpDevice->createStructuredBuffer(sizeof(float), packedDiffuseLeft.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseLeft.data(), false);
-    mpLeafDiffuseRight = mpDevice->createStructuredBuffer(sizeof(float), packedDiffuseRight.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseRight.data(), false);
-    mpLeafDiffuseRanks = mpDevice->createStructuredBuffer(sizeof(uint32_t), packedDiffuseRanks.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseRanks.data(), false);
+    mpLeafBallistic = mpDevice->createStructuredBuffer(
+        sizeof(float), packedBallistic.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedBallistic.data(), false
+    );
+    mpLeafNearScatter = mpDevice->createStructuredBuffer(
+        sizeof(float), packedNearScatter.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedNearScatter.data(), false
+    );
+    mpLeafDiffuseLeft = mpDevice->createStructuredBuffer(
+        sizeof(float), packedDiffuseLeft.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packedDiffuseLeft.data(), false
+    );
+    mpLeafDiffuseRight = mpDevice->createStructuredBuffer(
+        sizeof(float),
+        packedDiffuseRight.size(),
+        ResourceBindFlags::ShaderResource,
+        MemoryType::DeviceLocal,
+        packedDiffuseRight.data(),
+        false
+    );
+    mpLeafDiffuseRanks = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t),
+        packedDiffuseRanks.size(),
+        ResourceBindFlags::ShaderResource,
+        MemoryType::DeviceLocal,
+        packedDiffuseRanks.data(),
+        false
+    );
     mpLeafRadiance = mpDevice->createStructuredBuffer(
         sizeof(float4),
         traceDofs * leafCount,
@@ -416,7 +446,13 @@ void HSTRCloud::uploadHierarchy()
         nullptr,
         false
     );
-    logInfo("HSTRCloud: split transport budgets ballistic={} near={} diffuse={} (certified max rank {}).", mParams.ballisticBudget, mParams.nearScatterBudget, mParams.diffuseRankBudget, mParams.maximumDiffuseRank);
+    logInfo(
+        "HSTRCloud: split transport budgets ballistic={} near={} diffuse={} (certified max rank {}).",
+        mParams.ballisticBudget,
+        mParams.nearScatterBudget,
+        mParams.diffuseRankBudget,
+        mParams.maximumDiffuseRank
+    );
 }
 
 void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
@@ -508,9 +544,7 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
         candidates.begin(),
         candidates.end(),
         [](const CandidateColumn& a, const CandidateColumn& b)
-        {
-            return a.goalError / float(a.atoms.size()) > b.goalError / float(b.atoms.size());
-        }
+        { return a.goalError / float(a.atoms.size()) > b.goalError / float(b.atoms.size()); }
     );
     size_t admittedAtomCount = 0;
     std::vector<CandidateColumn> admitted;
@@ -604,9 +638,8 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
     if (!all(cell < mActualLeafDims))
     {
         const hstr::DenseMatrix clear = hstr::makeLeafTransport(float3(0.f), 0.f, mParams.anisotropy, 0.65f);
-        return mParams.traceSpatialOrder == 1
-            ? clear
-            : hstr::makeGridBoundaryTransport(kSubcellsPerAxis, std::vector<hstr::DenseMatrix>(8, clear));
+        return mParams.traceSpatialOrder == 1 ? clear
+                                              : hstr::makeGridBoundaryTransport(kSubcellsPerAxis, std::vector<hstr::DenseMatrix>(8, clear));
     }
 
     const auto& volume = mpScene->getGridVolume(0);
@@ -695,9 +728,9 @@ void HSTRCloud::updateHierarchy()
     uploadHierarchy();
     solveLighting();
     mOptionsChanged = true;
-    const char* strategyName = strategy == hstr::UpdateStrategy::Woodbury
-        ? "Woodbury"
-        : strategy == hstr::UpdateStrategy::WoodburyKrylov ? "Woodbury-plus-Krylov" : "subtree";
+    const char* strategyName = strategy == hstr::UpdateStrategy::Woodbury         ? "Woodbury"
+                               : strategy == hstr::UpdateStrategy::WoodburyKrylov ? "Woodbury-plus-Krylov"
+                                                                                  : "subtree";
     logInfo(
         "HSTRCloud: {} repair of {} changed leaves at measured rank {} across {} ancestor updates.",
         strategyName,
@@ -717,6 +750,9 @@ void HSTRCloud::solveLighting()
         for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
             for (uint32_t channel = 0; channel < 3; ++channel)
                 incident(face * mParams.hstrFaceDofs + mode, channel) = mParams.skyRadiance[channel];
+    const auto bounds = mpScene->getGridVolume(0)->getBounds();
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    mParams.goalFace = dominantFace(cameraPosition - bounds.center());
     const float3 sun = normalize(mParams.sunDirection);
     uint32_t sunAxis = 0;
     if (std::abs(sun.y) > std::abs(sun.x))
@@ -726,19 +762,17 @@ void HSTRCloud::solveLighting()
     const uint32_t sunFace = 2 * sunAxis + (sun[sunAxis] >= 0.f ? 1u : 0u);
     for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
         for (uint32_t channel = 0; channel < 3; ++channel)
-            incident(sunFace * mParams.hstrFaceDofs + mode, channel) +=
-                0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
+            incident(sunFace * mParams.hstrFaceDofs + mode, channel) += 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
 
-    const auto bounds = mpScene->getGridVolume(0)->getBounds();
-    const float3 cameraPosition = mpScene->getCamera()->getPosition();
     const float3 windowPosition = clamp((cameraPosition - bounds.minPoint) / bounds.extent(), float3(0.f), float3(0.999999f));
     mParams.schurWindowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
     if (any(mParams.localSourceRadiance > 0.f))
     {
         const auto sourceToRoot = mHierarchy.getLeafSourceToRootMatrices();
         const uint3 leafDims = mHierarchy.getLeafDims();
-        const size_t sourceLeaf = size_t(mParams.schurWindowCenter.x) + size_t(leafDims.x) *
-            (size_t(mParams.schurWindowCenter.y) + size_t(leafDims.y) * mParams.schurWindowCenter.z);
+        const size_t sourceLeaf =
+            size_t(mParams.schurWindowCenter.x) +
+            size_t(leafDims.x) * (size_t(mParams.schurWindowCenter.y) + size_t(leafDims.y) * mParams.schurWindowCenter.z);
         hstr::DenseMatrix localSource(mParams.hstrTraceDofs, 3);
         for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
             for (uint32_t channel = 0; channel < 3; ++channel)
@@ -788,11 +822,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     if (mpScene && !mpScene->getGridVolumes().empty())
     {
         const auto bounds = mpScene->getGridVolume(0)->getBounds();
-        const float3 windowPosition = clamp(
-            (mpScene->getCamera()->getPosition() - bounds.minPoint) / bounds.extent(),
-            float3(0.f),
-            float3(0.999999f)
-        );
+        const uint32_t goalFace = dominantFace(mpScene->getCamera()->getPosition() - bounds.center());
+        const bool goalChanged = goalFace != mParams.goalFace;
+        mParams.goalFace = goalFace;
+        const float3 windowPosition =
+            clamp((mpScene->getCamera()->getPosition() - bounds.minPoint) / bounds.extent(), float3(0.f), float3(0.999999f));
         const uint3 windowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
         if (any(windowCenter != mParams.schurWindowCenter))
         {
@@ -820,8 +854,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 solveLighting();
                 logInfo("HSTRCloud: moved exact Schur window across {} leaves with {} ancestor repairs.", changedLeaves, repairedNodes);
             }
-            else if (any(mParams.localSourceRadiance > 0.f))
+            else if (goalChanged || any(mParams.localSourceRadiance > 0.f))
                 solveLighting();
+            mOptionsChanged = true;
+        }
+        else if (goalChanged)
+        {
+            solveLighting();
             mOptionsChanged = true;
         }
     }
@@ -869,6 +908,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
     var["hstrRadiance"] = mpLeafRadiance;
+    var["hstrLeafBallistic"] = mpLeafBallistic;
+    var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["color"] = color;
     var["transportError"] = error;
     mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
@@ -880,12 +921,11 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     bool renderChanged = false;
     bool lightingChanged = false;
     bool operatorChanged = false;
-    renderChanged |= widget.var("Base view steps", mParams.baseSteps, 8u, 128u, 8u);
-    renderChanged |= widget.var("Refinement level", mParams.refinementLevel, 0u, 3u, 1u);
-    renderChanged |= widget.var("Residual blend", mParams.residualBlend, 0.f, 1.f, 0.01f);
+    renderChanged |= widget.var("Inside-cloud base steps", mParams.baseSteps, 8u, 128u, 8u);
+    renderChanged |= widget.var("Inside-cloud refinement", mParams.refinementLevel, 0u, 3u, 1u);
+    renderChanged |= widget.var("Inside-cloud residual blend", mParams.residualBlend, 0.f, 1.f, 0.01f);
     lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
     lightingChanged |= widget.var("Active-mode threshold", mParams.activeThreshold, 0.f, 1.f, 0.0001f);
-    lightingChanged |= widget.var("Adjoint goal face", mParams.goalFace, 0u, 5u, 1u);
     lightingChanged |= widget.var("Correction atom budget", mParams.correctionBudget, 0u, 1048576u, 4096u);
     renderChanged |= widget.var("Correction fade frames", mParams.correctionFadeFrames, 1u, 64u, 1u);
     operatorChanged |= widget.var("Ballistic entries per leaf", mParams.ballisticBudget, 0u, mParams.hstrTraceDofs, 1u);
@@ -910,8 +950,9 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         solveLighting();
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged;
     widget.textWrapped(
-        "Lighting is reconstructed from a persistent six-face spatial-angular Schur hierarchy. NanoVDB is queried only for primary "
-        "visibility and the deterministic near-field residual."
+        "Outside-cloud views composite preintegrated HST transport-cut nodes and never march NanoVDB. The density grid is queried only "
+        "by the exact inside-cloud fallback."
     );
     widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
+    widget.text(fmt::format("Camera-facing adjoint face: {}", mParams.goalFace));
 }

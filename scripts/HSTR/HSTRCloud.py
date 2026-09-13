@@ -10,7 +10,6 @@ def render_graph_HSTRCloud():
         "residualBlend": 1.0,
         "activeRank": 24,
         "activeThreshold": 0.0,
-        "goalFace": 1,
         "traceSpatialOrder": 2,
         "correctionBudget": 262144,
         "correctionFadeFrames": 8,

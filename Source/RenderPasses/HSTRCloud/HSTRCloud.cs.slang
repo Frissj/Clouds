@@ -48,17 +48,15 @@ struct HSTRCloudRenderer
         return max(0.f, grid.lookupLinearIndex(localPosition, accessor)) * volume.data.densityScale * params.densityScale;
     }
 
-    uint leafIndex(uint3 p)
-    {
-        return p.x + params.hstrLeafDims.x * (p.y + params.hstrLeafDims.y * p.z);
-    }
+    uint leafIndex(uint3 p) { return p.x + params.hstrLeafDims.x * (p.y + params.hstrLeafDims.y * p.z); }
 
     float3 sampleLeafFace(uint leaf, uint face, float3 localPosition)
     {
         const uint order = params.traceSpatialOrder;
         const uint faceDofs = params.hstrFaceDofs;
         const uint base = params.hstrTraceDofs * leaf + faceDofs * face;
-        if (order == 1) return hstrRadiance[base].rgb;
+        if (order == 1)
+            return hstrRadiance[base].rgb;
 
         const uint faceAxis = face / 2;
         const uint tangent0 = faceAxis == 0 ? 1 : 0;
@@ -122,17 +120,117 @@ struct HSTRCloudRenderer
         return result / max(1e-4f, abs(outgoing.x) + abs(outgoing.y) + abs(outgoing.z));
     }
 
+    uint rayInputFace(float3 direction)
+    {
+        uint axis = 0;
+        if (abs(direction.y) > abs(direction.x))
+            axis = 1;
+        if (abs(direction.z) > abs(direction[axis]))
+            axis = 2;
+        return 2 * axis + (direction[axis] >= 0.f ? 1u : 0u);
+    }
+
+    float sampleLeafTransmittance(uint leaf, uint face, float3 localPosition)
+    {
+        const uint order = params.traceSpatialOrder;
+        const uint base = leaf * params.hstrTraceDofs + face * params.hstrFaceDofs;
+        if (order == 1)
+            return hstrLeafBallistic[base];
+        const uint faceAxis = face / 2;
+        const uint tangent0 = faceAxis == 0 ? 1 : 0;
+        const uint tangent1 = faceAxis == 2 ? 1 : 2;
+        const float2 samplePosition = saturate(float2(localPosition[tangent0], localPosition[tangent1])) * order - 0.5f;
+        const int2 sampleBase = int2(floor(samplePosition));
+        const float2 f = frac(samplePosition);
+        float result = 0.f;
+        for (uint v = 0; v < 2; ++v)
+            for (uint u = 0; u < 2; ++u)
+            {
+                const uint2 q = uint2(clamp(sampleBase + int2(u, v), int2(0), int2(order) - 1));
+                const float2 w = select(uint2(u, v) == 0, 1.f - f, f);
+                result += hstrLeafBallistic[base + q.x + order * q.y] * w.x * w.y;
+            }
+        return saturate(result);
+    }
+
+    float hstrTransmittance(float3 p, uint face)
+    {
+        const int3 base = int3(floor(p));
+        const float3 f = frac(p);
+        float result = 0.f;
+        for (uint z = 0; z < 2; ++z)
+            for (uint y = 0; y < 2; ++y)
+                for (uint x = 0; x < 2; ++x)
+                {
+                    const int3 q = clamp(base + int3(x, y, z), int3(0), int3(params.hstrLeafDims) - 1);
+                    const float3 w = select(uint3(x, y, z) == 0, 1.f - f, f);
+                    result += sampleLeafTransmittance(leafIndex(uint3(q)), face, p - float3(q) + 0.5f) * w.x * w.y * w.z;
+                }
+        return saturate(result);
+    }
+
+    float4 integrateTransportCut(Ray ray, GridVolume volume, float2 interval, out float residualError)
+    {
+        residualError = 0.f;
+        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
+        const float3 entryIndex = mul(volume.data.invTransform, float4(ray.origin + max(0.f, interval.x) * ray.dir, 1.f)).xyz;
+        const float3 exitIndex = mul(volume.data.invTransform, float4(ray.origin + interval.y * ray.dir, 1.f)).xyz;
+        float3 position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 endPosition = (exitIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 direction = endPosition - position;
+        const int3 stepDirection = select(direction < 0.f, int3(-1), int3(1));
+        const float3 inverseDirection = 1.f / max(abs(direction), float3(1e-8f));
+        int3 cell = clamp(int3(floor(position + 1e-4f * float3(stepDirection))), int3(0), int3(params.hstrLeafDims) - 1);
+        const float3 nextBoundary = float3(cell) + select(stepDirection < 0, float3(0.f), float3(1.f));
+        float3 nextCrossing = abs(nextBoundary - position) * inverseDirection;
+        const float3 crossingStep = inverseDirection;
+        const uint inputFace = rayInputFace(direction);
+        const uint inputAxis = inputFace / 2;
+        float3 radiance = 0.f;
+        float transmittance = 1.f;
+        float currentCrossing = 0.f;
+
+        [loop]
+        for (uint visit = 0; visit < 256 && transmittance > 1e-3f; ++visit)
+        {
+            if (any(cell < 0) || any(cell >= int3(params.hstrLeafDims)))
+                break;
+            const float crossing = min(nextCrossing.x, min(nextCrossing.y, nextCrossing.z));
+            const float segmentEnd = min(1.f, crossing);
+            const float segmentLength = max(0.f, segmentEnd - currentCrossing) * abs(direction[inputAxis]);
+            const float3 samplePosition = position + (0.5f * (currentCrossing + segmentEnd)) * direction;
+            const float leafTransmittance = pow(max(1e-6f, hstrTransmittance(samplePosition - 0.5f, inputFace)), segmentLength);
+            const float alpha = 1.f - leafTransmittance;
+            const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * samplePosition;
+            radiance += transmittance * alpha * volume.data.albedo * hstrLighting(indexPosition, ray.dir);
+            residualError += transmittance * alpha * hstrResidualBound(indexPosition);
+            transmittance *= leafTransmittance;
+            currentCrossing = segmentEnd;
+
+            if (crossing >= 1.f)
+                break;
+            const bool3 crossAxis = nextCrossing <= crossing + 1e-6f;
+            cell += select(crossAxis, stepDirection, int3(0));
+            nextCrossing += select(crossAxis, crossingStep, float3(0.f));
+        }
+        return float4(radiance + transmittance * sky, transmittance);
+    }
+
     float3 deterministicResidual(GridVolume volume, Grid grid, float3 indexPosition, float3 viewDirection, inout Grid::Accessor accessor)
     {
         const float h = 1.5f;
         const float3 gradient = float3(
-            grid.lookupLinearIndex(indexPosition + float3(h, 0.f, 0.f), accessor) - grid.lookupLinearIndex(indexPosition - float3(h, 0.f, 0.f), accessor),
-            grid.lookupLinearIndex(indexPosition + float3(0.f, h, 0.f), accessor) - grid.lookupLinearIndex(indexPosition - float3(0.f, h, 0.f), accessor),
-            grid.lookupLinearIndex(indexPosition + float3(0.f, 0.f, h), accessor) - grid.lookupLinearIndex(indexPosition - float3(0.f, 0.f, h), accessor)
+            grid.lookupLinearIndex(indexPosition + float3(h, 0.f, 0.f), accessor) -
+                grid.lookupLinearIndex(indexPosition - float3(h, 0.f, 0.f), accessor),
+            grid.lookupLinearIndex(indexPosition + float3(0.f, h, 0.f), accessor) -
+                grid.lookupLinearIndex(indexPosition - float3(0.f, h, 0.f), accessor),
+            grid.lookupLinearIndex(indexPosition + float3(0.f, 0.f, h), accessor) -
+                grid.lookupLinearIndex(indexPosition - float3(0.f, 0.f, h), accessor)
         );
         const float density = max(0.f, grid.lookupLinearIndex(indexPosition, accessor));
         const float edge = saturate(2.f * length(gradient) / max(0.02f, density));
-        if (edge <= 0.f) return 0.f;
+        if (edge <= 0.f)
+            return 0.f;
 
         const float3 outwardIndex = -normalize(gradient + 1e-6f);
         const float3 sunIndex = normalize(mul(volume.data.invTransform, float4(normalize(params.sunDirection), 0.f)).xyz);
@@ -158,9 +256,11 @@ struct HSTRCloudRenderer
         const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
         float2 interval;
         AABB bounds = volume.getBounds();
-        if (!intersectRayAABB(ray.origin, ray.dir, bounds.minPoint, bounds.maxPoint, interval)) return float4(sky, 1.f);
+        if (!intersectRayAABB(ray.origin, ray.dir, bounds.minPoint, bounds.maxPoint, interval))
+            return float4(sky, 1.f);
         interval.x = max(interval.x, 0.f);
-        if (interval.x >= interval.y || !volume.hasDensityGrid()) return float4(sky, 1.f);
+        if (interval.x >= interval.y || !volume.hasDensityGrid())
+            return float4(sky, 1.f);
 
         Grid grid;
         gScene.getGrid(volume.getDensityGrid(), grid);
@@ -175,7 +275,8 @@ struct HSTRCloudRenderer
             const float t = interval.x + (step + jitter) * stepLength;
             const float3 position = ray.origin + t * ray.dir;
             const float extinction = densityAt(volume, grid, position, accessor);
-            if (extinction <= 0.f) continue;
+            if (extinction <= 0.f)
+                continue;
 
             const float alpha = 1.f - exp(-extinction * stepLength);
             const float3 indexPosition = mul(volume.data.invTransform, float4(position, 1.f)).xyz;
@@ -194,7 +295,8 @@ struct HSTRCloudRenderer
 
     void execute(uint2 pixel)
     {
-        if (any(pixel >= params.frameDim)) return;
+        if (any(pixel >= params.frameDim))
+            return;
         const Ray ray = gScene.camera.computeRayPinhole(pixel, params.frameDim);
         const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
         if (gScene.getGridVolumeCount() == 0)
@@ -204,15 +306,31 @@ struct HSTRCloudRenderer
             return;
         }
 
-        const uint coarseSteps = params.baseSteps << params.refinementLevel;
-        const uint fineSteps = min(1024u, coarseSteps << 1);
         const GridVolume volume = gScene.getGridVolume(0);
-        float coarseResidual;
-        float fineResidual;
-        const float4 coarse = integrateVolume(ray, volume, coarseSteps, pixel, coarseResidual);
-        const float4 fine = integrateVolume(ray, volume, fineSteps, pixel, fineResidual);
-        color[pixel] = float4(lerp(coarse.rgb, fine.rgb, params.residualBlend), 1.f);
-        transportError[pixel] = length(fine.rgb - coarse.rgb) + fineResidual;
+        const AABB bounds = volume.getBounds();
+        float2 interval;
+        if (!intersectRayAABB(ray.origin, ray.dir, bounds.minPoint, bounds.maxPoint, interval) || interval.y <= max(0.f, interval.x))
+        {
+            color[pixel] = float4(sky, 1.f);
+            transportError[pixel] = 0.f;
+            return;
+        }
+
+        const bool insideCloudBounds = all(ray.origin > bounds.minPoint) && all(ray.origin < bounds.maxPoint);
+        if (insideCloudBounds)
+        {
+            float residualError;
+            color[pixel] = float4(
+                integrateVolume(ray, volume, min(1024u, (params.baseSteps << params.refinementLevel) << 1), pixel, residualError).rgb, 1.f
+            );
+            transportError[pixel] = residualError;
+            return;
+        }
+
+        // HST-Cut: traverse preintegrated transport nodes, not NanoVDB samples.
+        float residualError;
+        color[pixel] = float4(integrateTransportCut(ray, volume, interval, residualError).rgb, 1.f);
+        transportError[pixel] = residualError;
     }
 };
 
@@ -222,17 +340,18 @@ cbuffer CB
 }
 
 [numthreads(16, 16, 1)]
-void main(uint3 dispatchThreadId : SV_DispatchThreadID)
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.execute(dispatchThreadId.xy);
 }
 
 [numthreads(64, 1, 1)]
-void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
+void solveLeaves(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     const uint leaf = dispatchThreadId.x;
     const uint leafCount = gHSTRCloud.params.hstrLeafDims.x * gHSTRCloud.params.hstrLeafDims.y * gHSTRCloud.params.hstrLeafDims.z;
-    if (leaf >= leafCount) return;
+    if (leaf >= leafCount)
+        return;
     const HSTRCloudParams params = gHSTRCloud.params;
 
     float3 incident[kMaxTraceDofs];
@@ -244,18 +363,15 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
     {
         float3 coefficient = 0.f;
         for (uint rootDof = 0; rootDof < params.hstrTraceDofs; ++rootDof)
-            coefficient += gHSTRCloud.hstrLeafBasisRight[
-                matrixSize * leaf + params.hstrStorageRank * rootDof + mode
-            ] * gHSTRCloud.hstrRootIncident[rootDof].rgb;
+            coefficient += gHSTRCloud.hstrLeafBasisRight[matrixSize * leaf + params.hstrStorageRank * rootDof + mode] *
+                           gHSTRCloud.hstrRootIncident[rootDof].rgb;
 
         const float adjointResponse = gHSTRCloud.hstrLeafAdjointResponses[leaf * params.hstrStorageRank + mode];
         const float importance = adjointResponse * length(coefficient);
         const bool active = mode < params.activeRank && importance >= params.activeThreshold;
         if (active)
             for (uint dof = 0; dof < params.hstrTraceDofs; ++dof)
-                incident[dof] += gHSTRCloud.hstrLeafBasisLeft[
-                    matrixSize * leaf + params.hstrStorageRank * dof + mode
-                ] * coefficient;
+                incident[dof] += gHSTRCloud.hstrLeafBasisLeft[matrixSize * leaf + params.hstrStorageRank * dof + mode] * coefficient;
         else
             omittedError += importance;
     }
@@ -269,21 +385,22 @@ void solveLeaves(uint3 dispatchThreadId : SV_DispatchThreadID)
         const uint ballisticOutput = (inputFace ^ 1u) * params.hstrFaceDofs + spatialMode;
         outgoing[ballisticOutput] += gHSTRCloud.hstrLeafBallistic[leaf * params.hstrTraceDofs + inputDof] * incident[inputDof];
         for (uint outputFace = 0; outputFace < 6; ++outputFace)
-            outgoing[outputFace * params.hstrFaceDofs + spatialMode] += gHSTRCloud.hstrLeafNearScatter[
-                (leaf * params.hstrTraceDofs + inputDof) * 6 + outputFace
-            ] * incident[inputDof];
+            outgoing[outputFace * params.hstrFaceDofs + spatialMode] +=
+                gHSTRCloud.hstrLeafNearScatter[(leaf * params.hstrTraceDofs + inputDof) * 6 + outputFace] * incident[inputDof];
     }
     for (uint mode = 0; mode < gHSTRCloud.hstrLeafDiffuseRanks[leaf]; ++mode)
     {
         float3 coefficient = 0.f;
         for (uint inputDof = 0; inputDof < params.hstrTraceDofs; ++inputDof)
-            coefficient += gHSTRCloud.hstrLeafDiffuseRight[
-                params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * inputDof + mode
-            ] * incident[inputDof];
+            coefficient +=
+                gHSTRCloud
+                    .hstrLeafDiffuseRight[params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * inputDof + mode] *
+                incident[inputDof];
         for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
-            outgoing[outputDof] += gHSTRCloud.hstrLeafDiffuseLeft[
-                params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * outputDof + mode
-            ] * coefficient;
+            outgoing[outputDof] +=
+                gHSTRCloud
+                    .hstrLeafDiffuseLeft[params.hstrTraceDofs * params.hstrTraceDofs * leaf + params.hstrTraceDofs * outputDof + mode] *
+                coefficient;
     }
     const float correctionFade = saturate(float(params.frameIndex + 1) / max(1.f, float(params.correctionFadeFrames)));
     const uint2 correctionRange = gHSTRCloud.hstrCorrectionRanges[leaf];
