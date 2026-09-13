@@ -34,9 +34,12 @@ struct HSTRCloudRenderer
     StructuredBuffer<HSTRCorrectionAtom> hstrCorrectionAtoms;
     StructuredBuffer<HSTRCutNode> hstrCutNodes;
     Texture3D<float> hstrExtinction;
+    Texture3D<float4> hstrCameraLighting;
+    RWTexture3D<float4> hstrCameraLightingOutput;
     SamplerState hstrExtinctionSampler;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
+    RWTexture2D<float4> cutStats;
 
     float phaseHG(float cosine)
     {
@@ -126,7 +129,33 @@ struct HSTRCloudRenderer
     float extinctionAt(float3 leafPosition)
     {
         const float3 voxelPosition = leafPosition * float(params.hstrCellWidth);
-        return hstrExtinction.SampleLevel(hstrExtinctionSampler, saturate(voxelPosition / float3(params.hstrExtinctionDims)), 0.f);
+        return hstrExtinction.SampleLevel(hstrExtinctionSampler, saturate((voxelPosition + 0.5f) / float3(params.hstrExtinctionDims)), 0.f);
+    }
+
+    float3 cameraLightingAt(float3 leafPosition)
+    {
+        return hstrCameraLighting.SampleLevel(hstrExtinctionSampler, saturate(leafPosition / float3(params.hstrLeafDims)), 0.f).rgb;
+    }
+
+    void writeCameraLighting(uint3 leaf)
+    {
+        if (any(leaf >= params.hstrLeafDims) || gScene.getGridVolumeCount() == 0)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * (float3(leaf) + 0.5f);
+        const float3 worldPosition = mul(volume.data.transform, float4(indexPosition, 1.f)).xyz;
+        const float3 view = normalize(gScene.camera.data.posW - worldPosition);
+        const float weightSum = abs(view.x) + abs(view.y) + abs(view.z);
+        const uint leafID = leafIndex(leaf);
+        float3 value = 0.f;
+        for (uint axis = 0; axis < 3; ++axis)
+        {
+            const uint face = 2u * axis + (view[axis] >= 0.f ? 1u : 0u);
+            for (uint mode = 0; mode < params.hstrFaceDofs; ++mode)
+                value += abs(view[axis]) * hstrRadiance[leafID * params.hstrTraceDofs + face * params.hstrFaceDofs + mode].rgb /
+                         float(params.hstrFaceDofs);
+        }
+        hstrCameraLightingOutput[leaf] = float4(value / max(1e-4f, weightSum), 0.f);
     }
 
     bool intersectCutNode(HSTRCutNode node, float3 origin, float3 direction, out float2 interval)
@@ -147,7 +176,115 @@ struct HSTRCloudRenderer
         return interval.x < interval.y;
     }
 
-    float4 integrateTransportCut(Ray ray, GridVolume volume, float2 interval, out float residualError)
+    void compositeBallisticSegment(
+        float3 position,
+        float3 direction,
+        float2 segment,
+        float totalWorldLength,
+        float extinction0,
+        float extinction1,
+        GridVolume volume,
+        inout float3 radiance,
+        inout float transmittance
+    )
+    {
+        const float worldLength = totalWorldLength * (segment.y - segment.x);
+        const float opticalDepth = 0.5f * worldLength * (extinction0 + extinction1);
+        if (opticalDepth <= 1e-8f)
+            return;
+        const float sampleTransmittance = exp(-opticalDepth);
+        const float alpha = 1.f - sampleTransmittance;
+        const float midpoint = 0.5f * (segment.x + segment.y);
+        const float3 source = cameraLightingAt(position + midpoint * direction);
+        radiance += transmittance * alpha * volume.data.albedo * source;
+        transmittance *= sampleTransmittance;
+    }
+
+    float transmittancePageAt(HSTRCutNode node, float3 leafPosition)
+    {
+        const float3 local = saturate((leafPosition - float3(node.minLeft.xyz)) / float3(node.maxRight.xyz - node.minLeft.xyz));
+        const float x00 = lerp(node.transmittanceCorners0.x, node.transmittanceCorners0.y, local.x);
+        const float x10 = lerp(node.transmittanceCorners0.z, node.transmittanceCorners0.w, local.x);
+        const float x01 = lerp(node.transmittanceCorners1.x, node.transmittanceCorners1.y, local.x);
+        const float x11 = lerp(node.transmittanceCorners1.z, node.transmittanceCorners1.w, local.x);
+        return lerp(lerp(x00, x10, local.y), lerp(x01, x11, local.y), local.z);
+    }
+
+    void integrateTransmittancePage(
+        HSTRCutNode node,
+        float3 position,
+        float3 direction,
+        float2 nodeInterval,
+        float totalWorldLength,
+        GridVolume volume,
+        inout float3 radiance,
+        inout float transmittance
+    )
+    {
+        static const float kGaussOffset = 0.2886751345948129f;
+        const float midpoint = 0.5f * (nodeInterval.x + nodeInterval.y);
+        const float segmentLength = nodeInterval.y - nodeInterval.x;
+        const float extinction0 = transmittancePageAt(node, position + (midpoint - kGaussOffset * segmentLength) * direction);
+        const float extinction1 = transmittancePageAt(node, position + (midpoint + kGaussOffset * segmentLength) * direction);
+        compositeBallisticSegment(
+            position, direction, nodeInterval, totalWorldLength, extinction0, extinction1, volume, radiance, transmittance
+        );
+    }
+
+    uint integrateExactTransmittancePage(
+        float3 position,
+        float3 direction,
+        float2 pageInterval,
+        float totalWorldLength,
+        GridVolume volume,
+        inout float3 radiance,
+        inout float transmittance
+    )
+    {
+        // The R16 page defines a continuous trilinear extinction field. Along
+        // a ray it is cubic inside each voxel, so two-point Gauss integration
+        // is exact after splitting at voxel boundaries.
+        const float3 voxelDirection = float(params.hstrCellWidth) * direction;
+        float t = pageInterval.x;
+        uint segmentCount = 0;
+        [loop]
+        for (uint step = 0; step < 52u && t < pageInterval.y - 1e-7f; ++step)
+        {
+            const float3 voxelPosition = float(params.hstrCellWidth) * (position + t * direction);
+            float3 next = float3(1e30f);
+            if (voxelDirection.x > 1e-8f)
+                next.x = t + (floor(voxelPosition.x + 1e-5f) + 1.f - voxelPosition.x) / voxelDirection.x;
+            else if (voxelDirection.x < -1e-8f)
+                next.x = t + (ceil(voxelPosition.x - 1e-5f) - 1.f - voxelPosition.x) / voxelDirection.x;
+            if (voxelDirection.y > 1e-8f)
+                next.y = t + (floor(voxelPosition.y + 1e-5f) + 1.f - voxelPosition.y) / voxelDirection.y;
+            else if (voxelDirection.y < -1e-8f)
+                next.y = t + (ceil(voxelPosition.y - 1e-5f) - 1.f - voxelPosition.y) / voxelDirection.y;
+            if (voxelDirection.z > 1e-8f)
+                next.z = t + (floor(voxelPosition.z + 1e-5f) + 1.f - voxelPosition.z) / voxelDirection.z;
+            else if (voxelDirection.z < -1e-8f)
+                next.z = t + (ceil(voxelPosition.z - 1e-5f) - 1.f - voxelPosition.z) / voxelDirection.z;
+            const float nextT = min(pageInterval.y, min(next.x, min(next.y, next.z)));
+            if (nextT <= t + 1e-7f)
+                break;
+
+            static const float kGaussOffset = 0.2886751345948129f;
+            const float midpoint = 0.5f * (t + nextT);
+            const float segmentLength = nextT - t;
+            const float extinction0 = extinctionAt(position + (midpoint - kGaussOffset * segmentLength) * direction);
+            const float extinction1 = extinctionAt(position + (midpoint + kGaussOffset * segmentLength) * direction);
+            compositeBallisticSegment(
+                position, direction, float2(t, nextT), totalWorldLength, extinction0, extinction1, volume, radiance, transmittance
+            );
+            t = nextT;
+            ++segmentCount;
+            if (transmittance <= 1e-3f)
+                break;
+        }
+        return segmentCount;
+    }
+
+    float4 integrateTransportCut(Ray ray, GridVolume volume, float2 interval, out float residualError, out float4 statistics)
     {
         residualError = 0.f;
         const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
@@ -156,70 +293,61 @@ struct HSTRCloudRenderer
         float3 position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         const float3 endPosition = (exitIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         const float3 direction = endPosition - position;
+        const float totalWorldLength = length(ray.dir) * (interval.y - max(0.f, interval.x));
         float3 radiance = 0.f;
         float transmittance = 1.f;
+        // A 32-entry DFS frontier covers binary HSTs with up to 2^31 leaves,
+        // beyond a feasible resident volume.
         uint stack[32];
         uint stackSize = 1;
         stack[0] = params.hstrRootNode;
-
+        uint visited = 0;
+        uint acceptedPages = 0;
+        uint exactSegments = 0;
         [loop]
-        for (uint visit = 0; visit < 512 && stackSize > 0 && transmittance > 1e-3f; ++visit)
+        while (stackSize > 0 && transmittance > 1e-3f)
         {
             const uint nodeID = stack[--stackSize];
             const HSTRCutNode node = hstrCutNodes[nodeID];
+            ++visited;
             float2 nodeInterval;
             if (node.statistics.y <= 1e-7f || !intersectCutNode(node, position, direction, nodeInterval))
                 continue;
-            const bool leaf = node.minLeft.w == ~0u;
-            const float variation = (node.statistics.y - node.statistics.x) / max(1e-6f, node.statistics.y);
-            const float3 midpointPosition = position + (0.5f * (nodeInterval.x + nodeInterval.y)) * direction;
-            const float projectedPixels =
-                params.frameDim.y *
-                max(node.maxRight.x - node.minLeft.x, max(node.maxRight.y - node.minLeft.y, node.maxRight.z - node.minLeft.z)) /
-                max(1.f, length(midpointPosition - position));
-            const bool accept = leaf || (variation <= params.mixedFidelityThreshold && node.statistics.z <= params.mixedFidelityThreshold &&
-                                         projectedPixels <= 12.f);
-            if (!accept)
+
+            const float nodeWorldLength = totalWorldLength * (nodeInterval.y - nodeInterval.x);
+            const float transmittanceError = transmittance * (1.f - exp(-node.transmittancePage.x * nodeWorldLength));
+            const bool leaf = node.transmittancePage.y > 0.5f;
+            if (transmittanceError <= params.cutTransmittanceTolerance)
             {
-                float2 leftInterval;
-                float2 rightInterval;
-                const bool hitLeft = intersectCutNode(hstrCutNodes[node.minLeft.w], position, direction, leftInterval);
-                const bool hitRight = intersectCutNode(hstrCutNodes[node.maxRight.w], position, direction, rightInterval);
-                if (hitLeft && hitRight)
-                {
-                    const bool leftFirst = leftInterval.x < rightInterval.x;
-                    stack[stackSize++] = leftFirst ? node.maxRight.w : node.minLeft.w;
-                    stack[stackSize++] = leftFirst ? node.minLeft.w : node.maxRight.w;
-                }
-                else if (hitLeft)
-                    stack[stackSize++] = node.minLeft.w;
-                else if (hitRight)
-                    stack[stackSize++] = node.maxRight.w;
+                integrateTransmittancePage(node, position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
+                residualError += transmittanceError;
+                ++acceptedPages;
+                continue;
+            }
+            if (leaf)
+            {
+                exactSegments +=
+                    integrateExactTransmittancePage(position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
+                ++acceptedPages;
                 continue;
             }
 
-            const float segmentParameterLength = nodeInterval.y - nodeInterval.x;
-            const float voxelLength = segmentParameterLength * length(direction) * params.hstrCellWidth;
-            const uint sampleCount =
-                leaf && variation > params.mixedFidelityThreshold ? clamp(uint(ceil(0.5f * voxelLength)), 2u, 12u) : 2u;
-            const float dt = segmentParameterLength / sampleCount;
-            [loop]
-            for (uint sample = 0; sample < sampleCount && transmittance > 1e-3f; ++sample)
+            float2 leftInterval;
+            float2 rightInterval;
+            const bool hitLeft = intersectCutNode(hstrCutNodes[node.minLeft.w], position, direction, leftInterval);
+            const bool hitRight = intersectCutNode(hstrCutNodes[node.maxRight.w], position, direction, rightInterval);
+            if (hitLeft && hitRight)
             {
-                const float t = nodeInterval.x + (sample + 0.5f) * dt;
-                const float3 samplePosition = position + t * direction;
-                const float extinction = extinctionAt(samplePosition);
-                if (extinction <= 1e-7f)
-                    continue;
-                const float worldLength = (interval.y - max(0.f, interval.x)) * dt;
-                const float sampleTransmittance = exp(-extinction * worldLength);
-                const float alpha = 1.f - sampleTransmittance;
-                const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * samplePosition;
-                radiance += transmittance * alpha * volume.data.albedo * hstrLighting(indexPosition, ray.dir);
-                residualError += transmittance * alpha * hstrResidualBound(indexPosition);
-                transmittance *= sampleTransmittance;
+                const bool leftFirst = leftInterval.x < rightInterval.x;
+                stack[stackSize++] = leftFirst ? node.maxRight.w : node.minLeft.w;
+                stack[stackSize++] = leftFirst ? node.minLeft.w : node.maxRight.w;
             }
+            else if (hitLeft)
+                stack[stackSize++] = node.minLeft.w;
+            else if (hitRight)
+                stack[stackSize++] = node.maxRight.w;
         }
+        statistics = float4(visited, acceptedPages, exactSegments, stackSize);
         return float4(radiance + transmittance * sky, transmittance);
     }
 
@@ -310,6 +438,7 @@ struct HSTRCloudRenderer
         {
             color[pixel] = float4(sky, 1.f);
             transportError[pixel] = 0.f;
+            cutStats[pixel] = 0;
             return;
         }
 
@@ -320,6 +449,7 @@ struct HSTRCloudRenderer
         {
             color[pixel] = float4(sky, 1.f);
             transportError[pixel] = 0.f;
+            cutStats[pixel] = 0;
             return;
         }
 
@@ -331,13 +461,16 @@ struct HSTRCloudRenderer
                 integrateVolume(ray, volume, min(1024u, (params.baseSteps << params.refinementLevel) << 1), pixel, residualError).rgb, 1.f
             );
             transportError[pixel] = residualError;
+            cutStats[pixel] = 0;
             return;
         }
 
         // HST-Cut: traverse preintegrated transport nodes, not NanoVDB samples.
         float residualError;
-        color[pixel] = float4(integrateTransportCut(ray, volume, interval, residualError).rgb, 1.f);
+        float4 statistics;
+        color[pixel] = float4(integrateTransportCut(ray, volume, interval, residualError, statistics).rgb, 1.f);
         transportError[pixel] = residualError;
+        cutStats[pixel] = statistics;
     }
 };
 
@@ -350,6 +483,12 @@ cbuffer CB
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.execute(dispatchThreadId.xy);
+}
+
+[numthreads(4, 4, 4)]
+void updateCameraLighting(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.writeCameraLighting(dispatchThreadId);
 }
 
 [numthreads(64, 1, 1)]

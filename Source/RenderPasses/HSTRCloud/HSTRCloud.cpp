@@ -5,6 +5,7 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <unordered_map>
 
@@ -13,6 +14,7 @@ namespace
 const char kShaderFile[] = "RenderPasses/HSTRCloud/HSTRCloud.cs.slang";
 const char kColor[] = "color";
 const char kTransportError[] = "transportError";
+const char kCutStats[] = "cutStats";
 
 const char kBaseSteps[] = "baseSteps";
 const char kRefinementLevel[] = "refinementLevel";
@@ -34,6 +36,7 @@ const char kSchurWindowRadius[] = "schurWindowRadius";
 const char kLocalSourceRadiance[] = "localSourceRadiance";
 const char kMixedFidelityThreshold[] = "mixedFidelityThreshold";
 const char kOperatorDictionaryTolerance[] = "operatorDictionaryTolerance";
+const char kCutTransmittanceTolerance[] = "cutTransmittanceTolerance";
 
 uint32_t nextPowerOfTwo(uint32_t value)
 {
@@ -48,15 +51,6 @@ bool insideWindow(uint3 leaf, uint3 center, uint32_t radius)
     return all(abs(int3(leaf) - int3(center)) <= int(radius));
 }
 
-uint32_t dominantFace(float3 direction)
-{
-    uint32_t axis = 0;
-    if (std::abs(direction.y) > std::abs(direction.x))
-        axis = 1;
-    if (std::abs(direction.z) > std::abs(direction[axis]))
-        axis = 2;
-    return 2 * axis + (direction[axis] >= 0.f ? 1u : 0u);
-}
 } // namespace
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
@@ -108,6 +102,8 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.mixedFidelityThreshold = value;
         else if (key == kOperatorDictionaryTolerance)
             mParams.operatorDictionaryTolerance = value;
+        else if (key == kCutTransmittanceTolerance)
+            mParams.cutTransmittanceTolerance = value;
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
     }
@@ -136,6 +132,7 @@ Properties HSTRCloud::getProperties() const
     props[kLocalSourceRadiance] = mParams.localSourceRadiance;
     props[kMixedFidelityThreshold] = mParams.mixedFidelityThreshold;
     props[kOperatorDictionaryTolerance] = mParams.operatorDictionaryTolerance;
+    props[kCutTransmittanceTolerance] = mParams.cutTransmittanceTolerance;
     return props;
 }
 
@@ -148,6 +145,9 @@ RenderPassReflection HSTRCloud::reflect(const CompileData& compileData)
     reflector.addOutput(kTransportError, "Goal-oriented omitted transport bound")
         .bindFlags(ResourceBindFlags::UnorderedAccess)
         .format(ResourceFormat::R32Float);
+    reflector.addOutput(kCutStats, "HST cut traversal statistics")
+        .bindFlags(ResourceBindFlags::UnorderedAccess)
+        .format(ResourceFormat::RGBA32Float);
     return reflector;
 }
 
@@ -161,7 +161,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpScene = pScene;
     mpPass = nullptr;
     mpSolvePass = nullptr;
+    mpCameraLightingPass = nullptr;
     mFirstFrame = true;
+    mCameraLightingDirty = true;
+    mCameraLightingPoseValid = false;
     if (!mpScene)
         return;
 
@@ -181,6 +184,11 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     solveDesc.addShaderLibrary(kShaderFile).csEntry("solveLeaves");
     solveDesc.addTypeConformances(mpScene->getTypeConformances());
     mpSolvePass = ComputePass::create(mpDevice, solveDesc, mpScene->getSceneDefines());
+    ProgramDesc cameraLightingDesc;
+    cameraLightingDesc.addShaderModules(mpScene->getShaderModules());
+    cameraLightingDesc.addShaderLibrary(kShaderFile).csEntry("updateCameraLighting");
+    cameraLightingDesc.addTypeConformances(mpScene->getTypeConformances());
+    mpCameraLightingPass = ComputePass::create(mpDevice, cameraLightingDesc, mpScene->getSceneDefines());
     buildHierarchy();
 }
 
@@ -197,6 +205,7 @@ void HSTRCloud::buildHierarchy()
         return;
 
     constexpr uint32_t kCellWidth = 16;
+    static_assert(3 * kCellWidth + 1 <= 52, "Exact transmittance page traversal bound is too small.");
     mGridMin = grid->getMinIndex();
     mGridMax = grid->getMaxIndex();
     const uint3 gridExtent = uint3(mGridMax - mGridMin + 1);
@@ -279,6 +288,7 @@ void HSTRCloud::uploadExtinction()
     const size_t leafCount = size_t(leafDims.x) * leafDims.y * leafDims.z;
     std::vector<float> minimum(nodes.size(), std::numeric_limits<float>::max());
     std::vector<float> maximum(nodes.size(), 0.f);
+    std::vector<uint32_t> sampleCount(nodes.size(), 0u);
     for (uint32_t z = 0; z < dims.z; ++z)
         for (uint32_t y = 0; y < dims.y; ++y)
             for (uint32_t x = 0; x < dims.x; ++x)
@@ -290,6 +300,7 @@ void HSTRCloud::uploadExtinction()
                 const size_t id = size_t(leaf.x) + size_t(leafDims.x) * (size_t(leaf.y) + size_t(leafDims.y) * leaf.z);
                 minimum[id] = std::min(minimum[id], value);
                 maximum[id] = std::max(maximum[id], value);
+                ++sampleCount[id];
             }
     std::vector<HSTRCutNode> packed(nodes.size());
     for (uint32_t z = 0; z < leafDims.z; ++z)
@@ -321,9 +332,79 @@ void HSTRCloud::uploadExtinction()
         );
         minimum[id] = std::min(minimum[node.left], minimum[node.right]);
         maximum[id] = std::max(maximum[node.left], maximum[node.right]);
+        sampleCount[id] = sampleCount[node.left] + sampleCount[node.right];
+    }
+    auto extinctionAtVoxel = [&](uint3 p)
+    {
+        p = min(p, dims - 1u);
+        return float(extinction[size_t(p.x) + size_t(dims.x) * (size_t(p.y) + size_t(dims.y) * p.z)]);
+    };
+    auto pageValue = [](const std::array<float, 8>& corners, float3 p)
+    {
+        auto mix = [](float a, float b, float t) { return a + t * (b - a); };
+        const float x00 = mix(corners[0], corners[1], p.x);
+        const float x10 = mix(corners[2], corners[3], p.x);
+        const float x01 = mix(corners[4], corners[5], p.x);
+        const float x11 = mix(corners[6], corners[7], p.x);
+        return mix(mix(x00, x10, p.y), mix(x01, x11, p.y), p.z);
+    };
+    std::vector<std::array<float, 8>> pageCorners(nodes.size());
+    std::vector<float> pageResidual(nodes.size(), 0.f);
+    for (size_t id = 0; id < nodes.size(); ++id)
+    {
+        const uint3 minimumVoxel = packed[id].minLeft.xyz() * mParams.hstrCellWidth;
+        const uint3 maximumVoxel = packed[id].maxRight.xyz() * mParams.hstrCellWidth;
+        for (uint32_t corner = 0; corner < 8; ++corner)
+        {
+            const uint3 p(
+                (corner & 1u) ? maximumVoxel.x : minimumVoxel.x,
+                (corner & 2u) ? maximumVoxel.y : minimumVoxel.y,
+                (corner & 4u) ? maximumVoxel.z : minimumVoxel.z
+            );
+            pageCorners[id][corner] = sampleCount[id] > 0 ? extinctionAtVoxel(p) : 0.f;
+        }
+        if (nodes[id].isLeaf() && sampleCount[id] > 0)
+        {
+            const uint3 end = min(maximumVoxel, dims - 1u);
+            const float3 extent = max(float3(maximumVoxel - minimumVoxel), float3(1.f));
+            for (uint32_t z = minimumVoxel.z; z <= end.z; ++z)
+                for (uint32_t y = minimumVoxel.y; y <= end.y; ++y)
+                    for (uint32_t x = minimumVoxel.x; x <= end.x; ++x)
+                    {
+                        const uint3 p(x, y, z);
+                        const float3 local = float3(p - minimumVoxel) / extent;
+                        pageResidual[id] = std::max(pageResidual[id], std::abs(extinctionAtVoxel(p) - pageValue(pageCorners[id], local)));
+                    }
+        }
+        else if (!nodes[id].isLeaf())
+        {
+            for (uint32_t childID : {nodes[id].left, nodes[id].right})
+            {
+                const uint3 childMinimum = packed[childID].minLeft.xyz() * mParams.hstrCellWidth;
+                const uint3 childMaximum = packed[childID].maxRight.xyz() * mParams.hstrCellWidth;
+                const float3 extent = max(float3(maximumVoxel - minimumVoxel), float3(1.f));
+                float pageDifference = 0.f;
+                for (uint32_t corner = 0; corner < 8; ++corner)
+                {
+                    const uint3 p(
+                        (corner & 1u) ? childMaximum.x : childMinimum.x,
+                        (corner & 2u) ? childMaximum.y : childMinimum.y,
+                        (corner & 4u) ? childMaximum.z : childMinimum.z
+                    );
+                    const float3 local = float3(p - minimumVoxel) / extent;
+                    pageDifference = std::max(pageDifference, std::abs(pageCorners[childID][corner] - pageValue(pageCorners[id], local)));
+                }
+                pageResidual[id] = std::max(pageResidual[id], pageResidual[childID] + pageDifference);
+            }
+        }
     }
     for (size_t id = 0; id < nodes.size(); ++id)
+    {
         packed[id].statistics = float4(minimum[id], maximum[id], nodes[id].residualNorm, 0.f);
+        packed[id].transmittancePage = float4(pageResidual[id], nodes[id].isLeaf() && sampleCount[id] > 0 ? 1.f : 0.f, 0.f, 0.f);
+        packed[id].transmittanceCorners0 = float4(pageCorners[id][0], pageCorners[id][1], pageCorners[id][2], pageCorners[id][3]);
+        packed[id].transmittanceCorners1 = float4(pageCorners[id][4], pageCorners[id][5], pageCorners[id][6], pageCorners[id][7]);
+    }
     mParams.hstrExtinctionDims = dims;
     mParams.hstrRootNode = mHierarchy.getRoot();
     const HSTRCutNode& root = packed[mParams.hstrRootNode];
@@ -338,14 +419,23 @@ void HSTRCloud::uploadExtinction()
         root.statistics.x,
         root.statistics.y
     );
-    mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
-    mpCutNodes = mpDevice->createStructuredBuffer(
-        sizeof(HSTRCutNode), packed.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packed.data(), false
-    );
-    Sampler::Desc samplerDesc;
-    samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
-    samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-    mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+    if (!mpExtinction || mpExtinction->getWidth() != dims.x || mpExtinction->getHeight() != dims.y || mpExtinction->getDepth() != dims.z)
+        mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
+    else
+        mpDevice->getRenderContext()->updateTextureData(mpExtinction.get(), extinction.data());
+    if (!mpCutNodes || mpCutNodes->getElementCount() != packed.size())
+        mpCutNodes = mpDevice->createStructuredBuffer(
+            sizeof(HSTRCutNode), packed.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packed.data(), false
+        );
+    else
+        mpCutNodes->setBlob(packed.data(), 0, packed.size() * sizeof(HSTRCutNode));
+    if (!mpExtinctionSampler)
+    {
+        Sampler::Desc samplerDesc;
+        samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+        samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+    }
 }
 
 void HSTRCloud::uploadHierarchy()
@@ -527,6 +617,18 @@ void HSTRCloud::uploadHierarchy()
         nullptr,
         false
     );
+    if (!mpCameraLighting || mpCameraLighting->getWidth() != leafDims.x || mpCameraLighting->getHeight() != leafDims.y ||
+        mpCameraLighting->getDepth() != leafDims.z)
+        mpCameraLighting = mpDevice->createTexture3D(
+            leafDims.x,
+            leafDims.y,
+            leafDims.z,
+            ResourceFormat::RGBA16Float,
+            1,
+            nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+    mCameraLightingDirty = true;
     logInfo(
         "HSTRCloud: split transport budgets ballistic={} near={} diffuse={} (certified max rank {}).",
         mParams.ballisticBudget,
@@ -553,15 +655,17 @@ void HSTRCloud::uploadCorrectionPool(const hstr::DenseMatrix& rootIncident)
     if (std::abs(sun.z) > std::abs(sun[sunAxis]))
         sunAxis = 2;
     const uint32_t sunFace = 2 * sunAxis + (sun[sunAxis] >= 0.f ? 1u : 0u);
-    mParams.adjointGoalCount = mParams.hstrFaceDofs + 2;
+    // Rank residual corrections against every outgoing trace degree of freedom.
+    // This keeps the correction pool view-independent, so camera motion never
+    // requires a CPU adjoint rebuild or a transport re-solve.
+    mParams.adjointGoalCount = mParams.hstrTraceDofs + 2;
     hstr::DenseMatrix rootGoals(mParams.hstrTraceDofs, mParams.adjointGoalCount);
-    for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
-    {
-        rootGoals(mParams.goalFace * mParams.hstrFaceDofs + mode, mode) = 1.f;
-        rootGoals(sunFace * mParams.hstrFaceDofs + mode, mParams.hstrFaceDofs) = 1.f / float(mParams.hstrFaceDofs);
-    }
     for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
-        rootGoals(dof, mParams.hstrFaceDofs + 1) = 1.f / float(mParams.hstrTraceDofs);
+        rootGoals(dof, dof) = 1.f;
+    for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
+        rootGoals(sunFace * mParams.hstrFaceDofs + mode, mParams.hstrTraceDofs) = 1.f / float(mParams.hstrFaceDofs);
+    for (uint32_t dof = 0; dof < mParams.hstrTraceDofs; ++dof)
+        rootGoals(dof, mParams.hstrTraceDofs + 1) = 1.f / float(mParams.hstrTraceDofs);
     const auto goals = mHierarchy.getLeafAdjointGoalMatrices(rootGoals);
     const size_t leafCount = transfers.size();
     std::vector<float> packedResponses(leafCount * mParams.hstrStorageRank, 0.f);
@@ -766,7 +870,6 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
 void HSTRCloud::updateHierarchy()
 {
     const std::vector<float> updatedDensity = sampleLeafDensities();
-    uploadExtinction();
     std::vector<uint32_t> changed;
     for (uint32_t leaf = 0; leaf < updatedDensity.size(); ++leaf)
         if (std::abs(updatedDensity[leaf] - mLeafDensity[leaf]) > 1e-4f * std::max(1.f, mLeafDensity[leaf]))
@@ -807,6 +910,7 @@ void HSTRCloud::updateHierarchy()
         mLeafDensity[changed[i]] = updatedDensity[changed[i]];
     }
     uploadHierarchy();
+    uploadExtinction();
     solveLighting();
     mOptionsChanged = true;
     const char* strategyName = strategy == hstr::UpdateStrategy::Woodbury         ? "Woodbury"
@@ -831,9 +935,6 @@ void HSTRCloud::solveLighting()
         for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
             for (uint32_t channel = 0; channel < 3; ++channel)
                 incident(face * mParams.hstrFaceDofs + mode, channel) = mParams.skyRadiance[channel];
-    const auto bounds = mpScene->getGridVolume(0)->getBounds();
-    const float3 cameraPosition = mpScene->getCamera()->getPosition();
-    mParams.goalFace = dominantFace(cameraPosition - bounds.center());
     const float3 sun = normalize(mParams.sunDirection);
     uint32_t sunAxis = 0;
     if (std::abs(sun.y) > std::abs(sun.x))
@@ -845,8 +946,6 @@ void HSTRCloud::solveLighting()
         for (uint32_t channel = 0; channel < 3; ++channel)
             incident(sunFace * mParams.hstrFaceDofs + mode, channel) += 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
 
-    const float3 windowPosition = clamp((cameraPosition - bounds.minPoint) / bounds.extent(), float3(0.f), float3(0.999999f));
-    mParams.schurWindowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
     if (any(mParams.localSourceRadiance > 0.f))
     {
         const auto sourceToRoot = mHierarchy.getLeafSourceToRootMatrices();
@@ -871,7 +970,6 @@ void HSTRCloud::solveLighting()
         sizeof(float4), rootIncident.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, rootIncident.data(), false
     );
     uploadCorrectionPool(incident);
-
     dispatchLightingSolve();
 }
 
@@ -896,54 +994,18 @@ void HSTRCloud::dispatchLightingSolve()
     var["hstrCorrectionAtoms"] = mpCorrectionAtoms;
     const uint3 leafDims = mHierarchy.getLeafDims();
     mpSolvePass->execute(mpDevice->getRenderContext(), uint3(leafDims.x * leafDims.y * leafDims.z, 1, 1));
+    mCameraLightingDirty = true;
 }
 
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    if (mpScene && !mpScene->getGridVolumes().empty())
+    if (mpScene)
     {
-        const auto bounds = mpScene->getGridVolume(0)->getBounds();
-        const uint32_t goalFace = dominantFace(mpScene->getCamera()->getPosition() - bounds.center());
-        const bool goalChanged = goalFace != mParams.goalFace;
-        mParams.goalFace = goalFace;
-        const float3 windowPosition =
-            clamp((mpScene->getCamera()->getPosition() - bounds.minPoint) / bounds.extent(), float3(0.f), float3(0.999999f));
-        const uint3 windowCenter = min(uint3(windowPosition * float3(mActualLeafDims)), mActualLeafDims - 1u);
-        if (any(windowCenter != mParams.schurWindowCenter))
-        {
-            const uint3 previousCenter = mParams.schurWindowCenter;
-            mParams.schurWindowCenter = windowCenter;
-            uint32_t repairedNodes = 0;
-            uint32_t changedLeaves = 0;
-            const uint3 leafDims = mHierarchy.getLeafDims();
-            for (uint32_t z = 0; z < mActualLeafDims.z; ++z)
-                for (uint32_t y = 0; y < mActualLeafDims.y; ++y)
-                    for (uint32_t x = 0; x < mActualLeafDims.x; ++x)
-                    {
-                        const uint3 leaf(x, y, z);
-                        if (insideWindow(leaf, previousCenter, mParams.schurWindowRadius) ==
-                            insideWindow(leaf, windowCenter, mParams.schurWindowRadius))
-                            continue;
-                        const uint32_t index = x + leafDims.x * (y + leafDims.y * z);
-                        repairedNodes += mHierarchy.updateLeaf(index, makeNestedLeafTransport(index), hstr::UpdateStrategy::SubtreeRepair);
-                        mDictionaryCorrections[index] = hstr::DenseMatrix(mParams.hstrTraceDofs, mParams.hstrTraceDofs);
-                        ++changedLeaves;
-                    }
-            if (changedLeaves > 0)
-            {
-                uploadHierarchy();
-                solveLighting();
-                logInfo("HSTRCloud: moved exact Schur window across {} leaves with {} ancestor repairs.", changedLeaves, repairedNodes);
-            }
-            else if (goalChanged || any(mParams.localSourceRadiance > 0.f))
-                solveLighting();
-            mOptionsChanged = true;
-        }
-        else if (goalChanged)
-        {
-            solveLighting();
-            mOptionsChanged = true;
-        }
+        const auto updates = mpScene->getUpdates();
+        const float3 cameraPosition = mpScene->getCamera()->getPosition();
+        const float3 cameraDirection = mpScene->getCamera()->getTarget() - cameraPosition;
+        mCameraLightingDirty |= !mCameraLightingPoseValid || any(cameraPosition != mCameraLightingPosition) ||
+                                any(cameraDirection != mCameraLightingDirection) || is_set(updates, IScene::UpdateFlags::GridVolumesMoved);
     }
     if (!mFirstFrame && mpScene)
     {
@@ -974,16 +1036,29 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
 
     const auto& color = renderData.getTexture(kColor);
     const auto& error = renderData.getTexture(kTransportError);
+    const auto& cutStats = renderData.getTexture(kCutStats);
     mParams.frameDim = uint2(color->getWidth(), color->getHeight());
     if (!mpScene || !mpPass || !mpLeafRadiance)
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(error->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(cutStats->getUAV().get(), float4(0.f));
         return;
     }
 
-    if (mParams.frameIndex < mParams.correctionFadeFrames)
-        dispatchLightingSolve();
+    if (mCameraLightingDirty)
+    {
+        mpScene->bindShaderDataForRaytracing(pRenderContext, mpCameraLightingPass->getRootVar()["gScene"]);
+        ShaderVar cameraVar = mpCameraLightingPass->getRootVar()["CB"]["gHSTRCloud"];
+        cameraVar["params"].setBlob(mParams);
+        cameraVar["hstrRadiance"] = mpLeafRadiance;
+        cameraVar["hstrCameraLightingOutput"] = mpCameraLighting;
+        mpCameraLightingPass->execute(pRenderContext, uint3(mParams.hstrLeafDims));
+        mCameraLightingDirty = false;
+        mCameraLightingPoseValid = true;
+        mCameraLightingPosition = mpScene->getCamera()->getPosition();
+        mCameraLightingDirection = mpScene->getCamera()->getTarget() - mCameraLightingPosition;
+    }
 
     mpScene->bindShaderDataForRaytracing(pRenderContext, mpPass->getRootVar()["gScene"]);
     ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
@@ -992,9 +1067,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["hstrCutNodes"] = mpCutNodes;
     var["hstrExtinction"] = mpExtinction;
+    var["hstrCameraLighting"] = mpCameraLighting;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["color"] = color;
     var["transportError"] = error;
+    var["cutStats"] = cutStats;
     mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
     ++mParams.frameIndex;
 }
@@ -1007,6 +1084,7 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     renderChanged |= widget.var("Inside-cloud base steps", mParams.baseSteps, 8u, 128u, 8u);
     renderChanged |= widget.var("Inside-cloud refinement", mParams.refinementLevel, 0u, 3u, 1u);
     renderChanged |= widget.var("Inside-cloud residual blend", mParams.residualBlend, 0.f, 1.f, 0.01f);
+    renderChanged |= widget.var("Cut transmittance error", mParams.cutTransmittanceTolerance, 0.0001f, 0.05f, 0.0001f);
     lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
     lightingChanged |= widget.var("Active-mode threshold", mParams.activeThreshold, 0.f, 1.f, 0.0001f);
     lightingChanged |= widget.var("Correction atom budget", mParams.correctionBudget, 0u, 1048576u, 4096u);
@@ -1037,5 +1115,4 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         "into the half-float transmittance residual, and NanoVDB is not marched per pixel."
     );
     widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
-    widget.text(fmt::format("Camera-facing adjoint face: {}", mParams.goalFace));
 }

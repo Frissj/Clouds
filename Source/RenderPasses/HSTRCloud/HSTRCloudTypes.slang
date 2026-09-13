@@ -8,6 +8,11 @@ struct HSTRCutNode
     uint4 minLeft;
     uint4 maxRight;
     float4 statistics;
+    // Maximum residual, exact-leaf residency, padding.
+    float4 transmittancePage;
+    // Rank-8 trilinear ballistic page in x + 2y + 4z corner order.
+    float4 transmittanceCorners0;
+    float4 transmittanceCorners1;
 };
 
 struct HSTRCloudParams
@@ -27,7 +32,7 @@ struct HSTRCloudParams
 
     uint activeRank = 24;
     float activeThreshold = 0.f;
-    uint goalFace = 1;
+    uint padHSTRGoal = 0;
     uint traceSpatialOrder = 2;
 
     uint hstrFaceDofs = 4;
@@ -72,8 +77,8 @@ struct HSTRCloudParams
 
     float mixedFidelityThreshold = 0.15f;
     float operatorDictionaryTolerance = 1e-4f;
-    float pad3 = 0.f;
-    float pad4 = 0.f;
+    float cutTransmittanceTolerance = 0.01f;
+    float padHSTR7 = 0.f;
 };
 
 END_NAMESPACE_FALCOR

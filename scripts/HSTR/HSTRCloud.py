@@ -20,6 +20,7 @@ def render_graph_HSTRCloud():
         "localSourceRadiance": float3(0.0),
         "mixedFidelityThreshold": 0.15,
         "operatorDictionaryTolerance": 1e-4,
+        "cutTransmittanceTolerance": 0.01,
     }), "HSTRCloud")
     graph.addPass(createPass("ToneMapper", {
         "autoExposure": False,
@@ -34,6 +35,7 @@ def render_graph_HSTRCloud():
     graph.markOutput("HSTRCloud.color")
     graph.markOutput("ToneMapper.dst")
     graph.markOutput("HSTRCloud.transportError")
+    graph.markOutput("HSTRCloud.cutStats")
     return graph
 
 

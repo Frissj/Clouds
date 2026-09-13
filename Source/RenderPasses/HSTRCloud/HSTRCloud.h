@@ -39,7 +39,7 @@ private:
         float goalError = 0.f;
     };
     static_assert(sizeof(CorrectionAtom) == 16);
-    static_assert(sizeof(HSTRCutNode) == 48);
+    static_assert(sizeof(HSTRCutNode) == 96);
 
     void buildHierarchy();
     void updateHierarchy();
@@ -54,6 +54,7 @@ private:
     ref<Scene> mpScene;
     ref<ComputePass> mpPass;
     ref<ComputePass> mpSolvePass;
+    ref<ComputePass> mpCameraLightingPass;
     ref<Buffer> mpLeafRadiance;
     ref<Buffer> mpLeafBasisLeft;
     ref<Buffer> mpLeafBasisRight;
@@ -69,6 +70,7 @@ private:
     ref<Buffer> mpCorrectionAtoms;
     ref<Buffer> mpCutNodes;
     ref<Texture> mpExtinction;
+    ref<Texture> mpCameraLighting;
     ref<Sampler> mpExtinctionSampler;
     hstr::Hierarchy mHierarchy;
     HSTRCloudParams mParams;
@@ -85,4 +87,8 @@ private:
     std::vector<hstr::DenseMatrix> mDictionaryCorrections;
     bool mOptionsChanged = false;
     bool mFirstFrame = true;
+    bool mCameraLightingDirty = true;
+    bool mCameraLightingPoseValid = false;
+    float3 mCameraLightingPosition = float3(0.f);
+    float3 mCameraLightingDirection = float3(0.f);
 };
