@@ -32,6 +32,9 @@ struct HSTRCloudRenderer
     StructuredBuffer<float> hstrLeafAdjointResponses;
     StructuredBuffer<uint2> hstrCorrectionRanges;
     StructuredBuffer<HSTRCorrectionAtom> hstrCorrectionAtoms;
+    StructuredBuffer<HSTRCutNode> hstrCutNodes;
+    Texture3D<float> hstrExtinction;
+    SamplerState hstrExtinctionSampler;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
 
@@ -120,53 +123,28 @@ struct HSTRCloudRenderer
         return result / max(1e-4f, abs(outgoing.x) + abs(outgoing.y) + abs(outgoing.z));
     }
 
-    uint rayInputFace(float3 direction)
+    float extinctionAt(float3 leafPosition)
     {
-        uint axis = 0;
-        if (abs(direction.y) > abs(direction.x))
-            axis = 1;
-        if (abs(direction.z) > abs(direction[axis]))
-            axis = 2;
-        return 2 * axis + (direction[axis] >= 0.f ? 1u : 0u);
+        const float3 voxelPosition = leafPosition * float(params.hstrCellWidth);
+        return hstrExtinction.SampleLevel(hstrExtinctionSampler, saturate(voxelPosition / float3(params.hstrExtinctionDims)), 0.f);
     }
 
-    float sampleLeafTransmittance(uint leaf, uint face, float3 localPosition)
+    bool intersectCutNode(HSTRCutNode node, float3 origin, float3 direction, out float2 interval)
     {
-        const uint order = params.traceSpatialOrder;
-        const uint base = leaf * params.hstrTraceDofs + face * params.hstrFaceDofs;
-        if (order == 1)
-            return hstrLeafBallistic[base];
-        const uint faceAxis = face / 2;
-        const uint tangent0 = faceAxis == 0 ? 1 : 0;
-        const uint tangent1 = faceAxis == 2 ? 1 : 2;
-        const float2 samplePosition = saturate(float2(localPosition[tangent0], localPosition[tangent1])) * order - 0.5f;
-        const int2 sampleBase = int2(floor(samplePosition));
-        const float2 f = frac(samplePosition);
-        float result = 0.f;
-        for (uint v = 0; v < 2; ++v)
-            for (uint u = 0; u < 2; ++u)
-            {
-                const uint2 q = uint2(clamp(sampleBase + int2(u, v), int2(0), int2(order) - 1));
-                const float2 w = select(uint2(u, v) == 0, 1.f - f, f);
-                result += hstrLeafBallistic[base + q.x + order * q.y] * w.x * w.y;
-            }
-        return saturate(result);
-    }
-
-    float hstrTransmittance(float3 p, uint face)
-    {
-        const int3 base = int3(floor(p));
-        const float3 f = frac(p);
-        float result = 0.f;
-        for (uint z = 0; z < 2; ++z)
-            for (uint y = 0; y < 2; ++y)
-                for (uint x = 0; x < 2; ++x)
-                {
-                    const int3 q = clamp(base + int3(x, y, z), int3(0), int3(params.hstrLeafDims) - 1);
-                    const float3 w = select(uint3(x, y, z) == 0, 1.f - f, f);
-                    result += sampleLeafTransmittance(leafIndex(uint3(q)), face, p - float3(q) + 0.5f) * w.x * w.y * w.z;
-                }
-        return saturate(result);
+        const bool3 parallel = abs(direction) < 1e-8f;
+        if (any(parallel && (origin < float3(node.minLeft.xyz) || origin >= float3(node.maxRight.xyz))))
+        {
+            interval = 0.f;
+            return false;
+        }
+        const float3 inverseDirection = 1.f / select(parallel, float3(1.f), direction);
+        const float3 a = (float3(node.minLeft.xyz) - origin) * inverseDirection;
+        const float3 b = (float3(node.maxRight.xyz) - origin) * inverseDirection;
+        const float3 lo = select(parallel, float3(-1e30f), min(a, b));
+        const float3 hi = select(parallel, float3(1e30f), max(a, b));
+        interval = float2(max(lo.x, max(lo.y, lo.z)), min(hi.x, min(hi.y, hi.z)));
+        interval = clamp(interval, 0.f, 1.f);
+        return interval.x < interval.y;
     }
 
     float4 integrateTransportCut(Ray ray, GridVolume volume, float2 interval, out float residualError)
@@ -178,40 +156,69 @@ struct HSTRCloudRenderer
         float3 position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         const float3 endPosition = (exitIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         const float3 direction = endPosition - position;
-        const int3 stepDirection = select(direction < 0.f, int3(-1), int3(1));
-        const float3 inverseDirection = 1.f / max(abs(direction), float3(1e-8f));
-        int3 cell = clamp(int3(floor(position + 1e-4f * float3(stepDirection))), int3(0), int3(params.hstrLeafDims) - 1);
-        const float3 nextBoundary = float3(cell) + select(stepDirection < 0, float3(0.f), float3(1.f));
-        float3 nextCrossing = abs(nextBoundary - position) * inverseDirection;
-        const float3 crossingStep = inverseDirection;
-        const uint inputFace = rayInputFace(direction);
-        const uint inputAxis = inputFace / 2;
         float3 radiance = 0.f;
         float transmittance = 1.f;
-        float currentCrossing = 0.f;
+        uint stack[32];
+        uint stackSize = 1;
+        stack[0] = params.hstrRootNode;
 
         [loop]
-        for (uint visit = 0; visit < 256 && transmittance > 1e-3f; ++visit)
+        for (uint visit = 0; visit < 512 && stackSize > 0 && transmittance > 1e-3f; ++visit)
         {
-            if (any(cell < 0) || any(cell >= int3(params.hstrLeafDims)))
-                break;
-            const float crossing = min(nextCrossing.x, min(nextCrossing.y, nextCrossing.z));
-            const float segmentEnd = min(1.f, crossing);
-            const float segmentLength = max(0.f, segmentEnd - currentCrossing) * abs(direction[inputAxis]);
-            const float3 samplePosition = position + (0.5f * (currentCrossing + segmentEnd)) * direction;
-            const float leafTransmittance = pow(max(1e-6f, hstrTransmittance(samplePosition - 0.5f, inputFace)), segmentLength);
-            const float alpha = 1.f - leafTransmittance;
-            const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * samplePosition;
-            radiance += transmittance * alpha * volume.data.albedo * hstrLighting(indexPosition, ray.dir);
-            residualError += transmittance * alpha * hstrResidualBound(indexPosition);
-            transmittance *= leafTransmittance;
-            currentCrossing = segmentEnd;
+            const uint nodeID = stack[--stackSize];
+            const HSTRCutNode node = hstrCutNodes[nodeID];
+            float2 nodeInterval;
+            if (node.statistics.y <= 1e-7f || !intersectCutNode(node, position, direction, nodeInterval))
+                continue;
+            const bool leaf = node.minLeft.w == ~0u;
+            const float variation = (node.statistics.y - node.statistics.x) / max(1e-6f, node.statistics.y);
+            const float3 midpointPosition = position + (0.5f * (nodeInterval.x + nodeInterval.y)) * direction;
+            const float projectedPixels =
+                params.frameDim.y *
+                max(node.maxRight.x - node.minLeft.x, max(node.maxRight.y - node.minLeft.y, node.maxRight.z - node.minLeft.z)) /
+                max(1.f, length(midpointPosition - position));
+            const bool accept = leaf || (variation <= params.mixedFidelityThreshold && node.statistics.z <= params.mixedFidelityThreshold &&
+                                         projectedPixels <= 12.f);
+            if (!accept)
+            {
+                float2 leftInterval;
+                float2 rightInterval;
+                const bool hitLeft = intersectCutNode(hstrCutNodes[node.minLeft.w], position, direction, leftInterval);
+                const bool hitRight = intersectCutNode(hstrCutNodes[node.maxRight.w], position, direction, rightInterval);
+                if (hitLeft && hitRight)
+                {
+                    const bool leftFirst = leftInterval.x < rightInterval.x;
+                    stack[stackSize++] = leftFirst ? node.maxRight.w : node.minLeft.w;
+                    stack[stackSize++] = leftFirst ? node.minLeft.w : node.maxRight.w;
+                }
+                else if (hitLeft)
+                    stack[stackSize++] = node.minLeft.w;
+                else if (hitRight)
+                    stack[stackSize++] = node.maxRight.w;
+                continue;
+            }
 
-            if (crossing >= 1.f)
-                break;
-            const bool3 crossAxis = nextCrossing <= crossing + 1e-6f;
-            cell += select(crossAxis, stepDirection, int3(0));
-            nextCrossing += select(crossAxis, crossingStep, float3(0.f));
+            const float segmentParameterLength = nodeInterval.y - nodeInterval.x;
+            const float voxelLength = segmentParameterLength * length(direction) * params.hstrCellWidth;
+            const uint sampleCount =
+                leaf && variation > params.mixedFidelityThreshold ? clamp(uint(ceil(0.5f * voxelLength)), 2u, 12u) : 2u;
+            const float dt = segmentParameterLength / sampleCount;
+            [loop]
+            for (uint sample = 0; sample < sampleCount && transmittance > 1e-3f; ++sample)
+            {
+                const float t = nodeInterval.x + (sample + 0.5f) * dt;
+                const float3 samplePosition = position + t * direction;
+                const float extinction = extinctionAt(samplePosition);
+                if (extinction <= 1e-7f)
+                    continue;
+                const float worldLength = (interval.y - max(0.f, interval.x)) * dt;
+                const float sampleTransmittance = exp(-extinction * worldLength);
+                const float alpha = 1.f - sampleTransmittance;
+                const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * samplePosition;
+                radiance += transmittance * alpha * volume.data.albedo * hstrLighting(indexPosition, ray.dir);
+                residualError += transmittance * alpha * hstrResidualBound(indexPosition);
+                transmittance *= sampleTransmittance;
+            }
         }
         return float4(radiance + transmittance * sky, transmittance);
     }

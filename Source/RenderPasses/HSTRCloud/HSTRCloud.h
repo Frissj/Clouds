@@ -39,10 +39,12 @@ private:
         float goalError = 0.f;
     };
     static_assert(sizeof(CorrectionAtom) == 16);
+    static_assert(sizeof(HSTRCutNode) == 48);
 
     void buildHierarchy();
     void updateHierarchy();
     void uploadHierarchy();
+    void uploadExtinction();
     void uploadCorrectionPool(const hstr::DenseMatrix& rootIncident);
     void solveLighting();
     void dispatchLightingSolve();
@@ -65,6 +67,9 @@ private:
     ref<Buffer> mpLeafAdjointResponses;
     ref<Buffer> mpCorrectionRanges;
     ref<Buffer> mpCorrectionAtoms;
+    ref<Buffer> mpCutNodes;
+    ref<Texture> mpExtinction;
+    ref<Sampler> mpExtinctionSampler;
     hstr::Hierarchy mHierarchy;
     HSTRCloudParams mParams;
     uint3 mActualLeafDims = uint3(0);

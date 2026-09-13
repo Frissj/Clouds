@@ -259,12 +259,93 @@ void HSTRCloud::buildHierarchy()
     mParams.operatorDictionarySize = uint32_t(mOperatorDictionary.size());
 
     mHierarchy = hstr::Hierarchy::compile(leafDims, leafTransport, mParams.traceSpatialOrder);
+    uploadExtinction();
     const float milliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - startTime).count();
     logInfo("HSTRCloud: compiled {} leaves and {} Schur nodes in {:.1f} ms.", leafCount, mHierarchy.getNodes().size(), milliseconds);
     logInfo("HSTRCloud: operator dictionary contains {} prototypes for {} leaves.", mOperatorDictionary.size(), leafCount);
 
     uploadHierarchy();
     solveLighting();
+}
+
+void HSTRCloud::uploadExtinction()
+{
+    const auto& volume = mpScene->getGridVolume(0);
+    const auto& grid = volume->getDensityGrid();
+    const uint3 dims = uint3(mGridMax - mGridMin + 1);
+    std::vector<float16_t> extinction(size_t(dims.x) * dims.y * dims.z);
+    const auto& nodes = mHierarchy.getNodes();
+    const uint3 leafDims = mHierarchy.getLeafDims();
+    const size_t leafCount = size_t(leafDims.x) * leafDims.y * leafDims.z;
+    std::vector<float> minimum(nodes.size(), std::numeric_limits<float>::max());
+    std::vector<float> maximum(nodes.size(), 0.f);
+    for (uint32_t z = 0; z < dims.z; ++z)
+        for (uint32_t y = 0; y < dims.y; ++y)
+            for (uint32_t x = 0; x < dims.x; ++x)
+            {
+                const float value =
+                    std::max(0.f, grid->getValue(mGridMin + int3(x, y, z))) * volume->getDensityScale() * mParams.densityScale;
+                extinction[size_t(x) + size_t(dims.x) * (size_t(y) + size_t(dims.y) * z)] = float16_t(value);
+                const uint3 leaf = uint3(x, y, z) / mParams.hstrCellWidth;
+                const size_t id = size_t(leaf.x) + size_t(leafDims.x) * (size_t(leaf.y) + size_t(leafDims.y) * leaf.z);
+                minimum[id] = std::min(minimum[id], value);
+                maximum[id] = std::max(maximum[id], value);
+            }
+    std::vector<HSTRCutNode> packed(nodes.size());
+    for (uint32_t z = 0; z < leafDims.z; ++z)
+        for (uint32_t y = 0; y < leafDims.y; ++y)
+            for (uint32_t x = 0; x < leafDims.x; ++x)
+            {
+                const size_t id = size_t(x) + size_t(leafDims.x) * (size_t(y) + size_t(leafDims.y) * z);
+                if (minimum[id] == std::numeric_limits<float>::max())
+                    minimum[id] = 0.f;
+                packed[id].minLeft = uint4(x, y, z, hstr::HierarchyNode::kInvalid);
+                packed[id].maxRight = uint4(x + 1, y + 1, z + 1, hstr::HierarchyNode::kInvalid);
+            }
+    for (size_t id = leafCount; id < nodes.size(); ++id)
+    {
+        const auto& node = nodes[id];
+        const HSTRCutNode& left = packed[node.left];
+        const HSTRCutNode& right = packed[node.right];
+        packed[id].minLeft = uint4(
+            std::min(left.minLeft.x, right.minLeft.x),
+            std::min(left.minLeft.y, right.minLeft.y),
+            std::min(left.minLeft.z, right.minLeft.z),
+            node.left
+        );
+        packed[id].maxRight = uint4(
+            std::max(left.maxRight.x, right.maxRight.x),
+            std::max(left.maxRight.y, right.maxRight.y),
+            std::max(left.maxRight.z, right.maxRight.z),
+            node.right
+        );
+        minimum[id] = std::min(minimum[node.left], minimum[node.right]);
+        maximum[id] = std::max(maximum[node.left], maximum[node.right]);
+    }
+    for (size_t id = 0; id < nodes.size(); ++id)
+        packed[id].statistics = float4(minimum[id], maximum[id], nodes[id].residualNorm, 0.f);
+    mParams.hstrExtinctionDims = dims;
+    mParams.hstrRootNode = mHierarchy.getRoot();
+    const HSTRCutNode& root = packed[mParams.hstrRootNode];
+    logInfo(
+        "HSTRCloud: cut root [{}, {}, {}]-[{}, {}, {}], extinction [{}, {}].",
+        root.minLeft.x,
+        root.minLeft.y,
+        root.minLeft.z,
+        root.maxRight.x,
+        root.maxRight.y,
+        root.maxRight.z,
+        root.statistics.x,
+        root.statistics.y
+    );
+    mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
+    mpCutNodes = mpDevice->createStructuredBuffer(
+        sizeof(HSTRCutNode), packed.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packed.data(), false
+    );
+    Sampler::Desc samplerDesc;
+    samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+    samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+    mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
 }
 
 void HSTRCloud::uploadHierarchy()
@@ -685,13 +766,13 @@ hstr::DenseMatrix HSTRCloud::makeNestedLeafTransport(uint32_t leafIndex) const
 void HSTRCloud::updateHierarchy()
 {
     const std::vector<float> updatedDensity = sampleLeafDensities();
+    uploadExtinction();
     std::vector<uint32_t> changed;
     for (uint32_t leaf = 0; leaf < updatedDensity.size(); ++leaf)
         if (std::abs(updatedDensity[leaf] - mLeafDensity[leaf]) > 1e-4f * std::max(1.f, mLeafDensity[leaf]))
             changed.push_back(leaf);
     if (changed.empty())
         return;
-
     const auto oldTransport = mHierarchy.getLeafTransportMatrices();
     std::vector<hstr::DenseMatrix> newTransport;
     newTransport.reserve(changed.size());
@@ -908,8 +989,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
     var["hstrRadiance"] = mpLeafRadiance;
-    var["hstrLeafBallistic"] = mpLeafBallistic;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
+    var["hstrCutNodes"] = mpCutNodes;
+    var["hstrExtinction"] = mpExtinction;
+    var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["color"] = color;
     var["transportError"] = error;
     mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
@@ -950,8 +1033,8 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         solveLighting();
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged;
     widget.textWrapped(
-        "Outside-cloud views composite preintegrated HST transport-cut nodes and never march NanoVDB. The density grid is queried only "
-        "by the exact inside-cloud fallback."
+        "Outside-cloud views use a view-dependent HST antichain. Smooth nodes are accepted, silhouette and high-variation nodes descend "
+        "into the half-float transmittance residual, and NanoVDB is not marched per pixel."
     );
     widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
     widget.text(fmt::format("Camera-facing adjoint face: {}", mParams.goalFace));

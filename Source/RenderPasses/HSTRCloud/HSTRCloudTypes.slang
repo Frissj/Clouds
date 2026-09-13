@@ -3,16 +3,26 @@
 
 BEGIN_NAMESPACE_FALCOR
 
+struct HSTRCutNode
+{
+    uint4 minLeft;
+    uint4 maxRight;
+    float4 statistics;
+};
+
 struct HSTRCloudParams
 {
-    uint2 frameDim = {0, 0};
+    uint2 frameDim = { 0, 0 };
     uint baseSteps = 32;
     uint refinementLevel = 1;
 
-    uint3 hstrLeafDims = {0, 0, 0};
+    uint3 hstrLeafDims = { 0, 0, 0 };
     uint hstrCellWidth = 1;
 
-    int3 hstrGridMin = {0, 0, 0};
+    uint3 hstrExtinctionDims = { 0, 0, 0 };
+    uint hstrRootNode = 0;
+
+    int3 hstrGridMin = { 0, 0, 0 };
     uint frameIndex = 0;
 
     uint activeRank = 24;
@@ -35,7 +45,7 @@ struct HSTRCloudParams
     uint diffuseRankBudget = 24;
     uint maximumDiffuseRank = 0;
 
-    uint3 schurWindowCenter = {0, 0, 0};
+    uint3 schurWindowCenter = { 0, 0, 0 };
     uint schurWindowRadius = 8;
 
     uint operatorDictionarySize = 0;
