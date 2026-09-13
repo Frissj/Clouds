@@ -154,6 +154,7 @@ RenderPassReflection HSTRCloud::reflect(const CompileData& compileData)
 void HSTRCloud::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
     mParams.frameDim = compileData.defaultTexDims;
+    mCutDirty = true;
 }
 
 void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
@@ -162,8 +163,13 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpPass = nullptr;
     mpSolvePass = nullptr;
     mpCameraLightingPass = nullptr;
+    mpProjectPass = nullptr;
+    mpCutPass = nullptr;
+    mpSortPass = nullptr;
+    mpQueryPass = nullptr;
     mFirstFrame = true;
     mCameraLightingDirty = true;
+    mCutDirty = true;
     mCameraLightingPoseValid = false;
     if (!mpScene)
         return;
@@ -189,6 +195,26 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     cameraLightingDesc.addShaderLibrary(kShaderFile).csEntry("updateCameraLighting");
     cameraLightingDesc.addTypeConformances(mpScene->getTypeConformances());
     mpCameraLightingPass = ComputePass::create(mpDevice, cameraLightingDesc, mpScene->getSceneDefines());
+    ProgramDesc projectDesc;
+    projectDesc.addShaderModules(mpScene->getShaderModules());
+    projectDesc.addShaderLibrary(kShaderFile).csEntry("projectCutNodes");
+    projectDesc.addTypeConformances(mpScene->getTypeConformances());
+    mpProjectPass = ComputePass::create(mpDevice, projectDesc, mpScene->getSceneDefines());
+    ProgramDesc cutDesc;
+    cutDesc.addShaderModules(mpScene->getShaderModules());
+    cutDesc.addShaderLibrary(kShaderFile).csEntry("binCutNodes");
+    cutDesc.addTypeConformances(mpScene->getTypeConformances());
+    mpCutPass = ComputePass::create(mpDevice, cutDesc, mpScene->getSceneDefines());
+    ProgramDesc sortDesc;
+    sortDesc.addShaderModules(mpScene->getShaderModules());
+    sortDesc.addShaderLibrary(kShaderFile).csEntry("sortTileCuts");
+    sortDesc.addTypeConformances(mpScene->getTypeConformances());
+    mpSortPass = ComputePass::create(mpDevice, sortDesc, mpScene->getSceneDefines());
+    ProgramDesc queryDesc;
+    queryDesc.addShaderModules(mpScene->getShaderModules());
+    queryDesc.addShaderLibrary(kShaderFile).csEntry("buildCameraQueries");
+    queryDesc.addTypeConformances(mpScene->getTypeConformances());
+    mpQueryPass = ComputePass::create(mpDevice, queryDesc, mpScene->getSceneDefines());
     buildHierarchy();
 }
 
@@ -205,7 +231,6 @@ void HSTRCloud::buildHierarchy()
         return;
 
     constexpr uint32_t kCellWidth = 16;
-    static_assert(3 * kCellWidth + 1 <= 52, "Exact transmittance page traversal bound is too small.");
     mGridMin = grid->getMinIndex();
     mGridMax = grid->getMaxIndex();
     const uint3 gridExtent = uint3(mGridMax - mGridMin + 1);
@@ -303,6 +328,7 @@ void HSTRCloud::uploadExtinction()
                 ++sampleCount[id];
             }
     std::vector<HSTRCutNode> packed(nodes.size());
+    std::vector<uint32_t> parents(nodes.size(), ~0u);
     for (uint32_t z = 0; z < leafDims.z; ++z)
         for (uint32_t y = 0; y < leafDims.y; ++y)
             for (uint32_t x = 0; x < leafDims.x; ++x)
@@ -330,6 +356,8 @@ void HSTRCloud::uploadExtinction()
             std::max(left.maxRight.z, right.maxRight.z),
             node.right
         );
+        parents[node.left] = uint32_t(id);
+        parents[node.right] = uint32_t(id);
         minimum[id] = std::min(minimum[node.left], minimum[node.right]);
         maximum[id] = std::max(maximum[node.left], maximum[node.right]);
         sampleCount[id] = sampleCount[node.left] + sampleCount[node.right];
@@ -407,6 +435,8 @@ void HSTRCloud::uploadExtinction()
     }
     mParams.hstrExtinctionDims = dims;
     mParams.hstrRootNode = mHierarchy.getRoot();
+    mParams.hstrNodeCount = uint32_t(packed.size());
+    mCutDirty = true;
     const HSTRCutNode& root = packed[mParams.hstrRootNode];
     logInfo(
         "HSTRCloud: cut root [{}, {}, {}]-[{}, {}, {}], extinction [{}, {}].",
@@ -429,6 +459,12 @@ void HSTRCloud::uploadExtinction()
         );
     else
         mpCutNodes->setBlob(packed.data(), 0, packed.size() * sizeof(HSTRCutNode));
+    if (!mpCutNodeParents || mpCutNodeParents->getElementCount() != parents.size())
+        mpCutNodeParents = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), parents.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, parents.data(), false
+        );
+    else
+        mpCutNodeParents->setBlob(parents.data(), 0, parents.size() * sizeof(uint32_t));
     if (!mpExtinctionSampler)
     {
         Sampler::Desc samplerDesc;
@@ -617,12 +653,13 @@ void HSTRCloud::uploadHierarchy()
         nullptr,
         false
     );
-    if (!mpCameraLighting || mpCameraLighting->getWidth() != leafDims.x || mpCameraLighting->getHeight() != leafDims.y ||
-        mpCameraLighting->getDepth() != leafDims.z)
+    const uint3 cameraLightingDims = leafDims;
+    if (!mpCameraLighting || mpCameraLighting->getWidth() != cameraLightingDims.x ||
+        mpCameraLighting->getHeight() != cameraLightingDims.y || mpCameraLighting->getDepth() != cameraLightingDims.z)
         mpCameraLighting = mpDevice->createTexture3D(
-            leafDims.x,
-            leafDims.y,
-            leafDims.z,
+            cameraLightingDims.x,
+            cameraLightingDims.y,
+            cameraLightingDims.z,
             ResourceFormat::RGBA16Float,
             1,
             nullptr,
@@ -1004,8 +1041,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const auto updates = mpScene->getUpdates();
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraDirection = mpScene->getCamera()->getTarget() - cameraPosition;
-        mCameraLightingDirty |= !mCameraLightingPoseValid || any(cameraPosition != mCameraLightingPosition) ||
-                                any(cameraDirection != mCameraLightingDirection) || is_set(updates, IScene::UpdateFlags::GridVolumesMoved);
+        const bool cameraChanged =
+            !mCameraLightingPoseValid || any(cameraPosition != mCameraLightingPosition) || any(cameraDirection != mCameraLightingDirection);
+        mCameraLightingDirty |= cameraChanged || is_set(updates, IScene::UpdateFlags::GridVolumesMoved);
+        mCutDirty |= cameraChanged || is_set(updates, IScene::UpdateFlags::GridVolumesMoved);
     }
     if (!mFirstFrame && mpScene)
     {
@@ -1037,7 +1076,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     const auto& color = renderData.getTexture(kColor);
     const auto& error = renderData.getTexture(kTransportError);
     const auto& cutStats = renderData.getTexture(kCutStats);
-    mParams.frameDim = uint2(color->getWidth(), color->getHeight());
+    const uint2 frameDim(color->getWidth(), color->getHeight());
+    mCutDirty |= any(frameDim != mParams.frameDim);
+    mParams.frameDim = frameDim;
+    mParams.hstrTileDims = (frameDim + 7u) / 8u;
+    mParams.hstrQueryDims = (frameDim + mParams.hstrQueryStride - 1u) / mParams.hstrQueryStride + 1u;
     if (!mpScene || !mpPass || !mpLeafRadiance)
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));
@@ -1060,14 +1103,86 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mCameraLightingDirection = mpScene->getCamera()->getTarget() - mCameraLightingPosition;
     }
 
+    const uint32_t nodeCount = mParams.hstrNodeCount;
+    const uint32_t tileCount = mParams.hstrTileDims.x * mParams.hstrTileDims.y;
+    const uint2 queryDims = mParams.hstrQueryDims;
+    const auto cutFlags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    if (!mpCameraQueries || mpCameraQueries->getWidth() != queryDims.x || mpCameraQueries->getHeight() != queryDims.y)
+        mpCameraQueries = mpDevice->createTexture2D(queryDims.x, queryDims.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, cutFlags);
+    if (!mpNodeProjection || mpNodeProjection->getElementCount() != nodeCount)
+    {
+        mpNodeProjection = mpDevice->createStructuredBuffer(sizeof(float4), nodeCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
+        mpNodeDepth = mpDevice->createStructuredBuffer(sizeof(float2), nodeCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
+        mCutDirty = true;
+    }
+    if (!mpTileNodeCounts || mpTileNodeCounts->getElementCount() != tileCount)
+    {
+        mpTileNodeCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
+        mpTileNodes = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), size_t(tileCount) * mParams.hstrMaxTileNodes, cutFlags, MemoryType::DeviceLocal, nullptr, false
+        );
+        mCutDirty = true;
+    }
+    if (mCutDirty)
+    {
+        mpScene->bindShaderDataForRaytracing(pRenderContext, mpProjectPass->getRootVar()["gScene"]);
+        ShaderVar projectVar = mpProjectPass->getRootVar()["CB"]["gHSTRCloud"];
+        projectVar["params"].setBlob(mParams);
+        projectVar["hstrCutNodes"] = mpCutNodes;
+        projectVar["hstrCutNodeParents"] = mpCutNodeParents;
+        projectVar["hstrNodeProjection"] = mpNodeProjection;
+        projectVar["hstrNodeDepth"] = mpNodeDepth;
+        mpProjectPass->execute(pRenderContext, uint3(nodeCount, 1, 1));
+
+        pRenderContext->clearUAV(mpTileNodeCounts->getUAV().get(), uint4(0));
+        mpScene->bindShaderDataForRaytracing(pRenderContext, mpCutPass->getRootVar()["gScene"]);
+        ShaderVar cutVar = mpCutPass->getRootVar()["CB"]["gHSTRCloud"];
+        cutVar["params"].setBlob(mParams);
+        cutVar["hstrCutNodes"] = mpCutNodes;
+        cutVar["hstrCutNodeParents"] = mpCutNodeParents;
+        cutVar["hstrNodeProjection"] = mpNodeProjection;
+        cutVar["hstrNodeDepth"] = mpNodeDepth;
+        cutVar["hstrTileNodeCounts"] = mpTileNodeCounts;
+        cutVar["hstrTileNodes"] = mpTileNodes;
+        mpCutPass->execute(pRenderContext, uint3(nodeCount, 1, 1));
+
+        mpScene->bindShaderDataForRaytracing(pRenderContext, mpSortPass->getRootVar()["gScene"]);
+        ShaderVar sortVar = mpSortPass->getRootVar()["CB"]["gHSTRCloud"];
+        sortVar["params"].setBlob(mParams);
+        sortVar["hstrCutNodes"] = mpCutNodes;
+        sortVar["hstrCutNodeParents"] = mpCutNodeParents;
+        sortVar["hstrNodeProjection"] = mpNodeProjection;
+        sortVar["hstrNodeDepth"] = mpNodeDepth;
+        sortVar["hstrTileNodeCounts"] = mpTileNodeCounts;
+        sortVar["hstrTileNodes"] = mpTileNodes;
+        mpSortPass->execute(pRenderContext, uint3(mParams.hstrTileDims, 1));
+        mCutDirty = false;
+    }
+
+    mpScene->bindShaderDataForRaytracing(pRenderContext, mpQueryPass->getRootVar()["gScene"]);
+    ShaderVar queryVar = mpQueryPass->getRootVar()["CB"]["gHSTRCloud"];
+    queryVar["params"].setBlob(mParams);
+    queryVar["hstrRadiance"] = mpLeafRadiance;
+    queryVar["hstrLeafResidualBounds"] = mpLeafResidualBounds;
+    queryVar["hstrCameraLighting"] = mpCameraLighting;
+    queryVar["hstrExtinctionSampler"] = mpExtinctionSampler;
+    queryVar["hstrCameraQueryOutput"] = mpCameraQueries;
+    mpQueryPass->execute(pRenderContext, uint3(queryDims, 1));
+
     mpScene->bindShaderDataForRaytracing(pRenderContext, mpPass->getRootVar()["gScene"]);
     ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
     var["hstrRadiance"] = mpLeafRadiance;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["hstrCutNodes"] = mpCutNodes;
+    var["hstrCutNodeParents"] = mpCutNodeParents;
+    var["hstrNodeProjection"] = mpNodeProjection;
+    var["hstrNodeDepth"] = mpNodeDepth;
+    var["hstrTileNodeCounts"] = mpTileNodeCounts;
+    var["hstrTileNodes"] = mpTileNodes;
     var["hstrExtinction"] = mpExtinction;
     var["hstrCameraLighting"] = mpCameraLighting;
+    var["hstrCameraQueries"] = mpCameraQueries;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["color"] = color;
     var["transportError"] = error;
@@ -1110,9 +1225,10 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     else if (lightingChanged)
         solveLighting();
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged;
+    mCutDirty |= renderChanged || operatorChanged;
     widget.textWrapped(
-        "Outside-cloud views use a view-dependent HST antichain. Smooth nodes are accepted, silhouette and high-variation nodes descend "
-        "into the half-float transmittance residual, and NanoVDB is not marched per pixel."
+        "Outside-cloud views share one projected HST antichain per 8x8 tile. Smooth nodes are accepted, silhouette and high-variation "
+        "nodes descend into the half-float transmittance residual, and NanoVDB is not marched per pixel."
     );
     widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
 }

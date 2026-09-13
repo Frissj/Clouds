@@ -55,6 +55,10 @@ private:
     ref<ComputePass> mpPass;
     ref<ComputePass> mpSolvePass;
     ref<ComputePass> mpCameraLightingPass;
+    ref<ComputePass> mpProjectPass;
+    ref<ComputePass> mpCutPass;
+    ref<ComputePass> mpSortPass;
+    ref<ComputePass> mpQueryPass;
     ref<Buffer> mpLeafRadiance;
     ref<Buffer> mpLeafBasisLeft;
     ref<Buffer> mpLeafBasisRight;
@@ -69,8 +73,14 @@ private:
     ref<Buffer> mpCorrectionRanges;
     ref<Buffer> mpCorrectionAtoms;
     ref<Buffer> mpCutNodes;
+    ref<Buffer> mpCutNodeParents;
+    ref<Buffer> mpNodeProjection;
+    ref<Buffer> mpNodeDepth;
+    ref<Buffer> mpTileNodeCounts;
+    ref<Buffer> mpTileNodes;
     ref<Texture> mpExtinction;
     ref<Texture> mpCameraLighting;
+    ref<Texture> mpCameraQueries;
     ref<Sampler> mpExtinctionSampler;
     hstr::Hierarchy mHierarchy;
     HSTRCloudParams mParams;
@@ -88,6 +98,7 @@ private:
     bool mOptionsChanged = false;
     bool mFirstFrame = true;
     bool mCameraLightingDirty = true;
+    bool mCutDirty = true;
     bool mCameraLightingPoseValid = false;
     float3 mCameraLightingPosition = float3(0.f);
     float3 mCameraLightingDirection = float3(0.f);

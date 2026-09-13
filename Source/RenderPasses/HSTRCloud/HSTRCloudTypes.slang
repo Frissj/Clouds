@@ -8,9 +8,7 @@ struct HSTRCutNode
     uint4 minLeft;
     uint4 maxRight;
     float4 statistics;
-    // Maximum residual, exact-leaf residency, padding.
     float4 transmittancePage;
-    // Rank-8 trilinear ballistic page in x + 2y + 4z corner order.
     float4 transmittanceCorners0;
     float4 transmittanceCorners1;
 };
@@ -26,6 +24,14 @@ struct HSTRCloudParams
 
     uint3 hstrExtinctionDims = { 0, 0, 0 };
     uint hstrRootNode = 0;
+
+    uint2 hstrTileDims = { 0, 0 };
+    uint hstrNodeCount = 0;
+    uint hstrMaxTileNodes = 128;
+
+    uint2 hstrQueryDims = { 0, 0 };
+    uint hstrQueryStride = 4;
+    uint hstrQuerySteps = 96;
 
     int3 hstrGridMin = { 0, 0, 0 };
     uint frameIndex = 0;

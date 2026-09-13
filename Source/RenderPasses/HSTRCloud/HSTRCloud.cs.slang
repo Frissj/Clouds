@@ -33,9 +33,16 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint2> hstrCorrectionRanges;
     StructuredBuffer<HSTRCorrectionAtom> hstrCorrectionAtoms;
     StructuredBuffer<HSTRCutNode> hstrCutNodes;
+    StructuredBuffer<uint> hstrCutNodeParents;
+    RWStructuredBuffer<float4> hstrNodeProjection;
+    RWStructuredBuffer<float2> hstrNodeDepth;
+    RWStructuredBuffer<uint> hstrTileNodeCounts;
+    RWStructuredBuffer<uint> hstrTileNodes;
     Texture3D<float> hstrExtinction;
     Texture3D<float4> hstrCameraLighting;
     RWTexture3D<float4> hstrCameraLightingOutput;
+    Texture2D<float4> hstrCameraQueries;
+    RWTexture2D<float4> hstrCameraQueryOutput;
     SamplerState hstrExtinctionSampler;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
@@ -137,25 +144,171 @@ struct HSTRCloudRenderer
         return hstrCameraLighting.SampleLevel(hstrExtinctionSampler, saturate(leafPosition / float3(params.hstrLeafDims)), 0.f).rgb;
     }
 
-    void writeCameraLighting(uint3 leaf)
+    void writeCameraLighting(uint3 samplePosition)
     {
-        if (any(leaf >= params.hstrLeafDims) || gScene.getGridVolumeCount() == 0)
+        if (any(samplePosition >= params.hstrLeafDims) || gScene.getGridVolumeCount() == 0)
             return;
         const GridVolume volume = gScene.getGridVolume(0);
-        const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * (float3(leaf) + 0.5f);
+        const float3 leafPosition = float3(samplePosition) + 0.5f;
+        const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * leafPosition;
         const float3 worldPosition = mul(volume.data.transform, float4(indexPosition, 1.f)).xyz;
-        const float3 view = normalize(gScene.camera.data.posW - worldPosition);
-        const float weightSum = abs(view.x) + abs(view.y) + abs(view.z);
-        const uint leafID = leafIndex(leaf);
-        float3 value = 0.f;
-        for (uint axis = 0; axis < 3; ++axis)
+        hstrCameraLightingOutput[samplePosition] =
+            float4(hstrLighting(indexPosition, worldPosition - gScene.camera.data.posW), 0.f);
+    }
+
+    float3 cutNodeWorldPosition(uint3 leafPosition, GridVolume volume)
+    {
+        const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * float3(leafPosition);
+        return mul(volume.data.transform, float4(indexPosition, 1.f)).xyz;
+    }
+
+    void projectCutNode(uint nodeID)
+    {
+        if (nodeID >= params.hstrNodeCount || gScene.getGridVolumeCount() == 0)
+            return;
+        const HSTRCutNode node = hstrCutNodes[nodeID];
+        const GridVolume volume = gScene.getGridVolume(0);
+        float2 minimumPixel = float2(params.frameDim);
+        float2 maximumPixel = 0.f;
+        float minimumDepth = 1e30f;
+        float maximumDepth = -1e30f;
+        bool crossesCamera = false;
+        [unroll]
+        for (uint corner = 0; corner < 8; ++corner)
         {
-            const uint face = 2u * axis + (view[axis] >= 0.f ? 1u : 0u);
-            for (uint mode = 0; mode < params.hstrFaceDofs; ++mode)
-                value += abs(view[axis]) * hstrRadiance[leafID * params.hstrTraceDofs + face * params.hstrFaceDofs + mode].rgb /
-                         float(params.hstrFaceDofs);
+            const uint3 leafPosition = uint3(
+                (corner & 1u) ? node.maxRight.x : node.minLeft.x,
+                (corner & 2u) ? node.maxRight.y : node.minLeft.y,
+                (corner & 4u) ? node.maxRight.z : node.minLeft.z
+            );
+            const float3 worldPosition = cutNodeWorldPosition(leafPosition, volume);
+            const float4 clip = mul(gScene.camera.data.viewProjMatNoJitter, float4(worldPosition, 1.f));
+            crossesCamera |= clip.w <= 1e-5f;
+            const float2 ndc = clip.xy / max(1e-5f, clip.w);
+            const float2 pixel = (ndc * float2(0.5f, -0.5f) + 0.5f) * float2(params.frameDim);
+            minimumPixel = min(minimumPixel, pixel);
+            maximumPixel = max(maximumPixel, pixel);
+            minimumDepth = min(minimumDepth, dot(worldPosition - gScene.camera.data.posW, gScene.camera.data.cameraW));
+            maximumDepth = max(maximumDepth, dot(worldPosition - gScene.camera.data.posW, gScene.camera.data.cameraW));
         }
-        hstrCameraLightingOutput[leaf] = float4(value / max(1e-4f, weightSum), 0.f);
+        if (crossesCamera)
+        {
+            minimumPixel = 0.f;
+            maximumPixel = float2(params.frameDim);
+        }
+        hstrNodeProjection[nodeID] = float4(
+            clamp(minimumPixel, 0.f, float2(params.frameDim)), clamp(maximumPixel, 0.f, float2(params.frameDim))
+        );
+        hstrNodeDepth[nodeID] = float2(minimumDepth, maximumDepth);
+    }
+
+    bool acceptTileCutNode(HSTRCutNode node, uint nodeID, GridVolume volume)
+    {
+        if (node.minLeft.w == ~0u)
+            return true;
+        const float3 leafExtent = float3(node.maxRight.xyz - node.minLeft.xyz) * float(params.hstrCellWidth);
+        const float3 axisX = mul(volume.data.transform, float4(leafExtent.x, 0.f, 0.f, 0.f)).xyz;
+        const float3 axisY = mul(volume.data.transform, float4(0.f, leafExtent.y, 0.f, 0.f)).xyz;
+        const float3 axisZ = mul(volume.data.transform, float4(0.f, 0.f, leafExtent.z, 0.f)).xyz;
+        const float maximumWorldLength = length(axisX) + length(axisY) + length(axisZ);
+        const float pageError = 1.f - exp(-node.transmittancePage.x * maximumWorldLength);
+        if (pageError <= params.cutTransmittanceTolerance)
+            return true;
+        const float variation = (node.statistics.y - node.statistics.x) / max(1e-6f, node.statistics.y);
+        const float4 bounds = hstrNodeProjection[nodeID];
+        const float projectedPixels = max(bounds.z - bounds.x, bounds.w - bounds.y);
+        return variation <= params.mixedFidelityThreshold && node.statistics.z <= params.mixedFidelityThreshold && projectedPixels <= 12.f;
+    }
+
+    void binCutNode(uint nodeID)
+    {
+        if (nodeID >= params.hstrNodeCount || gScene.getGridVolumeCount() == 0)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const HSTRCutNode node = hstrCutNodes[nodeID];
+        if (node.statistics.y <= 1e-7f || !acceptTileCutNode(node, nodeID, volume))
+            return;
+
+        // Every node tests its ancestor chain, producing one scene-wide antichain
+        // without repeating a hierarchy traversal for every screen tile.
+        uint parent = hstrCutNodeParents[nodeID];
+        [loop]
+        while (parent != ~0u)
+        {
+            if (acceptTileCutNode(hstrCutNodes[parent], parent, volume))
+                return;
+            parent = hstrCutNodeParents[parent];
+        }
+
+        const float4 bounds = hstrNodeProjection[nodeID];
+        const uint2 tileMinimum = min(uint2(floor(bounds.xy / 8.f)), params.hstrTileDims);
+        const uint2 tileMaximum = min(uint2(ceil(bounds.zw / 8.f)), params.hstrTileDims);
+        [loop]
+        for (uint y = tileMinimum.y; y < tileMaximum.y; ++y)
+            [loop]
+            for (uint x = tileMinimum.x; x < tileMaximum.x; ++x)
+            {
+                const uint tileID = x + params.hstrTileDims.x * y;
+                uint slot;
+                InterlockedAdd(hstrTileNodeCounts[tileID], 1u, slot);
+                if (slot < params.hstrMaxTileNodes)
+                    hstrTileNodes[tileID * params.hstrMaxTileNodes + slot] = nodeID;
+            }
+    }
+
+    void sortTileCut(uint2 tile)
+    {
+        if (any(tile >= params.hstrTileDims) || gScene.getGridVolumeCount() == 0)
+            return;
+        const uint tileID = tile.x + params.hstrTileDims.x * tile.y;
+        const uint count = min(hstrTileNodeCounts[tileID], params.hstrMaxTileNodes);
+        if (count < 2u)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const uint2 centerPixel = min(tile * 8u + 4u, params.frameDim - 1u);
+        const Ray centerRay = gScene.camera.computeRayPinhole(centerPixel, params.frameDim);
+        float2 volumeInterval;
+        const AABB volumeBounds = volume.getBounds();
+        const bool centerHitsVolume = intersectRayAABB(
+            centerRay.origin, centerRay.dir, volumeBounds.minPoint, volumeBounds.maxPoint, volumeInterval
+        );
+        const float centerEntry = centerHitsVolume ? max(0.f, volumeInterval.x) : 0.f;
+        const float3 centerEntryIndex =
+            mul(volume.data.invTransform, float4(centerRay.origin + centerEntry * centerRay.dir, 1.f)).xyz;
+        const float3 centerExitIndex = mul(
+            volume.data.invTransform,
+            float4(centerRay.origin + (centerHitsVolume ? volumeInterval.y : centerEntry + 1.f) * centerRay.dir, 1.f)
+        ).xyz;
+        const float3 centerPosition = (centerEntryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 centerDirection = (centerExitIndex - centerEntryIndex) / float(params.hstrCellWidth);
+        const uint base = tileID * params.hstrMaxTileNodes;
+        [loop]
+        for (uint i = 1; i < count; ++i)
+        {
+            const uint nodeID = hstrTileNodes[base + i];
+            float2 nodeInterval;
+            const bool centerHitsNode =
+                centerHitsVolume && intersectCutNode(hstrCutNodes[nodeID], centerPosition, centerDirection, nodeInterval);
+            const float depth = centerHitsNode ? nodeInterval.x : hstrNodeDepth[nodeID].x;
+            uint insertion = i;
+            [loop]
+            while (insertion > 0)
+            {
+                const uint previousID = hstrTileNodes[base + insertion - 1u];
+                float2 previousInterval;
+                const bool centerHitsPrevious = centerHitsVolume &&
+                                                intersectCutNode(
+                                                    hstrCutNodes[previousID], centerPosition, centerDirection, previousInterval
+                                                );
+                const float previousDepth = centerHitsPrevious ? previousInterval.x : hstrNodeDepth[previousID].x;
+                if (previousDepth <= depth)
+                    break;
+                hstrTileNodes[base + insertion] = previousID;
+                --insertion;
+            }
+            hstrTileNodes[base + insertion] = nodeID;
+        }
+
     }
 
     bool intersectCutNode(HSTRCutNode node, float3 origin, float3 direction, out float2 interval)
@@ -224,64 +377,52 @@ struct HSTRCloudRenderer
         static const float kGaussOffset = 0.2886751345948129f;
         const float midpoint = 0.5f * (nodeInterval.x + nodeInterval.y);
         const float segmentLength = nodeInterval.y - nodeInterval.x;
-        const float extinction0 = transmittancePageAt(node, position + (midpoint - kGaussOffset * segmentLength) * direction);
-        const float extinction1 = transmittancePageAt(node, position + (midpoint + kGaussOffset * segmentLength) * direction);
-        compositeBallisticSegment(
-            position, direction, nodeInterval, totalWorldLength, extinction0, extinction1, volume, radiance, transmittance
-        );
+        const float t0 = midpoint - kGaussOffset * segmentLength;
+        const float t1 = midpoint + kGaussOffset * segmentLength;
+        const float3 p0 = position + t0 * direction;
+        const float3 p1 = position + t1 * direction;
+        const float extinction0 = transmittancePageAt(node, p0);
+        const float extinction1 = transmittancePageAt(node, p1);
+        const float opticalDepth = 0.5f * totalWorldLength * segmentLength * (extinction0 + extinction1);
+        if (opticalDepth <= 1e-8f)
+            return;
+        const float sampleTransmittance = exp(-opticalDepth);
+        const float alpha = 1.f - sampleTransmittance;
+        const float attenuation0 = exp(-opticalDepth * (0.5f - kGaussOffset));
+        const float attenuation1 = exp(-opticalDepth * (0.5f + kGaussOffset));
+        const float weight0 = extinction0 * attenuation0;
+        const float weight1 = extinction1 * attenuation1;
+        const float3 source =
+            (weight0 * cameraLightingAt(p0) + weight1 * cameraLightingAt(p1)) / max(1e-8f, weight0 + weight1);
+        radiance += transmittance * alpha * volume.data.albedo * source;
+        transmittance *= sampleTransmittance;
     }
 
-    uint integrateExactTransmittancePage(
+    uint integrateFilteredLeaf(
         float3 position,
         float3 direction,
-        float2 pageInterval,
+        float2 leafInterval,
         float totalWorldLength,
         GridVolume volume,
         inout float3 radiance,
         inout float transmittance
     )
     {
-        // The R16 page defines a continuous trilinear extinction field. Along
-        // a ray it is cubic inside each voxel, so two-point Gauss integration
-        // is exact after splitting at voxel boundaries.
-        const float3 voxelDirection = float(params.hstrCellWidth) * direction;
-        float t = pageInterval.x;
-        uint segmentCount = 0;
+        const float parameterLength = leafInterval.y - leafInterval.x;
+        const float voxelLength = parameterLength * length(direction) * float(params.hstrCellWidth);
+        const uint sampleCount = clamp(uint(ceil(0.25f * voxelLength)), 2u, 8u);
+        const float dt = parameterLength / float(sampleCount);
         [loop]
-        for (uint step = 0; step < 52u && t < pageInterval.y - 1e-7f; ++step)
+        for (uint sample = 0; sample < sampleCount && transmittance > 1e-3f; ++sample)
         {
-            const float3 voxelPosition = float(params.hstrCellWidth) * (position + t * direction);
-            float3 next = float3(1e30f);
-            if (voxelDirection.x > 1e-8f)
-                next.x = t + (floor(voxelPosition.x + 1e-5f) + 1.f - voxelPosition.x) / voxelDirection.x;
-            else if (voxelDirection.x < -1e-8f)
-                next.x = t + (ceil(voxelPosition.x - 1e-5f) - 1.f - voxelPosition.x) / voxelDirection.x;
-            if (voxelDirection.y > 1e-8f)
-                next.y = t + (floor(voxelPosition.y + 1e-5f) + 1.f - voxelPosition.y) / voxelDirection.y;
-            else if (voxelDirection.y < -1e-8f)
-                next.y = t + (ceil(voxelPosition.y - 1e-5f) - 1.f - voxelPosition.y) / voxelDirection.y;
-            if (voxelDirection.z > 1e-8f)
-                next.z = t + (floor(voxelPosition.z + 1e-5f) + 1.f - voxelPosition.z) / voxelDirection.z;
-            else if (voxelDirection.z < -1e-8f)
-                next.z = t + (ceil(voxelPosition.z - 1e-5f) - 1.f - voxelPosition.z) / voxelDirection.z;
-            const float nextT = min(pageInterval.y, min(next.x, min(next.y, next.z)));
-            if (nextT <= t + 1e-7f)
-                break;
-
-            static const float kGaussOffset = 0.2886751345948129f;
-            const float midpoint = 0.5f * (t + nextT);
-            const float segmentLength = nextT - t;
-            const float extinction0 = extinctionAt(position + (midpoint - kGaussOffset * segmentLength) * direction);
-            const float extinction1 = extinctionAt(position + (midpoint + kGaussOffset * segmentLength) * direction);
+            const float2 segment = leafInterval.x + float2(sample, sample + 1u) * dt;
+            const float midpoint = 0.5f * (segment.x + segment.y);
+            const float extinction = extinctionAt(position + midpoint * direction);
             compositeBallisticSegment(
-                position, direction, float2(t, nextT), totalWorldLength, extinction0, extinction1, volume, radiance, transmittance
+                position, direction, segment, totalWorldLength, extinction, extinction, volume, radiance, transmittance
             );
-            t = nextT;
-            ++segmentCount;
-            if (transmittance <= 1e-3f)
-                break;
         }
-        return segmentCount;
+        return sampleCount;
     }
 
     float4 integrateTransportCut(Ray ray, GridVolume volume, float2 interval, out float residualError, out float4 statistics)
@@ -294,6 +435,7 @@ struct HSTRCloudRenderer
         const float3 endPosition = (exitIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         const float3 direction = endPosition - position;
         const float totalWorldLength = length(ray.dir) * (interval.y - max(0.f, interval.x));
+        const float3 cameraLeafPosition = position - max(0.f, interval.x) * direction / max(1e-6f, interval.y - max(0.f, interval.x));
         float3 radiance = 0.f;
         float transmittance = 1.f;
         // A 32-entry DFS frontier covers binary HSTs with up to 2^31 leaves,
@@ -303,7 +445,7 @@ struct HSTRCloudRenderer
         stack[0] = params.hstrRootNode;
         uint visited = 0;
         uint acceptedPages = 0;
-        uint exactSegments = 0;
+        uint leafSamples = 0;
         [loop]
         while (stackSize > 0 && transmittance > 1e-3f)
         {
@@ -316,8 +458,15 @@ struct HSTRCloudRenderer
 
             const float nodeWorldLength = totalWorldLength * (nodeInterval.y - nodeInterval.x);
             const float transmittanceError = transmittance * (1.f - exp(-node.transmittancePage.x * nodeWorldLength));
-            const bool leaf = node.transmittancePage.y > 0.5f;
-            if (transmittanceError <= params.cutTransmittanceTolerance)
+            const bool leaf = node.minLeft.w == ~0u;
+            const float variation = (node.statistics.y - node.statistics.x) / max(1e-6f, node.statistics.y);
+            const float3 midpointPosition = position + 0.5f * (nodeInterval.x + nodeInterval.y) * direction;
+            const float nodeExtent =
+                max(node.maxRight.x - node.minLeft.x, max(node.maxRight.y - node.minLeft.y, node.maxRight.z - node.minLeft.z));
+            const float projectedPixels = params.frameDim.y * nodeExtent / max(1.f, length(midpointPosition - cameraLeafPosition));
+            const bool smoothTransport = !leaf && variation <= params.mixedFidelityThreshold &&
+                                         node.statistics.z <= params.mixedFidelityThreshold && projectedPixels <= 12.f;
+            if (transmittanceError <= params.cutTransmittanceTolerance || smoothTransport)
             {
                 integrateTransmittancePage(node, position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
                 residualError += transmittanceError;
@@ -326,9 +475,8 @@ struct HSTRCloudRenderer
             }
             if (leaf)
             {
-                exactSegments +=
-                    integrateExactTransmittancePage(position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
-                ++acceptedPages;
+                leafSamples += integrateFilteredLeaf(position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
+                residualError += transmittanceError;
                 continue;
             }
 
@@ -347,8 +495,136 @@ struct HSTRCloudRenderer
             else if (hitRight)
                 stack[stackSize++] = node.maxRight.w;
         }
-        statistics = float4(visited, acceptedPages, exactSegments, stackSize);
+        statistics = float4(visited, acceptedPages, leafSamples, stackSize);
         return float4(radiance + transmittance * sky, transmittance);
+    }
+
+    float4 integrateTileCut(
+        Ray ray,
+        GridVolume volume,
+        float2 interval,
+        uint2 pixel,
+        out float residualError,
+        out float4 statistics
+    )
+    {
+        const uint2 tile = pixel / 8u;
+        const uint tileID = tile.x + params.hstrTileDims.x * tile.y;
+        const uint countWord = hstrTileNodeCounts[tileID];
+        if (countWord > params.hstrMaxTileNodes)
+        {
+            const float4 result = integrateTransportCut(ray, volume, interval, residualError, statistics);
+            statistics.w = 1.f;
+            return result;
+        }
+
+        residualError = 0.f;
+        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
+        const float entry = max(0.f, interval.x);
+        const float3 entryIndex = mul(volume.data.invTransform, float4(ray.origin + entry * ray.dir, 1.f)).xyz;
+        const float3 exitIndex = mul(volume.data.invTransform, float4(ray.origin + interval.y * ray.dir, 1.f)).xyz;
+        const float3 position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 endPosition = (exitIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 direction = endPosition - position;
+        const float totalWorldLength = length(ray.dir) * (interval.y - entry);
+        float3 radiance = 0.f;
+        float transmittance = 1.f;
+        uint acceptedPages = 0;
+        uint leafSamples = 0;
+        const uint count = countWord;
+        const uint base = tileID * params.hstrMaxTileNodes;
+        [loop]
+        for (uint i = 0; i < count && transmittance > 1e-3f; ++i)
+        {
+            const HSTRCutNode node = hstrCutNodes[hstrTileNodes[base + i]];
+            float2 nodeInterval;
+            if (!intersectCutNode(node, position, direction, nodeInterval))
+                continue;
+            const float nodeWorldLength = totalWorldLength * (nodeInterval.y - nodeInterval.x);
+            const float transmittanceError = transmittance * (1.f - exp(-node.transmittancePage.x * nodeWorldLength));
+            const bool leaf = node.minLeft.w == ~0u;
+            if (leaf && transmittanceError > params.cutTransmittanceTolerance)
+                leafSamples += integrateFilteredLeaf(
+                    position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance
+                );
+            else
+            {
+                integrateTransmittancePage(node, position, direction, nodeInterval, totalWorldLength, volume, radiance, transmittance);
+                ++acceptedPages;
+            }
+            residualError += transmittanceError;
+        }
+        statistics = float4(count, acceptedPages, leafSamples, 0.f);
+        return float4(radiance + transmittance * sky, transmittance);
+    }
+
+    float tileTransmittance(Ray ray, GridVolume volume, float2 interval, uint2 pixel)
+    {
+        const uint2 tile = pixel / 8u;
+        const uint tileID = tile.x + params.hstrTileDims.x * tile.y;
+        const uint countWord = hstrTileNodeCounts[tileID];
+        if (countWord > params.hstrMaxTileNodes)
+        {
+            float residualError;
+            return integrateVolume(ray, volume, 192u, pixel, false, residualError).a;
+        }
+        const float entry = max(0.f, interval.x);
+        const float3 entryIndex = mul(volume.data.invTransform, float4(ray.origin + entry * ray.dir, 1.f)).xyz;
+        const float3 exitIndex = mul(volume.data.invTransform, float4(ray.origin + interval.y * ray.dir, 1.f)).xyz;
+        const float3 position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+        const float3 direction = (exitIndex - entryIndex) / float(params.hstrCellWidth);
+        const float totalWorldLength = length(ray.dir) * (interval.y - entry);
+        float transmittance = 1.f;
+        const uint base = tileID * params.hstrMaxTileNodes;
+        [loop]
+        for (uint i = 0; i < countWord && transmittance > 1e-3f; ++i)
+        {
+            const HSTRCutNode node = hstrCutNodes[hstrTileNodes[base + i]];
+            float2 nodeInterval;
+            if (!intersectCutNode(node, position, direction, nodeInterval))
+                continue;
+            const float nodeWorldLength = totalWorldLength * (nodeInterval.y - nodeInterval.x);
+            const float pageError = 1.f - exp(-node.transmittancePage.x * nodeWorldLength);
+            if (node.minLeft.w == ~0u && pageError > params.cutTransmittanceTolerance)
+            {
+                const float parameterLength = nodeInterval.y - nodeInterval.x;
+                const float voxelLength = parameterLength * length(direction) * float(params.hstrCellWidth);
+                const uint sampleCount = clamp(uint(ceil(0.25f * voxelLength)), 2u, 8u);
+                const float dt = parameterLength / float(sampleCount);
+                [loop]
+                for (uint sample = 0; sample < sampleCount; ++sample)
+                {
+                    const float t = nodeInterval.x + (float(sample) + 0.5f) * dt;
+                    transmittance *= exp(-extinctionAt(position + t * direction) * totalWorldLength * dt);
+                }
+            }
+            else
+            {
+                static const float kGaussOffset = 0.2886751345948129f;
+                const float midpoint = 0.5f * (nodeInterval.x + nodeInterval.y);
+                const float segmentLength = nodeInterval.y - nodeInterval.x;
+                const float extinction0 = transmittancePageAt(
+                    node, position + (midpoint - kGaussOffset * segmentLength) * direction
+                );
+                const float extinction1 = transmittancePageAt(
+                    node, position + (midpoint + kGaussOffset * segmentLength) * direction
+                );
+                transmittance *= exp(-0.5f * nodeWorldLength * (extinction0 + extinction1));
+            }
+        }
+        return transmittance;
+    }
+
+    void writeCameraQuery(uint2 query)
+    {
+        if (any(query >= params.hstrQueryDims) || gScene.getGridVolumeCount() == 0)
+            return;
+        const uint2 pixel = min(query * params.hstrQueryStride, params.frameDim - 1u);
+        const Ray ray = gScene.camera.computeRayPinhole(pixel, params.frameDim);
+        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
+        float residualError;
+        const float4 result = integrateVolume(ray, gScene.getGridVolume(0), params.hstrQuerySteps, pixel, true, residualError);
+        hstrCameraQueryOutput[query] = float4(result.rgb - result.a * sky, result.a);
     }
 
     float3 deterministicResidual(GridVolume volume, Grid grid, float3 indexPosition, float3 viewDirection, inout Grid::Accessor accessor)
@@ -385,7 +661,14 @@ struct HSTRCloudRenderer
         return (value & 0x00ffffffu) / 16777216.f;
     }
 
-    float4 integrateVolume(Ray ray, GridVolume volume, uint stepCount, uint2 pixel, out float residualError)
+    float4 integrateVolume(
+        Ray ray,
+        GridVolume volume,
+        uint stepCount,
+        uint2 pixel,
+        bool cachedLighting,
+        out float residualError
+    )
     {
         residualError = 0.f;
         const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
@@ -415,7 +698,9 @@ struct HSTRCloudRenderer
 
             const float alpha = 1.f - exp(-extinction * stepLength);
             const float3 indexPosition = mul(volume.data.invTransform, float4(position, 1.f)).xyz;
-            const float3 base = hstrLighting(indexPosition, ray.dir);
+            const float3 leafSamplePosition =
+                (indexPosition - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
+            const float3 base = cachedLighting ? cameraLightingAt(leafSamplePosition) : hstrLighting(indexPosition, ray.dir);
             const int3 leafPosition = int3((indexPosition - float3(params.hstrGridMin)) / float(params.hstrCellWidth));
             const int3 windowOffset = abs(leafPosition - int3(params.schurWindowCenter));
             const bool insideWindow = all(windowOffset <= int(params.schurWindowRadius));
@@ -458,7 +743,15 @@ struct HSTRCloudRenderer
         {
             float residualError;
             color[pixel] = float4(
-                integrateVolume(ray, volume, min(1024u, (params.baseSteps << params.refinementLevel) << 1), pixel, residualError).rgb, 1.f
+                integrateVolume(
+                    ray,
+                    volume,
+                    min(1024u, (params.baseSteps << params.refinementLevel) << 1),
+                    pixel,
+                    false,
+                    residualError
+                ).rgb,
+                1.f
             );
             transportError[pixel] = residualError;
             cutStats[pixel] = 0;
@@ -466,11 +759,15 @@ struct HSTRCloudRenderer
         }
 
         // HST-Cut: traverse preintegrated transport nodes, not NanoVDB samples.
-        float residualError;
-        float4 statistics;
-        color[pixel] = float4(integrateTransportCut(ray, volume, interval, residualError, statistics).rgb, 1.f);
-        transportError[pixel] = residualError;
-        cutStats[pixel] = statistics;
+        const float transmittance = tileTransmittance(ray, volume, interval, pixel);
+        const float2 queryPosition = float2(pixel) / float(params.hstrQueryStride);
+        const float2 queryUV = (queryPosition + 0.5f) / float2(params.hstrQueryDims);
+        const float4 query = hstrCameraQueries.SampleLevel(hstrExtinctionSampler, queryUV, 0.f);
+        const float queryOpacity = max(1e-4f, 1.f - query.a);
+        const float opacity = 1.f - transmittance;
+        color[pixel] = float4(query.rgb * (opacity / queryOpacity) + transmittance * sky, 1.f);
+        transportError[pixel] = 0.f;
+        cutStats[pixel] = float4(0.f, 0.f, 0.f, transmittance);
     }
 };
 
@@ -489,6 +786,30 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 void updateCameraLighting(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.writeCameraLighting(dispatchThreadId);
+}
+
+[numthreads(8, 8, 1)]
+void buildCameraQueries(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.writeCameraQuery(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void projectCutNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.projectCutNode(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void binCutNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.binCutNode(dispatchThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void sortTileCuts(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.sortTileCut(dispatchThreadId.xy);
 }
 
 [numthreads(64, 1, 1)]

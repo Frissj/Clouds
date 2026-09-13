@@ -20,7 +20,7 @@ def render_graph_HSTRCloud():
         "localSourceRadiance": float3(0.0),
         "mixedFidelityThreshold": 0.15,
         "operatorDictionaryTolerance": 1e-4,
-        "cutTransmittanceTolerance": 0.01,
+        "cutTransmittanceTolerance": 0.05,
     }), "HSTRCloud")
     graph.addPass(createPass("ToneMapper", {
         "autoExposure": False,
