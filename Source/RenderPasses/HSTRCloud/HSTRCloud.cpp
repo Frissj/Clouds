@@ -81,6 +81,12 @@ const char kWorldCacheModulationDepth[] = "worldCacheModulationDepth";
 const char kWorldCacheZonalBands[] = "worldCacheZonalBands";
 const char kWorldCacheZonalWindow[] = "worldCacheZonalWindow";
 const char kWorldCacheSunOrder[] = "worldCacheSunOrder";
+const char kSunNearVoxels[] = "sunNearVoxels";
+const char kMaxMarchSteps[] = "maxMarchSteps";
+const char kAdaptiveMarch[] = "adaptiveMarch";
+const char kMarchTolerance[] = "marchTolerance";
+const char kMarchMinVoxels[] = "marchMinVoxels";
+const char kMarchCoarseVoxels[] = "marchCoarseVoxels";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
@@ -300,6 +306,18 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.worldCacheZonalWindow = value;
         else if (key == kWorldCacheSunOrder)
             mParams.worldCacheSunOrder = std::clamp(uint32_t(value), 2u, 3u);
+        else if (key == kSunNearVoxels)
+            mParams.sunNearVoxels = std::clamp(float(value), 0.f, 16.f);
+        else if (key == kMaxMarchSteps)
+            mParams.maxMarchSteps = std::max(1u, uint32_t(value));
+        else if (key == kAdaptiveMarch)
+            mParams.adaptiveMarch = bool(value) ? 1u : 0u;
+        else if (key == kMarchTolerance)
+            mParams.marchTolerance = std::max(1e-6f, float(value));
+        else if (key == kMarchMinVoxels)
+            mParams.marchMinVoxels = std::max(1e-3f, float(value));
+        else if (key == kMarchCoarseVoxels)
+            mParams.marchCoarseVoxels = std::max(0.1f, float(value));
         else if (key == kSaveReference)
             mSaveReferencePath = value.operator std::string();
         else if (key == kLoadReference)
@@ -433,6 +451,12 @@ Properties HSTRCloud::getProperties() const
     props[kWorldCacheZonalBands] = mParams.worldCacheZonalBands;
     props[kWorldCacheZonalWindow] = mParams.worldCacheZonalWindow;
     props[kWorldCacheSunOrder] = mParams.worldCacheSunOrder;
+    props[kSunNearVoxels] = mParams.sunNearVoxels;
+    props[kMaxMarchSteps] = mParams.maxMarchSteps;
+    props[kAdaptiveMarch] = mParams.adaptiveMarch != 0;
+    props[kMarchTolerance] = mParams.marchTolerance;
+    props[kMarchMinVoxels] = mParams.marchMinVoxels;
+    props[kMarchCoarseVoxels] = mParams.marchCoarseVoxels;
     props[kBeamTolerance] = mParams.beamTolerance;
     props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
     props[kStoreExact] = mStoreExact;

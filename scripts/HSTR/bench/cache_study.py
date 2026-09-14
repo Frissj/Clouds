@@ -23,8 +23,13 @@ target = float3(-10.0, 73.0, -43.0)
 radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
-        "worldCacheBakeInterval": 1, "stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "debugView": 8,
-        "worldCacheModulation": 0.0, "worldCacheZonalBands": 0, "worldCacheZonalWindow": 0, "worldCacheSunOrder": 2}
+        "worldCacheBakeInterval": 1, "stepOpticalDepth": 0.5, "lightingStride": 1, "debugView": 8,
+        # The camera integrates analytically with error-controlled bisection (march_study.py); the fixed march resolves the
+        # lit skin only at small steps (a voxel is many optical depths).
+        "adaptiveMarch": True, "marchTolerance": 0.01, "marchCoarseVoxels": 2.0,
+        "minStepVoxels": float(os.environ.get("HSTR_MINSTEP", "0.1")),
+        "worldCacheModulation": 0.0, "worldCacheZonalBands": 0, "worldCacheZonalWindow": 0, "worldCacheSunOrder": 2,
+        "sunNearVoxels": 0.0, "maxMarchSteps": int(os.environ.get("HSTR_MAXSTEPS", "8192"))}
 # Every configuration starts from these, so no setting leaks into the next.
 SUFFIX = ""  # Reference name suffix for non-default media.
 if os.environ.get("HSTR_ANISOTROPY"):
@@ -82,6 +87,13 @@ configs = [
     ("sun L3 64x", {"worldCacheModulation": -1.0, "worldCacheSunOrder": 3}, 2048),
     ("1-voxel 64x", {"worldCacheModulation": -1.0, "worldCacheCellVoxels": 1}, 2048),
     ("no window 64x", {"worldCacheModulation": -1.0, "worldCacheWindow": 0}, 2048),
+    # Fixed camera march, for comparison with the adaptive one: at least minStepVoxels voxels per step.
+    ("fixed 1", {"worldCacheModulation": -1.0, "adaptiveMarch": False, "minStepVoxels": 1.0}, 512),
+    ("fixed 0.1", {"worldCacheModulation": -1.0, "adaptiveMarch": False, "minStepVoxels": 0.1}, 512),
+    ("no modulation", {"worldCacheModulation": 0.0}, 512),
+    ("mod 0.1 64x", {"worldCacheModulation": 0.1}, 2048),
+    ("mod 0.14 64x", {"worldCacheModulation": 0.14}, 2048),
+    ("mod depth 16 64x", {"worldCacheModulation": -1.0, "worldCacheModulationDepth": 16.0}, 2048),
 ]
 MAP = float(os.environ.get("HSTR_MAP", "0"))  # >0: also capture each configuration's signed block log error map at this scale.
 tone = g.getPass("ToneMapper")
@@ -129,18 +141,31 @@ for name, position, sun in views:
         pixel = measure(15, 1)
         lines.append(f"{name:10s} {label:24s} {BLOCK}x{BLOCK}-block log err: full {full[0]:.4f}  smooth {smooth[0]:.4f}  "
                      f"(noise {full[1]:.4f})  per pixel: full {pixel[0]:.4f} (noise {pixel[1]:.4f})")
+        # HSTR_MEASUREMASKS adds block errors of single components (1 background, 2 single scatter).
+        for mask in [int(v) for v in os.environ.get("HSTR_MEASUREMASKS", "").split(",") if v]:
+            lines.append(f"{'':10s} {'':24s} component {mask}: {measure(mask)[0]:.4f}")
         m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}"
         m.frameCapture.capture()
+        # HSTR_FRAMEMASKS captures frames of single components (1 background, 2 single scatter, 12 the cache).
+        for mask in [int(v) for v in os.environ.get("HSTR_FRAMEMASKS", "").split(",") if v]:
+            hstr.set_properties({"hstComponents": mask})
+            m.renderFrame()
+            m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}_c{mask}"
+            m.frameCapture.capture()
+            hstr.set_properties({"hstComponents": 15})
         if MAP > 0:
             # Red: brighter than the reference, blue: darker, saturating at MAP; the tone mapper passes it through unchanged.
+            # HSTR_MAPMASKS maps single components too (1 background, 2 single scatter, 12 the cache).
             operator = tone.properties["operator"]
             tone.set_properties({"operator": "Linear"})
-            hstr.set_properties({"hstComponents": 15, "compareTarget": 15, "compareSubstitute": 0, "compareBlock": BLOCK,
-                                 "compareMapScale": MAP, "compareReference": True})
-            m.renderFrame()
-            m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}_errmap"
-            m.frameCapture.capture()
-            hstr.set_properties({"compareReference": False, "compareMapScale": 0.0, "compareBlock": 1})
+            for mask in [int(v) for v in os.environ.get("HSTR_MAPMASKS", "15").split(",")]:
+                hstr.set_properties({"hstComponents": mask, "compareTarget": mask, "compareSubstitute": 0, "compareBlock": BLOCK,
+                                     "compareMapScale": MAP, "compareReference": True})
+                m.renderFrame()
+                suffix = "" if mask == 15 else f"_c{mask}"
+                m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}_errmap{suffix}"
+                m.frameCapture.capture()
+            hstr.set_properties({"compareReference": False, "compareMapScale": 0.0, "compareBlock": 1, "hstComponents": 15})
             tone.set_properties({"operator": operator})
         with open(f"{OUT}/{TAG}_test.txt", "w") as f:
             f.write("\n".join(lines) + "\n")

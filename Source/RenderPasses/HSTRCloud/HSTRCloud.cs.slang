@@ -62,6 +62,26 @@ struct BeamSample
     float depth;
 };
 
+/// Camera-ray sample of the adaptive cache march (integrateCachedSegment).
+struct MarchSample
+{
+    float t;         ///< Ray parameter.
+    float sigma;     ///< Extinction.
+    float sunCache;  ///< Sun optical depth of the cache modulation (the voxel-centre field, capped as the deposits cap it).
+    float sunSingle; ///< Sun optical depth of single scattering (sunDepthAt).
+    float3 cache;    ///< Stored (demodulated) cache radiance towards the camera.
+};
+
+/// Light gathered over one camera segment from unit transmittance, and its optical depth.
+struct SegmentLight
+{
+    float3 cache;
+    float3 single;
+    float depth;
+};
+
+static const uint kMarchStack = 8; ///< Pending right halves of bisected segments.
+
 /// A primary ray restricted to the volume bounds, expressed in leaf space.
 /// position is the entry point (t = 0), direction the entry-to-exit vector (t = 1).
 struct CutRay
@@ -280,14 +300,41 @@ struct HSTRCloudRenderer
         return float4(phaseHG(cosine, g), a * phaseHG(cosine, c * g), a * a * phaseHG(cosine, c * c * g), a * a * a * phaseHG(cosine, c * c * c * g));
     }
 
-    /// Rasterized sun residual at v (before albedo): the page's sun optical depth attenuated per octave.
-    /// The stored depth is read one voxel upstream towards the sun and the last voxel is integrated from the trilinear density
-    /// at v itself, so the sub-voxel lit shell of thick surfaces follows the density instead of the voxel grid.
-    float3 residualAtVoxel(float3 v, float4 octaves)
+    /// Sun optical depth from voxel position v to the grid boundary. The voxel-centre field alone steps at voxel scale, where
+    /// a voxel of cloud is many optical depths: the first sunNearVoxels voxels towards the sun are marched on the trilinear
+    /// density (majorant-bounded steps of at most stepOpticalDepth), so lit skins, shadow edges and terminators follow the
+    /// density below voxel scale, and the field is read only where the march leaves off. Past kSunDepthOpaque nothing is lit.
+    float sunDepthAt(float3 v)
     {
-        const float3 upstream = v + params.sunVoxelDirection;
-        const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (upstream + 0.5f) / float3(params.hstrFineDims), 0.f) +
-                            extinctionAtVoxel(v + 0.5f * params.sunVoxelDirection) * params.sunVoxelWorldLength;
+        static const float kSunDepthOpaque = 12.f;
+        const float3 direction = params.sunVoxelDirection;
+        const float near = params.sunNearVoxels;
+        if (near <= 0.f)
+            return hstrFineSun.SampleLevel(hstrLinearSampler, (v + direction + 0.5f) / float3(params.hstrFineDims), 0.f) +
+                   extinctionAtVoxel(v + 0.5f * direction) * params.sunVoxelWorldLength;
+        float depth = 0.f;
+        float t = 0.f;
+        [loop]
+        for (uint i = 0; i < 64 && t < near; ++i)
+        {
+            const float3 p = v + t * direction;
+            const float majorant = majorantAt(p);
+            const float dt = min(clamp(params.stepOpticalDepth / max(1e-6f, majorant * params.sunVoxelWorldLength), 0.0625f, 1.f), near - t);
+            if (majorant > 0.f)
+                depth += extinctionAtVoxel(p + 0.5f * dt * direction) * dt * params.sunVoxelWorldLength;
+            t += dt;
+            if (depth > kSunDepthOpaque)
+                return depth;
+        }
+        return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (v + t * direction + 0.5f) / float3(params.hstrFineDims), 0.f);
+    }
+
+    /// Rasterized sun residual at v (before albedo): the sun optical depth attenuated per octave.
+    float3 residualAtVoxel(float3 v, float4 octaves) { return residualAtDepth(v, sunDepthAt(v), octaves); }
+
+    /// residualAtVoxel for an already computed sun optical depth at v.
+    float3 residualAtDepth(float3 v, float depth, float4 octaves)
+    {
         if (all(octaves.yzw == 0.f))
             return params.residualStrength * params.sunRadiance * octaves.x * exp(-depth);
         // Octaves 1-3 are multiply scattered: they arrive from the scatterers around v, not along v's own sun ray.
@@ -547,6 +594,163 @@ struct HSTRCloudRenderer
     // ---------------------------------------------------------------------------------------------
     // Transmittance and source integration along the projected cut.
 
+    // ---------------------------------------------------------------------------------------------
+    // Adaptive cache march. The cache frame's sources are exp(-b tau_sun) times a smooth factor: the cache modulation
+    // (b = worldCacheModulation) times the stored cache R, and single scattering (b = 1) times a constant. Over a segment
+    // with constant extinction, linear tau_sun and linear R, sigma T(s) exp(-b tau_sun(s)) R(s) integrates in closed form, so
+    // the lit skin needs no small steps. Each segment is compared with its two halves; it is bisected only while that
+    // difference, projected through the ray's transmittance, exceeds marchTolerance of the pixel.
+
+    /// Sample at ray parameter t. The stored cache R is smooth at cell scale, so it is looked up only at coarse segment ends
+    /// (withCache); samples inside a coarse segment interpolate it and resolve only the extinction and the sun depths.
+    MarchSample marchSampleAt(CutRay ray, float t, bool withSource, bool withSingle, bool withCache = true)
+    {
+        const float3 v = (ray.position + t * ray.direction) * float(params.hstrCellWidth);
+        MarchSample s;
+        s.t = t;
+        s.sigma = extinctionAtVoxel(v);
+        s.sunCache = 0.f;
+        s.sunSingle = 0.f;
+        s.cache = 0.f;
+        if (withSource)
+        {
+            if (params.worldCacheModulation > 0.f)
+                s.sunCache = min(hstrFineSun.SampleLevel(hstrLinearSampler, (v + 0.5f) / float3(params.hstrFineDims), 0.f),
+                                 params.worldCacheModulationDepth);
+            if (withCache)
+                s.cache = worldCacheRadianceStored(v, ray.viewDirection);
+        }
+        if (withSingle)
+            s.sunSingle = sunDepthAt(v);
+        return s;
+    }
+
+    /// E0 = int_0^h exp(-K s) ds and E1 = int_0^h s exp(-K s) ds, with series near K h = 0.
+    float2 exponentialMoments(float K, float h)
+    {
+        const float x = K * h;
+        if (abs(x) < 1e-2f)
+            return float2(h * (1.f - x / 2.f + x * x / 6.f), h * h * (0.5f - x / 3.f + x * x / 8.f));
+        const float e = exp(-x);
+        return float2((1.f - e) / K, (1.f - e * (1.f + x)) / (K * K));
+    }
+
+    /// Light of segment [a, b] of world length h from unit transmittance: extinction the endpoint mean, sun depths and cache
+    /// linear between the endpoints.
+    SegmentLight segmentLight(MarchSample a, MarchSample b, float h, float3 singleScale)
+    {
+        SegmentLight light;
+        const float sigma = 0.5f * (a.sigma + b.sigma);
+        light.depth = sigma * h;
+        const float bc = params.worldCacheModulation > 0.f ? params.worldCacheModulation : 0.f;
+        const float2 cacheMoments = exponentialMoments(sigma + bc * (b.sunCache - a.sunCache) / h, h);
+        light.cache = sigma * exp(-bc * a.sunCache) * (a.cache * cacheMoments.x + (b.cache - a.cache) * (cacheMoments.y / h));
+        const float2 singleMoments = exponentialMoments(sigma + (b.sunSingle - a.sunSingle) / h, h);
+        light.single = sigma * exp(-a.sunSingle) * singleMoments.x * singleScale;
+        return light;
+    }
+
+    void integrateCachedSegment(
+        CutRay ray,
+        float2 segment,
+        bool withSource,
+        bool withSingle,
+        inout float3 radiance,
+        inout float3 singleRadiance,
+        inout float transmittance,
+        inout uint steps
+    )
+    {
+        const float voxelsPerUnit = length(ray.direction) * float(params.hstrCellWidth);
+        if (voxelsPerUnit <= 1e-6f)
+            return;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        const float3 singleScale = withSingle ? params.residualStrength * params.sunRadiance * ray.sunOctaves.x : 0.f;
+        const float skyLevel = dot(params.skyRadiance, 1.f / 3.f);
+        const float minUnits = params.marchMinVoxels / voxelsPerUnit;
+
+        MarchSample a;
+        MarchSample b;
+        bool haveA = false;
+        bool haveB = false;
+        MarchSample pending[kMarchStack];
+        uint depth = 0;
+        float t = segment.x;
+        [loop]
+        while (t < segment.y && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
+        {
+            if (!haveB)
+            {
+                // A new coarse segment: majorant-bounded, and empty blocks are crossed without samples.
+                const float3 v = (ray.position + t * ray.direction) * float(params.hstrCellWidth);
+                const float majorant = majorantAt(v);
+                const float stepVoxels = clamp(
+                    params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel),
+                    params.marchCoarseVoxels,
+                    max(params.maxStepVoxels, params.marchCoarseVoxels)
+                );
+                const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
+                if (majorant <= 0.f)
+                {
+                    t += dt;
+                    haveA = false;
+                    ++steps;
+                    continue;
+                }
+                if (!haveA)
+                {
+                    a = marchSampleAt(ray, t, withSource, withSingle);
+                    haveA = true;
+                }
+                b = marchSampleAt(ray, t + dt, withSource, withSingle);
+                haveB = true;
+            }
+            const float h = (b.t - a.t) * ray.worldLength;
+            MarchSample m = marchSampleAt(ray, 0.5f * (a.t + b.t), withSource, withSingle, false);
+            m.cache = 0.5f * (a.cache + b.cache);
+            ++steps;
+            const SegmentLight whole = segmentLight(a, b, h, singleScale);
+            const SegmentLight first = segmentLight(a, m, 0.5f * h, singleScale);
+            const SegmentLight second = segmentLight(m, b, 0.5f * h, singleScale);
+            const float firstTransmittance = exp(-first.depth);
+            const float3 halves = first.cache + first.single + firstTransmittance * (second.cache + second.single);
+            const float halvesDepth = first.depth + second.depth;
+            // Error of the whole-segment model: its light, and its transmittance times the light behind (at most about the
+            // sources here plus the sky), relative to 1 + the pixel's radiance so far and what may still arrive.
+            const float behind = max(max(maxComponent(m.cache * exp(-params.worldCacheModulation * m.sunCache)), maxComponent(singleScale) * exp(-m.sunSingle)), skyLevel);
+            const float error = transmittance * (maxComponent(abs(whole.cache + whole.single - halves)) + abs(exp(-whole.depth) - exp(-halvesDepth)) * behind);
+            const float scale = 1.f + maxComponent(radiance + singleRadiance) + transmittance * behind;
+            if (error <= params.marchTolerance * scale || b.t - a.t <= minUnits || depth >= kMarchStack)
+            {
+                radiance += transmittance * (first.cache + firstTransmittance * second.cache);
+                singleRadiance += transmittance * (first.single + firstTransmittance * second.single);
+                transmittance *= exp(-halvesDepth);
+                a = b;
+                t = b.t;
+                haveB = depth > 0;
+                if (haveB)
+                    b = pending[--depth];
+                // Once all the light that can still arrive is within the tolerance, the rest of the ray is closed off as
+                // an opaque medium lit like this sample.
+                const float3 cacheHere = a.cache * exp(-params.worldCacheModulation * a.sunCache);
+                const float3 singleHere = singleScale * exp(-a.sunSingle);
+                const float remaining = transmittance * max(maxComponent(cacheHere + singleHere), skyLevel);
+                if (a.sigma > 0.f && remaining <= params.marchTolerance * (1.f + maxComponent(radiance + singleRadiance)))
+                {
+                    radiance += transmittance * cacheHere;
+                    singleRadiance += transmittance * singleHere;
+                    transmittance = 0.f;
+                    break;
+                }
+            }
+            else
+            {
+                pending[depth++] = b;
+                b = m;
+            }
+        }
+    }
+
     /// Majorant-bounded march of [segment.x, segment.y]: every step spans at most stepOpticalDepth at the local extinction
     /// bound, so thick shells are resolved at sub-voxel spacing while empty blocks are crossed in one step.
     /// radiance accumulates the camera-basis source when withSource is set; residualRadiance accumulates the rasterized residual
@@ -568,6 +772,11 @@ struct HSTRCloudRenderer
             return;
         const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
         const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
+        if (cached && params.adaptiveMarch != 0)
+        {
+            integrateCachedSegment(ray, segment, withSource, residual, radiance, residualRadiance, transmittance, steps);
+            return;
+        }
         float3 held = 0.f;
         float3 heldAt = 0.f;
         uint sinceLighting = ~0u;
@@ -1207,17 +1416,18 @@ struct HSTRCloudRenderer
                 const uint base = index + 9 * field;
                 // Deposits are divided by the modulation at the middle of this cell's part of the flight.
                 const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
+                const float scale = perUnit * fraction * inverseModulation;
                 for (uint k = 0; k < coefficients; ++k)
                 {
                     // Stochastic rounding keeps the fixed-point sum unbiased.
-                    const float value = shBasis(k, look) * perUnit * fraction * inverseModulation;
+                    const float value = shBasis(k, look) * scale;
                     const int quantized = int(floor(value + randomFloat(rng)));
                     if (quantized != 0)
                         InterlockedAdd(hstrWorldCacheDeposit[base + k], quantized);
                 }
                 for (uint j = 0; j < extension; ++j)
                 {
-                    const float value = extensionBasis[j] * perUnit * fraction * inverseModulation;
+                    const float value = extensionBasis[j] * scale;
                     const int quantized = int(floor(value + randomFloat(rng)));
                     if (quantized != 0)
                         InterlockedAdd(hstrWorldCacheDeposit[index + 18 + j], quantized);
@@ -1587,6 +1797,7 @@ struct HSTRCloudRenderer
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
     /// the HG phase convolves SH band l by g^l. Trilinear over valid cell centres (cells without an estimate get no weight
     /// rather than black light); bands above worldCacheOrder are dropped.
+    /// The modulation reads the voxel-centre sun field exactly as the photon deposits do, so the stored ratio cancels.
     float3 worldCacheRadiance(float3 v, float3 w) { return worldCacheModulation(v) * worldCacheRadianceStored(v, w); }
 
     /// Voxel-resolution factor the cache is divided by when deposited and multiplied by when read: exp(-b tau_sun), with tau_sun

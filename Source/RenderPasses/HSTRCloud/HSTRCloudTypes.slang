@@ -46,7 +46,7 @@ struct HSTRCloudParams
 
     uint2 hstrLatticeDims = { 0, 0 }; ///< Tile-corner camera queries, (tileDims + 1).
     uint hstrTileSize = 8;
-    uint maxMarchSteps = 512;
+    uint maxMarchSteps = 4096;
 
     int3 hstrGridMin = { 0, 0, 0 };
     uint frameIndex = 0;
@@ -183,6 +183,18 @@ struct HSTRCloudParams
     uint worldCacheZonalWindow = 0; ///< Window order of that zonal part (0: max(worldCacheZonalBands, 2)).
     uint worldCacheSunOrder = 2;    ///< 3: the sun field carries all of band 3 (7 extension slots) instead of zonal bands.
     uint padHSTR27 = 0;
+
+    uint padHSTR28 = 0;
+    float sunNearVoxels = 0.f; ///< Camera samples march the sun optical depth exactly over this many voxels towards the sun, then
+                               ///< read the voxel-centre field; 0: one-voxel midpoint step onto the field (enough for the
+                               ///< adaptive march, which integrates the sun attenuation analytically).
+    uint padHSTR29 = 0;
+    uint padHSTR30 = 0;
+
+    uint adaptiveMarch = 1;          ///< 1: the cache views integrate camera segments analytically and bisect on estimated error.
+    float marchTolerance = 0.01f;    ///< Accepted segment error relative to 1 + the pixel's expected radiance.
+    float marchMinVoxels = 0.03f;    ///< Shortest bisected segment.
+    float marchCoarseVoxels = 2.f;   ///< Shortest coarse segment in the medium (longer where the majorant allows).
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
