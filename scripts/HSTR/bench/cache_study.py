@@ -50,7 +50,10 @@ configs = [
     ("L1 window", {"worldCacheOrder": 1}, 512),
     # Cache stored relative to exp(-b tau_sun) of the voxel-resolution sun field.
     ("auto", {"worldCacheModulation": -1.0}, 32),
+    ("auto 4x photons", {"worldCacheModulation": -1.0}, 128),
     ("auto 16x photons", {"worldCacheModulation": -1.0}, 512),
+    ("auto no window 16x", {"worldCacheModulation": -1.0, "worldCacheWindow": 0}, 512),
+    ("auto L1 16x", {"worldCacheModulation": -1.0, "worldCacheOrder": 1}, 512),
     ("mod 0.05", {"worldCacheModulation": 0.05}, 512),
     ("mod 0.07", {"worldCacheModulation": 0.07}, 512),
     ("mod 0.1", {"worldCacheModulation": 0.1}, 512),
