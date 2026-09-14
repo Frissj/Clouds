@@ -619,6 +619,13 @@ struct HSTRCloudRenderer
     // with constant extinction, linear tau_sun and linear R, sigma T(s) exp(-b tau_sun(s)) R(s) integrates in closed form, so
     // the lit skin needs no small steps. Each segment is compared with its two halves; it is bisected only while that
     // difference, projected through the ray's transmittance, exceeds marchTolerance of the pixel.
+    //
+    // Measured and switched off by default (adaptiveMarch 0): 8x8-block log error against the 4K path tracer / GPU ms of the
+    // per-pixel view 8 and the beam view 9. Sunbehind: fixed 1-voxel steps 0.0252 (6.1 / 3.3 ms), fixed 0.1-voxel steps
+    // 0.0243 (~100 / 36 ms), adaptive 0.0236 (17 / 6.2 ms). Side: fixed 0.0264 (6.6 / 4.1 ms), adaptive 0.0256 (17 / 5.7 ms).
+    // After the beam optimizations (beam_truth h16x3 full .05): fixed ~1.0 ms, adaptive ~2.0 ms for ~0.001-0.002 less
+    // error. marchTolerance 0 (analytic integration, no bisection) still costs 1.8-2.0 ms: every sample does the full cache
+    // lookup. The remaining error is in the cache, not the camera quadrature.
 
     /// Sample at ray parameter t. The stored cache R is smooth at cell scale, so it is looked up only at coarse segment ends
     /// (withCache); samples inside a coarse segment interpolate it and resolve only the extinction and the sun depths.
@@ -783,6 +790,10 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// The fixed march's voxel "drip" artefacts against the path tracer come from its 1-voxel minimum step (a voxel of cloud is
+    /// ~10 optical depths, so a sample sits half a voxel inside the lit skin), not from the cache; finer steps fix them at
+    /// 10x the cost (see the adaptive march above). Background and single scatter are exact with fine steps (log error
+    /// 0.0002 / 0.0006), so all remaining error is the cache.
     /// Majorant-bounded march of [segment.x, segment.y]: every step spans at most stepOpticalDepth at the local extinction
     /// bound, so thick shells are resolved at sub-voxel spacing while empty blocks are crossed in one step.
     /// radiance accumulates the camera-basis source when withSource is set; residualRadiance accumulates the rasterized residual
@@ -1453,6 +1464,11 @@ struct HSTRCloudRenderer
     /// Light-tracing deposit of one straight flight from v0 to v1 (voxel coordinates): track length per crossed cell times
     /// the photon weight, projected on SH bands 0-worldCacheBands of the direction the light arrives from, plus the sun
     /// extension slots for the sun field, into the photon's accumulator.
+    ///
+    /// Tried and removed (sunbehind, 8x8-block log error): density-weighted collision deposits (0.07-0.37, far noisier than
+    /// track length); skin-weighted deposits, sigma times the visibility from outside (best 0.0246, equal to track length
+    /// within run noise); skipping empty 16-voxel blocks in this cell walk (1.75 vs 1.78 ms per frame, no gain: the
+    /// per-cell majorant test already rejects them cheaply).
     void depositSegment(float3 v0, float3 v1, float3 look, float weight, inout DepositAccumulator acc, inout uint rng)
     {
         const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
@@ -1537,6 +1553,14 @@ struct HSTRCloudRenderer
 
     /// One light-tracing photon: emitted from the sun through a sun-facing side of the grid box, or from the unit-colour sky
     /// through any side, chosen by power. Every flight segment after the first sun segment (direct sunlight) is deposited.
+    ///
+    /// Photon cost history (65536 photons per update, 4K laptop GPU): 5.8-6.4 ms -> 1.8-1.9 ms from the similarity relation
+    /// (photonSimilar), deposits skipping cells without medium, the undilated majorant with 16-voxel empty skipping
+    /// (sampleCollision) and register deposit accumulation (DepositAccumulator). Equal-time error, 8x8 blocks against the
+    /// path tracer: side 200 ms 0.0371 -> 0.0300, 800 ms 0.0290 -> 0.0265; sunbehind 200 ms 0.0383 -> 0.0279, 800 ms
+    /// 0.0286 -> 0.0242, reaching the exact tracer's floor (0.0230 vs 0.0231 at 134M photons): no measurable bias.
+    /// Tried and removed: Russian roulette of the tail after 32 (or 8/16) bounces saves ~0.1 ms per update but raises the
+    /// error 0.0241 -> 0.0273, so the roulette stays weight-bounded from bounce 8.
     void tracePhoton(uint index)
     {
         if (index >= params.worldCachePhotons || gScene.getGridVolumeCount() == 0)
@@ -1817,6 +1841,13 @@ struct HSTRCloudRenderer
     /// sky fields take their colours here. With worldCacheZonalBands, each sun band splits into its zonal part about the sun
     /// direction s, f_l(s) P_l(w . s), windowed at the zonal order and continued by the zonal extension bands, and the rest,
     /// windowed at order 2. With worldCacheSunOrder 3 the sun field is plain SH to band 3.
+    ///
+    /// Angular resolution is not the bottleneck (sunbehind, 8x8-block log error against the path tracer, reference noise
+    /// 0.0093): at 33M photons L2 0.0252, zonal 4 0.0245, zonal 6 0.0248, zonal 8 0.0250, sun L3 0.0237, the zonal part
+    /// rewindowed at order 8 only 0.0376; at 134M photons L2 0.0239, zonal 4 0.0230, sun L3 0.0223, 1-voxel cells 0.0217,
+    /// no window 0.0388. Beyond L2 removes at most ~8%, so the extension is off by default. Unwindowed order 2 is worse than
+    /// windowed order 1 (0.040 vs 0.028). A 3x3x3 tent filter of the stored cache plateaus at 0.037. The error maps show lit
+    /// faces too dark and silhouettes/creases too bright at every g: sub-cell skin structure, not angular detail.
     float3 worldCacheRadianceTextured(float3 v, float3 w)
     {
         const float3 uvw = v / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
@@ -1905,6 +1936,11 @@ struct HSTRCloudRenderer
     /// the fine sun optical depth (capped so deep interiors do not inflate the fixed-point deposits). Multiple scattering falls
     /// off into the cloud with the sun depth, so the stored ratio is much smoother than the radiance at cell scale, and the
     /// camera recovers the voxel-scale structure near lit surfaces from the fine sun field. b = 0 disables it.
+    ///
+    /// Measured at 33M photons, 2-voxel cells: side 0.032 -> 0.026, sunbehind 0.038 -> 0.025 with the modulation, matching
+    /// 1-voxel cells at an eighth of the memory. With it, 1-voxel cells no longer help (0.0233 vs 0.0231 at 134M photons).
+    /// Tried and removed instead of it: per-cell fits against the sun transmittance (0.033), medium-weighted cells (0.040),
+    /// exterior-weighted cells (0.053), blends of the two (best 0.024 at 60% medium).
     float worldCacheModulation(float3 v)
     {
         if (params.worldCacheModulation <= 0.f)

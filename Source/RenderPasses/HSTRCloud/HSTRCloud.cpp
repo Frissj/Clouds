@@ -1899,6 +1899,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 false
             );
         mParams.worldVoxelSize = mVoxelSize;
+        // Measured (frame_cost.py, 4K laptop GPU): one photon update has a ~0.8 ms floor independent of the photon count (64
+        // photons cost as much as 16k, an empty dispatch 0.02 ms): the tracer is latency bound at low occupancy. Not caused
+        // by path length (roulette from 8 bounces: 1k photons 1.78 -> 1.66 ms), the modulation read (off: 1.66 ms), or the
+        // deposit walk. The persistent pool (worldCacheSegments > 0) does not remove it: 64k slots x 4 flights 2.12 ms against
+        // 1.96 ms for 16k whole paths, and no error gain at equal time (photon_study.py).
+        // Async compute would hide it, but slang-gfx 2024.1.34 exposes only a graphics queue (ICommandQueue::QueueType), and
+        // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
+        // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
         FALCOR_PROFILE(pRenderContext, "worldCache");
         for (uint32_t i = 0; i < mWorldCacheUpdates; ++i)
         {
@@ -1981,6 +1989,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
             mWorldCacheBakeDirty = true;
         }
+        // A full bake cost 0.72 ms; skipping cells without medium (bakeWorldCacheCell) made it 0.24 ms, and baking every
+        // mWorldCacheBakeInterval (8) updates makes it negligible per frame (16k photons per frame, side: 2.07 ms baking every
+        // update, 1.95 ms every 8).
         const bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % mWorldCacheBakeInterval == 0;
         if (mWorldCacheBakeDirty && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && bakeDue)
         {
