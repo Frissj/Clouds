@@ -139,6 +139,50 @@ The static view still has log error 0.165.
   is lit as an isolated box, which produces leaf-sized horizontal bands, and it
   costs about 44 s of CPU per sun change.
 
+## Error budget and world cache (2026-09-14, second session)
+
+End goal restated by the user: a flyable sea of clouds at path-tracer quality in 3-4 ms or less, with no cost that scales
+with cloud count. `Downloads\split_hst_paper.pdf` (Split-HST) is the architecture under test: exact first scattering,
+scene-global sun field, HST as an instance-shared high-order predictor, optional world-space Monte Carlo correction.
+
+Tooling added (all uncommitted, `Source/RenderPasses/HSTRCloud/*`, `scripts/HSTR/ErrorBudget.py`, `WorldCacheTest.py`):
+
+- The reference tracer splits radiance into components (bits): 1 background, 2 sun single, 4 sun multiple (2+ events),
+  8 scattered sky. `hstComponents` masks the HST frame the same way (sun octave 0 = single, octaves 1-3 = multiple,
+  HST camera source = sky). `compareSubstitute` adds reference components to the HST frame (oracle substitution),
+  `compareTarget` picks the reference components compared against. Frames alternate between two reference halves;
+  `referenceNoiseError`/`referenceNoiseLogError` are the reference's own expected error.
+- Fixed: the reference did not restart on sun/density changes; its RNG was seeded by `frameIndex`, which every
+  `setProperties` resets (repeated samples). The compiler mis-built the first version of the per-half averaging loop
+  (`referenceHalves` is the verified form; do not reintroduce a `halves`-mask loop).
+- `skyScale`/`skyAmbient`: calibration and ambient baseline for the HST sky.
+- `debugView 8`: world-space SH radiance cache experiment (`worldCacheCellVoxels`, `worldCacheOrder`,
+  `worldCacheUpdates`). Cells store order-2 SH of all incident radiance except direct sun, gathered by one path per cell
+  per pass; the view renders only the resulting sun-multiple + scattered-sky term.
+- Measure at 960x540 with 1024+ spp: sun-multiple noise falls much slower than 1/sqrt(N) (HG g = 0.85 NEE), so the old
+  1080p/256-spp numbers (and the octave fit made on them) were partly noise.
+
+Findings (log error, 960x540, 1024 spp):
+
+- Sun single scattering is 1.5-2.5% of image radiance in all nine views; substituting the exact term does not reduce
+  error. Sun scattered 2+ times carries 50-63% of the error. The fitted octaves put out about half the reference
+  multiple-scatter energy and a 40% excess of single scatter, and the HST sky is 1.6-1.9x too bright; the errors
+  partially cancel on the fitted views and not on others (per-view error 0.140 fit, 0.159 held out).
+- The tile camera basis is lossless (mean differs from exact per-pixel integration by ~2e-6): all HST error is lighting.
+- HST sky with its best global scale (0.6) beats a scaled `sky * opacity` ambient by only ~10% (0.089 vs 0.097 summed
+  over held-out cameras, noise 0.034). This is close to Split-HST falsification criterion 2 for the sky field.
+- World cache, converged, no fitting: summed smooth-term error over four views 0.726 (HST) -> ~0.37 (4-voxel cells;
+  2-voxel barely better), noise floor 0.236; backlit reaches 0.032 against noise 0.017. Error still falls between 1024
+  and 4096 paths per cell, so it is variance-limited, not representation-limited. It beats the HST after 16-64 paths
+  per cell, but the gather estimator costs ~7 ms per full pass of 4-voxel cells: ~0.45 s of GPU to beat the HST and
+  ~30 s near convergence. Remaining visual defects: cell-scale outliers (fireflies) and dark holes from skipped cells
+  (cells with no majorant are written as zero and pulled in by trilinear lookups near thin density).
+
+Next steps, in order: a splatting estimator (trace from sun and sky, deposit along every segment) plus firefly control
+and light spatial filtering, measured as error against GPU milliseconds; weight trilinear lookups by valid cells; then
+the scene-level pieces (instance TLAS, sun-space optical-depth clipmap). Only revisit HST internal sources if the cache
+cannot converge within budget and the HST warm start is shown to shorten it.
+
 ## Build, run, compare
 
 ```powershell

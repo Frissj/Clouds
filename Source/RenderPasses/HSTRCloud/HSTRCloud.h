@@ -84,11 +84,16 @@ private:
     ref<ComputePass> mpBlurOctavesPass;
     ref<ComputePass> mpReferencePass;
     ref<ComputePass> mpCompareReferencePass;
-    ref<Texture> mpReferenceSum;     ///< Running sum of path-traced reference frames (rgb) and their count (a).
+    ref<Texture> mpReferenceSum;     ///< Running sums of path-traced reference frames (rgb) and their count (a), per component and half.
     ref<Buffer> mpReferenceRowError; ///< Per-row mean error of the HST frame against the reference average.
     bool mCompareReference = false;
-    float mReferenceError = -1.f;    ///< Mean |HST - reference| in linear radiance.
-    float mReferenceLogError = -1.f; ///< Mean |log(1 + HST) - log(1 + reference)|.
+    float mReferenceError = -1.f;         ///< Mean |HST - reference| in linear radiance.
+    float mReferenceLogError = -1.f;      ///< Mean |log(1 + HST) - log(1 + reference)|.
+    float mReferenceNoiseError = -1.f;    ///< Expected linear error of the reference average itself, from its two halves.
+    float mReferenceNoiseLogError = -1.f; ///< Same in log(1 + radiance).
+    ref<ComputePass> mpWorldCachePass;
+    ref<Buffer> mpWorldCache;        ///< World-space radiance cache experiment: SH running sums per cell.
+    uint32_t mWorldCacheUpdates = 1; ///< Cache gather passes per frame in the world cache view.
     float3 mReferencePosition = float3(0.f);
     float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;

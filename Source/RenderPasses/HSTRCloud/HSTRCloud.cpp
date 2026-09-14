@@ -54,8 +54,21 @@ const char kOctavePhase[] = "octavePhase";
 const char kHstSunFraction[] = "hstSunFraction";
 const char kOctaveBlurSigma[] = "octaveBlurSigma";
 const char kCompareReference[] = "compareReference";
+const char kHstComponents[] = "hstComponents";
+const char kSkyScale[] = "skyScale";
+const char kSkyAmbient[] = "skyAmbient";
+const char kWorldCacheCellVoxels[] = "worldCacheCellVoxels";
+const char kWorldCacheOrder[] = "worldCacheOrder";
+const char kWorldCacheUpdates[] = "worldCacheUpdates";
+const char kWorldCacheSampleCount[] = "worldCacheSampleCount";
+const char kReferenceShow[] = "referenceShow";
+const char kCompareSubstitute[] = "compareSubstitute";
+const char kCompareTarget[] = "compareTarget";
 const char kReferenceError[] = "referenceError";
 const char kReferenceLogError[] = "referenceLogError";
+const char kReferenceNoiseError[] = "referenceNoiseError";
+const char kReferenceNoiseLogError[] = "referenceNoiseLogError";
+const char kReferenceSampleCount[] = "referenceSampleCount";
 constexpr uint32_t kReferenceView = 6;
 
 uint32_t nextPowerOfTwo(uint32_t value)
@@ -210,7 +223,25 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.octaveBlurSigma = value;
         else if (key == kCompareReference)
             mCompareReference = value;
-        else if (key == kReferenceError || key == kReferenceLogError)
+        else if (key == kHstComponents)
+            mParams.hstComponents = value;
+        else if (key == kSkyScale)
+            mParams.skyScale = value;
+        else if (key == kSkyAmbient)
+            mParams.skyAmbient = value;
+        else if (key == kWorldCacheCellVoxels)
+            mParams.worldCacheCellVoxels = std::max(1u, uint32_t(value));
+        else if (key == kWorldCacheOrder)
+            mParams.worldCacheOrder = std::min(2u, uint32_t(value));
+        else if (key == kWorldCacheUpdates)
+            mWorldCacheUpdates = value;
+        else if (key == kReferenceShow)
+            mParams.referenceShow = value;
+        else if (key == kCompareSubstitute)
+            mParams.compareSubstitute = value;
+        else if (key == kCompareTarget)
+            mParams.compareTarget = value;
+        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount)
             continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
@@ -238,6 +269,14 @@ void HSTRCloud::setProperties(const Properties& props)
         buildHierarchy();
     else if (lightingChanged)
         solveLighting();
+    // The reference and the world cache solve the same lights and medium, so they restart with them.
+    if (operatorChanged || lightingChanged)
+    {
+        mParams.referenceSamples = 0;
+        mParams.worldCacheSamples = 0;
+    }
+    if (p.worldCacheCellVoxels != q.worldCacheCellVoxels)
+        mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
                       p.maxStepVoxels != q.maxStepVoxels;
@@ -285,8 +324,21 @@ Properties HSTRCloud::getProperties() const
     props[kHstSunFraction] = mParams.hstSunFraction;
     props[kOctaveBlurSigma] = mParams.octaveBlurSigma;
     props[kCompareReference] = mCompareReference;
+    props[kHstComponents] = mParams.hstComponents;
+    props[kSkyScale] = mParams.skyScale;
+    props[kSkyAmbient] = mParams.skyAmbient;
+    props[kWorldCacheCellVoxels] = mParams.worldCacheCellVoxels;
+    props[kWorldCacheOrder] = mParams.worldCacheOrder;
+    props[kWorldCacheUpdates] = mWorldCacheUpdates;
+    props[kWorldCacheSampleCount] = mParams.worldCacheSamples;
+    props[kReferenceShow] = mParams.referenceShow;
+    props[kCompareSubstitute] = mParams.compareSubstitute;
+    props[kCompareTarget] = mParams.compareTarget;
     props[kReferenceError] = mReferenceError;
     props[kReferenceLogError] = mReferenceLogError;
+    props[kReferenceNoiseError] = mReferenceNoiseError;
+    props[kReferenceNoiseLogError] = mReferenceNoiseLogError;
+    props[kReferenceSampleCount] = mParams.referenceSamples;
     return props;
 }
 
@@ -326,6 +378,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpResidualMaskPass = nullptr;
     mpGatherOctavesPass = nullptr;
     mpCompareReferencePass = nullptr;
+    mpWorldCachePass = nullptr;
     mpBlurOctavesPass = nullptr;
     mpReferencePass = nullptr;
     mFirstFrame = true;
@@ -363,6 +416,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpResidualMaskPass = createPass("maskResidual");
     mpGatherOctavesPass = createPass("gatherSunOctaves");
     mpCompareReferencePass = createPass("compareReference");
+    mpWorldCachePass = createPass("updateWorldCache");
     mpBlurOctavesPass = createPass("blurSunOctaves");
     mpReferencePass = createPass("referencePathTrace");
     buildHierarchy();
@@ -1351,6 +1405,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrTileCenters"] = mpTileCenters;
     var["hstrTileBasis"] = mpTileBasis;
     var["hstrTileState"] = mpTileState;
+    if (mpWorldCache)
+        var["hstrWorldCache"] = mpWorldCache;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
 }
@@ -1533,13 +1589,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             frameDim.x,
             frameDim.y,
             ResourceFormat::RGBA32Float,
-            1,
+            2 * kComponentCount,
             1,
             nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mpReferenceRowError = mpDevice->createStructuredBuffer(
-            sizeof(float2),
+            sizeof(float4),
             frameDim.y,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
             MemoryType::DeviceLocal,
@@ -1568,6 +1624,35 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         ++mParams.referenceSamples;
         ++mParams.frameIndex;
         return;
+    }
+
+    // World cache experiment: camera-independent gather passes accumulated while its view is shown.
+    if (mParams.debugView == kWorldCacheView)
+    {
+        const uint32_t cellVoxels = mParams.worldCacheCellVoxels;
+        const uint3 dims = (mParams.hstrExtinctionDims + cellVoxels - 1u) / cellVoxels;
+        const size_t floatCount = size_t(dims.x) * dims.y * dims.z * 27;
+        if (!mpWorldCache || any(dims != mParams.worldCacheDims) || mpWorldCache->getElementCount() != floatCount)
+        {
+            mpWorldCache = mpDevice->createStructuredBuffer(
+                sizeof(float),
+                uint32_t(floatCount),
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                MemoryType::DeviceLocal,
+                nullptr,
+                false
+            );
+            mParams.worldCacheDims = dims;
+            mParams.worldCacheSamples = 0;
+            logInfo("HSTRCloud: world cache {} cells of {} voxels ({:.1f} MB).", dims, cellVoxels, floatCount * 4.0 / (1 << 20));
+        }
+        FALCOR_PROFILE(pRenderContext, "worldCache");
+        for (uint32_t i = 0; i < mWorldCacheUpdates; ++i)
+        {
+            bindRenderer(pRenderContext, mpWorldCachePass);
+            mpWorldCachePass->execute(pRenderContext, dims);
+            ++mParams.worldCacheSamples;
+        }
     }
 
     // World space: residual pages depend on the sun and density only.
@@ -1646,12 +1731,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         var["hstrReferenceRowError"] = mpReferenceRowError;
         var["color"] = color;
         mpCompareReferencePass->execute(pRenderContext, uint3(frameDim.y, 1, 1));
-        const std::vector<float2> rows = mpReferenceRowError->getElements<float2>();
-        float2 total(0.f);
-        for (const float2& row : rows)
+        const std::vector<float4> rows = mpReferenceRowError->getElements<float4>();
+        float4 total(0.f);
+        for (const float4& row : rows)
             total += row;
         mReferenceError = total.x / float(rows.size());
         mReferenceLogError = total.y / float(rows.size());
+        mReferenceNoiseError = total.z / float(rows.size());
+        mReferenceNoiseLogError = total.w / float(rows.size());
     }
     ++mParams.frameIndex;
 }
@@ -1687,7 +1774,8 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
             {4, "Exact everywhere"},
             {5, "Residual fields"},
             {kReferenceView, "Path-traced reference"},
-            {7, "Rasterized sun residual"}};
+            {7, "Rasterized sun residual"},
+            {kWorldCacheView, "World cache (multiple scattering + sky)"}};
         renderChanged |= widget.dropdown("Debug view", debugViews, mParams.debugView);
     }
     lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
@@ -1714,6 +1802,11 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         buildHierarchy();
     else if (lightingChanged)
         solveLighting();
+    if (operatorChanged || lightingChanged)
+    {
+        mParams.referenceSamples = 0;
+        mParams.worldCacheSamples = 0;
+    }
     mResidualDirty |= residualChanged;
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged || residualChanged;
     mCutDirty |= renderChanged || operatorChanged || residualChanged;

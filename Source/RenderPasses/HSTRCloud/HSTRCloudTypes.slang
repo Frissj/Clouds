@@ -3,6 +3,17 @@
 
 BEGIN_NAMESPACE_FALCOR
 
+// Radiance components shared by the HST frame and the path-traced reference, as bits of hstComponents, referenceShow,
+// compareSubstitute and compareTarget. The HST approximates them by: background transmittance * sky; octave 0 of the sun
+// residual; octaves 1-3 of the sun residual; the HST camera source (sky, plus hstSunFraction of the sun).
+static const uint kComponentBackground = 1;  ///< Sky seen through the medium without scattering.
+static const uint kComponentSunSingle = 2;   ///< Sun light scattered once.
+static const uint kComponentSunMultiple = 4; ///< Sun light scattered two or more times.
+static const uint kComponentSkyScattered = 8; ///< Sky light scattered one or more times.
+static const uint kComponentCount = 4;
+
+static const uint kWorldCacheView = 8; ///< debugView of the world-space radiance cache experiment.
+
 struct HSTRCutNode
 {
     uint4 minLeft;
@@ -49,7 +60,7 @@ struct HSTRCloudParams
     uint correctionAtomCount = 0;
     uint correctionFadeFrames = 8;
     uint adjointGoalCount = 0;
-    uint padHSTR1 = 0;
+    uint compareTarget = 0xF; ///< Reference components the comparison measures against (kComponent* bits).
 
     uint ballisticBudget = 24;
     uint nearScatterBudget = 120;
@@ -60,14 +71,14 @@ struct HSTRCloudParams
     uint schurWindowRadius = 8;
 
     uint operatorDictionarySize = 0;
-    uint padHSTR4 = 0;
-    uint padHSTR5 = 0;
-    uint padHSTR6 = 0;
+    uint hstComponents = 0xF;     ///< Components the HST frame includes (kComponent* bits).
+    uint referenceShow = 0xF;     ///< Reference components the reference view displays.
+    uint compareSubstitute = 0;   ///< Reference components added to the HST frame before comparing (oracle substitution).
 
     float residualBlend = 1.f;
     float densityScale = 1.f;
-    float padHSTR2 = 0.f;
-    float padHSTR3 = 0.f;
+    float skyScale = 1.f;   ///< Scale of the HST camera source (the scattered sky when hstSunFraction = 0), for calibration tests.
+    float skyAmbient = 0.f; ///< When positive, replaces the HST camera source by this multiple of an opacity-weighted ambient sky.
 
     float3 sunDirection = float3(0.4319f, 0.8639f, 0.2699f);
     float anisotropy = 0.85f;
@@ -122,6 +133,15 @@ struct HSTRCloudParams
     float padHSTR10 = 0.f;
     float padHSTR11 = 0.f;
     float padHSTR12 = 0.f;
+
+    // World-space radiance cache experiment (debugView kWorldCacheView).
+    uint3 worldCacheDims = { 0, 0, 0 };
+    uint worldCacheCellVoxels = 4; ///< Voxels per cache cell edge.
+
+    uint worldCacheSamples = 0; ///< Gather passes accumulated into the cache.
+    uint worldCacheOrder = 2;   ///< Highest SH band the camera evaluates (0-2).
+    uint padHSTR13 = 0;
+    uint padHSTR14 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

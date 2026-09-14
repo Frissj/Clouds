@@ -20,6 +20,26 @@ struct HSTRCorrectionAtom
     float goalError;
 };
 
+/// One reference path's radiance, split into the kComponent* components.
+struct ReferenceSample
+{
+    float3 background;
+    float3 sunSingle;
+    float3 sunMultiple;
+    float3 sky;
+
+    /// Component by bit position.
+    float3 component(uint c) { return c == 0 ? background : (c == 1 ? sunSingle : (c == 2 ? sunMultiple : sky)); }
+};
+
+/// Reference averages of a set of components over the even-frame half, the odd-frame half, and both.
+struct ReferenceHalves
+{
+    float3 first;
+    float3 second;
+    float3 both;
+};
+
 /// A primary ray restricted to the volume bounds, expressed in leaf space.
 /// position is the entry point (t = 0), direction the entry-to-exit vector (t = 1).
 struct CutRay
@@ -27,7 +47,8 @@ struct CutRay
     float3 position;
     float3 direction;
     float worldLength;
-    float4 sunOctaves; ///< Per-octave sun weight a^n p(theta; c^n g) for this ray's direction.
+    float4 sunOctaves;    ///< Per-octave sun weight a^n p(theta; c^n g) for this ray's direction.
+    float3 viewDirection; ///< Unit world-space direction of the camera ray.
 };
 
 struct HSTRCloudRenderer
@@ -76,9 +97,12 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<HSTRTileBasis> hstrTileBasis;
     RWStructuredBuffer<uint> hstrTileState;
 
-    // Path-traced reference: running sum and per-row comparison against the HST frame.
-    RWTexture2D<float4> hstrReferenceSum;
-    RWStructuredBuffer<float2> hstrReferenceRowError;
+    // Path-traced reference: running sums per radiance component, in two halves that alternate by frame (slice
+    // 2 * component + half, rgb sum and sample count), and per-row comparison against the HST frame.
+    RWTexture2DArray<float4> hstrReferenceSum;
+    RWStructuredBuffer<float4> hstrReferenceRowError;
+    // World-space radiance cache experiment: 9 SH coefficients x RGB running sums per cell.
+    RWStructuredBuffer<float> hstrWorldCache;
 
     SamplerState hstrExtinctionSampler;
     SamplerState hstrLinearSampler;
@@ -451,6 +475,7 @@ struct HSTRCloudRenderer
         ray.direction = 0.f;
         ray.worldLength = 0.f;
         ray.sunOctaves = 0.f;
+        ray.viewDirection = normalize(direction);
         float2 interval;
         const AABB bounds = volume.getBounds();
         if (!intersectRayAABB(origin, direction, bounds.minPoint, bounds.maxPoint, interval))
@@ -463,7 +488,9 @@ struct HSTRCloudRenderer
         ray.position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         ray.direction = (exitIndex - entryIndex) / float(params.hstrCellWidth);
         ray.worldLength = length(direction) * (interval.y - entry);
-        ray.sunOctaves = sunOctaveWeights(direction);
+        const float single = (params.hstComponents & kComponentSunSingle) != 0 ? 1.f : 0.f;
+        const float multiple = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
+        ray.sunOctaves = sunOctaveWeights(direction) * float4(single, multiple, multiple, multiple);
         return true;
     }
 
@@ -506,7 +533,8 @@ struct HSTRCloudRenderer
                 const float alpha = 1.f - exp(-extinctionAtVoxel(midpoint) * dt * ray.worldLength);
                 if ((withSource || residual) && alpha > 1e-6f)
                 {
-                    const float3 base = sourceAtVoxel(midpoint);
+                    const float3 base =
+                        params.debugView == kWorldCacheView ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
                     if (withSource)
                         radiance += transmittance * alpha * base;
                     if (residual)
@@ -920,29 +948,49 @@ struct HSTRCloudRenderer
         return normalize(sinTheta * cos(phi) * tangent + sinTheta * sin(phi) * bitangent + cosTheta * forward);
     }
 
-    float3 referencePath(float3 origin, float3 direction, GridVolume volume, inout uint rng)
+    /// One reference path, split into the kComponent* radiance components.
+    ReferenceSample referencePath(float3 origin, float3 direction, GridVolume volume, inout uint rng)
     {
         float2 interval;
         const AABB bounds = volume.getBounds();
         if (!intersectRayAABB(origin, direction, bounds.minPoint, bounds.maxPoint, interval) || interval.y <= max(0.f, interval.x))
-            return skyRadianceAt(direction);
+        {
+            ReferenceSample miss = {};
+            miss.background = skyRadianceAt(direction);
+            return miss;
+        }
+        const float3 entryIndex = mul(volume.data.invTransform, float4(origin + max(0.f, interval.x) * direction, 1.f)).xyz;
+        return tracePath(entryIndex - float3(params.hstrGridMin), direction, volume, rng);
+    }
+
+    /// Radiance arriving back along -direction at voxel position v, split into components by the number of scattering events
+    /// after v. Direct sunlight at v itself is not included.
+    ReferenceSample tracePath(float3 v, float3 direction, GridVolume volume, inout uint rng)
+    {
+        ReferenceSample result = {};
         const float3 sunDirection = normalize(params.sunDirection);
         const float3 sunVoxel = mul(volume.data.invTransform, float4(sunDirection, 0.f)).xyz;
-        const float3 entryIndex = mul(volume.data.invTransform, float4(origin + max(0.f, interval.x) * direction, 1.f)).xyz;
-        float3 v = entryIndex - float3(params.hstrGridMin);
-        float3 radiance = 0.f;
         float3 throughput = 1.f;
         for (uint bounce = 0; bounce < 4096; ++bounce)
         {
             const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
             if (!sampleCollision(v, d, rng))
             {
-                radiance += throughput * skyRadianceAt(direction);
+                // Escaping after `bounce` scattering events: unscattered background or scattered sky.
+                const float3 sky = throughput * skyRadianceAt(direction);
+                if (bounce == 0)
+                    result.background += sky;
+                else
+                    result.sky += sky;
                 break;
             }
             throughput *= volume.data.albedo;
-            // Sun: directional irradiance through the ratio-tracked transmittance.
-            radiance += throughput * phaseHG(dot(sunDirection, direction)) * params.sunRadiance * ratioTrack(v, sunVoxel, rng);
+            // Sun: directional irradiance through the ratio-tracked transmittance; this is scattering order bounce + 1.
+            const float3 sun = throughput * phaseHG(dot(sunDirection, direction)) * params.sunRadiance * ratioTrack(v, sunVoxel, rng);
+            if (bounce == 0)
+                result.sunSingle += sun;
+            else
+                result.sunMultiple += sun;
             direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
             if (bounce >= 8)
             {
@@ -952,44 +1000,187 @@ struct HSTRCloudRenderer
                 throughput /= survive;
             }
         }
-        return radiance;
+        return result;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // World-space radiance cache (experiment): per cell, order-2 SH of all incident radiance except direct sunlight,
+    // gathered by paths started inside the cell. Scattered towards the camera it is the sun-multiple plus scattered-sky term.
+
+    /// Real SH basis function k (0-8, bands 0-2) at unit direction d.
+    float shBasis(uint k, float3 d)
+    {
+        switch (k)
+        {
+        case 0:
+            return 0.282095f;
+        case 1:
+            return 0.488603f * d.y;
+        case 2:
+            return 0.488603f * d.z;
+        case 3:
+            return 0.488603f * d.x;
+        case 4:
+            return 1.092548f * d.x * d.y;
+        case 5:
+            return 1.092548f * d.y * d.z;
+        case 6:
+            return 0.315392f * (3.f * d.z * d.z - 1.f);
+        case 7:
+            return 1.092548f * d.x * d.z;
+        default:
+            return 0.546274f * (d.x * d.x - d.y * d.y);
+        }
+    }
+
+    uint worldCacheIndex(uint3 cell) { return cell.x + params.worldCacheDims.x * (cell.y + params.worldCacheDims.y * cell.z); }
+
+    /// One gather pass: a single path per cell, from a uniform point in the cell along a uniform direction.
+    void updateWorldCacheCell(uint3 cell)
+    {
+        if (any(cell >= params.worldCacheDims) || gScene.getGridVolumeCount() == 0)
+            return;
+        const uint index = worldCacheIndex(cell);
+        const float cellVoxels = float(params.worldCacheCellVoxels);
+        const float3 center = (float3(cell) + 0.5f) * cellVoxels;
+        // Cells far from any density are never interpolated by a sample with extinction (the majorant is dilated by one block).
+        const bool needed = params.worldCacheCellVoxels > 4 || majorantAt(center) > 0.f;
+        float3 value = 0.f;
+        float3 d = float3(0.f, 0.f, 1.f);
+        if (needed)
+        {
+            uint rng = hashUint(index * 7919u + 17u) ^ hashUint(params.worldCacheSamples * 9781u + 6271u);
+            const float3 v = (float3(cell) + float3(randomFloat(rng), randomFloat(rng), randomFloat(rng))) * cellVoxels;
+            const float z = 1.f - 2.f * randomFloat(rng);
+            const float phi = 2.f * kPi * randomFloat(rng);
+            const float r = sqrt(max(0.f, 1.f - z * z));
+            d = float3(r * cos(phi), r * sin(phi), z);
+            const ReferenceSample path = tracePath(v, d, gScene.getGridVolume(0), rng);
+            value = path.background + path.sunSingle + path.sunMultiple + path.sky;
+            if (any(isnan(value) || isinf(value)))
+                value = 0.f;
+        }
+        const bool restart = params.worldCacheSamples == 0;
+        [unroll]
+        for (uint k = 0; k < 9; ++k)
+        {
+            const float3 projected = 4.f * kPi * shBasis(k, d) * value;
+            [unroll]
+            for (uint c = 0; c < 3; ++c)
+            {
+                const uint slot = 27 * index + 3 * k + c;
+                hstrWorldCache[slot] = (restart ? 0.f : hstrWorldCache[slot]) + projected[c];
+            }
+        }
+    }
+
+    /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
+    /// the HG phase convolves SH band l by g^l. Trilinear over cell centres; bands above worldCacheOrder are dropped.
+    float3 worldCacheRadiance(float3 v, float3 w)
+    {
+        const float3 p = v / float(params.worldCacheCellVoxels) - 0.5f;
+        const float3 base = floor(p);
+        const float3 f = p - base;
+        const float g = params.anisotropy;
+        const uint coefficients = (params.worldCacheOrder + 1) * (params.worldCacheOrder + 1);
+        float3 result = 0.f;
+        [unroll]
+        for (uint corner = 0; corner < 8; ++corner)
+        {
+            const uint3 offset = uint3(corner & 1, (corner >> 1) & 1, corner >> 2);
+            const float3 weights = lerp(1.f - f, f, float3(offset));
+            const float weight = weights.x * weights.y * weights.z;
+            const uint3 cell = uint3(clamp(int3(base) + int3(offset), int3(0), int3(params.worldCacheDims) - 1));
+            const uint index = worldCacheIndex(cell);
+            for (uint k = 0; k < coefficients; ++k)
+            {
+                const float band = k == 0 ? 1.f : (k < 4 ? g : g * g);
+                const float3 c = float3(hstrWorldCache[27 * index + 3 * k], hstrWorldCache[27 * index + 3 * k + 1], hstrWorldCache[27 * index + 3 * k + 2]);
+                result += weight * band * shBasis(k, w) * c;
+            }
+        }
+        return max(0.f, result / float(max(params.worldCacheSamples, 1u)));
+    }
+
+    /// Reference averages of the selected components: the even-frame half, the odd-frame half, and both.
+    ReferenceHalves referenceHalves(uint2 pixel, uint mask)
+    {
+        float3 evenSum = 0.f;
+        float3 oddSum = 0.f;
+        [unroll]
+        for (uint c = 0; c < kComponentCount; ++c)
+        {
+            const float weight = (mask & (1u << c)) != 0 ? 1.f : 0.f;
+            evenSum += weight * hstrReferenceSum[uint3(pixel, 2 * c)].rgb;
+            oddSum += weight * hstrReferenceSum[uint3(pixel, 2 * c + 1)].rgb;
+        }
+        const float evenCount = hstrReferenceSum[uint3(pixel, 0)].a;
+        const float oddCount = hstrReferenceSum[uint3(pixel, 1)].a;
+        ReferenceHalves result;
+        result.first = evenSum / max(evenCount, 1.f);
+        result.second = oddSum / max(oddCount, 1.f);
+        result.both = (evenSum + oddSum) / max(evenCount + oddCount, 1.f);
+        return result;
     }
 
     void referencePixel(uint2 pixel)
     {
         if (any(pixel >= params.frameDim))
             return;
-        uint rng = hashUint(pixel.x + params.frameDim.x * pixel.y) ^ hashUint(params.frameIndex * 9781u + 6271u);
+        // Seeded by the sample index, not frameIndex: property changes reset frameIndex and would repeat earlier samples.
+        uint rng = hashUint(pixel.x + params.frameDim.x * pixel.y) ^ hashUint(params.referenceSamples * 9781u + 6271u);
         const float2 jitter = float2(randomFloat(rng), randomFloat(rng));
         const float3 direction = cameraRayDirection(float2(pixel) + jitter);
-        float3 result = skyRadianceAt(direction);
+        ReferenceSample path = {};
+        path.background = skyRadianceAt(direction);
         if (gScene.getGridVolumeCount() > 0)
-            result = referencePath(gScene.camera.data.posW, direction, gScene.getGridVolume(0), rng);
-        if (any(isnan(result) || isinf(result)))
-            result = 0.f;
-        const float4 sum = (params.referenceSamples == 0 ? 0.f : hstrReferenceSum[pixel]) + float4(result, 1.f);
-        hstrReferenceSum[pixel] = sum;
-        color[pixel] = float4(sum.rgb / sum.a, 1.f);
+            path = referencePath(gScene.camera.data.posW, direction, gScene.getGridVolume(0), rng);
+        bool valid = true;
+        for (uint c = 0; c < kComponentCount; ++c)
+            valid = valid && !any(isnan(path.component(c)) || isinf(path.component(c)));
+        // Frames alternate between two independent halves, whose disagreement estimates the reference's own noise.
+        const uint halfIndex = params.referenceSamples & 1u;
+        const bool restart = params.referenceSamples < 2;
+        for (uint c = 0; c < kComponentCount; ++c)
+        {
+            const uint3 slice = uint3(pixel, 2 * c + halfIndex);
+            const float4 previous = restart ? float4(0.f) : hstrReferenceSum[slice];
+            const float3 value = valid ? path.component(c) : float3(0.f);
+            hstrReferenceSum[slice] = previous + float4(value, 1.f);
+        }
+        // referenceShow bits 4-5 pick one half (1: even frames, 2: odd frames); 0 shows both.
+        const ReferenceHalves shown = referenceHalves(pixel, params.referenceShow & 0xFu);
+        const uint shownHalves = (params.referenceShow >> 4) & 3u;
+        color[pixel] = float4(shownHalves == 1 ? shown.first : (shownHalves == 2 ? shown.second : shown.both), 1.f);
         transportError[pixel] = 0.f;
         cutStats[pixel] = 0.f;
     }
 
-    /// Mean absolute difference of one image row against the reference average: linear radiance and log(1 + radiance).
+    /// Mean absolute difference of one image row against the reference average, in linear radiance (x) and log(1 + radiance) (y).
+    /// The compared value is the HST frame plus the substituted reference components; the reference is the target components.
+    /// zw hold the same measures between the two reference halves, halved: the expected noise of the full reference average.
     void compareReferenceRow(uint row)
     {
         if (row >= params.frameDim.y)
             return;
-        float2 error = 0.f;
+        float4 error = 0.f;
         uint count = 0;
         for (uint x = 0; x < params.frameDim.x; ++x)
         {
-            const float4 sum = hstrReferenceSum[uint2(x, row)];
-            const float3 reference = sum.rgb / max(sum.a, 1.f);
-            const float3 value = color[uint2(x, row)].rgb;
+            const uint2 pixel = uint2(x, row);
+            const ReferenceHalves target = referenceHalves(pixel, params.compareTarget);
+            const float3 reference = target.both;
+            const float3 value = color[pixel].rgb + referenceHalves(pixel, params.compareSubstitute).both;
             if (any(isnan(value) || isinf(value) || isnan(reference) || isinf(reference)))
                 continue;
-            error.x += dot(abs(value - reference), 1.f / 3.f);
-            error.y += dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f);
+            const float3 halfDifference = abs(target.first - target.second);
+            const float3 halfLogDifference = abs(log(1.f + max(target.first, 0.f)) - log(1.f + max(target.second, 0.f)));
+            error += float4(
+                dot(abs(value - reference), 1.f / 3.f),
+                dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f),
+                0.5f * dot(halfDifference, 1.f / 3.f),
+                0.5f * dot(halfLogDifference, 1.f / 3.f)
+            );
             ++count;
         }
         hstrReferenceRowError[row] = error / float(max(count, 1u));
@@ -1033,7 +1224,21 @@ struct HSTRCloudRenderer
         CutRay ray;
         if (!makeCutRay(origin, direction, volume, ray))
         {
-            color[pixel] = float4(sky, 1.f);
+            color[pixel] = float4((params.hstComponents & kComponentBackground) != 0 ? sky : 0.f, 1.f);
+            transportError[pixel] = 0.f;
+            cutStats[pixel] = 0.f;
+            return;
+        }
+
+        if (params.debugView == kWorldCacheView)
+        {
+            // World cache experiment: the cache's sun-multiple plus scattered-sky term only, marched exactly per pixel.
+            float3 cached = 0.f;
+            float3 unused = 0.f;
+            float cachedTransmittance = 1.f;
+            uint cachedSteps = 0;
+            marchSegment(ray, float2(0.f, 1.f), true, false, cached, unused, cachedTransmittance, cachedSteps);
+            color[pixel] = float4(cached * volume.data.albedo, 1.f);
             transportError[pixel] = 0.f;
             cutStats[pixel] = 0.f;
             return;
@@ -1091,7 +1296,14 @@ struct HSTRCloudRenderer
 
         // L = L_base + sum of rasterized residuals + tau * background.
         residual *= volume.data.albedo;
-        float3 result = max(0.f, radiance + residual) + transmittance * sky;
+        // Baseline for the HST sky: a constant source at the sphere-averaged sky radiance, weighted by this pixel's opacity.
+        if (params.skyAmbient > 0.f)
+            radiance = params.skyAmbient * volume.data.albedo * params.skyRadiance * 0.675f * (1.f - transmittance);
+        radiance *= params.skyScale;
+        if ((params.hstComponents & kComponentSkyScattered) == 0)
+            radiance = 0.f;
+        const float3 background = (params.hstComponents & kComponentBackground) != 0 ? transmittance * sky : 0.f;
+        float3 result = max(0.f, radiance + residual) + background;
         if (params.debugView == 7)
             result = 0.5f + 4.f * residual;
         if (params.debugView == 1 && refine)
@@ -1127,6 +1339,12 @@ void referencePathTrace(uint3 dispatchThreadId: SV_DispatchThreadID)
 void compareReference(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.compareReferenceRow(dispatchThreadId.x);
+}
+
+[numthreads(4, 4, 4)]
+void updateWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.updateWorldCacheCell(dispatchThreadId);
 }
 
 [numthreads(4, 4, 4)]
