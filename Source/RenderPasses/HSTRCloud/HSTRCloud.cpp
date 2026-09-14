@@ -39,6 +39,24 @@ const char kLocalSourceRadiance[] = "localSourceRadiance";
 const char kMixedFidelityThreshold[] = "mixedFidelityThreshold";
 const char kOperatorDictionaryTolerance[] = "operatorDictionaryTolerance";
 const char kCutTransmittanceTolerance[] = "cutTransmittanceTolerance";
+const char kCutHysteresis[] = "cutHysteresis";
+const char kBasisTolerance[] = "basisTolerance";
+const char kBasisHysteresis[] = "basisHysteresis";
+const char kResidualTolerance[] = "residualTolerance";
+const char kResidualStrength[] = "residualStrength";
+const char kStepOpticalDepth[] = "stepOpticalDepth";
+const char kMinStepVoxels[] = "minStepVoxels";
+const char kMaxStepVoxels[] = "maxStepVoxels";
+const char kDebugView[] = "debugView";
+const char kOctaveEnergy[] = "octaveEnergy";
+const char kOctaveExtinction[] = "octaveExtinction";
+const char kOctavePhase[] = "octavePhase";
+const char kHstSunFraction[] = "hstSunFraction";
+const char kOctaveBlurSigma[] = "octaveBlurSigma";
+const char kCompareReference[] = "compareReference";
+const char kReferenceError[] = "referenceError";
+const char kReferenceLogError[] = "referenceLogError";
+constexpr uint32_t kReferenceView = 6;
 
 uint32_t nextPowerOfTwo(uint32_t value)
 {
@@ -113,6 +131,11 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
 
 HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
+    parseProperties(props);
+}
+
+void HSTRCloud::parseProperties(const Properties& props)
+{
     for (const auto& [key, value] : props)
     {
         if (key == kBaseSteps)
@@ -157,9 +180,70 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
             mParams.operatorDictionaryTolerance = value;
         else if (key == kCutTransmittanceTolerance)
             mParams.cutTransmittanceTolerance = value;
+        else if (key == kCutHysteresis)
+            mParams.cutHysteresis = value;
+        else if (key == kBasisTolerance)
+            mParams.basisTolerance = value;
+        else if (key == kBasisHysteresis)
+            mParams.basisHysteresis = value;
+        else if (key == kResidualTolerance)
+            mParams.residualTolerance = value;
+        else if (key == kResidualStrength)
+            mParams.residualStrength = value;
+        else if (key == kStepOpticalDepth)
+            mParams.stepOpticalDepth = value;
+        else if (key == kMinStepVoxels)
+            mParams.minStepVoxels = value;
+        else if (key == kMaxStepVoxels)
+            mParams.maxStepVoxels = value;
+        else if (key == kDebugView)
+            mParams.debugView = value;
+        else if (key == kOctaveEnergy)
+            mParams.octaveEnergy = value;
+        else if (key == kOctaveExtinction)
+            mParams.octaveExtinction = value;
+        else if (key == kOctavePhase)
+            mParams.octavePhase = value;
+        else if (key == kHstSunFraction)
+            mParams.hstSunFraction = value;
+        else if (key == kOctaveBlurSigma)
+            mParams.octaveBlurSigma = value;
+        else if (key == kCompareReference)
+            mCompareReference = value;
+        else if (key == kReferenceError || key == kReferenceLogError)
+            continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
     }
+}
+
+void HSTRCloud::setProperties(const Properties& props)
+{
+    const HSTRCloudParams previous = mParams;
+    parseProperties(props);
+    if (!mpScene || !mpLeafRadiance)
+        return;
+    const auto& p = mParams;
+    const auto& q = previous;
+    const bool operatorChanged = p.densityScale != q.densityScale || p.anisotropy != q.anisotropy ||
+                                 p.traceSpatialOrder != q.traceSpatialOrder || p.ballisticBudget != q.ballisticBudget ||
+                                 p.nearScatterBudget != q.nearScatterBudget || p.diffuseRankBudget != q.diffuseRankBudget ||
+                                 p.mixedFidelityThreshold != q.mixedFidelityThreshold ||
+                                 p.operatorDictionaryTolerance != q.operatorDictionaryTolerance;
+    const bool lightingChanged =
+        any(p.sunDirection != q.sunDirection) || any(p.sunRadiance != q.sunRadiance) || any(p.skyRadiance != q.skyRadiance) ||
+        any(p.localSourceRadiance != q.localSourceRadiance) || p.activeRank != q.activeRank || p.activeThreshold != q.activeThreshold ||
+        p.correctionBudget != q.correctionBudget || p.schurWindowRadius != q.schurWindowRadius || p.hstSunFraction != q.hstSunFraction;
+    if (operatorChanged)
+        buildHierarchy();
+    else if (lightingChanged)
+        solveLighting();
+    mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
+                      p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
+                      p.maxStepVoxels != q.maxStepVoxels;
+    mCutDirty = true;
+    mBasisDirty = true;
+    mOptionsChanged = true;
 }
 
 Properties HSTRCloud::getProperties() const
@@ -186,6 +270,23 @@ Properties HSTRCloud::getProperties() const
     props[kMixedFidelityThreshold] = mParams.mixedFidelityThreshold;
     props[kOperatorDictionaryTolerance] = mParams.operatorDictionaryTolerance;
     props[kCutTransmittanceTolerance] = mParams.cutTransmittanceTolerance;
+    props[kCutHysteresis] = mParams.cutHysteresis;
+    props[kBasisTolerance] = mParams.basisTolerance;
+    props[kBasisHysteresis] = mParams.basisHysteresis;
+    props[kResidualTolerance] = mParams.residualTolerance;
+    props[kResidualStrength] = mParams.residualStrength;
+    props[kStepOpticalDepth] = mParams.stepOpticalDepth;
+    props[kMinStepVoxels] = mParams.minStepVoxels;
+    props[kMaxStepVoxels] = mParams.maxStepVoxels;
+    props[kDebugView] = mParams.debugView;
+    props[kOctaveEnergy] = mParams.octaveEnergy;
+    props[kOctaveExtinction] = mParams.octaveExtinction;
+    props[kOctavePhase] = mParams.octavePhase;
+    props[kHstSunFraction] = mParams.hstSunFraction;
+    props[kOctaveBlurSigma] = mParams.octaveBlurSigma;
+    props[kCompareReference] = mCompareReference;
+    props[kReferenceError] = mReferenceError;
+    props[kReferenceLogError] = mReferenceLogError;
     return props;
 }
 
@@ -220,9 +321,18 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCutPass = nullptr;
     mpSortPass = nullptr;
     mpQueryPass = nullptr;
+    mpTileBasisPass = nullptr;
+    mpFineSunPass = nullptr;
+    mpResidualMaskPass = nullptr;
+    mpGatherOctavesPass = nullptr;
+    mpCompareReferencePass = nullptr;
+    mpBlurOctavesPass = nullptr;
+    mpReferencePass = nullptr;
     mFirstFrame = true;
     mCameraLightingDirty = true;
     mCutDirty = true;
+    mResidualDirty = true;
+    mBasisDirty = true;
     mCameraLightingPoseValid = false;
     if (!mpScene)
         return;
@@ -233,41 +343,28 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
         logInfo("HSTRCloud: first grid-volume bounds are {} to {}.", bounds.minPoint, bounds.maxPoint);
     }
 
-    ProgramDesc desc;
-    desc.addShaderModules(mpScene->getShaderModules());
-    desc.addShaderLibrary(kShaderFile).csEntry("main");
-    desc.addTypeConformances(mpScene->getTypeConformances());
-    mpPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
-    ProgramDesc solveDesc;
-    solveDesc.addShaderModules(mpScene->getShaderModules());
-    solveDesc.addShaderLibrary(kShaderFile).csEntry("solveLeaves");
-    solveDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpSolvePass = ComputePass::create(mpDevice, solveDesc, mpScene->getSceneDefines());
-    ProgramDesc cameraLightingDesc;
-    cameraLightingDesc.addShaderModules(mpScene->getShaderModules());
-    cameraLightingDesc.addShaderLibrary(kShaderFile).csEntry("updateCameraLighting");
-    cameraLightingDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpCameraLightingPass = ComputePass::create(mpDevice, cameraLightingDesc, mpScene->getSceneDefines());
-    ProgramDesc projectDesc;
-    projectDesc.addShaderModules(mpScene->getShaderModules());
-    projectDesc.addShaderLibrary(kShaderFile).csEntry("projectCutNodes");
-    projectDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpProjectPass = ComputePass::create(mpDevice, projectDesc, mpScene->getSceneDefines());
-    ProgramDesc cutDesc;
-    cutDesc.addShaderModules(mpScene->getShaderModules());
-    cutDesc.addShaderLibrary(kShaderFile).csEntry("binCutNodes");
-    cutDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpCutPass = ComputePass::create(mpDevice, cutDesc, mpScene->getSceneDefines());
-    ProgramDesc sortDesc;
-    sortDesc.addShaderModules(mpScene->getShaderModules());
-    sortDesc.addShaderLibrary(kShaderFile).csEntry("sortTileCuts");
-    sortDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpSortPass = ComputePass::create(mpDevice, sortDesc, mpScene->getSceneDefines());
-    ProgramDesc queryDesc;
-    queryDesc.addShaderModules(mpScene->getShaderModules());
-    queryDesc.addShaderLibrary(kShaderFile).csEntry("buildCameraQueries");
-    queryDesc.addTypeConformances(mpScene->getTypeConformances());
-    mpQueryPass = ComputePass::create(mpDevice, queryDesc, mpScene->getSceneDefines());
+    auto createPass = [&](const char* entry)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kShaderFile).csEntry(entry);
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        return ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
+    };
+    mpPass = createPass("main");
+    mpSolvePass = createPass("solveLeaves");
+    mpCameraLightingPass = createPass("updateCameraLighting");
+    mpProjectPass = createPass("projectCutNodes");
+    mpCutPass = createPass("binCutNodes");
+    mpSortPass = createPass("sortTileCuts");
+    mpQueryPass = createPass("buildCameraQueries");
+    mpTileBasisPass = createPass("buildTileBases");
+    mpFineSunPass = createPass("computeFineSun");
+    mpResidualMaskPass = createPass("maskResidual");
+    mpGatherOctavesPass = createPass("gatherSunOctaves");
+    mpCompareReferencePass = createPass("compareReference");
+    mpBlurOctavesPass = createPass("blurSunOctaves");
+    mpReferencePass = createPass("referencePathTrace");
     buildHierarchy();
 }
 
@@ -552,6 +649,7 @@ void HSTRCloud::uploadExtinction()
         mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
     else
         mpDevice->getRenderContext()->updateTextureData(mpExtinction.get(), extinction.data());
+
     if (!mpCutNodes || mpCutNodes->getElementCount() != packed.size())
         mpCutNodes = mpDevice->createStructuredBuffer(
             sizeof(HSTRCutNode), packed.size(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, packed.data(), false
@@ -564,12 +662,81 @@ void HSTRCloud::uploadExtinction()
         );
     else
         mpCutNodeParents->setBlob(parents.data(), 0, parents.size() * sizeof(uint32_t));
+
+    // Extinction majorants over 4^3-voxel blocks, dilated by one block: a march step of at most one block from any point
+    // inside a block never meets extinction above that block's value, which bounds the optical depth of every step.
+    constexpr uint32_t kMajorantBlock = 4;
+    const uint3 majorantDims = (dims + kMajorantBlock - 1u) / kMajorantBlock;
+    const size_t majorantCount = size_t(majorantDims.x) * majorantDims.y * majorantDims.z;
+    auto majorantIndex = [&](uint3 b) { return size_t(b.x) + size_t(majorantDims.x) * (size_t(b.y) + size_t(majorantDims.y) * b.z); };
+    std::vector<float> blockMaximum(majorantCount, 0.f);
+    parallelFor(
+        majorantCount,
+        [&](size_t i)
+        {
+            const uint3 b(
+                uint32_t(i % majorantDims.x),
+                uint32_t((i / majorantDims.x) % majorantDims.y),
+                uint32_t(i / (majorantDims.x * majorantDims.y))
+            );
+            // Trilinear lookups inside the block also read the voxels one past its upper faces.
+            const uint3 begin = b * kMajorantBlock;
+            const uint3 end = min(begin + kMajorantBlock, dims - 1u);
+            float value = 0.f;
+            for (uint32_t z = begin.z; z <= end.z; ++z)
+                for (uint32_t y = begin.y; y <= end.y; ++y)
+                    for (uint32_t x = begin.x; x <= end.x; ++x)
+                        value = std::max(value, extinctionAtVoxel(uint3(x, y, z)));
+            blockMaximum[i] = value;
+        }
+    );
+    std::vector<float16_t> majorant(majorantCount);
+    parallelFor(
+        majorantCount,
+        [&](size_t i)
+        {
+            const int3 b(
+                int32_t(i % majorantDims.x), int32_t((i / majorantDims.x) % majorantDims.y), int32_t(i / (majorantDims.x * majorantDims.y))
+            );
+            float value = 0.f;
+            for (int32_t z = -1; z <= 1; ++z)
+                for (int32_t y = -1; y <= 1; ++y)
+                    for (int32_t x = -1; x <= 1; ++x)
+                    {
+                        const int3 n = b + int3(x, y, z);
+                        if (all(n >= 0) && all(n < int3(majorantDims)))
+                            value = std::max(value, blockMaximum[majorantIndex(uint3(n))]);
+                    }
+            // Round up so the half-float majorant stays an upper bound.
+            float16_t rounded(value);
+            if (float(rounded) < value)
+                rounded = float16_t(value * (1.f + 1.f / 1024.f));
+            majorant[i] = rounded;
+        }
+    );
+    mParams.hstrMajorantDims = majorantDims;
+    mpMajorant = mpDevice->createTexture3D(majorantDims.x, majorantDims.y, majorantDims.z, ResourceFormat::R16Float, 1, majorant.data());
+
+    // Sun residual pages live at voxel resolution.
+    mParams.hstrFineDims = dims;
+    mResidualDirty = true;
+    mBasisDirty = true;
+
     if (!mpExtinctionSampler)
+    {
+        // Density is zero outside the active-voxel bounds, so extinction lookups use a zero border instead of clamping.
+        Sampler::Desc samplerDesc;
+        samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+        samplerDesc.setAddressingMode(TextureAddressingMode::Border, TextureAddressingMode::Border, TextureAddressingMode::Border);
+        samplerDesc.setBorderColor(float4(0.f));
+        mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+    }
+    if (!mpLinearSampler)
     {
         Sampler::Desc samplerDesc;
         samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
         samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-        mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+        mpLinearSampler = mpDevice->createSampler(samplerDesc);
     }
 }
 
@@ -757,7 +924,9 @@ void HSTRCloud::uploadHierarchy()
         nullptr,
         false
     );
-    const uint3 cameraLightingDims = leafDims;
+    // Two lattice points per leaf axis resolve the 2x2 spatial modes of each face trace.
+    const uint3 cameraLightingDims = leafDims * 2u;
+    mParams.hstrCameraLightingDims = cameraLightingDims;
     if (!mpCameraLighting || mpCameraLighting->getWidth() != cameraLightingDims.x ||
         mpCameraLighting->getHeight() != cameraLightingDims.y || mpCameraLighting->getDepth() != cameraLightingDims.z)
         mpCameraLighting = mpDevice->createTexture3D(
@@ -1082,12 +1251,39 @@ void HSTRCloud::solveLighting()
     if (mHierarchy.getRoot() == hstr::HierarchyNode::kInvalid)
         return;
 
+    // Sky radiance entering each face: the cosine-weighted mean of the sky gradient over the hemisphere the face looks at,
+    // the same sky the background and the path-traced reference use (dimmer below the horizon).
     hstr::DenseMatrix incident(mParams.hstrTraceDofs, 3);
     for (uint32_t face = 0; face < 6; ++face)
+    {
+        float3 normal(0.f);
+        normal[face / 2] = (face & 1u) ? 1.f : -1.f;
+        const float3 tangent = std::abs(normal.y) < 0.5f ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
+        const float3 u = normalize(cross(tangent, normal));
+        const float3 v = cross(normal, u);
+        constexpr uint32_t kSamples = 32;
+        float weightSum = 0.f;
+        float skyScale = 0.f;
+        for (uint32_t i = 0; i < kSamples; ++i)
+            for (uint32_t j = 0; j < kSamples; ++j)
+            {
+                const float cosTheta = (float(i) + 0.5f) / float(kSamples);
+                const float phi = 2.f * 3.14159265f * (float(j) + 0.5f) / float(kSamples);
+                const float sinTheta = std::sqrt(1.f - cosTheta * cosTheta);
+                const float3 direction = cosTheta * normal + sinTheta * (std::cos(phi) * u + std::sin(phi) * v);
+                skyScale += cosTheta * (0.35f + 0.65f * std::clamp(0.5f + 0.5f * direction.y, 0.f, 1.f));
+                weightSum += cosTheta;
+            }
+        skyScale /= weightSum;
         for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
             for (uint32_t channel = 0; channel < 3; ++channel)
-                incident(face * mParams.hstrFaceDofs + mode, channel) = mParams.skyRadiance[channel];
+                incident(face * mParams.hstrFaceDofs + mode, channel) = skyScale * mParams.skyRadiance[channel];
+    }
     const float3 sun = normalize(mParams.sunDirection);
+    // One voxel step towards the sun for the sub-voxel sun reconstruction (the grid axes are world aligned).
+    const float3 sunVoxels = sun / mVoxelSize;
+    mParams.sunVoxelDirection = sunVoxels / length(sunVoxels);
+    mParams.sunVoxelWorldLength = 1.f / length(sunVoxels);
     uint32_t sunAxis = 0;
     if (std::abs(sun.y) > std::abs(sun.x))
         sunAxis = 1;
@@ -1096,7 +1292,8 @@ void HSTRCloud::solveLighting()
     const uint32_t sunFace = 2 * sunAxis + (sun[sunAxis] >= 0.f ? 1u : 0u);
     for (uint32_t mode = 0; mode < mParams.hstrFaceDofs; ++mode)
         for (uint32_t channel = 0; channel < 3; ++channel)
-            incident(sunFace * mParams.hstrFaceDofs + mode, channel) += 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
+            incident(sunFace * mParams.hstrFaceDofs + mode, channel) +=
+                mParams.hstSunFraction * 0.2f * std::abs(sun[sunAxis]) * mParams.sunRadiance[channel];
 
     if (any(mParams.localSourceRadiance > 0.f))
     {
@@ -1123,6 +1320,131 @@ void HSTRCloud::solveLighting()
     );
     uploadCorrectionPool(incident);
     dispatchLightingSolve();
+    mResidualDirty = true;
+}
+
+/// Binds the scene and every read-only renderer resource. Passes attach their own outputs with bindOutput, which also unbinds
+/// the read view of the same resource so no texture is ever bound as SRV and UAV in one dispatch.
+void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass)
+{
+    mpScene->bindShaderDataForRaytracing(pRenderContext, pPass->getRootVar()["gScene"]);
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["params"].setBlob(mParams);
+    var["hstrRadiance"] = mpLeafRadiance;
+    var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
+    var["hstrCutNodes"] = mpCutNodes;
+    var["hstrCutNodeParents"] = mpCutNodeParents;
+    var["hstrNodeProjection"] = mpNodeProjection;
+    var["hstrNodeDepth"] = mpNodeDepth;
+    var["hstrNodeOrder"] = mpNodeOrder;
+    var["hstrCutStatePrevious"] = mpCutState[mParams.cutParity ^ 1u];
+    var["hstrCutState"] = mpCutState[mParams.cutParity];
+    var["hstrTileNodeCounts"] = mpTileNodeCounts;
+    var["hstrTileNodes"] = mpTileNodes;
+    var["hstrExtinction"] = mpExtinction;
+    var["hstrMajorant"] = mpMajorant;
+    var["hstrCameraLighting"] = mpCameraLighting;
+    var["hstrFineSun"] = mpFineSun;
+    var["hstrLeafResidual"] = mpLeafResidual;
+    var["hstrSunOctaves"] = mpSunOctaveField;
+    var["hstrCameraQueries"] = mpCameraQueries;
+    var["hstrTileCenters"] = mpTileCenters;
+    var["hstrTileBasis"] = mpTileBasis;
+    var["hstrTileState"] = mpTileState;
+    var["hstrExtinctionSampler"] = mpExtinctionSampler;
+    var["hstrLinearSampler"] = mpLinearSampler;
+}
+
+namespace
+{
+void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Texture>& pTexture, const char* input)
+{
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var[input] = ref<Texture>();
+    var[output] = pTexture;
+}
+} // namespace
+
+void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
+{
+    const uint3 fineDims = mParams.hstrFineDims;
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    if (!mpFineSun || mpFineSun->getWidth() != fineDims.x || mpFineSun->getHeight() != fineDims.y || mpFineSun->getDepth() != fineDims.z)
+        mpFineSun = mpDevice->createTexture3D(fineDims.x, fineDims.y, fineDims.z, ResourceFormat::R16Float, 1, nullptr, flags);
+    const uint3 leafDims = mParams.hstrLeafDims;
+    const size_t leafCount = size_t(leafDims.x) * leafDims.y * leafDims.z;
+    if (!mpLeafResidual || mpLeafResidual->getElementCount() != leafCount)
+        mpLeafResidual = mpDevice->createStructuredBuffer(sizeof(uint32_t), leafCount, flags, MemoryType::DeviceLocal, nullptr, false);
+
+    // Ballistic sun transmittance per residual cell, with per-leaf activation, then non-resident pages are cleared.
+    pRenderContext->clearUAV(mpLeafResidual->getUAV().get(), uint4(0));
+    bindRenderer(pRenderContext, mpFineSunPass);
+    bindOutput(mpFineSunPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
+    mpFineSunPass->execute(pRenderContext, fineDims);
+
+    bindRenderer(pRenderContext, mpResidualMaskPass);
+    bindOutput(mpResidualMaskPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
+    mpResidualMaskPass->execute(pRenderContext, fineDims);
+
+    // Octaves 1-3: scatterer-weighted sun arrival on a 2-voxel grid, spread by a separable Gaussian.
+    const uint3 octaveDims = (fineDims + 1u) / 2u;
+    mParams.hstrOctaveDims = octaveDims;
+    for (auto& texture : mpSunOctaves)
+        if (!texture || texture->getWidth() != octaveDims.x || texture->getHeight() != octaveDims.y || texture->getDepth() != octaveDims.z)
+            texture = mpDevice->createTexture3D(octaveDims.x, octaveDims.y, octaveDims.z, ResourceFormat::RGBA32Float, 1, nullptr, flags);
+    bindRenderer(pRenderContext, mpGatherOctavesPass);
+    bindOutput(mpGatherOctavesPass, "hstrSunOctavesOutput", mpSunOctaves[0], "hstrSunOctaves");
+    mpGatherOctavesPass->execute(pRenderContext, octaveDims);
+    uint32_t current = 0;
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        mParams.octaveBlurAxis = axis;
+        bindRenderer(pRenderContext, mpBlurOctavesPass);
+        ShaderVar var = mpBlurOctavesPass->getRootVar()["CB"]["gHSTRCloud"];
+        var["hstrSunOctaves"] = mpSunOctaves[current];
+        var["hstrSunOctavesOutput"] = mpSunOctaves[current ^ 1u];
+        mpBlurOctavesPass->execute(pRenderContext, octaveDims);
+        current ^= 1u;
+    }
+    mpSunOctaveField = mpSunOctaves[current];
+}
+
+void HSTRCloud::ensureCameraResources()
+{
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const uint32_t nodeCount = mParams.hstrNodeCount;
+    const uint2 tileDims = mParams.hstrTileDims;
+    const uint32_t tileCount = tileDims.x * tileDims.y;
+    const uint2 latticeDims = mParams.hstrLatticeDims;
+    if (!mpCameraQueries || mpCameraQueries->getWidth() != latticeDims.x || mpCameraQueries->getHeight() != latticeDims.y)
+    {
+        mpCameraQueries = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+        mpTileCenters = mpDevice->createTexture2D(tileDims.x, tileDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+        mBasisDirty = true;
+    }
+    if (!mpNodeProjection || mpNodeProjection->getElementCount() != nodeCount)
+    {
+        mpNodeProjection = mpDevice->createStructuredBuffer(sizeof(float4), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpNodeDepth = mpDevice->createStructuredBuffer(sizeof(float2), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpNodeOrder = mpDevice->createStructuredBuffer(sizeof(uint32_t), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        for (auto& state : mpCutState)
+        {
+            state = mpDevice->createStructuredBuffer(sizeof(uint32_t), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
+            mpDevice->getRenderContext()->clearUAV(state->getUAV().get(), uint4(0));
+        }
+        mCutDirty = true;
+    }
+    if (!mpTileNodeCounts || mpTileNodeCounts->getElementCount() != tileCount)
+    {
+        mpTileNodeCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpTileNodes = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), size_t(tileCount) * mParams.hstrMaxTileNodes, flags, MemoryType::DeviceLocal, nullptr, false
+        );
+        mpTileBasis = mpDevice->createStructuredBuffer(sizeof(HSTRTileBasis), tileCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpTileState = mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpDevice->getRenderContext()->clearUAV(mpTileState->getUAV().get(), uint4(0));
+        mCutDirty = true;
+    }
 }
 
 void HSTRCloud::dispatchLightingSolve()
@@ -1194,8 +1516,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     const uint2 frameDim(color->getWidth(), color->getHeight());
     mCutDirty |= any(frameDim != mParams.frameDim);
     mParams.frameDim = frameDim;
-    mParams.hstrTileDims = (frameDim + 7u) / 8u;
-    mParams.hstrQueryDims = (frameDim + mParams.hstrQueryStride - 1u) / mParams.hstrQueryStride + 1u;
+    mParams.hstrTileDims = (frameDim + mParams.hstrTileSize - 1u) / mParams.hstrTileSize;
+    mParams.hstrLatticeDims = mParams.hstrTileDims + 1u;
     if (!mpScene || !mpPass || !mpLeafRadiance)
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));
@@ -1204,108 +1526,133 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         return;
     }
 
+    // Unbiased reference on the same medium and lights; accumulated over frames by the graph.
+    if (!mpReferenceSum || mpReferenceSum->getWidth() != frameDim.x || mpReferenceSum->getHeight() != frameDim.y)
+    {
+        mpReferenceSum = mpDevice->createTexture2D(
+            frameDim.x,
+            frameDim.y,
+            ResourceFormat::RGBA32Float,
+            1,
+            1,
+            nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mpReferenceRowError = mpDevice->createStructuredBuffer(
+            sizeof(float2),
+            frameDim.y,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal,
+            nullptr,
+            false
+        );
+        mParams.referenceSamples = 0;
+    }
+    if (mParams.debugView == kReferenceView)
+    {
+        // The reference average restarts whenever the camera or the medium changes.
+        const float3 position = mpScene->getCamera()->getPosition();
+        const float3 direction = mpScene->getCamera()->getTarget() - position;
+        if (any(position != mReferencePosition) || any(direction != mReferenceDirection))
+            mParams.referenceSamples = 0;
+        mReferencePosition = position;
+        mReferenceDirection = direction;
+        FALCOR_PROFILE(pRenderContext, "reference");
+        bindRenderer(pRenderContext, mpReferencePass);
+        ShaderVar var = mpReferencePass->getRootVar()["CB"]["gHSTRCloud"];
+        var["hstrReferenceSum"] = mpReferenceSum;
+        var["color"] = color;
+        var["transportError"] = error;
+        var["cutStats"] = cutStats;
+        mpReferencePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+        ++mParams.referenceSamples;
+        ++mParams.frameIndex;
+        return;
+    }
+
+    // World space: residual pages depend on the sun and density only.
+    if (mResidualDirty)
+    {
+        FALCOR_PROFILE(pRenderContext, "residualPages");
+        dispatchResidualPages(pRenderContext);
+        mResidualDirty = false;
+        mBasisDirty = true;
+    }
+
+    // Camera space: nothing below re-solves transport; it reprojects the solved field.
     if (mCameraLightingDirty)
     {
         FALCOR_PROFILE(pRenderContext, "cameraLighting");
-        mpScene->bindShaderDataForRaytracing(pRenderContext, mpCameraLightingPass->getRootVar()["gScene"]);
-        ShaderVar cameraVar = mpCameraLightingPass->getRootVar()["CB"]["gHSTRCloud"];
-        cameraVar["params"].setBlob(mParams);
-        cameraVar["hstrRadiance"] = mpLeafRadiance;
-        cameraVar["hstrCameraLightingOutput"] = mpCameraLighting;
-        mpCameraLightingPass->execute(pRenderContext, uint3(mParams.hstrLeafDims));
+        bindRenderer(pRenderContext, mpCameraLightingPass);
+        bindOutput(mpCameraLightingPass, "hstrCameraLightingOutput", mpCameraLighting, "hstrCameraLighting");
+        mpCameraLightingPass->execute(pRenderContext, mParams.hstrCameraLightingDims);
         mCameraLightingDirty = false;
         mCameraLightingPoseValid = true;
         mCameraLightingPosition = mpScene->getCamera()->getPosition();
         mCameraLightingDirection = mpScene->getCamera()->getTarget() - mCameraLightingPosition;
+        mBasisDirty = true;
     }
 
-    const uint32_t nodeCount = mParams.hstrNodeCount;
-    const uint32_t tileCount = mParams.hstrTileDims.x * mParams.hstrTileDims.y;
-    const uint2 queryDims = mParams.hstrQueryDims;
-    const auto cutFlags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
-    if (!mpCameraQueries || mpCameraQueries->getWidth() != queryDims.x || mpCameraQueries->getHeight() != queryDims.y)
-        mpCameraQueries = mpDevice->createTexture2D(queryDims.x, queryDims.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, cutFlags);
-    if (!mpNodeProjection || mpNodeProjection->getElementCount() != nodeCount)
-    {
-        mpNodeProjection = mpDevice->createStructuredBuffer(sizeof(float4), nodeCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
-        mpNodeDepth = mpDevice->createStructuredBuffer(sizeof(float2), nodeCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
-        mCutDirty = true;
-    }
-    if (!mpTileNodeCounts || mpTileNodeCounts->getElementCount() != tileCount)
-    {
-        mpTileNodeCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount, cutFlags, MemoryType::DeviceLocal, nullptr, false);
-        mpTileNodes = mpDevice->createStructuredBuffer(
-            sizeof(uint32_t), size_t(tileCount) * mParams.hstrMaxTileNodes, cutFlags, MemoryType::DeviceLocal, nullptr, false
-        );
-        mCutDirty = true;
-    }
+    ensureCameraResources();
     if (mCutDirty)
     {
         FALCOR_PROFILE(pRenderContext, "cut");
-        mpScene->bindShaderDataForRaytracing(pRenderContext, mpProjectPass->getRootVar()["gScene"]);
-        ShaderVar projectVar = mpProjectPass->getRootVar()["CB"]["gHSTRCloud"];
-        projectVar["params"].setBlob(mParams);
-        projectVar["hstrCutNodes"] = mpCutNodes;
-        projectVar["hstrCutNodeParents"] = mpCutNodeParents;
-        projectVar["hstrNodeProjection"] = mpNodeProjection;
-        projectVar["hstrNodeDepth"] = mpNodeDepth;
+        const uint32_t nodeCount = mParams.hstrNodeCount;
+        bindRenderer(pRenderContext, mpProjectPass);
         mpProjectPass->execute(pRenderContext, uint3(nodeCount, 1, 1));
 
+        // The previous cut's acceptance feeds the split/merge hysteresis of this one.
+        mParams.cutParity ^= 1u;
         pRenderContext->clearUAV(mpTileNodeCounts->getUAV().get(), uint4(0));
-        mpScene->bindShaderDataForRaytracing(pRenderContext, mpCutPass->getRootVar()["gScene"]);
-        ShaderVar cutVar = mpCutPass->getRootVar()["CB"]["gHSTRCloud"];
-        cutVar["params"].setBlob(mParams);
-        cutVar["hstrCutNodes"] = mpCutNodes;
-        cutVar["hstrCutNodeParents"] = mpCutNodeParents;
-        cutVar["hstrNodeProjection"] = mpNodeProjection;
-        cutVar["hstrNodeDepth"] = mpNodeDepth;
-        cutVar["hstrTileNodeCounts"] = mpTileNodeCounts;
-        cutVar["hstrTileNodes"] = mpTileNodes;
+        bindRenderer(pRenderContext, mpCutPass);
         mpCutPass->execute(pRenderContext, uint3(nodeCount, 1, 1));
 
-        mpScene->bindShaderDataForRaytracing(pRenderContext, mpSortPass->getRootVar()["gScene"]);
-        ShaderVar sortVar = mpSortPass->getRootVar()["CB"]["gHSTRCloud"];
-        sortVar["params"].setBlob(mParams);
-        sortVar["hstrCutNodes"] = mpCutNodes;
-        sortVar["hstrCutNodeParents"] = mpCutNodeParents;
-        sortVar["hstrNodeProjection"] = mpNodeProjection;
-        sortVar["hstrNodeDepth"] = mpNodeDepth;
-        sortVar["hstrTileNodeCounts"] = mpTileNodeCounts;
-        sortVar["hstrTileNodes"] = mpTileNodes;
-        mpSortPass->execute(pRenderContext, uint3(mParams.hstrTileDims, 1));
+        bindRenderer(pRenderContext, mpSortPass);
+        mpSortPass->execute(pRenderContext, uint3(mParams.hstrTileDims.x * 64u, mParams.hstrTileDims.y, 1));
         mCutDirty = false;
+        mBasisDirty = true;
     }
 
-    FALCOR_PROFILE(pRenderContext, "queries+resolve");
-    mpScene->bindShaderDataForRaytracing(pRenderContext, mpQueryPass->getRootVar()["gScene"]);
-    ShaderVar queryVar = mpQueryPass->getRootVar()["CB"]["gHSTRCloud"];
-    queryVar["params"].setBlob(mParams);
-    queryVar["hstrRadiance"] = mpLeafRadiance;
-    queryVar["hstrLeafResidualBounds"] = mpLeafResidualBounds;
-    queryVar["hstrCameraLighting"] = mpCameraLighting;
-    queryVar["hstrExtinctionSampler"] = mpExtinctionSampler;
-    queryVar["hstrCameraQueryOutput"] = mpCameraQueries;
-    mpQueryPass->execute(pRenderContext, uint3(queryDims, 1));
+    // Tile camera bases are deterministic, so a static camera reuses them.
+    if (mBasisDirty)
+    {
+        FALCOR_PROFILE(pRenderContext, "cameraBasis");
+        bindRenderer(pRenderContext, mpQueryPass);
+        bindOutput(mpQueryPass, "hstrCameraQueryOutput", mpCameraQueries, "hstrCameraQueries");
+        bindOutput(mpQueryPass, "hstrTileCenterOutput", mpTileCenters, "hstrTileCenters");
+        mpQueryPass->execute(pRenderContext, uint3(mParams.hstrLatticeDims, 1));
 
-    mpScene->bindShaderDataForRaytracing(pRenderContext, mpPass->getRootVar()["gScene"]);
-    ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
-    var["params"].setBlob(mParams);
-    var["hstrRadiance"] = mpLeafRadiance;
-    var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
-    var["hstrCutNodes"] = mpCutNodes;
-    var["hstrCutNodeParents"] = mpCutNodeParents;
-    var["hstrNodeProjection"] = mpNodeProjection;
-    var["hstrNodeDepth"] = mpNodeDepth;
-    var["hstrTileNodeCounts"] = mpTileNodeCounts;
-    var["hstrTileNodes"] = mpTileNodes;
-    var["hstrExtinction"] = mpExtinction;
-    var["hstrCameraLighting"] = mpCameraLighting;
-    var["hstrCameraQueries"] = mpCameraQueries;
-    var["hstrExtinctionSampler"] = mpExtinctionSampler;
-    var["color"] = color;
-    var["transportError"] = error;
-    var["cutStats"] = cutStats;
-    mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+        bindRenderer(pRenderContext, mpTileBasisPass);
+        mpTileBasisPass->execute(pRenderContext, uint3(mParams.hstrTileDims, 1));
+        mBasisDirty = false;
+    }
+
+    {
+        FALCOR_PROFILE(pRenderContext, "resolve");
+        bindRenderer(pRenderContext, mpPass);
+        ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
+        var["color"] = color;
+        var["transportError"] = error;
+        var["cutStats"] = cutStats;
+        mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+    }
+
+    // Error against the accumulated path-traced reference of this view, read by scripts through getProperties().
+    if (mCompareReference && mParams.referenceSamples > 0)
+    {
+        bindRenderer(pRenderContext, mpCompareReferencePass);
+        ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];
+        var["hstrReferenceSum"] = mpReferenceSum;
+        var["hstrReferenceRowError"] = mpReferenceRowError;
+        var["color"] = color;
+        mpCompareReferencePass->execute(pRenderContext, uint3(frameDim.y, 1, 1));
+        const std::vector<float2> rows = mpReferenceRowError->getElements<float2>();
+        float2 total(0.f);
+        for (const float2& row : rows)
+            total += row;
+        mReferenceError = total.x / float(rows.size());
+        mReferenceLogError = total.y / float(rows.size());
+    }
     ++mParams.frameIndex;
 }
 
@@ -1314,10 +1661,35 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     bool renderChanged = false;
     bool lightingChanged = false;
     bool operatorChanged = false;
+    bool residualChanged = false;
     renderChanged |= widget.var("Inside-cloud base steps", mParams.baseSteps, 8u, 128u, 8u);
     renderChanged |= widget.var("Inside-cloud refinement", mParams.refinementLevel, 0u, 3u, 1u);
     renderChanged |= widget.var("Inside-cloud residual blend", mParams.residualBlend, 0.f, 1.f, 0.01f);
     renderChanged |= widget.var("Cut transmittance error", mParams.cutTransmittanceTolerance, 0.0001f, 0.05f, 0.0001f);
+    renderChanged |= widget.var("Cut split/merge hysteresis", mParams.cutHysteresis, 0.f, 0.9f, 0.01f);
+    renderChanged |= widget.var("Tile basis surplus tolerance", mParams.basisTolerance, 0.f, 1.f, 0.001f);
+    renderChanged |= widget.var("Tile basis merge fraction", mParams.basisHysteresis, 0.f, 1.f, 0.01f);
+    renderChanged |= widget.var("March step optical depth", mParams.stepOpticalDepth, 0.02f, 2.f, 0.01f);
+    renderChanged |= widget.var("Minimum march step (voxels)", mParams.minStepVoxels, 0.05f, 2.f, 0.05f);
+    renderChanged |= widget.var("Maximum march step (voxels)", mParams.maxStepVoxels, 0.5f, 4.f, 0.25f);
+    residualChanged |= widget.var("Residual page tolerance", mParams.residualTolerance, 0.f, 1.f, 0.001f);
+    renderChanged |= widget.var("Residual strength", mParams.residualStrength, 0.f, 4.f, 0.01f);
+    renderChanged |= widget.var("Sun octave energy", mParams.octaveEnergy, 0.f, 1.f, 0.01f);
+    residualChanged |= widget.var("Sun octave extinction", mParams.octaveExtinction, 0.01f, 1.f, 0.01f);
+    renderChanged |= widget.var("Sun octave phase", mParams.octavePhase, 0.f, 1.f, 0.01f);
+    lightingChanged |= widget.var("HST sun share", mParams.hstSunFraction, 0.f, 1.f, 0.01f);
+    {
+        Gui::DropdownList debugViews = {
+            {0, "Final"},
+            {1, "Refined tiles"},
+            {2, "March cost"},
+            {3, "Opacity"},
+            {4, "Exact everywhere"},
+            {5, "Residual fields"},
+            {kReferenceView, "Path-traced reference"},
+            {7, "Rasterized sun residual"}};
+        renderChanged |= widget.dropdown("Debug view", debugViews, mParams.debugView);
+    }
     lightingChanged |= widget.var("Active transport rank", mParams.activeRank, 1u, mParams.hstrStorageRank, 1u);
     lightingChanged |= widget.var("Active-mode threshold", mParams.activeThreshold, 0.f, 1.f, 0.0001f);
     lightingChanged |= widget.var("Correction atom budget", mParams.correctionBudget, 0u, 1048576u, 4096u);
@@ -1342,11 +1714,13 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
         buildHierarchy();
     else if (lightingChanged)
         solveLighting();
-    mOptionsChanged |= renderChanged || lightingChanged || operatorChanged;
-    mCutDirty |= renderChanged || operatorChanged;
+    mResidualDirty |= residualChanged;
+    mOptionsChanged |= renderChanged || lightingChanged || operatorChanged || residualChanged;
+    mCutDirty |= renderChanged || operatorChanged || residualChanged;
     widget.textWrapped(
-        "Outside-cloud views share one projected HST antichain per 8x8 tile. Smooth nodes are accepted, silhouette and high-variation "
-        "nodes descend into the half-float transmittance residual, and NanoVDB is not marched per pixel."
+        "Outside-cloud views share one projected HST antichain per 8x8 tile. Every pixel integrates its own transmittance through the "
+        "cut; its source radiance comes from the tile camera basis, or from an exact per-pixel integral where the basis surplus or a "
+        "resident residual page's footprint demands it. Camera motion only reprojects; transport is re-solved for sun or density changes."
     );
     widget.text(fmt::format("Operator dictionary: {} prototypes", mParams.operatorDictionarySize));
 }

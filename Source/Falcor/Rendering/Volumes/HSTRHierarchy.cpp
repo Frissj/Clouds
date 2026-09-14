@@ -26,16 +26,27 @@ void require(bool condition, const char* message)
         FALCOR_THROW(message);
 }
 
+thread_local bool tInsideParallelFor = false;
+
 /// Runs f(i) for i in [0, count) on all hardware threads and rethrows the first worker exception.
+/// Nested calls (for example compiling many small hierarchies from a parallel loop) run serially.
 template<typename F>
 void parallelFor(size_t count, F&& f)
 {
+    if (tInsideParallelFor)
+    {
+        for (size_t i = 0; i < count; ++i)
+            f(i);
+        return;
+    }
     const size_t threadCount = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), count);
     std::atomic<size_t> next{0};
     std::exception_ptr error;
     std::mutex errorMutex;
     auto worker = [&]()
     {
+        const bool wasInside = tInsideParallelFor;
+        tInsideParallelFor = true;
         try
         {
             for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1))
@@ -48,6 +59,7 @@ void parallelFor(size_t count, F&& f)
                 error = std::current_exception();
             next = count;
         }
+        tInsideParallelFor = wasInside;
     };
     std::vector<std::thread> threads;
     for (size_t t = 1; t < threadCount; ++t)

@@ -29,9 +29,9 @@ struct HSTRCloudParams
     uint hstrNodeCount = 0;
     uint hstrMaxTileNodes = 128;
 
-    uint2 hstrQueryDims = { 0, 0 };
-    uint hstrQueryStride = 4;
-    uint hstrQuerySteps = 96;
+    uint2 hstrLatticeDims = { 0, 0 }; ///< Tile-corner camera queries, (tileDims + 1).
+    uint hstrTileSize = 8;
+    uint maxMarchSteps = 512;
 
     int3 hstrGridMin = { 0, 0, 0 };
     uint frameIndex = 0;
@@ -84,7 +84,57 @@ struct HSTRCloudParams
     float mixedFidelityThreshold = 0.15f;
     float operatorDictionaryTolerance = 1e-4f;
     float cutTransmittanceTolerance = 0.01f;
-    float padHSTR7 = 0.f;
+    float cutHysteresis = 0.25f; ///< Relative split/merge band for view-dependent cut acceptance.
+
+    // World-space residual pages (2-voxel cells) and extinction majorants (4-voxel blocks).
+    uint3 hstrFineDims = { 0, 0, 0 };
+    uint referenceSamples = 0; ///< Path-traced frames already accumulated into the reference average.
+
+    uint3 hstrMajorantDims = { 0, 0, 0 };
+    uint debugView = 0;
+
+    uint3 hstrCameraLightingDims = { 0, 0, 0 };
+    uint cutParity = 0;
+
+    float basisTolerance = 0.02f;  ///< Relative hierarchical surplus above which a tile descends to per-pixel integration.
+    float basisHysteresis = 0.5f;  ///< A refined tile merges back once its surplus falls below this fraction of the tolerance.
+    float residualTolerance = 0.02f; ///< Pages whose largest opacity-weighted sun deposit stays below this are not resident.
+    float residualStrength = 1.4f;
+
+    float stepOpticalDepth = 0.5f; ///< Target optical depth per majorant-bounded march step.
+    float minStepVoxels = 1.f;     ///< Midpoint quadrature of trilinear extinction is accurate at one-voxel steps at any density.
+    float maxStepVoxels = 4.f;
+    float padHSTR9 = 0.f;
+
+    // Sun transport carried by the voxel-resolution sun optical-depth pages: octave n scatters with energy a^n, extinction
+    // b^n and phase anisotropy c^n g. Octave 0 is exact single scattering; the parameters are fitted to the path tracer.
+    float octaveEnergy = 0.8f;     // Fitted against the path-traced reference (static, backlit, oblique views).
+    float octaveExtinction = 0.4f;
+    float octavePhase = 0.3f;
+    float hstSunFraction = 0.f; ///< Share of the sun also injected into the HST boundary solve (0: HST carries the sky).
+
+    float3 sunVoxelDirection = float3(0.f); ///< One voxel step towards the sun, in voxel coordinates.
+    float sunVoxelWorldLength = 0.f;        ///< World length of that step.
+
+    uint3 hstrOctaveDims = { 0, 0, 0 }; ///< 2-voxel grid of scatterer-weighted sun arrival for octaves 1-3.
+    uint octaveBlurAxis = 0;
+    float octaveBlurSigma = 1.f; ///< Lateral spread of multiply scattered sun light, in 2-voxel cells.
+    float padHSTR10 = 0.f;
+    float padHSTR11 = 0.f;
+    float padHSTR12 = 0.f;
+};
+
+/// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
+/// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and
+/// multiplies it by its own full-resolution opacity.
+struct HSTRTileBasis
+{
+    float4 c0;
+    float4 cx;
+    float4 cy;
+    float4 cxy;
+    float4 bubble;
+    float4 info; ///< x: relative surplus, y: refined flag, z: minimum corner opacity, w: unused.
 };
 
 END_NAMESPACE_FALCOR

@@ -7,12 +7,24 @@
 #include "RenderGraph/RenderPass.h"
 #include "HSTRCloudTypes.slang"
 
+#include <array>
+
 using namespace Falcor;
 
 /** Hierarchical Schur transport renderer for heterogeneous cloud volumes.
  *
  * Lighting is solved through persistent spatial-angular six-face boundary
  * operators. NanoVDB supplies visibility and unresolved residual detail only.
+ *
+ * The image is produced in three bands so that no transport work runs per pixel:
+ * - World space (sun or density changes): the HST leaf solve and fine residual pages
+ *   carrying the ballistic sun transmittance for the forward-peaked single scattering
+ *   that the isotropic boundary basis cannot represent.
+ * - Camera space (camera changes): the camera lighting basis, the projected cut with
+ *   split/merge hysteresis, and one tile camera basis per 8x8 tile fitted to tile-corner
+ *   and tile-centre queries, with a hierarchical-surplus error flag.
+ * - Every pixel: full-resolution transmittance through the cut, multiplied by the
+ *   reconstructed tile basis, or the exact per-pixel integral in refined tiles.
  */
 class HSTRCloud : public RenderPass
 {
@@ -24,6 +36,7 @@ public:
     HSTRCloud(ref<Device> pDevice, const Properties& props);
 
     Properties getProperties() const override;
+    void setProperties(const Properties& props) override;
     RenderPassReflection reflect(const CompileData& compileData) override;
     void compile(RenderContext* pRenderContext, const CompileData& compileData) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
@@ -40,7 +53,9 @@ private:
     };
     static_assert(sizeof(CorrectionAtom) == 16);
     static_assert(sizeof(HSTRCutNode) == 96);
+    static_assert(sizeof(HSTRTileBasis) == 96);
 
+    void parseProperties(const Properties& props);
     void buildHierarchy();
     void updateHierarchy();
     void uploadHierarchy();
@@ -48,6 +63,9 @@ private:
     void uploadCorrectionPool(const hstr::DenseMatrix& rootIncident);
     void solveLighting();
     void dispatchLightingSolve();
+    void dispatchResidualPages(RenderContext* pRenderContext);
+    void bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass);
+    void ensureCameraResources();
     std::vector<float> sampleLeafDensities() const;
     hstr::DenseMatrix makeNestedLeafTransport(uint32_t leafIndex) const;
 
@@ -59,6 +77,20 @@ private:
     ref<ComputePass> mpCutPass;
     ref<ComputePass> mpSortPass;
     ref<ComputePass> mpQueryPass;
+    ref<ComputePass> mpTileBasisPass;
+    ref<ComputePass> mpFineSunPass;
+    ref<ComputePass> mpResidualMaskPass;
+    ref<ComputePass> mpGatherOctavesPass;
+    ref<ComputePass> mpBlurOctavesPass;
+    ref<ComputePass> mpReferencePass;
+    ref<ComputePass> mpCompareReferencePass;
+    ref<Texture> mpReferenceSum;     ///< Running sum of path-traced reference frames (rgb) and their count (a).
+    ref<Buffer> mpReferenceRowError; ///< Per-row mean error of the HST frame against the reference average.
+    bool mCompareReference = false;
+    float mReferenceError = -1.f;    ///< Mean |HST - reference| in linear radiance.
+    float mReferenceLogError = -1.f; ///< Mean |log(1 + HST) - log(1 + reference)|.
+    float3 mReferencePosition = float3(0.f);
+    float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;
     ref<Buffer> mpLeafBasisLeft;
     ref<Buffer> mpLeafBasisRight;
@@ -76,12 +108,23 @@ private:
     ref<Buffer> mpCutNodeParents;
     ref<Buffer> mpNodeProjection;
     ref<Buffer> mpNodeDepth;
+    ref<Buffer> mpNodeOrder; ///< BSP front-to-back key of every node for the current camera.
     ref<Buffer> mpTileNodeCounts;
     ref<Buffer> mpTileNodes;
+    std::array<ref<Buffer>, 2> mpCutState; ///< Per-node acceptance of the previous and current cut, for hysteresis.
     ref<Texture> mpExtinction;
+    ref<Texture> mpMajorant;
     ref<Texture> mpCameraLighting;
     ref<Texture> mpCameraQueries;
+    ref<Texture> mpTileCenters;
+    ref<Buffer> mpTileBasis;
+    ref<Buffer> mpTileState;
+    ref<Texture> mpFineSun;
+    ref<Buffer> mpLeafResidual;
+    std::array<ref<Texture>, 2> mpSunOctaves; ///< Ping-pong storage for the octave spread.
+    ref<Texture> mpSunOctaveField;            ///< The spread octave field the renderer samples.
     ref<Sampler> mpExtinctionSampler;
+    ref<Sampler> mpLinearSampler;
     hstr::Hierarchy mHierarchy;
     HSTRCloudParams mParams;
     uint3 mActualLeafDims = uint3(0);
@@ -100,6 +143,8 @@ private:
     bool mFirstFrame = true;
     bool mCameraLightingDirty = true;
     bool mCutDirty = true;
+    bool mResidualDirty = true;
+    bool mBasisDirty = true;
     bool mCameraLightingPoseValid = false;
     float3 mCameraLightingPosition = float3(0.f);
     float3 mCameraLightingDirection = float3(0.f);
