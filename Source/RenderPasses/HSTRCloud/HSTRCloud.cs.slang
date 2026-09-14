@@ -144,6 +144,12 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
     RWStructuredBuffer<uint> hstrBeamArgs;
+    // Temporal beam tiles: last frame's lists and counts, and per finest cell the levels at which the tile starting there was
+    // refined (bit per level), last frame's and this frame's.
+    StructuredBuffer<uint> hstrBeamPreviousLists;
+    StructuredBuffer<uint> hstrBeamPreviousCounts;
+    Texture2D<uint> hstrBeamHistory;
+    RWTexture2D<uint> hstrBeamHistoryOutput;
     Texture2D<float4> hstrExactFrame;
 
     SamplerState hstrExtinctionSampler;
@@ -1560,6 +1566,11 @@ struct HSTRCloudRenderer
     /// zw hold the same measures between the two reference halves, halved: the expected noise of the full reference average.
     void compareReferenceRow(uint row)
     {
+        if (params.compareBlock > 1)
+        {
+            compareReferenceBlockRow(row);
+            return;
+        }
         if (row >= params.frameDim.y)
             return;
         float4 error = 0.f;
@@ -1640,13 +1651,33 @@ struct HSTRCloudRenderer
     /// Lattice query at a pixel-corner position (a multiple of beamLatticeStep).
     float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[uint3(position / params.beamLatticeStep, slice)]; }
 
-    /// Pixel-corner position of query q of the current pass level. Level 0 queries every coarsest corner, then every coarsest
-    /// centre; a finer level queries eight points per tile refined at the level above: its edge midpoints, then its children's
-    /// centres (its corners and centre are already on the lattice).
+    /// Pixel-corner position of query q. Per level: the current pass level, over the lists refined this frame. Temporal: every
+    /// level in one dispatch, level 0 first, then each finer level over the tiles refined last frame.
     bool beamQueryPosition(uint q, out uint2 position)
     {
+        if (params.beamTemporal == 0)
+            return beamQueryAt(params.beamPassLevel, q, false, position);
+        const uint levelZero = beamBlockQueries(params.beamTileDims + 1u) + beamBlockQueries(params.beamTileDims);
+        if (q < levelZero)
+            return beamQueryAt(0, q, true, position);
+        q -= levelZero;
+        for (uint level = 1; level < params.beamLevels; ++level)
+        {
+            const uint queries = 8u * hstrBeamPreviousCounts[level];
+            if (q < queries)
+                return beamQueryAt(level, q, true, position);
+            q -= queries;
+        }
         position = 0;
-        const uint level = params.beamPassLevel;
+        return false;
+    }
+
+    /// Query q of one level. Level 0 queries every coarsest corner, then every coarsest centre; a finer level queries eight
+    /// points per tile refined at the level above (this frame's list, or last frame's when previous is set): its edge
+    /// midpoints, then its children's centres (its corners and centre are already on the lattice).
+    bool beamQueryAt(uint level, uint q, bool previous, out uint2 position)
+    {
+        position = 0;
         if (level == 0)
         {
             // Corners, then centres, each in blocks of 8 x 4 lattice points per 32 consecutive queries so that a wave's rays
@@ -1667,7 +1698,7 @@ struct HSTRCloudRenderer
             return true;
         }
         const uint entry = q / 8;
-        if (entry >= hstrBeamCounts[level])
+        if (entry >= (previous ? hstrBeamPreviousCounts[level] : hstrBeamCounts[level]))
             return false;
         const uint s = beamTileEdge(level - 1);
         const uint h = s / 2;
@@ -1700,7 +1731,8 @@ struct HSTRCloudRenderer
             offset = uint2(h + k, h + k);
             break;
         }
-        position = unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) * s + offset;
+        const uint index = beamListOffset(level) + entry;
+        position = unpackBeamTile(previous ? hstrBeamPreviousLists[index] : hstrBeamLists[index]) * s + offset;
         return true;
     }
 
@@ -1721,31 +1753,12 @@ struct HSTRCloudRenderer
         return albedo * (phase * single + cache) + background;
     }
 
-    /// Surplus test of one tile of the current pass level: the centre as the bilinear corner basis predicts it, against the
-    /// exact centre query, in log(1 + radiance). Accepted tiles write their level into the level map. Refined tiles join the
-    /// next level's list, or at the finest level are marked for per-pixel marching (level beamLevels).
-    void testBeamTile(uint thread)
+    /// Surplus test of one tile: the centre as the bilinear corner basis predicts it, against the exact centre query, in
+    /// log(1 + radiance); optionally also a straddled beamEdgeDepth.
+    bool beamTileRefines(uint level, uint2 tile)
     {
-        const uint level = params.beamPassLevel;
-        uint2 tile;
-        if (level == 0)
-        {
-            if (thread >= params.beamTileDims.x * params.beamTileDims.y)
-                return;
-            tile = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
-        }
-        else
-        {
-            const uint entry = thread / 4;
-            if (entry >= hstrBeamCounts[level])
-                return;
-            const uint child = thread % 4;
-            tile = 2u * unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) + uint2(child & 1u, child >> 1);
-        }
         const uint s = beamTileEdge(level);
         const uint2 origin = tile * s;
-        if (any(origin >= params.frameDim))
-            return;
         const float4 a00 = beamLatticeAt(origin, 0);
         const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
         const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
@@ -1766,34 +1779,134 @@ struct HSTRCloudRenderer
             const float maximumDepth = max(max(max(a00.a, a10.a), max(a01.a, a11.a)), ac.a);
             refine = refine || (minimumDepth < params.beamEdgeDepth && maximumDepth >= params.beamEdgeDepth);
         }
-        uint finalLevel = level;
-        if (refine)
+        return refine;
+    }
+
+    /// Appends a refined tile to the list of the level below it; past the finest level, that list is the per-pixel march list.
+    /// The tile's origin cell in the history map records the refinement for the next frame's temporal queries.
+    void recordBeamRefinement(uint level, uint2 tile)
+    {
+        uint slot;
+        InterlockedAdd(hstrBeamCounts[level + 1], 1u, slot);
+        hstrBeamLists[beamListOffset(level + 1) + slot] = packBeamTile(tile);
+        if (params.beamTemporal != 0)
         {
-            // Refined tiles join the next level's list; past the finest level, that list is the per-pixel march list.
-            uint slot;
-            InterlockedAdd(hstrBeamCounts[level + 1], 1u, slot);
-            hstrBeamLists[beamListOffset(level + 1) + slot] = packBeamTile(tile);
-            if (level + 1 < params.beamLevels)
-                return;
-            finalLevel = params.beamLevels;
+            const uint2 cell = tile * beamTileEdge(level) / beamTileEdge(params.beamLevels - 1);
+            if (all(cell < params.beamLevelDims))
+                InterlockedOr(hstrBeamHistoryOutput[cell], 1u << level);
         }
+    }
+
+    /// Whether this frame queried the children of a level tile: it was refined last frame.
+    bool beamChildrenQueried(uint level, uint2 tile)
+    {
+        const uint2 cell = tile * beamTileEdge(level) / beamTileEdge(params.beamLevels - 1);
+        return all(cell < params.beamLevelDims) && (hstrBeamHistory[cell] & (1u << level)) != 0;
+    }
+
+    /// Writes the level that finalised a tile into all its level-map cells.
+    void writeBeamLevel(uint level, uint2 tile, uint value)
+    {
         const uint finest = beamTileEdge(params.beamLevels - 1);
-        const uint cells = s / finest;
-        const uint2 first = origin / finest;
+        const uint cells = beamTileEdge(level) / finest;
+        const uint2 first = tile * cells;
         for (uint y = 0; y < cells; ++y)
             for (uint x = 0; x < cells; ++x)
             {
                 const uint2 cell = first + uint2(x, y);
                 if (all(cell < params.beamLevelDims))
-                    hstrBeamLevelOutput[cell] = finalLevel;
+                    hstrBeamLevelOutput[cell] = value;
             }
     }
 
+    /// Tile test of the current pass level. Accepted tiles write their level into the level map. Refined tiles join the next
+    /// level's list, or at the finest level are marked for per-pixel marching (level beamLevels).
+    void testBeamTile(uint thread)
+    {
+        const uint level = params.beamPassLevel;
+        uint2 tile;
+        if (level == 0)
+        {
+            if (thread >= params.beamTileDims.x * params.beamTileDims.y)
+                return;
+            tile = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+        }
+        else
+        {
+            const uint entry = thread / 4;
+            if (entry >= hstrBeamCounts[level])
+                return;
+            const uint child = thread % 4;
+            tile = 2u * unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) + uint2(child & 1u, child >> 1);
+        }
+        if (any(tile * beamTileEdge(level) >= params.frameDim))
+            return;
+        if (!beamTileRefines(level, tile))
+        {
+            writeBeamLevel(level, tile, level);
+            return;
+        }
+        recordBeamRefinement(level, tile);
+        if (level + 1 >= params.beamLevels)
+            writeBeamLevel(level, tile, params.beamLevels);
+    }
+
+    /// Temporal tile tests: one thread walks one coarsest tile down through the levels whose queries exist this frame (children
+    /// of tiles refined last frame). A tile that needs refining but whose children were not queried keeps its own basis for
+    /// this frame; its refinement is recorded, so the next frame queries them.
+    void testBeamTileTemporal(uint thread)
+    {
+        if (thread >= params.beamTileDims.x * params.beamTileDims.y)
+            return;
+        // Depth-first stack of (tile, level); each refined tile pushes four children, so it never exceeds 1 + 3 levels.
+        uint stackTile[1 + 3 * kBeamMaxLevels];
+        uint stackLevel[1 + 3 * kBeamMaxLevels];
+        uint depth = 1;
+        stackTile[0] = packBeamTile(uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x));
+        stackLevel[0] = 0;
+        while (depth > 0)
+        {
+            --depth;
+            const uint2 tile = unpackBeamTile(stackTile[depth]);
+            const uint level = stackLevel[depth];
+            if (any(tile * beamTileEdge(level) >= params.frameDim))
+                continue;
+            if (!beamTileRefines(level, tile))
+            {
+                writeBeamLevel(level, tile, level);
+                continue;
+            }
+            const bool childrenQueried = level + 1 < params.beamLevels && beamChildrenQueried(level, tile);
+            recordBeamRefinement(level, tile);
+            if (level + 1 >= params.beamLevels)
+                writeBeamLevel(level, tile, params.beamLevels);
+            else if (!childrenQueried)
+                writeBeamLevel(level, tile, level);
+            else
+                for (uint child = 0; child < 4; ++child)
+                {
+                    stackTile[depth] = packBeamTile(2u * tile + uint2(child & 1u, child >> 1));
+                    stackLevel[depth] = level + 1;
+                    ++depth;
+                }
+        }
+    }
+
     /// Indirect arguments of the query and tile passes of the current pass level, from its list count; at level beamLevels,
-    /// of the per-pixel march pass.
+    /// of the per-pixel march pass. Temporal level 0: the single query pass over every level (see beamQueryPosition).
     void writeBeamArgs()
     {
         const uint level = params.beamPassLevel;
+        if (params.beamTemporal != 0 && level == 0)
+        {
+            uint queries = beamBlockQueries(params.beamTileDims + 1u) + beamBlockQueries(params.beamTileDims);
+            for (uint l = 1; l < params.beamLevels; ++l)
+                queries += 8u * hstrBeamPreviousCounts[l];
+            hstrBeamArgs[0] = (queries * params.beamSegments + 63u) / 64u;
+            hstrBeamArgs[1] = 1;
+            hstrBeamArgs[2] = 1;
+            return;
+        }
         const uint count = hstrBeamCounts[level];
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint threadsPerEntry = level < params.beamLevels ? 8u * params.beamSegments : finest * finest;
@@ -1849,6 +1962,56 @@ struct HSTRCloudRenderer
         const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
+    }
+
+    /// compareReferenceRow on compareBlock x compareBlock pixel means: one row of blocks. Averaging removes most of the
+    /// reference's per-pixel noise (and the halves' estimate of it shrinks accordingly), so what remains is systematic error.
+    void compareReferenceBlockRow(uint blockRow)
+    {
+        const uint block = params.compareBlock;
+        const uint2 blocks = params.frameDim / block;
+        if (blockRow >= blocks.y)
+            return;
+        float4 error = 0.f;
+        uint count = 0;
+        for (uint bx = 0; bx < blocks.x; ++bx)
+        {
+            float3 value = 0.f;
+            float3 reference = 0.f;
+            float3 first = 0.f;
+            float3 second = 0.f;
+            for (uint y = 0; y < block; ++y)
+                for (uint x = 0; x < block; ++x)
+                {
+                    const uint2 pixel = uint2(bx, blockRow) * block + uint2(x, y);
+                    value += params.compareExact != 0 ? color[pixel].rgb
+                                                      : color[pixel].rgb + referenceHalves(pixel, params.compareSubstitute).both;
+                    if (params.compareExact != 0)
+                    {
+                        reference += hstrExactFrame[pixel].rgb;
+                        continue;
+                    }
+                    const ReferenceHalves target = referenceHalves(pixel, params.compareTarget);
+                    reference += target.both;
+                    first += target.first;
+                    second += target.second;
+                }
+            const float inverse = 1.f / float(block * block);
+            value *= inverse;
+            reference *= inverse;
+            first *= inverse;
+            second *= inverse;
+            if (any(isnan(value) || isinf(value) || isnan(reference) || isinf(reference)))
+                continue;
+            error += float4(
+                dot(abs(value - reference), 1.f / 3.f),
+                dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f),
+                0.5f * dot(abs(first - second), 1.f / 3.f),
+                0.5f * dot(abs(log(1.f + max(first, 0.f)) - log(1.f + max(second, 0.f))), 1.f / 3.f)
+            );
+            ++count;
+        }
+        hstrReferenceRowError[blockRow] = error / float(max(count, 1u));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2038,6 +2201,12 @@ void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupTh
 void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.testBeamTile(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void testBeamTilesTemporal(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.testBeamTileTemporal(dispatchThreadId.x);
 }
 
 [numthreads(8, 8, 1)]

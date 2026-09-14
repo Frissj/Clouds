@@ -3,6 +3,7 @@
  **************************************************************************/
 #include "HSTRCloud.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Utils/Image/Bitmap.h"
 
 #include <algorithm>
 #include <array>
@@ -72,6 +73,10 @@ const char kWorldCacheSegments[] = "worldCacheSegments";
 const char kBeamTileSize[] = "beamTileSize";
 const char kBeamLevels[] = "beamLevels";
 const char kBeamSegments[] = "beamSegments";
+const char kBeamTemporal[] = "beamTemporal";
+const char kCompareBlock[] = "compareBlock";
+const char kSaveReference[] = "saveReference";
+const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
 const char kBeamEdgeDepth[] = "beamEdgeDepth";
 const char kStoreExact[] = "storeExact";
@@ -273,6 +278,14 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamLevels = std::clamp(uint32_t(value), 1u, kBeamMaxLevels);
         else if (key == kBeamSegments)
             mParams.beamSegments = nextPowerOfTwo(std::clamp(uint32_t(value), 1u, 64u));
+        else if (key == kBeamTemporal)
+            mParams.beamTemporal = bool(value) ? 1u : 0u;
+        else if (key == kCompareBlock)
+            mParams.compareBlock = std::max(1u, uint32_t(value));
+        else if (key == kSaveReference)
+            mSaveReferencePath = value.operator std::string();
+        else if (key == kLoadReference)
+            mLoadReferencePath = value.operator std::string();
         else if (key == kBeamTolerance)
             mParams.beamTolerance = value;
         else if (key == kBeamEdgeDepth)
@@ -330,6 +343,7 @@ void HSTRCloud::setProperties(const Properties& props)
                       p.maxStepVoxels != q.maxStepVoxels;
     mCutDirty = true;
     mBasisDirty = true;
+    mBeamReusable = false;
     mOptionsChanged = true;
 }
 
@@ -390,6 +404,8 @@ Properties HSTRCloud::getProperties() const
     props[kBeamTileSize] = mParams.beamTileSize;
     props[kBeamLevels] = mParams.beamLevels;
     props[kBeamSegments] = mParams.beamSegments;
+    props[kBeamTemporal] = mParams.beamTemporal != 0;
+    props[kCompareBlock] = mParams.compareBlock;
     props[kBeamTolerance] = mParams.beamTolerance;
     props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
     props[kStoreExact] = mStoreExact;
@@ -499,6 +515,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamQueryPass = createPass("buildBeamQueries");
     mpBeamTilePass = createPass("testBeamTiles");
     mpBeamArgsPass = createPass("writeBeamArgs");
+    mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamMarchPass = createPass("marchBeamPixels");
     buildHierarchy();
@@ -1502,8 +1519,11 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamLevel"] = mpBeamLevel;
-    var["hstrBeamLists"] = mpBeamLists;
-    var["hstrBeamCounts"] = mpBeamCounts;
+    var["hstrBeamLists"] = mpBeamLists[mBeamParity];
+    var["hstrBeamCounts"] = mpBeamCounts[mBeamParity];
+    var["hstrBeamPreviousLists"] = mpBeamLists[mBeamParity ^ 1u];
+    var["hstrBeamPreviousCounts"] = mpBeamCounts[mBeamParity ^ 1u];
+    var["hstrBeamHistory"] = mpBeamHistory[mBeamParity ^ 1u];
     var["hstrExactFrame"] = mpExactFrame;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
@@ -1702,6 +1722,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         );
         mParams.referenceSamples = 0;
     }
+    if (!mLoadReferencePath.empty())
+    {
+        loadReference(pRenderContext, mLoadReferencePath);
+        mLoadReferencePath.clear();
+    }
     if (mParams.debugView == kReferenceView)
     {
         // The reference average restarts whenever the camera or the medium changes.
@@ -1721,6 +1746,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpReferencePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
         ++mParams.referenceSamples;
         ++mParams.frameIndex;
+        if (!mSaveReferencePath.empty())
+        {
+            saveReference(pRenderContext, mSaveReferencePath);
+            mSaveReferencePath.clear();
+        }
         return;
     }
 
@@ -1814,6 +1844,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 }
             }
             ++mParams.worldCacheSamples;
+            ++mWorldCacheBakes; // Buffer lookups see every update.
             mWorldCacheBakeDirty = true;
         }
 
@@ -1846,6 +1877,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
             mpWorldCacheBakePass->execute(pRenderContext, dims);
             mWorldCacheBakeDirty = false;
+            ++mWorldCacheBakes;
         }
     }
 
@@ -1931,13 +1963,33 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
         // List l (1-4) holds up to 4^(l-1) entries per coarsest tile; the list after the finest level is the march list.
-        if (!mpBeamLists || mpBeamLists->getElementCount() != tileCount * 85)
-            mpBeamLists =
-                mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount * 85, flags, MemoryType::DeviceLocal, nullptr, false);
-        if (!mpBeamCounts)
+        bool layoutChanged = false;
+        for (uint32_t i = 0; i < 2; ++i)
         {
-            mpBeamCounts =
-                mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamMaxLevels + 1, flags, MemoryType::DeviceLocal, nullptr, false);
+            if (!mpBeamLists[i] || mpBeamLists[i]->getElementCount() != tileCount * 85)
+            {
+                mpBeamLists[i] =
+                    mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount * 85, flags, MemoryType::DeviceLocal, nullptr, false);
+                layoutChanged = true;
+            }
+            if (!mpBeamCounts[i])
+                mpBeamCounts[i] =
+                    mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamMaxLevels + 1, flags, MemoryType::DeviceLocal, nullptr, false);
+            if (!mpBeamHistory[i] || mpBeamHistory[i]->getWidth() != levelDims.x || mpBeamHistory[i]->getHeight() != levelDims.y)
+            {
+                mpBeamHistory[i] = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                layoutChanged = true;
+            }
+        }
+        const uint4 layout(frameDim, mParams.beamTileSize, mParams.beamLevels);
+        if (layoutChanged || any(layout != mBeamLayout))
+        {
+            mBeamLayout = layout;
+            mBeamHistoryValid = false;
+            mBeamReusable = false;
+        }
+        if (!mpBeamArgs)
+        {
             mpBeamArgs = mpDevice->createStructuredBuffer(
                 sizeof(uint32_t),
                 6 * (kBeamMaxLevels + 1),
@@ -1954,36 +2006,78 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mpBeamArgsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamArgs"] = mpBeamArgs;
             mpBeamArgsPass->execute(pRenderContext, uint3(1));
         };
-        FALCOR_PROFILE(pRenderContext, "beamQueries");
-        pRenderContext->clearUAV(mpBeamCounts->getUAV().get(), uint4(0));
-        for (uint32_t level = 0; level < mParams.beamLevels; ++level)
+        // Temporal: with the camera and the cache unchanged since the last build, its queries and tile levels are still exact.
+        const bool temporal = mParams.beamTemporal != 0;
+        const float3 cameraPosition = mpScene->getCamera()->getPosition();
+        const float3 cameraTarget = mpScene->getCamera()->getTarget();
+        const bool reuse = temporal && mBeamReusable && all(cameraPosition == mBeamCameraPosition) &&
+                           all(cameraTarget == mBeamCameraTarget) && mBeamBakes == mWorldCacheBakes;
+        if (!reuse)
         {
-            FALCOR_PROFILE(pRenderContext, "beamLevel" + std::to_string(level));
-            if (level > 0)
-                writeArgs(level);
-            mParams.beamPassLevel = level;
+            FALCOR_PROFILE(pRenderContext, "beamQueries");
+            if (temporal)
             {
-                FALCOR_PROFILE(pRenderContext, "queries" + std::to_string(level));
-                bindRenderer(pRenderContext, mpBeamQueryPass);
-                bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
-                if (level == 0)
+                // One query pass over every level (children of the tiles refined last frame) and one tile pass walking each
+                // coarsest tile down those levels; this frame's refinements drive the next frame's queries.
+                mBeamParity ^= 1u;
+                if (!mBeamHistoryValid)
                 {
-                    // Corners and centres in blocks of 8 x 4 lattice points (see beamQueryPosition).
-                    auto blockQueries = [](uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; };
-                    const uint32_t queries = blockQueries(mParams.beamTileDims + 1u) + blockQueries(mParams.beamTileDims);
-                    mpBeamQueryPass->execute(pRenderContext, uint3(queries * mParams.beamSegments, 1, 1));
+                    pRenderContext->clearUAV(mpBeamCounts[mBeamParity ^ 1u]->getUAV().get(), uint4(0));
+                    pRenderContext->clearUAV(mpBeamHistory[mBeamParity ^ 1u]->getUAV().get(), uint4(0));
                 }
-                else
-                    mpBeamQueryPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level);
+                pRenderContext->clearUAV(mpBeamCounts[mBeamParity]->getUAV().get(), uint4(0));
+                pRenderContext->clearUAV(mpBeamHistory[mBeamParity]->getUAV().get(), uint4(0));
+                writeArgs(0);
+                {
+                    FALCOR_PROFILE(pRenderContext, "queries0");
+                    bindRenderer(pRenderContext, mpBeamQueryPass);
+                    bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                    mpBeamQueryPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 0);
+                }
+                bindRenderer(pRenderContext, mpBeamTemporalTilePass);
+                bindOutput(mpBeamTemporalTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                mpBeamTemporalTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                mpBeamTemporalTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
+                mBeamHistoryValid = true;
             }
-            bindRenderer(pRenderContext, mpBeamTilePass);
-            bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
-            if (level == 0)
-                mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
             else
-                mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
+            {
+                pRenderContext->clearUAV(mpBeamCounts[mBeamParity]->getUAV().get(), uint4(0));
+                for (uint32_t level = 0; level < mParams.beamLevels; ++level)
+                {
+                    FALCOR_PROFILE(pRenderContext, "beamLevel" + std::to_string(level));
+                    if (level > 0)
+                        writeArgs(level);
+                    mParams.beamPassLevel = level;
+                    {
+                        FALCOR_PROFILE(pRenderContext, "queries" + std::to_string(level));
+                        bindRenderer(pRenderContext, mpBeamQueryPass);
+                        bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                        if (level == 0)
+                        {
+                            // Corners and centres in blocks of 8 x 4 lattice points (see beamQueryPosition).
+                            auto blockQueries = [](uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; };
+                            const uint32_t queries = blockQueries(mParams.beamTileDims + 1u) + blockQueries(mParams.beamTileDims);
+                            mpBeamQueryPass->execute(pRenderContext, uint3(queries * mParams.beamSegments, 1, 1));
+                        }
+                        else
+                            mpBeamQueryPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level);
+                    }
+                    bindRenderer(pRenderContext, mpBeamTilePass);
+                    bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                    if (level == 0)
+                        mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
+                    else
+                        mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
+                }
+                mBeamHistoryValid = false;
+            }
+            writeArgs(mParams.beamLevels);
+            mBeamReusable = true;
+            mBeamCameraPosition = cameraPosition;
+            mBeamCameraTarget = cameraTarget;
+            mBeamBakes = mWorldCacheBakes;
         }
-        writeArgs(mParams.beamLevels);
     }
 
     if (mParams.debugView == kBeamView)
@@ -2023,10 +2117,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     // getProperties().
     if (mCompareReference && (mParams.referenceSamples > 0 || (mParams.compareExact != 0 && mpExactFrame)))
     {
-        if (mParams.debugView == kBeamView && mpBeamCounts)
+        if (mParams.debugView == kBeamView && mpBeamCounts[mBeamParity])
         {
             const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
-            const uint32_t marchedTiles = mpBeamCounts->getElement<uint32_t>(mParams.beamLevels);
+            const uint32_t marchedTiles = mpBeamCounts[mBeamParity]->getElement<uint32_t>(mParams.beamLevels);
             mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);
@@ -2034,8 +2128,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         var["hstrReferenceSum"] = mpReferenceSum;
         var["hstrReferenceRowError"] = mpReferenceRowError;
         var["color"] = color;
-        mpCompareReferencePass->execute(pRenderContext, uint3(frameDim.y, 1, 1));
-        const std::vector<float4> rows = mpReferenceRowError->getElements<float4>();
+        // Block comparisons write one entry per row of blocks.
+        const uint32_t rowCount = mParams.compareBlock > 1 ? frameDim.y / mParams.compareBlock : frameDim.y;
+        mpCompareReferencePass->execute(pRenderContext, uint3(rowCount, 1, 1));
+        const std::vector<float4> rows = mpReferenceRowError->getElements<float4>(0, rowCount);
         float4 total(0.f);
         for (const float4& row : rows)
             total += row;
@@ -2044,7 +2140,101 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mReferenceNoiseError = total.z / float(rows.size());
         mReferenceNoiseLogError = total.w / float(rows.size());
     }
+    if (!mSaveReferencePath.empty())
+    {
+        saveReference(pRenderContext, mSaveReferencePath);
+        mSaveReferencePath.clear();
+    }
     ++mParams.frameIndex;
+}
+
+/// Writes the reference (per component and half: rgb mean, a sample count) as one EXR per slice, so an expensive path-traced
+/// reference survives the process and can be reloaded for comparisons. Compressed EXRs hold half floats, so means are stored
+/// rather than sums, which would overflow at high sample counts.
+void HSTRCloud::saveReference(RenderContext* pRenderContext, const std::string& path)
+{
+    if (!mpReferenceSum || mParams.referenceSamples == 0)
+    {
+        logWarning("HSTRCloud: no reference accumulated, nothing saved to '{}'.", path);
+        return;
+    }
+    for (uint32_t slice = 0; slice < mpReferenceSum->getArraySize(); ++slice)
+    {
+        std::vector<uint8_t> data =
+            pRenderContext->readTextureSubresource(mpReferenceSum.get(), mpReferenceSum->getSubresourceIndex(slice, 0));
+        float4* texels = reinterpret_cast<float4*>(data.data());
+        for (size_t i = 0; i < data.size() / sizeof(float4); ++i)
+            if (texels[i].w > 0.f)
+                texels[i] = float4(texels[i].xyz() / texels[i].w, texels[i].w);
+        Bitmap::saveImage(
+            path + "_s" + std::to_string(slice) + ".exr",
+            mpReferenceSum->getWidth(),
+            mpReferenceSum->getHeight(),
+            Bitmap::FileFormat::ExrFile,
+            Bitmap::ExportFlags::ExportAlpha,
+            ResourceFormat::RGBA32Float,
+            true,
+            data.data()
+        );
+    }
+    logInfo("HSTRCloud: saved the {}-sample reference to '{}_s*.exr'.", mParams.referenceSamples, path);
+}
+
+/// Reads reference running sums written by saveReference into the reference texture; the sample count comes from the
+/// halves' counts. The frame size must match. Set the camera and lights first: changing them afterwards restarts the reference.
+void HSTRCloud::loadReference(RenderContext* pRenderContext, const std::string& path)
+{
+    if (!mpReferenceSum)
+        return;
+    const uint32_t width = mpReferenceSum->getWidth();
+    const uint32_t height = mpReferenceSum->getHeight();
+    float samples = 0.f;
+    for (uint32_t slice = 0; slice < mpReferenceSum->getArraySize(); ++slice)
+    {
+        const std::filesystem::path file = path + "_s" + std::to_string(slice) + ".exr";
+        auto bitmap = Bitmap::createFromFile(file, true);
+        const ResourceFormat format = bitmap ? bitmap->getFormat() : ResourceFormat::Unknown;
+        if (!bitmap || bitmap->getWidth() != width || bitmap->getHeight() != height ||
+            (format != ResourceFormat::RGBA32Float && format != ResourceFormat::RGBA16Float))
+        {
+            logWarning(
+                "HSTRCloud: cannot load reference slice '{}': {}x{} {}, {}x{} RGBA expected.",
+                file,
+                bitmap ? bitmap->getWidth() : 0,
+                bitmap ? bitmap->getHeight() : 0,
+                bitmap ? to_string(format) : std::string("unreadable"),
+                width,
+                height
+            );
+            return;
+        }
+        // Means back to running sums.
+        std::vector<float4> sums(size_t(width) * height);
+        for (size_t i = 0; i < sums.size(); ++i)
+        {
+            float4 texel;
+            if (format == ResourceFormat::RGBA32Float)
+                texel = reinterpret_cast<const float4*>(bitmap->getData())[i];
+            else
+            {
+                const uint16_t* bits = reinterpret_cast<const uint16_t*>(bitmap->getData()) + 4 * i;
+                texel = float4(
+                    math::float16ToFloat32(bits[0]),
+                    math::float16ToFloat32(bits[1]),
+                    math::float16ToFloat32(bits[2]),
+                    math::float16ToFloat32(bits[3])
+                );
+            }
+            sums[i] = float4(texel.xyz() * texel.w, texel.w);
+        }
+        pRenderContext->updateSubresourceData(mpReferenceSum.get(), mpReferenceSum->getSubresourceIndex(slice, 0), sums.data());
+        if (slice < 2)
+            samples += sums[0].w;
+    }
+    mParams.referenceSamples = uint32_t(std::lround(samples));
+    mReferencePosition = mpScene->getCamera()->getPosition();
+    mReferenceDirection = mpScene->getCamera()->getTarget() - mReferencePosition;
+    logInfo("HSTRCloud: loaded a {}-sample reference from '{}_s*.exr'.", mParams.referenceSamples, path);
 }
 
 void HSTRCloud::renderUI(Gui::Widgets& widget)

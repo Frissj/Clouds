@@ -65,6 +65,8 @@ private:
     void dispatchLightingSolve();
     void dispatchResidualPages(RenderContext* pRenderContext);
     void bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass);
+    void saveReference(RenderContext* pRenderContext, const std::string& path);
+    void loadReference(RenderContext* pRenderContext, const std::string& path);
     void ensureCameraResources();
     std::vector<float> sampleLeafDensities() const;
     hstr::DenseMatrix makeNestedLeafTransport(uint32_t leafIndex) const;
@@ -109,14 +111,26 @@ private:
     ref<ComputePass> mpBeamArgsPass;
     ref<ComputePass> mpBeamResolvePass;
     ref<ComputePass> mpBeamMarchPass;
-    ref<Texture> mpBeamLattice;        ///< Beam view queries at every tile corner and centre (2 slices).
-    ref<Texture> mpBeamLevel;          ///< Level that finalised every finest beam tile.
-    ref<Buffer> mpBeamLists;           ///< Refined tiles per level.
-    ref<Buffer> mpBeamCounts;          ///< Refined tile count per level.
+    ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
+    ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
+    ref<ComputePass> mpBeamTemporalTilePass;
+    std::array<ref<Buffer>, 2> mpBeamLists;    ///< Refined tiles per level, this frame's and last frame's by parity.
+    std::array<ref<Buffer>, 2> mpBeamCounts;   ///< Refined tile count per level, by parity.
+    std::array<ref<Texture>, 2> mpBeamHistory; ///< Levels refined per finest cell, by parity.
+    uint32_t mBeamParity = 0;                  ///< Index of this frame's lists, counts and history.
+    bool mBeamHistoryValid = false;            ///< Last frame's beam lists belong to the current tile layout.
+    bool mBeamReusable = false;                ///< The beam queries and tile levels of the last frame are still exact.
+    uint32_t mWorldCacheBakes = 0;             ///< Bakes of the world cache textures, to detect lighting changes.
+    uint32_t mBeamBakes = 0;                   ///< mWorldCacheBakes when the beam queries were last built.
+    uint4 mBeamLayout = uint4(0);              ///< Frame size, tile size and levels the beam lists were built for.
+    float3 mBeamCameraPosition = float3(0.f);
+    float3 mBeamCameraTarget = float3(0.f);
     ref<Buffer> mpBeamArgs;            ///< Indirect arguments of the query and tile passes per level.
     ref<Texture> mpExactFrame;         ///< Stored frame that compareExact measures against.
     bool mStoreExact = false;          ///< Copy the next frame into mpExactFrame.
     float mBeamMarchedFraction = -1.f; ///< Share of pixels the beam view marched per pixel, read with the comparison.
+    std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.
+    std::string mLoadReferencePath;    ///< When set, the reference sums are read from <path>_s<slice>.exr at the start of the frame.
     float3 mReferencePosition = float3(0.f);
     float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;

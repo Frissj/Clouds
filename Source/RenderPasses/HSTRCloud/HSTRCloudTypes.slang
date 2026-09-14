@@ -170,7 +170,12 @@ struct HSTRCloudParams
 
     uint2 beamLevelDims = { 0, 0 }; ///< Level map, one texel per finest tile.
     uint beamLatticeStep = 2;       ///< Pixels between lattice texels: half the finest tile.
-    uint padHSTR23 = 0;
+    uint beamTemporal = 0;          ///< 1: query every level in one pass over the tiles refined last frame (one frame of lag).
+
+    uint compareBlock = 1; ///< Comparisons average compareBlock x compareBlock pixel blocks first (1: per pixel).
+    uint padHSTR24 = 0;
+    uint padHSTR25 = 0;
+    uint padHSTR26 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
