@@ -12,7 +12,8 @@ static const uint kComponentSunMultiple = 4; ///< Sun light scattered two or mor
 static const uint kComponentSkyScattered = 8; ///< Sky light scattered one or more times.
 static const uint kComponentCount = 4;
 
-static const uint kWorldCacheView = 8; ///< debugView of the world-space radiance cache experiment.
+static const uint kWorldCacheView = 8;     ///< debugView of the world-space radiance cache experiment.
+static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the 27 cache slots (SH coefficient k, channel c at 3k + c).
 
 struct HSTRCutNode
 {
@@ -138,10 +139,24 @@ struct HSTRCloudParams
     uint3 worldCacheDims = { 0, 0, 0 };
     uint worldCacheCellVoxels = 4; ///< Voxels per cache cell edge.
 
-    uint worldCacheSamples = 0; ///< Gather passes accumulated into the cache.
-    uint worldCacheOrder = 2;   ///< Highest SH band the camera evaluates (0-2).
-    uint padHSTR13 = 0;
-    uint padHSTR14 = 0;
+    uint worldCacheSamples = 0;   ///< Estimator passes (gather passes or photon batches) accumulated into the cache.
+    uint worldCacheOrder = 2;     ///< Highest SH band the camera evaluates (0-2; light tracing fills bands 0-1 only).
+    uint worldCacheEstimator = 0; ///< 0: one gather path per cell per pass; 1: light tracing with track-length deposition.
+    uint worldCachePhotons = 262144; ///< Photons per light-tracing batch.
+
+    float3 worldVoxelSize = float3(0.f);   ///< World size of one voxel (the grid axes are world aligned).
+    float worldCacheDepositScale = 4096.f; ///< Fixed-point scale of the light-tracing deposition atomics.
+
+    uint worldCacheSegments = 0; ///< 0: every batch traces whole photon paths; >0: a persistent photon pool advances this many
+                                 ///< flight segments per photon per update, respawning photons as they die.
+    uint padHSTR18 = 0;
+    uint padHSTR19 = 0;
+    uint padHSTR20 = 0;
+
+    uint worldCacheBands = 1; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
+    uint worldCacheWindow = 0; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
+    uint worldCacheTextured = 1; ///< 1: the camera reads the cache from baked, hardware-filtered 3D textures.
+    uint lightingStride = 1;     ///< The camera march re-evaluates the cache every lightingStride steps and holds it between.
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import time
@@ -16,9 +17,43 @@ H = int(os.environ.get("HSTR_H", "540"))
 # (cell voxels, gather passes, passes per frame); HSTR_CACHE_SCALE shortens the convergence for smoke tests.
 SCALE = float(os.environ.get("HSTR_CACHE_SCALE", "1"))
 CELLS = [(c, max(1, int(n * SCALE)), k) for c, n, k in [(8, 4096, 64), (4, 4096, 16), (2, 2048, 4)]]
-# HSTR_CACHE_CURVE=1: instead of the cell sweep, error of 4-voxel order-1 cells against the number of paths per cell.
+# HSTR_CACHE_CURVE=1: instead of the cell sweep, error of 4-voxel cells against GPU time for each estimator:
+# (name, worldCacheEstimator, updates per frame while converging, checkpoints in estimator passes).
 CURVE = os.environ.get("HSTR_CACHE_CURVE", "0") == "1"
-CHECKPOINTS = [4, 16, 64, 256, 1024, 4096]
+PHOTONS = int(os.environ.get("HSTR_CACHE_PHOTONS", "262144"))
+ESTIMATORS = [
+    (label, estimator, per_frame, sorted({max(1, int(c * SCALE)) for c in checkpoints}))
+    for label, estimator, per_frame, checkpoints in [
+        ("gather", 0, 16, [4, 16, 64, 256, 1024, 4096]),
+        ("light tracing", 1, 4, [int(c) for c in os.environ.get("HSTR_CACHE_CHECKPOINTS", "1,4,16,64,256,1024").split(",")]),
+    ]
+    if label in os.environ.get("HSTR_CACHE_ESTIMATORS", "gather,light tracing").split(",")
+]
+# HSTR_CACHE_LIGHTSWEEP=1: converged light-tracing caches over (cell voxels, deposited SH bands), every evaluation order.
+LIGHTSWEEP = os.environ.get("HSTR_CACHE_LIGHTSWEEP", "0") == "1"
+LIGHTSWEEP_BATCHES = max(1, int(32 * SCALE))
+# HSTR_CACHE_FULL=1: the complete split frame (background + fine-sun single scattering + cache) against the current frame.
+FULL = os.environ.get("HSTR_CACHE_FULL", "0") == "1"
+FULL_VARIANTS = json.loads(os.environ.get("HSTR_FULL_VARIANTS", "[]"))
+FULL_DEFAULTS = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "maxStepVoxels": 4.0, "lightingStride": 1, "worldCacheOrder": 2,
+                 "worldCacheWindow": 1, "worldCacheTextured": 1}
+# HSTR_CACHE_CONFIGS="4:2,2:2" restricts the sweep to (cell voxels, bands) pairs.
+LIGHTSWEEP_CONFIGS = [tuple(int(x) for x in c.split(":")) for c in os.environ.get("HSTR_CACHE_CONFIGS", "8:1,4:1,4:2,2:1,2:2").split(",")]
+
+
+def update_cost_ms(estimator, per_frame):
+    """Mean GPU time of one estimator pass, from a profiled run of frames doing per_frame passes each."""
+    hstr.set_properties({"debugView": 8, "compareReference": False, "worldCacheEstimator": estimator, "worldCacheUpdates": per_frame})
+    for i in range(4):
+        m.renderFrame()
+    m.profiler.enabled = True
+    m.profiler.start_capture()
+    for i in range(16):
+        m.renderFrame()
+    capture = m.profiler.end_capture()
+    m.profiler.enabled = False
+    times = [lane["stats"]["mean"] for name, lane in capture["events"].items() if name.endswith("/worldCache/gpu_time")]
+    return (times[0] if times else float("nan")) / per_frame
 ONLY = [c for c in os.environ.get("HSTR_CASES", "").split(",") if c]
 
 target = float3(-10.0, 73.0, -43.0)
@@ -113,21 +148,93 @@ for name, position, sun in CASES:
     lines.append(f"  current HST (sky + sun octaves 1-3)      term {fmt(term)}   total {fmt(total)}")
     lines.append(f"  current HST + exact background/single    total {fmt(measure(SMOOTH, BACKGROUND | SUN1, ALL))}")
 
-    if CURVE:
-        hstr.set_properties({"debugView": 8, "compareReference": False, "worldCacheCellVoxels": 8})
-        m.renderFrame()  # A cell-size change restarts the cache.
-        hstr.set_properties({"worldCacheCellVoxels": 4, "worldCacheUpdates": 1, "worldCacheOrder": 1})
-        for checkpoint in CHECKPOINTS:
-            while int(hstr.properties["worldCacheSampleCount"]) < checkpoint:
-                per_frame = min(16, checkpoint - int(hstr.properties["worldCacheSampleCount"]))
-                hstr.set_properties({"worldCacheUpdates": per_frame})
+    if FULL:
+        # Complete frame, no reference components: transmitted background + fine-sun-field single scattering (residual
+        # octave 0 at strength 1) + light-traced 2-voxel cache, SH order 2 windowed.
+        split = {"residualStrength": 1.0, "worldCacheOrder": 2, "worldCacheWindow": 1}
+        hstr.set_properties({"worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCachePhotons": 262144, "worldCacheEstimator": 0})
+        hstr.set_properties({"debugView": 8, "compareReference": False, "worldCacheUpdates": 0})
+        m.renderFrame()  # Restart the cache.
+        hstr.set_properties({"worldCacheEstimator": 1})
+        while int(hstr.properties["worldCacheSampleCount"]) < 32:
+            hstr.set_properties({"worldCacheUpdates": 4})
+            m.renderFrame()
+        hstr.set_properties({"worldCacheUpdates": 0})
+        lines.append(f"  split frame (fine-sun single + cache + background)  total {fmt(measure(ALL, 0, ALL, 8, split))}")
+        lines.append(f"  split frame with exact single scattering            total {fmt(measure(ALL & ~SUN1, SUN1, ALL, 8, split))}")
+        lines.append(f"  single scattering alone: fine sun field {fmt(measure(SUN1, 0, SUN1, 8, split))}"
+                     f"   current octave 0 {fmt(measure(SUN1, 0, SUN1, 0, {'residualStrength': 1.4}))}")
+        # Cost/quality variants of the split frame; every key a variant sets is restored from DEFAULTS afterwards.
+        for label, props in FULL_VARIANTS:
+            lines.append(f"  variant {label:40s} total {fmt(measure(ALL, 0, ALL, 8, dict(split, **props)))}")
+            hstr.set_properties({key: FULL_DEFAULTS[key] for key in props})
+        hstr.set_properties(dict(split, debugView=8, hstComponents=ALL, compareReference=False))
+        m.renderFrame()
+        shoot(f"{name}_split")
+        hstr.set_properties({"debugView": 0, "residualStrength": 1.4, "worldCacheWindow": 0})
+        m.renderFrame()
+        m.renderFrame()
+        shoot(f"{name}_hst")
+        hstr.set_properties({"debugView": 6, "referenceShow": ALL})
+        m.renderFrame()
+        shoot(f"{name}_pt")
+        trace(f"{name} full done")
+        with open(f"{OUT}/{TAG}_cache.txt", "w") as f:
+            f.write("Split frame vs current HST frame vs reference (log error of the whole image).\n\n" + "\n".join(lines) + "\n")
+        continue
+
+    if LIGHTSWEEP:
+        for cell_voxels, bands in LIGHTSWEEP_CONFIGS:
+            hstr.set_properties({"worldCacheCellVoxels": cell_voxels, "worldCacheBands": bands, "worldCachePhotons": PHOTONS, "worldCacheOrder": 0})
+            cost = update_cost_ms(1, 4)
+            hstr.set_properties({"worldCacheEstimator": 0, "worldCacheUpdates": 0})
+            m.renderFrame()  # Restart the cache.
+            hstr.set_properties({"worldCacheEstimator": 1})
+            while int(hstr.properties["worldCacheSampleCount"]) < LIGHTSWEEP_BATCHES:
+                hstr.set_properties({"worldCacheUpdates": min(4, LIGHTSWEEP_BATCHES - int(hstr.properties["worldCacheSampleCount"]))})
                 m.renderFrame()
             hstr.set_properties({"worldCacheUpdates": 0})
-            samples = int(hstr.properties["worldCacheSampleCount"])
-            for order in (0, 1):
-                cache_term = measure(0, 0, SMOOTH, 8, {"worldCacheOrder": order})
-                lines.append(f"  4-voxel order {order}, {samples:5d} paths per cell: term {fmt(cache_term)}")
-        trace(f"{name} curve done")
+            evaluations = [(str(order), order, 0) for order in range(bands + 1)] + [(f"{order}w", order, 1) for order in range(1, bands + 1)]
+            errors = [(label, measure(SMOOTH, 0, SMOOTH, 8, {"worldCacheOrder": order, "worldCacheWindow": window})[1]) for label, order, window in evaluations]
+            hstr.set_properties({"worldCacheWindow": 0})
+            lines.append(
+                f"  {cell_voxels}-voxel cells, bands 0-{bands}: {cost:.2f} ms per batch; after {LIGHTSWEEP_BATCHES} batches log error by order "
+                + ", ".join(f"{label}: {e:.4f}" for label, e in errors)
+            )
+            trace(f"{name} {cell_voxels}/{bands} done")
+        with open(f"{OUT}/{TAG}_cache.txt", "w") as f:
+            f.write("Light-tracing cache: cell size and SH bands (smooth term).\n\n" + "\n".join(lines) + "\n")
+        continue
+
+    if CURVE:
+        reference_mean = measure(0, 0, SMOOTH)[0]
+        curve_cell = int(os.environ.get("HSTR_CACHE_CELL", "4"))
+        curve_bands = int(os.environ.get("HSTR_CACHE_BANDS", "1"))
+        hstr.set_properties({"worldCacheCellVoxels": curve_cell, "worldCacheBands": curve_bands, "worldCachePhotons": PHOTONS, "worldCacheOrder": 1})
+        lines.append(f"  {curve_cell}-voxel cells, SH bands 0-{curve_bands}")
+        for label, estimator, per_frame, checkpoints in ESTIMATORS:
+            cost = update_cost_ms(estimator, per_frame)
+            # Switching the estimator away and back restarts the cache.
+            hstr.set_properties({"worldCacheEstimator": 1 - estimator, "worldCacheUpdates": 0})
+            m.renderFrame()
+            hstr.set_properties({"worldCacheEstimator": estimator})
+            unit = "paths per cell" if estimator == 0 else f"batches of {PHOTONS} photons"
+            lines.append(f"  {label}: {cost:.2f} ms GPU per pass ({unit})")
+            for checkpoint in checkpoints:
+                while int(hstr.properties["worldCacheSampleCount"]) < checkpoint:
+                    hstr.set_properties({"worldCacheUpdates": min(per_frame, checkpoint - int(hstr.properties["worldCacheSampleCount"]))})
+                    m.renderFrame()
+                hstr.set_properties({"worldCacheUpdates": 0})
+                samples = int(hstr.properties["worldCacheSampleCount"])
+                evaluations = [("order 0", 0, 0), ("order 1", 1, 0)] + ([("order 2w", 2, 1)] if curve_bands >= 2 and estimator == 1 else [])
+                errors = [(label, measure(SMOOTH, 0, SMOOTH, 8, {"worldCacheOrder": order, "worldCacheWindow": window})) for label, order, window in evaluations]
+                hstr.set_properties({"worldCacheWindow": 0})
+                cache_mean = measure(SMOOTH, 0, 0, 8, {"worldCacheOrder": 0})[0]
+                lines.append(
+                    f"    {samples:5d} passes = {samples * cost:8.1f} ms GPU: " + ", ".join(f"{label} log {e[1]:.4f}" for label, e in errors)
+                    + f"  (cache mean {cache_mean:.4f} vs reference {reference_mean:.4f})"
+                )
+            trace(f"{name} {label} curve done")
         with open(f"{OUT}/{TAG}_cache.txt", "w") as f:
             f.write("World cache error against paths per cell (smooth term).\n\n" + "\n".join(lines) + "\n")
         continue
@@ -144,8 +251,8 @@ for name, position, sun in CASES:
         lines.append(f"  cache {cell_voxels}-voxel cells: {samples} paths per cell in {seconds:.1f} s ({1000.0 * seconds / max(samples, 1):.1f} ms per pass incl. camera frames)")
         for order in (0, 1, 2):
             extra = {"worldCacheOrder": order}
-            cache_term = measure(0, 0, SMOOTH, 8, extra)
-            cache_total = measure(0, BACKGROUND | SUN1, ALL, 8, extra)
+            cache_term = measure(SMOOTH, 0, SMOOTH, 8, extra)
+            cache_total = measure(SMOOTH, BACKGROUND | SUN1, ALL, 8, extra)
             lines.append(f"    SH order {order}: term {fmt(cache_term)}   total with exact background/single {fmt(cache_total)}")
         if cell_voxels == 4:
             hstr.set_properties({"worldCacheOrder": 2, "compareReference": False})

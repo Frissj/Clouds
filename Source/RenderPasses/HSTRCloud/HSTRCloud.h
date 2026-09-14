@@ -92,8 +92,18 @@ private:
     float mReferenceNoiseError = -1.f;    ///< Expected linear error of the reference average itself, from its two halves.
     float mReferenceNoiseLogError = -1.f; ///< Same in log(1 + radiance).
     ref<ComputePass> mpWorldCachePass;
+    ref<ComputePass> mpWorldCachePhotonPass;
+    ref<ComputePass> mpWorldCacheResolvePass;
     ref<Buffer> mpWorldCache;        ///< World-space radiance cache experiment: SH running sums per cell.
-    uint32_t mWorldCacheUpdates = 1; ///< Cache gather passes per frame in the world cache view.
+    ref<Buffer> mpWorldCacheDeposit; ///< Fixed-point light-tracing deposits of the current batch.
+    ref<ComputePass> mpWorldCacheBakePass;
+    ref<ComputePass> mpWorldCacheAdvancePass;
+    ref<Buffer> mpPhotonPool;                                           ///< Persistent light-tracing photons (48 bytes each).
+    ref<Buffer> mpPhotonEmitted;                                        ///< Photons emitted by the pool since the last restart.
+    std::array<ref<Texture>, kWorldCacheTextures> mpWorldCacheTextures; ///< Cache means packed for hardware-filtered lookups.
+    bool mWorldCacheBakeDirty = true;
+    uint32_t mWorldCacheBakeInterval = 1; ///< Batches between bakes of the camera textures while updating.
+    uint32_t mWorldCacheUpdates = 1;      ///< Cache gather passes per frame in the world cache view.
     float3 mReferencePosition = float3(0.f);
     float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;

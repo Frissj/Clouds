@@ -61,6 +61,14 @@ const char kWorldCacheCellVoxels[] = "worldCacheCellVoxels";
 const char kWorldCacheOrder[] = "worldCacheOrder";
 const char kWorldCacheUpdates[] = "worldCacheUpdates";
 const char kWorldCacheSampleCount[] = "worldCacheSampleCount";
+const char kWorldCacheEstimator[] = "worldCacheEstimator";
+const char kWorldCachePhotons[] = "worldCachePhotons";
+const char kWorldCacheBands[] = "worldCacheBands";
+const char kWorldCacheWindow[] = "worldCacheWindow";
+const char kWorldCacheTextured[] = "worldCacheTextured";
+const char kLightingStride[] = "lightingStride";
+const char kWorldCacheBakeInterval[] = "worldCacheBakeInterval";
+const char kWorldCacheSegments[] = "worldCacheSegments";
 const char kReferenceShow[] = "referenceShow";
 const char kCompareSubstitute[] = "compareSubstitute";
 const char kCompareTarget[] = "compareTarget";
@@ -235,6 +243,22 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.worldCacheOrder = std::min(2u, uint32_t(value));
         else if (key == kWorldCacheUpdates)
             mWorldCacheUpdates = value;
+        else if (key == kWorldCacheEstimator)
+            mParams.worldCacheEstimator = value;
+        else if (key == kWorldCachePhotons)
+            mParams.worldCachePhotons = std::max(64u, uint32_t(value));
+        else if (key == kWorldCacheBands)
+            mParams.worldCacheBands = std::clamp(uint32_t(value), 1u, 2u);
+        else if (key == kWorldCacheWindow)
+            mParams.worldCacheWindow = value;
+        else if (key == kWorldCacheTextured)
+            mParams.worldCacheTextured = value;
+        else if (key == kLightingStride)
+            mParams.lightingStride = std::max(1u, uint32_t(value));
+        else if (key == kWorldCacheBakeInterval)
+            mWorldCacheBakeInterval = std::max(1u, uint32_t(value));
+        else if (key == kWorldCacheSegments)
+            mParams.worldCacheSegments = value;
         else if (key == kReferenceShow)
             mParams.referenceShow = value;
         else if (key == kCompareSubstitute)
@@ -275,7 +299,9 @@ void HSTRCloud::setProperties(const Properties& props)
         mParams.referenceSamples = 0;
         mParams.worldCacheSamples = 0;
     }
-    if (p.worldCacheCellVoxels != q.worldCacheCellVoxels)
+    if (p.worldCacheCellVoxels != q.worldCacheCellVoxels || p.worldCacheEstimator != q.worldCacheEstimator ||
+        p.worldCachePhotons != q.worldCachePhotons || p.worldCacheBands != q.worldCacheBands ||
+        p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -331,6 +357,14 @@ Properties HSTRCloud::getProperties() const
     props[kWorldCacheOrder] = mParams.worldCacheOrder;
     props[kWorldCacheUpdates] = mWorldCacheUpdates;
     props[kWorldCacheSampleCount] = mParams.worldCacheSamples;
+    props[kWorldCacheEstimator] = mParams.worldCacheEstimator;
+    props[kWorldCachePhotons] = mParams.worldCachePhotons;
+    props[kWorldCacheBands] = mParams.worldCacheBands;
+    props[kWorldCacheWindow] = mParams.worldCacheWindow;
+    props[kWorldCacheTextured] = mParams.worldCacheTextured;
+    props[kLightingStride] = mParams.lightingStride;
+    props[kWorldCacheBakeInterval] = mWorldCacheBakeInterval;
+    props[kWorldCacheSegments] = mParams.worldCacheSegments;
     props[kReferenceShow] = mParams.referenceShow;
     props[kCompareSubstitute] = mParams.compareSubstitute;
     props[kCompareTarget] = mParams.compareTarget;
@@ -379,6 +413,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpGatherOctavesPass = nullptr;
     mpCompareReferencePass = nullptr;
     mpWorldCachePass = nullptr;
+    mpWorldCachePhotonPass = nullptr;
+    mpWorldCacheResolvePass = nullptr;
+    mpWorldCacheBakePass = nullptr;
+    mpWorldCacheAdvancePass = nullptr;
     mpBlurOctavesPass = nullptr;
     mpReferencePass = nullptr;
     mFirstFrame = true;
@@ -417,6 +455,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpGatherOctavesPass = createPass("gatherSunOctaves");
     mpCompareReferencePass = createPass("compareReference");
     mpWorldCachePass = createPass("updateWorldCache");
+    mpWorldCachePhotonPass = createPass("traceWorldCachePhotons");
+    mpWorldCacheResolvePass = createPass("resolveWorldCache");
+    mpWorldCacheBakePass = createPass("bakeWorldCache");
+    mpWorldCacheAdvancePass = createPass("advanceWorldCachePhotons");
     mpBlurOctavesPass = createPass("blurSunOctaves");
     mpReferencePass = createPass("referencePathTrace");
     buildHierarchy();
@@ -1407,6 +1449,15 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrTileState"] = mpTileState;
     if (mpWorldCache)
         var["hstrWorldCache"] = mpWorldCache;
+    if (mpWorldCacheDeposit)
+        var["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+    if (mpPhotonPool)
+        var["hstrPhotonPool"] = mpPhotonPool;
+    if (mpPhotonEmitted)
+        var["hstrPhotonEmitted"] = mpPhotonEmitted;
+    for (uint32_t i = 0; i < kWorldCacheTextures; ++i)
+        if (mpWorldCacheTextures[i])
+            var["hstrWorldCacheTexture"][i] = mpWorldCacheTextures[i];
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
 }
@@ -1646,12 +1697,107 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mParams.worldCacheSamples = 0;
             logInfo("HSTRCloud: world cache {} cells of {} voxels ({:.1f} MB).", dims, cellVoxels, floatCount * 4.0 / (1 << 20));
         }
+        const size_t depositCount = size_t(dims.x) * dims.y * dims.z * 18;
+        if (mParams.worldCacheEstimator != 0 && (!mpWorldCacheDeposit || mpWorldCacheDeposit->getElementCount() != depositCount))
+            mpWorldCacheDeposit = mpDevice->createStructuredBuffer(
+                sizeof(int32_t),
+                uint32_t(depositCount),
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                MemoryType::DeviceLocal,
+                nullptr,
+                false
+            );
+        mParams.worldVoxelSize = mVoxelSize;
         FALCOR_PROFILE(pRenderContext, "worldCache");
         for (uint32_t i = 0; i < mWorldCacheUpdates; ++i)
         {
-            bindRenderer(pRenderContext, mpWorldCachePass);
-            mpWorldCachePass->execute(pRenderContext, dims);
+            if (mParams.worldCacheEstimator == 0)
+            {
+                bindRenderer(pRenderContext, mpWorldCachePass);
+                mpWorldCachePass->execute(pRenderContext, dims);
+            }
+            else if (mParams.worldCacheSegments > 0)
+            {
+                // Persistent pool: a fixed amount of flight segments per update; deposits and the emitted count accumulate.
+                const uint64_t poolBytes = uint64_t(mParams.worldCachePhotons) * 48;
+                if (!mpPhotonPool || mpPhotonPool->getSize() != poolBytes)
+                {
+                    mpPhotonPool = mpDevice->createStructuredBuffer(
+                        48,
+                        mParams.worldCachePhotons,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                        MemoryType::DeviceLocal,
+                        nullptr,
+                        false
+                    );
+                    mParams.worldCacheSamples = 0;
+                }
+                if (!mpPhotonEmitted)
+                    mpPhotonEmitted = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t),
+                        1,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                        MemoryType::DeviceLocal,
+                        nullptr,
+                        false
+                    );
+                if (mParams.worldCacheSamples == 0)
+                {
+                    pRenderContext->clearUAV(mpWorldCacheDeposit->getUAV().get(), uint4(0));
+                    pRenderContext->clearUAV(mpPhotonPool->getUAV().get(), uint4(0));
+                    pRenderContext->clearUAV(mpPhotonEmitted->getUAV().get(), uint4(0));
+                }
+                bindRenderer(pRenderContext, mpWorldCacheAdvancePass);
+                mpWorldCacheAdvancePass->execute(pRenderContext, uint3(mParams.worldCachePhotons, 1, 1));
+            }
+            else
+            {
+                // With textures, deposits accumulate across batches and the bake reads them directly: no per-batch clear or
+                // resolve. The buffer lookup still folds every batch into the float sums.
+                const bool accumulate = mParams.worldCacheTextured != 0;
+                if (!accumulate || mParams.worldCacheSamples == 0)
+                    pRenderContext->clearUAV(mpWorldCacheDeposit->getUAV().get(), uint4(0));
+                bindRenderer(pRenderContext, mpWorldCachePhotonPass);
+                mpWorldCachePhotonPass->execute(pRenderContext, uint3(mParams.worldCachePhotons, 1, 1));
+                if (!accumulate)
+                {
+                    bindRenderer(pRenderContext, mpWorldCacheResolvePass);
+                    mpWorldCacheResolvePass->execute(pRenderContext, dims);
+                }
+            }
             ++mParams.worldCacheSamples;
+            mWorldCacheBakeDirty = true;
+        }
+
+        // Bake the means into hardware-filtered textures for the camera whenever the sums changed.
+        if (!mpWorldCacheTextures[0] || mpWorldCacheTextures[0]->getWidth() != dims.x || mpWorldCacheTextures[0]->getHeight() != dims.y ||
+            mpWorldCacheTextures[0]->getDepth() != dims.z)
+        {
+            for (auto& texture : mpWorldCacheTextures)
+                texture = mpDevice->createTexture3D(
+                    dims.x,
+                    dims.y,
+                    dims.z,
+                    ResourceFormat::RGBA16Float,
+                    1,
+                    nullptr,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                );
+            mWorldCacheBakeDirty = true;
+        }
+        const bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % mWorldCacheBakeInterval == 0;
+        if (mWorldCacheBakeDirty && mParams.worldCacheTextured != 0 && bakeDue)
+        {
+            FALCOR_PROFILE(pRenderContext, "worldCacheBake");
+            bindRenderer(pRenderContext, mpWorldCacheBakePass);
+            ShaderVar var = mpWorldCacheBakePass->getRootVar()["CB"]["gHSTRCloud"];
+            for (uint32_t i = 0; i < kWorldCacheTextures; ++i)
+            {
+                var["hstrWorldCacheTexture"][i] = ref<Texture>();
+                var["hstrWorldCacheTextureOutput"][i] = mpWorldCacheTextures[i];
+            }
+            mpWorldCacheBakePass->execute(pRenderContext, dims);
+            mWorldCacheBakeDirty = false;
         }
     }
 
@@ -1679,7 +1825,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     ensureCameraResources();
-    if (mCutDirty)
+    // The world cache view integrates every pixel itself: the HST cut and camera basis stay dirty until they are used again.
+    const bool hstCamera = mParams.debugView != kWorldCacheView;
+    if (mCutDirty && hstCamera)
     {
         FALCOR_PROFILE(pRenderContext, "cut");
         const uint32_t nodeCount = mParams.hstrNodeCount;
@@ -1699,7 +1847,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     // Tile camera bases are deterministic, so a static camera reuses them.
-    if (mBasisDirty)
+    if (mBasisDirty && hstCamera)
     {
         FALCOR_PROFILE(pRenderContext, "cameraBasis");
         bindRenderer(pRenderContext, mpQueryPass);

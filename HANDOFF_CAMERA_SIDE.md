@@ -178,10 +178,29 @@ Findings (log error, 960x540, 1024 spp):
   ~30 s near convergence. Remaining visual defects: cell-scale outliers (fireflies) and dark holes from skipped cells
   (cells with no majorant are written as zero and pulled in by trilinear lookups near thin density).
 
-Next steps, in order: a splatting estimator (trace from sun and sky, deposit along every segment) plus firefly control
-and light spatial filtering, measured as error against GPU milliseconds; weight trilinear lookups by valid cells; then
-the scene-level pieces (instance TLAS, sun-space optical-depth clipmap). Only revisit HST internal sources if the cache
-cannot converge within budget and the HST warm start is shown to shorten it.
+Update, same day (supersedes the absolute numbers above):
+
+- **Russian roulette bug.** Every path in the pass (reference, gather, light tracer) used
+  `survive = min(0.95, throughput); throughput /= survive`. With albedo 0.99 the surviving weight grows by 0.99/0.95
+  per bounce; the second moment sums (0.99^2/0.95)^n and diverges, so the estimators had infinite variance (unbiased,
+  but slow, outlier-prone convergence). Now `survive = min(1, throughput)`. At 1024 spp the static view's reference
+  noise fell from 0.064 to 0.033 (log). Paths are about 3-4x longer. All earlier absolute errors were inflated by it.
+- **Light tracing estimator** (`worldCacheEstimator = 1`): photons from the sun through the sun-facing box sides and
+  from the sky through all sides, chosen by power; track-length deposition along every flight segment (3D DDA over
+  cache cells), skipping the first unscattered sun segment; 4 fixed-point atomics per crossed cell (unit sun field and
+  unit sky field, SH bands 0-1), resolved into the float sums per batch. Gather and light tracing agree on energy.
+- Static view, 4-voxel cells, smooth-term log error after the fix: HST 0.155; light tracing 0.078 after one batch of
+  262k photons (16.5 ms GPU), 0.066 after four, 0.060 converged (16 batches, ~0.26 s); the gather needs ~67 s of GPU
+  for 0.062. The cache is now representation-limited (0.060 at SH order 1 vs reference noise 0.033), not
+  variance-limited. At 1 ms per frame it halves the HST error within ~16 frames and converges in ~4 s at 60 fps.
+- The world-cache lookup now weights only valid cells (no black interpolation from skipped gather cells); the metric
+  did not move, so the holes were cosmetic.
+- The machine rebooted uncleanly during the next run (Kernel-Power 41 after repeated power-source changes, no display
+  driver event). Keep the laptop on mains power for long runs; the per-dispatch cost is higher since the roulette fix.
+
+Next: the front-lit hold-out curve with the fixed roulette; SH order 2 and 2-voxel cells for the light tracer (is the
+0.060 floor angular or spatial?); rerun ErrorBudget.py on the fixed reference; then the scene-level pieces (instance
+TLAS, sun-space optical-depth clipmap) with a fixed per-frame photon budget.
 
 ## Build, run, compare
 

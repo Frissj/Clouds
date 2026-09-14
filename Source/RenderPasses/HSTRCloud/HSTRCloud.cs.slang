@@ -32,6 +32,19 @@ struct ReferenceSample
     float3 component(uint c) { return c == 0 ? background : (c == 1 ? sunSingle : (c == 2 ? sunMultiple : sky)); }
 };
 
+/// One photon of the persistent light-tracing pool.
+struct Photon
+{
+    float4 positionWeight;      ///< Voxel position and emission weight.
+    float4 directionThroughput; ///< World direction and Russian-roulette throughput.
+    uint rng;
+    uint state; ///< Bounce count, kPhotonSky, kPhotonAlive.
+    uint2 pad;
+};
+static const uint kPhotonBounceMask = 0xFFFF;
+static const uint kPhotonSky = 1u << 16;
+static const uint kPhotonAlive = 1u << 17;
+
 /// Reference averages of a set of components over the even-frame half, the odd-frame half, and both.
 struct ReferenceHalves
 {
@@ -101,8 +114,16 @@ struct HSTRCloudRenderer
     // 2 * component + half, rgb sum and sample count), and per-row comparison against the HST frame.
     RWTexture2DArray<float4> hstrReferenceSum;
     RWStructuredBuffer<float4> hstrReferenceRowError;
-    // World-space radiance cache experiment: 9 SH coefficients x RGB running sums per cell.
+    // World-space radiance cache experiment: 9 SH coefficients x RGB running sums per cell, and the light-tracing
+    // batch's fixed-point deposits (9 SH coefficients for a unit sun, then 9 for a unit-colour sky, per cell).
     RWStructuredBuffer<float> hstrWorldCache;
+    RWStructuredBuffer<int> hstrWorldCacheDeposit;
+    // Persistent light-tracing pool and the number of photons it has emitted since the last restart.
+    RWStructuredBuffer<Photon> hstrPhotonPool;
+    RWStructuredBuffer<uint> hstrPhotonEmitted;
+    // The cache means baked for the camera: slot s = 3k + c of the 27 in texture s / 4, channel s % 4, trilinear by hardware.
+    Texture3D<float4> hstrWorldCacheTexture[kWorldCacheTextures];
+    RWTexture3D<float4> hstrWorldCacheTextureOutput[kWorldCacheTextures];
 
     SamplerState hstrExtinctionSampler;
     SamplerState hstrLinearSampler;
@@ -517,6 +538,9 @@ struct HSTRCloudRenderer
         if (voxelsPerUnit <= 1e-6f)
             return;
         const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        const bool cached = params.debugView == kWorldCacheView;
+        float3 held = 0.f;
+        uint sinceLighting = ~0u;
         float t = segment.x;
         [loop]
         while (t < segment.y && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
@@ -533,10 +557,17 @@ struct HSTRCloudRenderer
                 const float alpha = 1.f - exp(-extinctionAtVoxel(midpoint) * dt * ray.worldLength);
                 if ((withSource || residual) && alpha > 1e-6f)
                 {
-                    const float3 base =
-                        params.debugView == kWorldCacheView ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
                     if (withSource)
-                        radiance += transmittance * alpha * base;
+                    {
+                        // The cache is smooth at cell scale: it is re-evaluated every lightingStride contributing steps.
+                        if (!cached || sinceLighting >= params.lightingStride)
+                        {
+                            held = cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
+                            sinceLighting = 0;
+                        }
+                        ++sinceLighting;
+                        radiance += transmittance * alpha * held;
+                    }
                     if (residual)
                         residualRadiance += transmittance * alpha * residualAtVoxel(midpoint, ray.sunOctaves);
                 }
@@ -992,9 +1023,11 @@ struct HSTRCloudRenderer
             else
                 result.sunMultiple += sun;
             direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
+            // Russian roulette keeps the weight at or below one. A survival probability capped below the albedo (the former
+            // min(0.95, throughput)) grows the weight by albedo / cap per bounce and gives infinite variance at albedo 0.99.
             if (bounce >= 8)
             {
-                const float survive = min(0.95f, maxComponent(throughput));
+                const float survive = min(1.f, maxComponent(throughput));
                 if (randomFloat(rng) >= survive)
                     break;
                 throughput /= survive;
@@ -1035,6 +1068,268 @@ struct HSTRCloudRenderer
 
     uint worldCacheIndex(uint3 cell) { return cell.x + params.worldCacheDims.x * (cell.y + params.worldCacheDims.y * cell.z); }
 
+    /// Whether a cell holds an estimate. The gather skips cells with no density within a majorant block of their centre;
+    /// light tracing deposits into every cell a photon crosses.
+    bool worldCacheCellValid(uint3 cell)
+    {
+        if (params.worldCacheEstimator != 0 || params.worldCacheCellVoxels > 4)
+            return true;
+        return majorantAt((float3(cell) + 0.5f) * float(params.worldCacheCellVoxels)) > 0.f;
+    }
+
+    /// Light-tracing deposit of one straight flight from v0 to v1 (voxel coordinates): track length per crossed cell times
+    /// the photon weight, projected on SH bands 0-worldCacheBands of the direction the light arrives from. field 0: sun, 1: sky.
+    void depositSegment(float3 v0, float3 v1, float3 look, float weight, uint field, inout uint rng)
+    {
+        const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
+        const float cellVoxels = float(params.worldCacheCellVoxels);
+        const float worldLength = length((v1 - v0) * params.worldVoxelSize);
+        if (worldLength <= 0.f || weight <= 0.f)
+            return;
+        const float cellVolume = cellVoxels * cellVoxels * cellVoxels * params.worldVoxelSize.x * params.worldVoxelSize.y *
+                                 params.worldVoxelSize.z;
+        // Fixed-point deposit per unit of segment parameter.
+        const float perUnit = weight * worldLength / cellVolume * params.worldCacheDepositScale;
+
+        const float3 p0 = v0 / cellVoxels;
+        const float3 delta = (v1 - v0) / cellVoxels;
+        int3 cell = int3(floor(p0));
+        const int3 stepDirection = int3(sign(delta));
+        const float3 inverse = 1.f / max(abs(delta), 1e-12f);
+        float3 tMax = float3(
+            delta.x > 0.f ? (floor(p0.x) + 1.f - p0.x) * inverse.x : (delta.x < 0.f ? (p0.x - floor(p0.x)) * inverse.x : 1e30f),
+            delta.y > 0.f ? (floor(p0.y) + 1.f - p0.y) * inverse.y : (delta.y < 0.f ? (p0.y - floor(p0.y)) * inverse.y : 1e30f),
+            delta.z > 0.f ? (floor(p0.z) + 1.f - p0.z) * inverse.z : (delta.z < 0.f ? (p0.z - floor(p0.z)) * inverse.z : 1e30f)
+        );
+        const float3 tDelta = float3(delta.x != 0.f ? inverse.x : 1e30f, delta.y != 0.f ? inverse.y : 1e30f, delta.z != 0.f ? inverse.z : 1e30f);
+        float t = 0.f;
+        for (uint i = 0; i < 1024; ++i)
+        {
+            const float tNext = min(min(tMax.x, tMax.y), min(tMax.z, 1.f));
+            const float fraction = tNext - t;
+            if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)))
+            {
+                const uint base = 18 * worldCacheIndex(uint3(cell)) + 9 * field;
+                for (uint k = 0; k < coefficients; ++k)
+                {
+                    // Stochastic rounding keeps the fixed-point sum unbiased.
+                    const float value = shBasis(k, look) * perUnit * fraction;
+                    const int quantized = int(floor(value + randomFloat(rng)));
+                    if (quantized != 0)
+                        InterlockedAdd(hstrWorldCacheDeposit[base + k], quantized);
+                }
+            }
+            if (tNext >= 1.f)
+                break;
+            t = tNext;
+            if (tMax.x <= tMax.y && tMax.x <= tMax.z)
+            {
+                cell.x += stepDirection.x;
+                tMax.x += tDelta.x;
+            }
+            else if (tMax.y <= tMax.z)
+            {
+                cell.y += stepDirection.y;
+                tMax.y += tDelta.y;
+            }
+            else
+            {
+                cell.z += stepDirection.z;
+                tMax.z += tDelta.z;
+            }
+        }
+    }
+
+    /// Emitted power of photon source i: the sun through the side facing it on axis i (0-2), or the unit-colour sky
+    /// L(d) = 0.675 + 0.325 d.y through side i - 3 (outward normal n), whose inward flux is A (0.675 pi + 0.325 (2 pi / 3) n.y).
+    float photonSourcePower(uint i, float3 sun, float3 faceArea, float sunMean, float skyMean)
+    {
+        if (i < 3)
+            return sunMean * abs(sun[i]) * faceArea[i];
+        const uint axis = (i - 3) >> 1;
+        const float ny = axis == 1 ? (((i - 3) & 1) != 0 ? 1.f : -1.f) : 0.f;
+        return skyMean * faceArea[axis] * (0.675f * kPi + 0.325f * 2.f * kPi / 3.f * ny);
+    }
+
+    /// One light-tracing photon: emitted from the sun through a sun-facing side of the grid box, or from the unit-colour sky
+    /// through any side, chosen by power. Every flight segment after the first sun segment (direct sunlight) is deposited.
+    void tracePhoton(uint index)
+    {
+        if (index >= params.worldCachePhotons || gScene.getGridVolumeCount() == 0)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        uint rng = hashUint(index * 2654435761u + 1013u) ^ hashUint(params.worldCacheSamples * 9781u + 6271u);
+        Photon photon = spawnPhoton(rng);
+        float3 v = photon.positionWeight.xyz;
+        const float weight = photon.positionWeight.w;
+        float3 direction = photon.directionThroughput.xyz;
+        const bool fromSun = (photon.state & kPhotonSky) == 0;
+
+        // The medium is grey: one scalar albedo.
+        const float albedo = dot(volume.data.albedo, 1.f / 3.f);
+        float throughput = 1.f;
+        for (uint bounce = 0; bounce < 4096; ++bounce)
+        {
+            const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
+            const float3 start = v;
+            const bool collided = sampleCollision(v, d, rng);
+            if (!fromSun || bounce > 0)
+                depositSegment(start, v, -direction, weight * throughput, fromSun ? 0u : 1u, rng);
+            if (!collided)
+                break;
+            throughput *= albedo;
+            direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
+            // Weight-bounded Russian roulette, as in tracePath.
+            if (bounce >= 8)
+            {
+                const float survive = min(1.f, throughput);
+                if (randomFloat(rng) >= survive)
+                    break;
+                throughput /= survive;
+            }
+        }
+    }
+
+    /// Persistent pool: advances one photon by worldCacheSegments flight segments, respawning it whenever it dies, so every
+    /// update costs the same and every path is still deposited in full across updates. Counts the photons emitted.
+    void advancePhoton(uint slot)
+    {
+        if (slot >= params.worldCachePhotons || gScene.getGridVolumeCount() == 0)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float albedo = dot(volume.data.albedo, 1.f / 3.f);
+        Photon photon = hstrPhotonPool[slot];
+        uint rng = photon.rng != 0 ? photon.rng : hashUint(slot * 2654435761u + 1013u) ^ hashUint(params.worldCacheSamples * 9781u + 7919u);
+        uint emitted = 0;
+        for (uint segment = 0; segment < params.worldCacheSegments; ++segment)
+        {
+            if ((photon.state & kPhotonAlive) == 0)
+            {
+                photon = spawnPhoton(rng);
+                ++emitted;
+            }
+            float3 v = photon.positionWeight.xyz;
+            float3 direction = photon.directionThroughput.xyz;
+            float throughput = photon.directionThroughput.w;
+            const uint bounce = photon.state & kPhotonBounceMask;
+            const bool fromSun = (photon.state & kPhotonSky) == 0;
+            const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
+            const float3 start = v;
+            const bool collided = sampleCollision(v, d, rng);
+            if (!fromSun || bounce > 0)
+                depositSegment(start, v, -direction, photon.positionWeight.w * throughput, fromSun ? 0u : 1u, rng);
+            bool alive = collided;
+            if (collided)
+            {
+                throughput *= albedo;
+                direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
+                if (bounce >= 8)
+                {
+                    const float survive = min(1.f, throughput);
+                    alive = randomFloat(rng) < survive;
+                    throughput /= survive;
+                }
+            }
+            photon.positionWeight.xyz = v;
+            photon.directionThroughput = float4(direction, throughput);
+            photon.state = (photon.state & ~(kPhotonAlive | kPhotonBounceMask)) | (alive ? kPhotonAlive : 0u) | min(bounce + 1, kPhotonBounceMask);
+        }
+        photon.rng = rng;
+        hstrPhotonPool[slot] = photon;
+        const uint waveEmitted = WaveActiveSum(emitted);
+        if (WaveIsFirstLane() && waveEmitted > 0)
+            InterlockedAdd(hstrPhotonEmitted[0], waveEmitted);
+    }
+
+    /// A new photon at the grid box boundary (see tracePhoton), with its weight normalised by worldCachePhotons.
+    Photon spawnPhoton(inout uint rng)
+    {
+        const float3 dims = float3(params.hstrExtinctionDims);
+        const float3 extent = dims * params.worldVoxelSize;
+        const float3 faceArea = float3(extent.y * extent.z, extent.x * extent.z, extent.x * extent.y);
+        const float3 sun = normalize(params.sunDirection);
+        const float sunMean = dot(params.sunRadiance, 1.f / 3.f);
+        const float skyMean = dot(params.skyRadiance, 1.f / 3.f);
+
+        // Sources by power: three sun-facing sides (0-2), then six sky sides (3-8: -x, +x, -y, +y, -z, +z).
+        float total = 0.f;
+        for (uint i = 0; i < 9; ++i)
+            total += photonSourcePower(i, sun, faceArea, sunMean, skyMean);
+        float u = randomFloat(rng) * total;
+        uint choice = 8;
+        for (uint i = 0; i < 9; ++i)
+        {
+            const float power = photonSourcePower(i, sun, faceArea, sunMean, skyMean);
+            if (u < power)
+            {
+                choice = i;
+                break;
+            }
+            u -= power;
+        }
+
+        const bool fromSun = choice < 3;
+        const uint axis = fromSun ? choice : (choice - 3) >> 1;
+        // Outward normal of the entry side: the sun side faces the sun; sky sides alternate -/+.
+        const float side = fromSun ? (sun[axis] >= 0.f ? 1.f : -1.f) : (((choice - 3) & 1) != 0 ? 1.f : -1.f);
+        float3 normal = 0.f;
+        normal[axis] = side;
+        float3 v = float3(randomFloat(rng), randomFloat(rng), randomFloat(rng)) * dims;
+        v[axis] = side > 0.f ? dims[axis] - 1e-3f : 1e-3f;
+
+        float3 direction;
+        float weight;
+        if (fromSun)
+        {
+            direction = -sun;
+            weight = total / (sunMean * float(params.worldCachePhotons));
+        }
+        else
+        {
+            // Cosine-weighted direction d towards the sky about the outward normal; the photon travels along -d.
+            const float r = sqrt(randomFloat(rng));
+            const float phi = 2.f * kPi * randomFloat(rng);
+            const float3 up = abs(normal.y) < 0.999f ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
+            const float3 tangent = normalize(cross(up, normal));
+            const float3 bitangent = cross(normal, tangent);
+            const float3 d = normalize(r * cos(phi) * tangent + r * sin(phi) * bitangent + sqrt(max(0.f, 1.f - r * r)) * normal);
+            direction = -d;
+            // f / pdf with pdf = (power / total) (1 / area) (cos / pi); power / (skyMean area) is the side's unit flux.
+            const float unitFlux = photonSourcePower(choice, sun, faceArea, sunMean, skyMean) / (skyMean * faceArea[axis]);
+            weight = (0.675f + 0.325f * d.y) * kPi * total / (skyMean * unitFlux * float(params.worldCachePhotons));
+        }
+
+        Photon photon;
+        photon.positionWeight = float4(v, weight);
+        photon.directionThroughput = float4(direction, 1.f);
+        photon.rng = rng;
+        photon.state = kPhotonAlive | (fromSun ? 0u : kPhotonSky);
+        photon.pad = 0;
+        return photon;
+    }
+
+    /// Adds one light-tracing batch to the running sums: deposits times the sun and sky colours.
+    void resolveWorldCacheCell(uint3 cell)
+    {
+        if (any(cell >= params.worldCacheDims))
+            return;
+        const uint index = worldCacheIndex(cell);
+        const bool restart = params.worldCacheSamples == 0;
+        const float scale = 1.f / params.worldCacheDepositScale;
+        [unroll]
+        for (uint k = 0; k < 9; ++k)
+        {
+            const float3 value = scale * (float(hstrWorldCacheDeposit[18 * index + k]) * params.sunRadiance +
+                                          float(hstrWorldCacheDeposit[18 * index + 9 + k]) * params.skyRadiance);
+            [unroll]
+            for (uint c = 0; c < 3; ++c)
+            {
+                const uint slot = 27 * index + 3 * k + c;
+                hstrWorldCache[slot] = (restart ? 0.f : hstrWorldCache[slot]) + value[c];
+            }
+        }
+    }
+
     /// One gather pass: a single path per cell, from a uniform point in the cell along a uniform direction.
     void updateWorldCacheCell(uint3 cell)
     {
@@ -1042,9 +1337,7 @@ struct HSTRCloudRenderer
             return;
         const uint index = worldCacheIndex(cell);
         const float cellVoxels = float(params.worldCacheCellVoxels);
-        const float3 center = (float3(cell) + 0.5f) * cellVoxels;
-        // Cells far from any density are never interpolated by a sample with extinction (the majorant is dilated by one block).
-        const bool needed = params.worldCacheCellVoxels > 4 || majorantAt(center) > 0.f;
+        const bool needed = worldCacheCellValid(cell);
         float3 value = 0.f;
         float3 d = float3(0.f, 0.f, 1.f);
         if (needed)
@@ -1074,32 +1367,110 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// Mean of cache slot s = 3k + c of a cell. The textured light tracer bakes straight from its fixed-point deposits, which
+    /// accumulate over every batch since the last restart; the gather bakes from its float sums.
+    float worldCacheSlotMean(uint index, uint slot)
+    {
+        const float inverseSamples = 1.f / float(max(params.worldCacheSamples, 1u));
+        if (params.worldCacheEstimator == 0)
+            return hstrWorldCache[27 * index + slot] * inverseSamples;
+        const uint k = slot / 3;
+        const uint c = slot % 3;
+        // Photon weights are normalised by worldCachePhotons; a pool has emitted hstrPhotonEmitted[0] of them in total.
+        const float batches = params.worldCacheSegments > 0 ? float(max(hstrPhotonEmitted[0], 1u)) / float(params.worldCachePhotons)
+                                                            : float(max(params.worldCacheSamples, 1u));
+        const float scale = 1.f / (batches * params.worldCacheDepositScale);
+        return scale * (float(hstrWorldCacheDeposit[18 * index + k]) * params.sunRadiance[c] +
+                        float(hstrWorldCacheDeposit[18 * index + 9 + k]) * params.skyRadiance[c]);
+    }
+
+    /// Writes one cell's cache means into the packed camera textures.
+    void bakeWorldCacheCell(uint3 cell)
+    {
+        if (any(cell >= params.worldCacheDims))
+            return;
+        const uint index = worldCacheIndex(cell);
+        [unroll]
+        for (uint t = 0; t < kWorldCacheTextures; ++t)
+        {
+            float4 texel = 0.f;
+            [unroll]
+            for (uint c = 0; c < 4; ++c)
+            {
+                const uint slot = 4 * t + c;
+                if (slot < 27)
+                    texel[c] = worldCacheSlotMean(index, slot);
+            }
+            hstrWorldCacheTextureOutput[t][cell] = texel;
+        }
+    }
+
+    /// Textured form of worldCacheRadiance: one trilinear fetch per four slots, only for the evaluated bands.
+    float3 worldCacheRadianceTextured(float3 v, float3 w)
+    {
+        const float3 uvw = v / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
+        const float g = params.anisotropy;
+        const uint order = params.worldCacheOrder;
+        float3 result = 0.f;
+        float4 texels[kWorldCacheTextures];
+        [unroll]
+        for (uint t = 0; t < kWorldCacheTextures; ++t)
+            texels[t] = 0.f;
+        // Bands 0, 0-1 and 0-2 need slots 0-2, 0-11 and 0-26: textures 0, 0-2 and 0-6.
+        const uint textures = order == 0 ? 1u : (order == 1 ? 3u : 7u);
+        [unroll]
+        for (uint t = 0; t < kWorldCacheTextures; ++t)
+            if (t < textures)
+                texels[t] = hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f);
+        [unroll]
+        for (uint k = 0; k < 9; ++k)
+        {
+            const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
+            if (l > order)
+                continue;
+            const float window = params.worldCacheWindow != 0 ? 0.5f + 0.5f * cos(kPi * float(l) / float(order + 1)) : 1.f;
+            const float band = window * (l == 0 ? 1.f : (l == 1 ? g : g * g)) * shBasis(k, w);
+            const float3 c = float3(
+                texels[(3 * k) / 4][(3 * k) % 4], texels[(3 * k + 1) / 4][(3 * k + 1) % 4], texels[(3 * k + 2) / 4][(3 * k + 2) % 4]
+            );
+            result += band * c;
+        }
+        return max(0.f, result);
+    }
+
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
-    /// the HG phase convolves SH band l by g^l. Trilinear over cell centres; bands above worldCacheOrder are dropped.
+    /// the HG phase convolves SH band l by g^l. Trilinear over valid cell centres (cells without an estimate get no weight
+    /// rather than black light); bands above worldCacheOrder are dropped.
     float3 worldCacheRadiance(float3 v, float3 w)
     {
+        if (params.worldCacheTextured != 0)
+            return worldCacheRadianceTextured(v, w);
         const float3 p = v / float(params.worldCacheCellVoxels) - 0.5f;
         const float3 base = floor(p);
         const float3 f = p - base;
         const float g = params.anisotropy;
         const uint coefficients = (params.worldCacheOrder + 1) * (params.worldCacheOrder + 1);
         float3 result = 0.f;
+        float weightSum = 0.f;
         [unroll]
         for (uint corner = 0; corner < 8; ++corner)
         {
             const uint3 offset = uint3(corner & 1, (corner >> 1) & 1, corner >> 2);
             const float3 weights = lerp(1.f - f, f, float3(offset));
-            const float weight = weights.x * weights.y * weights.z;
             const uint3 cell = uint3(clamp(int3(base) + int3(offset), int3(0), int3(params.worldCacheDims) - 1));
+            const float weight = worldCacheCellValid(cell) ? weights.x * weights.y * weights.z : 0.f;
+            weightSum += weight;
             const uint index = worldCacheIndex(cell);
             for (uint k = 0; k < coefficients; ++k)
             {
-                const float band = k == 0 ? 1.f : (k < 4 ? g : g * g);
+                const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
+                const float window = params.worldCacheWindow != 0 ? 0.5f + 0.5f * cos(kPi * float(l) / float(params.worldCacheOrder + 1)) : 1.f;
+                const float band = window * (l == 0 ? 1.f : (l == 1 ? g : g * g));
                 const float3 c = float3(hstrWorldCache[27 * index + 3 * k], hstrWorldCache[27 * index + 3 * k + 1], hstrWorldCache[27 * index + 3 * k + 2]);
                 result += weight * band * shBasis(k, w) * c;
             }
         }
-        return max(0.f, result / float(max(params.worldCacheSamples, 1u)));
+        return max(0.f, result / (float(max(params.worldCacheSamples, 1u)) * max(weightSum, 1e-6f)));
     }
 
     /// Reference averages of the selected components: the even-frame half, the odd-frame half, and both.
@@ -1232,13 +1603,18 @@ struct HSTRCloudRenderer
 
         if (params.debugView == kWorldCacheView)
         {
-            // World cache experiment: the cache's sun-multiple plus scattered-sky term only, marched exactly per pixel.
+            // World cache experiment, marched exactly per pixel: the cache supplies sun-multiple plus scattered sky, the fine sun
+            // field supplies single scattering (octave 0 only), and the background is transmitted; each gated by hstComponents.
+            ray.sunOctaves.yzw = 0.f;
             float3 cached = 0.f;
-            float3 unused = 0.f;
+            float3 single = 0.f;
             float cachedTransmittance = 1.f;
             uint cachedSteps = 0;
-            marchSegment(ray, float2(0.f, 1.f), true, false, cached, unused, cachedTransmittance, cachedSteps);
-            color[pixel] = float4(cached * volume.data.albedo, 1.f);
+            const bool withCache = (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0;
+            const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0;
+            marchSegment(ray, float2(0.f, 1.f), withCache, withSingle, cached, single, cachedTransmittance, cachedSteps);
+            const float3 background = (params.hstComponents & kComponentBackground) != 0 ? cachedTransmittance * sky : 0.f;
+            color[pixel] = float4((cached + single) * volume.data.albedo + background, 1.f);
             transportError[pixel] = 0.f;
             cutStats[pixel] = 0.f;
             return;
@@ -1345,6 +1721,30 @@ void compareReference(uint3 dispatchThreadId: SV_DispatchThreadID)
 void updateWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.updateWorldCacheCell(dispatchThreadId);
+}
+
+[numthreads(64, 1, 1)]
+void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.tracePhoton(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void advanceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.advancePhoton(dispatchThreadId.x);
+}
+
+[numthreads(4, 4, 4)]
+void resolveWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.resolveWorldCacheCell(dispatchThreadId);
+}
+
+[numthreads(4, 4, 4)]
+void bakeWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.bakeWorldCacheCell(dispatchThreadId);
 }
 
 [numthreads(4, 4, 4)]
