@@ -104,6 +104,19 @@ private:
     bool mWorldCacheBakeDirty = true;
     uint32_t mWorldCacheBakeInterval = 1; ///< Batches between bakes of the camera textures while updating.
     uint32_t mWorldCacheUpdates = 1;      ///< Cache gather passes per frame in the world cache view.
+    ref<ComputePass> mpBeamQueryPass;
+    ref<ComputePass> mpBeamTilePass;
+    ref<ComputePass> mpBeamArgsPass;
+    ref<ComputePass> mpBeamResolvePass;
+    ref<ComputePass> mpBeamMarchPass;
+    ref<Texture> mpBeamLattice;        ///< Beam view queries at every tile corner and centre (2 slices).
+    ref<Texture> mpBeamLevel;          ///< Level that finalised every finest beam tile.
+    ref<Buffer> mpBeamLists;           ///< Refined tiles per level.
+    ref<Buffer> mpBeamCounts;          ///< Refined tile count per level.
+    ref<Buffer> mpBeamArgs;            ///< Indirect arguments of the query and tile passes per level.
+    ref<Texture> mpExactFrame;         ///< Stored frame that compareExact measures against.
+    bool mStoreExact = false;          ///< Copy the next frame into mpExactFrame.
+    float mBeamMarchedFraction = -1.f; ///< Share of pixels the beam view marched per pixel, read with the comparison.
     float3 mReferencePosition = float3(0.f);
     float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;

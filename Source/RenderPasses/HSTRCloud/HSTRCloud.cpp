@@ -69,6 +69,14 @@ const char kWorldCacheTextured[] = "worldCacheTextured";
 const char kLightingStride[] = "lightingStride";
 const char kWorldCacheBakeInterval[] = "worldCacheBakeInterval";
 const char kWorldCacheSegments[] = "worldCacheSegments";
+const char kBeamTileSize[] = "beamTileSize";
+const char kBeamLevels[] = "beamLevels";
+const char kBeamSegments[] = "beamSegments";
+const char kBeamTolerance[] = "beamTolerance";
+const char kBeamEdgeDepth[] = "beamEdgeDepth";
+const char kStoreExact[] = "storeExact";
+const char kCompareExact[] = "compareExact";
+const char kBeamMarchedFraction[] = "beamMarchedFraction";
 const char kReferenceShow[] = "referenceShow";
 const char kCompareSubstitute[] = "compareSubstitute";
 const char kCompareTarget[] = "compareTarget";
@@ -259,13 +267,27 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheBakeInterval = std::max(1u, uint32_t(value));
         else if (key == kWorldCacheSegments)
             mParams.worldCacheSegments = value;
+        else if (key == kBeamTileSize)
+            mParams.beamTileSize = nextPowerOfTwo(std::clamp(uint32_t(value), 2u, 64u));
+        else if (key == kBeamLevels)
+            mParams.beamLevels = std::clamp(uint32_t(value), 1u, kBeamMaxLevels);
+        else if (key == kBeamSegments)
+            mParams.beamSegments = nextPowerOfTwo(std::clamp(uint32_t(value), 1u, 64u));
+        else if (key == kBeamTolerance)
+            mParams.beamTolerance = value;
+        else if (key == kBeamEdgeDepth)
+            mParams.beamEdgeDepth = value;
+        else if (key == kStoreExact)
+            mStoreExact = value;
+        else if (key == kCompareExact)
+            mParams.compareExact = bool(value) ? 1u : 0u;
         else if (key == kReferenceShow)
             mParams.referenceShow = value;
         else if (key == kCompareSubstitute)
             mParams.compareSubstitute = value;
         else if (key == kCompareTarget)
             mParams.compareTarget = value;
-        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount)
+        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction)
             continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
@@ -365,6 +387,14 @@ Properties HSTRCloud::getProperties() const
     props[kLightingStride] = mParams.lightingStride;
     props[kWorldCacheBakeInterval] = mWorldCacheBakeInterval;
     props[kWorldCacheSegments] = mParams.worldCacheSegments;
+    props[kBeamTileSize] = mParams.beamTileSize;
+    props[kBeamLevels] = mParams.beamLevels;
+    props[kBeamSegments] = mParams.beamSegments;
+    props[kBeamTolerance] = mParams.beamTolerance;
+    props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
+    props[kStoreExact] = mStoreExact;
+    props[kCompareExact] = mParams.compareExact != 0;
+    props[kBeamMarchedFraction] = mBeamMarchedFraction;
     props[kReferenceShow] = mParams.referenceShow;
     props[kCompareSubstitute] = mParams.compareSubstitute;
     props[kCompareTarget] = mParams.compareTarget;
@@ -419,6 +449,11 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpWorldCacheAdvancePass = nullptr;
     mpBlurOctavesPass = nullptr;
     mpReferencePass = nullptr;
+    mpBeamQueryPass = nullptr;
+    mpBeamTilePass = nullptr;
+    mpBeamArgsPass = nullptr;
+    mpBeamResolvePass = nullptr;
+    mpBeamMarchPass = nullptr;
     mFirstFrame = true;
     mCameraLightingDirty = true;
     mCutDirty = true;
@@ -461,6 +496,11 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpWorldCacheAdvancePass = createPass("advanceWorldCachePhotons");
     mpBlurOctavesPass = createPass("blurSunOctaves");
     mpReferencePass = createPass("referencePathTrace");
+    mpBeamQueryPass = createPass("buildBeamQueries");
+    mpBeamTilePass = createPass("testBeamTiles");
+    mpBeamArgsPass = createPass("writeBeamArgs");
+    mpBeamResolvePass = createPass("resolveBeam");
+    mpBeamMarchPass = createPass("marchBeamPixels");
     buildHierarchy();
 }
 
@@ -1458,6 +1498,13 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     for (uint32_t i = 0; i < kWorldCacheTextures; ++i)
         if (mpWorldCacheTextures[i])
             var["hstrWorldCacheTexture"][i] = mpWorldCacheTextures[i];
+    // The indirect argument buffer is bound only by the pass that writes it: a dispatch cannot read it as arguments and
+    // hold it as a UAV.
+    var["hstrBeamLattice"] = mpBeamLattice;
+    var["hstrBeamLevel"] = mpBeamLevel;
+    var["hstrBeamLists"] = mpBeamLists;
+    var["hstrBeamCounts"] = mpBeamCounts;
+    var["hstrExactFrame"] = mpExactFrame;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
 }
@@ -1678,7 +1725,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     // World cache experiment: camera-independent gather passes accumulated while its view is shown.
-    if (mParams.debugView == kWorldCacheView)
+    const bool worldCacheFrame = mParams.debugView == kWorldCacheView || mParams.debugView == kBeamView;
+    if (worldCacheFrame)
     {
         const uint32_t cellVoxels = mParams.worldCacheCellVoxels;
         const uint3 dims = (mParams.hstrExtinctionDims + cellVoxels - 1u) / cellVoxels;
@@ -1810,8 +1858,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mBasisDirty = true;
     }
 
-    // Camera space: nothing below re-solves transport; it reprojects the solved field.
-    if (mCameraLightingDirty)
+    // Camera space: nothing below re-solves transport; it reprojects the solved field. The world cache views integrate
+    // every pixel themselves: the HST camera lighting, cut and camera basis stay dirty until they are used again.
+    const bool hstCamera = !worldCacheFrame;
+    if (mCameraLightingDirty && hstCamera)
     {
         FALCOR_PROFILE(pRenderContext, "cameraLighting");
         bindRenderer(pRenderContext, mpCameraLightingPass);
@@ -1825,8 +1875,6 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     ensureCameraResources();
-    // The world cache view integrates every pixel itself: the HST cut and camera basis stay dirty until they are used again.
-    const bool hstCamera = mParams.debugView != kWorldCacheView;
     if (mCutDirty && hstCamera)
     {
         FALCOR_PROFILE(pRenderContext, "cut");
@@ -1860,6 +1908,97 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mBasisDirty = false;
     }
 
+    // Beam view: hierarchical tiles. Level 0 queries every coarsest tile corner and centre and tests every tile; each finer
+    // level queries and tests only the children of the tiles refined above it, through compacted lists and indirect
+    // dispatches. Tiles failing the finest level are marched per pixel.
+    if (mParams.debugView == kBeamView)
+    {
+        uint32_t maximumLevels = 0;
+        while ((mParams.beamTileSize >> (maximumLevels + 1)) >= 2u && maximumLevels + 1 < kBeamMaxLevels)
+            ++maximumLevels;
+        mParams.beamLevels = std::clamp(mParams.beamLevels, 1u, maximumLevels + 1);
+        const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
+        mParams.beamLatticeStep = std::max(1u, finest / 2);
+        mParams.beamTileDims = (frameDim + mParams.beamTileSize - 1u) / mParams.beamTileSize;
+        mParams.beamLatticeDims = mParams.beamTileDims * mParams.beamTileSize / mParams.beamLatticeStep + 1u;
+        mParams.beamLevelDims = (frameDim + finest - 1u) / finest;
+        const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+        const uint2 latticeDims = mParams.beamLatticeDims;
+        const uint2 levelDims = mParams.beamLevelDims;
+        const uint32_t tileCount = mParams.beamTileDims.x * mParams.beamTileDims.y;
+        if (!mpBeamLattice || mpBeamLattice->getWidth() != latticeDims.x || mpBeamLattice->getHeight() != latticeDims.y)
+            mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 2, 1, nullptr, flags);
+        if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
+            mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+        // List l (1-4) holds up to 4^(l-1) entries per coarsest tile; the list after the finest level is the march list.
+        if (!mpBeamLists || mpBeamLists->getElementCount() != tileCount * 85)
+            mpBeamLists =
+                mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount * 85, flags, MemoryType::DeviceLocal, nullptr, false);
+        if (!mpBeamCounts)
+        {
+            mpBeamCounts =
+                mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamMaxLevels + 1, flags, MemoryType::DeviceLocal, nullptr, false);
+            mpBeamArgs = mpDevice->createStructuredBuffer(
+                sizeof(uint32_t),
+                6 * (kBeamMaxLevels + 1),
+                ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg,
+                MemoryType::DeviceLocal,
+                nullptr,
+                false
+            );
+        }
+        auto writeArgs = [&](uint32_t level)
+        {
+            mParams.beamPassLevel = level;
+            bindRenderer(pRenderContext, mpBeamArgsPass);
+            mpBeamArgsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamArgs"] = mpBeamArgs;
+            mpBeamArgsPass->execute(pRenderContext, uint3(1));
+        };
+        FALCOR_PROFILE(pRenderContext, "beamQueries");
+        pRenderContext->clearUAV(mpBeamCounts->getUAV().get(), uint4(0));
+        for (uint32_t level = 0; level < mParams.beamLevels; ++level)
+        {
+            FALCOR_PROFILE(pRenderContext, "beamLevel" + std::to_string(level));
+            if (level > 0)
+                writeArgs(level);
+            mParams.beamPassLevel = level;
+            {
+                FALCOR_PROFILE(pRenderContext, "queries" + std::to_string(level));
+                bindRenderer(pRenderContext, mpBeamQueryPass);
+                bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                if (level == 0)
+                {
+                    // Corners and centres in blocks of 8 x 4 lattice points (see beamQueryPosition).
+                    auto blockQueries = [](uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; };
+                    const uint32_t queries = blockQueries(mParams.beamTileDims + 1u) + blockQueries(mParams.beamTileDims);
+                    mpBeamQueryPass->execute(pRenderContext, uint3(queries * mParams.beamSegments, 1, 1));
+                }
+                else
+                    mpBeamQueryPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level);
+            }
+            bindRenderer(pRenderContext, mpBeamTilePass);
+            bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+            if (level == 0)
+                mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
+            else
+                mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
+        }
+        writeArgs(mParams.beamLevels);
+    }
+
+    if (mParams.debugView == kBeamView)
+    {
+        // Reconstruction of every accepted pixel in a light kernel, then the compacted per-pixel march of failed finest tiles.
+        FALCOR_PROFILE(pRenderContext, "resolve");
+        bindRenderer(pRenderContext, mpBeamResolvePass);
+        mpBeamResolvePass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+        mpBeamResolvePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+        FALCOR_PROFILE(pRenderContext, "march");
+        bindRenderer(pRenderContext, mpBeamMarchPass);
+        mpBeamMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+        mpBeamMarchPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * mParams.beamLevels);
+    }
+    else
     {
         FALCOR_PROFILE(pRenderContext, "resolve");
         bindRenderer(pRenderContext, mpPass);
@@ -1870,9 +2009,26 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
     }
 
-    // Error against the accumulated path-traced reference of this view, read by scripts through getProperties().
-    if (mCompareReference && mParams.referenceSamples > 0)
+    if (mStoreExact)
     {
+        if (!mpExactFrame || mpExactFrame->getWidth() != frameDim.x || mpExactFrame->getHeight() != frameDim.y)
+            mpExactFrame = mpDevice->createTexture2D(
+                frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, ResourceBindFlags::ShaderResource
+            );
+        pRenderContext->copyResource(mpExactFrame.get(), color.get());
+        mStoreExact = false;
+    }
+
+    // Error against the accumulated path-traced reference of this view (or the stored exact frame), read by scripts through
+    // getProperties().
+    if (mCompareReference && (mParams.referenceSamples > 0 || (mParams.compareExact != 0 && mpExactFrame)))
+    {
+        if (mParams.debugView == kBeamView && mpBeamCounts)
+        {
+            const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
+            const uint32_t marchedTiles = mpBeamCounts->getElement<uint32_t>(mParams.beamLevels);
+            mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
+        }
         bindRenderer(pRenderContext, mpCompareReferencePass);
         ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];
         var["hstrReferenceSum"] = mpReferenceSum;

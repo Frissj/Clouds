@@ -53,6 +53,15 @@ struct ReferenceHalves
     float3 both;
 };
 
+/// Split-frame terms along one camera ray, before albedo: world-cache radiance, single-scattered sun without its phase factor,
+/// and optical depth (capped where the march terminates).
+struct BeamSample
+{
+    float3 cache;
+    float3 single;
+    float depth;
+};
+
 /// A primary ray restricted to the volume bounds, expressed in leaf space.
 /// position is the entry point (t = 0), direction the entry-to-exit vector (t = 1).
 struct CutRay
@@ -124,6 +133,18 @@ struct HSTRCloudRenderer
     // The cache means baked for the camera: slot s = 3k + c of the 27 in texture s / 4, channel s % 4, trilinear by hardware.
     Texture3D<float4> hstrWorldCacheTexture[kWorldCacheTextures];
     RWTexture3D<float4> hstrWorldCacheTextureOutput[kWorldCacheTextures];
+    // Beam view: exact queries on the lattice of all tile corners and centres, slice 0 (cache rgb, optical depth), slice 1
+    // (single scatter without phase, unused); the level that finalised every finest tile (beamLevels: marched per pixel);
+    // the per-level lists of refined tiles (list beamLevels: finest tiles marched per pixel), their counts and indirect
+    // arguments; and the stored exact frame for comparisons.
+    Texture2DArray<float4> hstrBeamLattice;
+    RWTexture2DArray<float4> hstrBeamLatticeOutput;
+    Texture2D<uint> hstrBeamLevel;
+    RWTexture2D<uint> hstrBeamLevelOutput;
+    RWStructuredBuffer<uint> hstrBeamLists;
+    RWStructuredBuffer<uint> hstrBeamCounts;
+    RWStructuredBuffer<uint> hstrBeamArgs;
+    Texture2D<float4> hstrExactFrame;
 
     SamplerState hstrExtinctionSampler;
     SamplerState hstrLinearSampler;
@@ -261,6 +282,8 @@ struct HSTRCloudRenderer
         const float3 upstream = v + params.sunVoxelDirection;
         const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (upstream + 0.5f) / float3(params.hstrFineDims), 0.f) +
                             extinctionAtVoxel(v + 0.5f * params.sunVoxelDirection) * params.sunVoxelWorldLength;
+        if (all(octaves.yzw == 0.f))
+            return params.residualStrength * params.sunRadiance * octaves.x * exp(-depth);
         // Octaves 1-3 are multiply scattered: they arrive from the scatterers around v, not along v's own sun ray.
         const float4 spread = hstrSunOctaves.SampleLevel(hstrLinearSampler, (v + 0.5f) / (2.f * float3(params.hstrOctaveDims)), 0.f);
         const float b = params.octaveExtinction;
@@ -538,8 +561,9 @@ struct HSTRCloudRenderer
         if (voxelsPerUnit <= 1e-6f)
             return;
         const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
-        const bool cached = params.debugView == kWorldCacheView;
+        const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
         float3 held = 0.f;
+        float3 heldAt = 0.f;
         uint sinceLighting = ~0u;
         float t = segment.x;
         [loop]
@@ -559,10 +583,14 @@ struct HSTRCloudRenderer
                 {
                     if (withSource)
                     {
-                        // The cache is smooth at cell scale: it is re-evaluated every lightingStride contributing steps.
-                        if (!cached || sinceLighting >= params.lightingStride)
+                        // The cache is smooth at cell scale: it is re-evaluated every lightingStride contributing steps, and
+                        // whenever the march has moved a cache cell since, so a held value never crosses a gap between puffs.
+                        const float3 moved = midpoint - heldAt;
+                        const float cellVoxels = float(params.worldCacheCellVoxels);
+                        if (!cached || sinceLighting >= params.lightingStride || dot(moved, moved) > cellVoxels * cellVoxels)
                         {
                             held = cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
+                            heldAt = midpoint;
                             sinceLighting = 0;
                         }
                         ++sinceLighting;
@@ -1539,6 +1567,18 @@ struct HSTRCloudRenderer
         for (uint x = 0; x < params.frameDim.x; ++x)
         {
             const uint2 pixel = uint2(x, row);
+            if (params.compareExact != 0)
+            {
+                // Against the stored exact frame: zw become the fractions of pixels whose log error exceeds 0.02 and 0.1.
+                const float3 value = color[pixel].rgb;
+                const float3 reference = hstrExactFrame[pixel].rgb;
+                if (any(isnan(value) || isinf(value)))
+                    continue;
+                const float logError = dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f);
+                error += float4(dot(abs(value - reference), 1.f / 3.f), logError, logError > 0.02f ? 1.f : 0.f, logError > 0.1f ? 1.f : 0.f);
+                ++count;
+                continue;
+            }
             const ReferenceHalves target = referenceHalves(pixel, params.compareTarget);
             const float3 reference = target.both;
             const float3 value = color[pixel].rgb + referenceHalves(pixel, params.compareSubstitute).both;
@@ -1555,6 +1595,260 @@ struct HSTRCloudRenderer
             ++count;
         }
         hstrReferenceRowError[row] = error / float(max(count, 1u));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Beam view: the split frame's terms are marched exactly only at tile corners and centres. Pixels reconstruct them from a
+    // bilinear-plus-bubble tile basis and apply their own phase, transmittance and background.
+
+    /// Split-frame terms along the [segment.x, segment.y] part of one camera ray's volume interval, starting from unit
+    /// transmittance. The phase is applied per pixel: octave 0 carries a unit weight.
+    BeamSample marchBeam(float3 direction, float2 segment)
+    {
+        BeamSample result = {};
+        CutRay ray;
+        if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
+            return result;
+        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+        float transmittance = 1.f;
+        uint steps = 0;
+        marchSegment(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps);
+        result.depth = -log(max(transmittance, 1e-12f));
+        return result;
+    }
+
+    bool beamWithCache() { return (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0; }
+
+    bool beamWithSingle() { return (params.hstComponents & kComponentSunSingle) != 0; }
+
+    uint beamTileEdge(uint level) { return params.beamTileSize >> level; }
+
+    /// Queries covering a grid of lattice points in blocks of 8 x 4.
+    uint beamBlockQueries(uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; }
+
+    /// Start of the list of tiles refined at level - 1, whose children are processed at level (>= 1).
+    uint beamListOffset(uint level)
+    {
+        const uint tiles = params.beamTileDims.x * params.beamTileDims.y;
+        return tiles * (((1u << (2u * (level - 1u))) - 1u) / 3u);
+    }
+
+    uint packBeamTile(uint2 tile) { return tile.x | (tile.y << 16); }
+
+    uint2 unpackBeamTile(uint value) { return uint2(value & 0xFFFFu, value >> 16); }
+
+    /// Lattice query at a pixel-corner position (a multiple of beamLatticeStep).
+    float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[uint3(position / params.beamLatticeStep, slice)]; }
+
+    /// Pixel-corner position of query q of the current pass level. Level 0 queries every coarsest corner, then every coarsest
+    /// centre; a finer level queries eight points per tile refined at the level above: its edge midpoints, then its children's
+    /// centres (its corners and centre are already on the lattice).
+    bool beamQueryPosition(uint q, out uint2 position)
+    {
+        position = 0;
+        const uint level = params.beamPassLevel;
+        if (level == 0)
+        {
+            // Corners, then centres, each in blocks of 8 x 4 lattice points per 32 consecutive queries so that a wave's rays
+            // are neighbours.
+            const uint s = params.beamTileSize;
+            const uint2 corners = params.beamTileDims + 1u;
+            const uint cornerQueries = beamBlockQueries(corners);
+            const bool centre = q >= cornerQueries;
+            const uint2 grid = centre ? params.beamTileDims : corners;
+            const uint local = centre ? q - cornerQueries : q;
+            const uint blocksX = (grid.x + 7u) / 8u;
+            const uint block = local / 32u;
+            const uint lane = local % 32u;
+            const uint2 point = uint2(block % blocksX, block / blocksX) * uint2(8u, 4u) + uint2(lane % 8u, lane / 8u);
+            if (any(point >= grid))
+                return false;
+            position = point * s + (centre ? s / 2 : 0u);
+            return true;
+        }
+        const uint entry = q / 8;
+        if (entry >= hstrBeamCounts[level])
+            return false;
+        const uint s = beamTileEdge(level - 1);
+        const uint h = s / 2;
+        const uint k = s / 4;
+        uint2 offset;
+        switch (q % 8)
+        {
+        case 0:
+            offset = uint2(h, 0);
+            break;
+        case 1:
+            offset = uint2(0, h);
+            break;
+        case 2:
+            offset = uint2(s, h);
+            break;
+        case 3:
+            offset = uint2(h, s);
+            break;
+        case 4:
+            offset = uint2(k, k);
+            break;
+        case 5:
+            offset = uint2(h + k, k);
+            break;
+        case 6:
+            offset = uint2(k, h + k);
+            break;
+        default:
+            offset = uint2(h + k, h + k);
+            break;
+        }
+        position = unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) * s + offset;
+        return true;
+    }
+
+    void writeBeamQuery(uint2 position, float4 depthCache, float4 single)
+    {
+        const uint2 texel = position / params.beamLatticeStep;
+        hstrBeamLatticeOutput[uint3(texel, 0)] = depthCache;
+        hstrBeamLatticeOutput[uint3(texel, 1)] = single;
+    }
+
+    float4 bilinear(float4 q00, float4 q10, float4 q01, float4 q11, float2 f) { return lerp(lerp(q00, q10, f.x), lerp(q01, q11, f.x), f.y); }
+
+    /// Split-frame radiance from its terms (before albedo) for view direction w.
+    float3 beamRadiance(float3 cache, float3 single, float depth, float3 w, float3 albedo)
+    {
+        const float phase = phaseHG(dot(normalize(params.sunDirection), w));
+        const float3 background = (params.hstComponents & kComponentBackground) != 0 ? exp(-depth) * skyRadianceAt(w) : 0.f;
+        return albedo * (phase * single + cache) + background;
+    }
+
+    /// Surplus test of one tile of the current pass level: the centre as the bilinear corner basis predicts it, against the
+    /// exact centre query, in log(1 + radiance). Accepted tiles write their level into the level map. Refined tiles join the
+    /// next level's list, or at the finest level are marked for per-pixel marching (level beamLevels).
+    void testBeamTile(uint thread)
+    {
+        const uint level = params.beamPassLevel;
+        uint2 tile;
+        if (level == 0)
+        {
+            if (thread >= params.beamTileDims.x * params.beamTileDims.y)
+                return;
+            tile = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+        }
+        else
+        {
+            const uint entry = thread / 4;
+            if (entry >= hstrBeamCounts[level])
+                return;
+            const uint child = thread % 4;
+            tile = 2u * unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) + uint2(child & 1u, child >> 1);
+        }
+        const uint s = beamTileEdge(level);
+        const uint2 origin = tile * s;
+        if (any(origin >= params.frameDim))
+            return;
+        const float4 a00 = beamLatticeAt(origin, 0);
+        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
+        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
+        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
+        const float4 ac = beamLatticeAt(origin + s / 2, 0);
+        const float4 bp = 0.25f * (beamLatticeAt(origin, 1) + beamLatticeAt(origin + uint2(s, 0), 1) + beamLatticeAt(origin + uint2(0, s), 1) +
+                                   beamLatticeAt(origin + uint2(s, s), 1));
+        const float4 bc = beamLatticeAt(origin + s / 2, 1);
+        const float4 ap = 0.25f * (a00 + a10 + a01 + a11);
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        const float3 wc = cameraRayDirection(float2(origin + s / 2));
+        const float3 exactCentre = beamRadiance(ac.rgb, bc.rgb, ac.a, wc, albedo);
+        const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
+        bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
+        if (params.beamEdgeDepth > 0.f)
+        {
+            const float minimumDepth = min(min(min(a00.a, a10.a), min(a01.a, a11.a)), ac.a);
+            const float maximumDepth = max(max(max(a00.a, a10.a), max(a01.a, a11.a)), ac.a);
+            refine = refine || (minimumDepth < params.beamEdgeDepth && maximumDepth >= params.beamEdgeDepth);
+        }
+        uint finalLevel = level;
+        if (refine)
+        {
+            // Refined tiles join the next level's list; past the finest level, that list is the per-pixel march list.
+            uint slot;
+            InterlockedAdd(hstrBeamCounts[level + 1], 1u, slot);
+            hstrBeamLists[beamListOffset(level + 1) + slot] = packBeamTile(tile);
+            if (level + 1 < params.beamLevels)
+                return;
+            finalLevel = params.beamLevels;
+        }
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint cells = s / finest;
+        const uint2 first = origin / finest;
+        for (uint y = 0; y < cells; ++y)
+            for (uint x = 0; x < cells; ++x)
+            {
+                const uint2 cell = first + uint2(x, y);
+                if (all(cell < params.beamLevelDims))
+                    hstrBeamLevelOutput[cell] = finalLevel;
+            }
+    }
+
+    /// Indirect arguments of the query and tile passes of the current pass level, from its list count; at level beamLevels,
+    /// of the per-pixel march pass.
+    void writeBeamArgs()
+    {
+        const uint level = params.beamPassLevel;
+        const uint count = hstrBeamCounts[level];
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint threadsPerEntry = level < params.beamLevels ? 8u * params.beamSegments : finest * finest;
+        hstrBeamArgs[6 * level + 0] = (count * threadsPerEntry + 63u) / 64u;
+        hstrBeamArgs[6 * level + 1] = 1;
+        hstrBeamArgs[6 * level + 2] = 1;
+        hstrBeamArgs[6 * level + 3] = (count * 4u + 63u) / 64u;
+        hstrBeamArgs[6 * level + 4] = 1;
+        hstrBeamArgs[6 * level + 5] = 1;
+    }
+
+    /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel
+    /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel.
+    void resolveBeamPixel(uint2 pixel)
+    {
+        if (any(pixel >= params.frameDim))
+            return;
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint level = hstrBeamLevel[pixel / finest];
+        if (level >= params.beamLevels)
+            return;
+        const uint s = beamTileEdge(level);
+        const uint2 origin = pixel / s * s;
+        const float4 a00 = beamLatticeAt(origin, 0);
+        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
+        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
+        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
+        const float4 ac = beamLatticeAt(origin + s / 2, 0);
+        const float4 b00 = beamLatticeAt(origin, 1);
+        const float4 b10 = beamLatticeAt(origin + uint2(s, 0), 1);
+        const float4 b01 = beamLatticeAt(origin + uint2(0, s), 1);
+        const float4 b11 = beamLatticeAt(origin + uint2(s, s), 1);
+        const float4 bc = beamLatticeAt(origin + s / 2, 1);
+        const float2 f = (float2(pixel - origin) + 0.5f) / float(s);
+        const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
+        const float4 a = bilinear(a00, a10, a01, a11, f) + (ac - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
+        const float4 b = bilinear(b00, b10, b01, b11, f) + (bc - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        color[pixel] = float4(beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo), 1.f);
+    }
+
+    /// One pixel of a finest tile that failed its surplus test, marched exactly.
+    void marchBeamPixel(uint thread)
+    {
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint entry = thread / (finest * finest);
+        if (entry >= hstrBeamCounts[params.beamLevels])
+            return;
+        const uint local = thread % (finest * finest);
+        const uint2 pixel = unpackBeamTile(hstrBeamLists[beamListOffset(params.beamLevels) + entry]) * finest + uint2(local % finest, local / finest);
+        if (any(pixel >= params.frameDim))
+            return;
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1703,6 +1997,65 @@ cbuffer CB
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.execute(dispatchThreadId.xy);
+}
+
+groupshared float4 gBeamDepthCache[64];
+groupshared float4 gBeamSingle[64];
+
+/// Beam queries of one level: beamSegments consecutive threads march consecutive segments of one query ray from unit
+/// transmittance, and the first composes them front to back, (C, T) = (C_a + T_a C_b, T_a T_b).
+[numthreads(64, 1, 1)]
+void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    const uint segments = gHSTRCloud.params.beamSegments;
+    const uint segment = dispatchThreadId.x % segments;
+    uint2 position;
+    const bool valid = gHSTRCloud.beamQueryPosition(dispatchThreadId.x / segments, position);
+    BeamSample sample = {};
+    if (valid)
+        sample = gHSTRCloud.marchBeam(
+            gHSTRCloud.cameraRayDirection(float2(position)), float2(float(segment), float(segment + 1)) / float(segments)
+        );
+    gBeamDepthCache[groupThreadId.x] = float4(sample.cache, sample.depth);
+    gBeamSingle[groupThreadId.x] = float4(sample.single, 0.f);
+    GroupMemoryBarrierWithGroupSync();
+    if (!valid || segment != 0)
+        return;
+    float depth = 0.f;
+    float3 cache = 0.f;
+    float3 single = 0.f;
+    for (uint k = 0; k < segments; ++k)
+    {
+        const float transmittance = exp(-depth);
+        cache += transmittance * gBeamDepthCache[groupThreadId.x + k].rgb;
+        single += transmittance * gBeamSingle[groupThreadId.x + k].rgb;
+        depth += gBeamDepthCache[groupThreadId.x + k].a;
+    }
+    gHSTRCloud.writeBeamQuery(position, float4(cache, depth), float4(single, 0.f));
+}
+
+[numthreads(64, 1, 1)]
+void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.testBeamTile(dispatchThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.resolveBeamPixel(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void marchBeamPixels(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.marchBeamPixel(dispatchThreadId.x);
+}
+
+[numthreads(1, 1, 1)]
+void writeBeamArgs(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.writeBeamArgs();
 }
 
 [numthreads(8, 8, 1)]

@@ -14,6 +14,8 @@ static const uint kComponentCount = 4;
 
 static const uint kWorldCacheView = 8;     ///< debugView of the world-space radiance cache experiment.
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the 27 cache slots (SH coefficient k, channel c at 3k + c).
+static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
+static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
 
 struct HSTRCutNode
 {
@@ -149,14 +151,26 @@ struct HSTRCloudParams
 
     uint worldCacheSegments = 0; ///< 0: every batch traces whole photon paths; >0: a persistent photon pool advances this many
                                  ///< flight segments per photon per update, respawning photons as they die.
-    uint padHSTR18 = 0;
-    uint padHSTR19 = 0;
-    uint padHSTR20 = 0;
+    uint beamTileSize = 16;       ///< Pixels per edge of the coarsest beam tiles.
+    uint beamLevels = 3;          ///< Beam tile levels; tiles that fail at the finest level are marched per pixel.
+    float beamTolerance = 0.02f;  ///< log(1 + radiance) surplus at a tile centre above which the tile is refined.
 
     uint worldCacheBands = 1; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
     uint worldCacheWindow = 0; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
     uint worldCacheTextured = 1; ///< 1: the camera reads the cache from baked, hardware-filtered 3D textures.
     uint lightingStride = 1;     ///< The camera march re-evaluates the cache every lightingStride steps and holds it between.
+
+    uint2 beamTileDims = { 0, 0 };    ///< Coarsest beam tiles.
+    uint2 beamLatticeDims = { 0, 0 }; ///< Query lattice, one texel per beamLatticeStep pixels; every tile corner and centre is a texel.
+
+    float beamEdgeDepth = 0.f; ///< When positive, tiles whose queries straddle this optical depth (silhouettes) are refined.
+    uint compareExact = 0;     ///< 1: the comparison measures against the stored exact frame instead of the reference.
+    uint beamSegments = 4;     ///< Threads that march consecutive segments of one query ray in parallel (divides 64).
+    uint beamPassLevel = 0;    ///< Tile level the current beam query or tile pass processes.
+
+    uint2 beamLevelDims = { 0, 0 }; ///< Level map, one texel per finest tile.
+    uint beamLatticeStep = 2;       ///< Pixels between lattice texels: half the finest tile.
+    uint padHSTR23 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
