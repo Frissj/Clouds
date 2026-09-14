@@ -28,6 +28,64 @@ struct HSTRCutNode
     float4 transmittanceCorners1;
 };
 
+// Virtual cloud density. Every VDB of the cloud library is a sparse mip pyramid of 8^3 bricks (level L voxels cover 2^L source
+// voxels) stored with a one-voxel apron, so a resident brick filters trilinearly in the atlas without its neighbours.
+static const uint kCloudBrickCore = 8;
+static const uint kCloudBrickEdge = 10;        ///< Stored edge: core plus apron.
+static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 bricks (128 source voxels).
+static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
+static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
+static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
+
+/// One tile of the cloud sea domain: a library asset placed with a quarter-turn rotation, mirror, scale and offset.
+struct HSTRCloudInstance
+{
+    float4 row0; ///< Domain voxel position to asset source voxel position (affine rows).
+    float4 row1;
+    float4 row2;
+    uint asset;
+    float sourceVoxelWorld; ///< World size of one source voxel of this instance.
+    float proxyLevel;       ///< Pyramid level whose voxels are as coarse as the domain proxy: from here on the proxy is used.
+    uint occupied;
+};
+
+struct HSTRCloudAsset
+{
+    uint3 dims; ///< Source voxels, multiples of 128.
+    uint directoryOffset;
+    uint3 chunkDims;
+    uint topLevel;
+};
+
+/// A resident brick: an atlas slot (or a constant), its quantisation and its place in the pyramid.
+struct HSTRCloudBrick
+{
+    uint slot;
+    uint info;   ///< Level (bits 0-3), child mask (bits 4-11), kCloudBrickConstant.
+    uint parent; ///< Brick index of the parent, kCloudRefNone at the top.
+    float fade;  ///< Blend weight against the parent while the brick streams in or out.
+    float minValue;
+    float range; ///< density = minValue + range * t^2 for the stored unorm t.
+};
+
+/// A brick staged for GPU reconstruction (see reconstructBrick in CloudFormat.h): parent prediction plus dequantised residual,
+/// requantised into its atlas slot.
+struct HSTRCloudStaging
+{
+    uint slot;
+    uint parentSlot; ///< kCloudRefNone: the prediction is zero.
+    uint parity;     ///< Brick coordinate & 1 per axis (bits 0-2).
+    uint bits;       ///< 0: the residual is residualMin everywhere.
+    float residualMin;
+    float residualStep;
+    float parentMin;
+    float parentRange;
+    float valueMin;
+    float valueRange;
+    uint pad0;
+    uint pad1;
+};
+
 struct HSTRCloudParams
 {
     uint2 frameDim = { 0, 0 };
@@ -197,6 +255,33 @@ struct HSTRCloudParams
     float marchTolerance = 0.01f;    ///< Accepted segment error relative to 1 + the pixel's expected radiance.
     float marchMinVoxels = 0.03f;    ///< Shortest bisected segment.
     float marchCoarseVoxels = 2.f;   ///< Shortest coarse segment in the medium (longer where the majorant allows).
+
+    uint seaMode = 0;               ///< The cloud library domain repeats in world X/Z: a periodic sea with periodic transport.
+    float seaViewDistance = 4000.f; ///< Maximum world distance marched through the cloud sea.
+    uint cloudDomain = 0;           ///< 1: the medium is the cloud library domain (seaOrigin, seaVoxelSize), not the scene grid.
+    uint cloudVirtual = 0;          ///< 1: camera samples read resident fine bricks where mapped.
+
+    float3 seaOrigin = float3(0.f); ///< World position of the domain's minimum corner (voxel i is centred at seaOrigin + (i + 0.5) size).
+    float cloudPixelAngle = 0.f;    ///< World footprint of one pixel per unit of distance.
+    float3 seaVoxelSize = float3(1.f); ///< World size of one domain voxel.
+    float cloudLodBias = 0.f;          ///< Added to the footprint level of camera samples.
+
+    uint2 cloudTiles = { 1, 1 }; ///< Instances per domain axis (X, Z).
+    uint cloudTileVoxels = 64;   ///< Domain voxels per tile edge.
+    uint cloudAtlasShift = 6;    ///< log2 of the atlas bricks per X and Y axis.
+
+    uint cloudCommitCount = 0; ///< Staged bricks the current commit dispatch reconstructs, from cloudCommitOffset.
+    float cloudFineMinVoxels = 0.05f; ///< Shortest camera step inside fine bricks, in domain voxels.
+    uint cloudCommitOffset = 0;
+    uint padHSTRCloud1 = 0;
+
+    uint3 fineSunOffset = { 0, 0, 0 }; ///< First voxel of the sun page region computeFineSun updates.
+    uint padHSTRCloud2 = 0;
+    uint3 fineSunSize = { 0, 0, 0 };   ///< Voxels of that region (0: the whole grid).
+    uint padHSTRCloud3 = 0;
+
+    float3 cloudAtlasInvSize = float3(1.f); ///< Reciprocal texel dimensions of the brick atlas.
+    float worldCacheKeep = 1.f;              ///< Share of the world cache deposits decayWorldCache keeps.
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

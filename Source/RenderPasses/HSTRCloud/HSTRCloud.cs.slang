@@ -98,6 +98,7 @@ struct CutRay
     float3 position;
     float3 direction;
     float worldLength;
+    float entryDistance; ///< World distance from the camera to t = 0, for pixel footprints.
     float4 sunOctaves;    ///< Per-octave sun weight a^n p(theta; c^n g) for this ray's direction.
     float3 viewDirection; ///< Unit world-space direction of the camera ray.
 };
@@ -131,6 +132,19 @@ struct HSTRCloudRenderer
     Texture3D<float> hstrMajorant;
     Texture3D<float> hstrTightMajorant; ///< Undilated block maxima: bound the trilinear extinction inside the block only.
     Texture3D<uint> hstrOccupancy;      ///< 1 where a 16-voxel block holds any extinction.
+    // Virtual cloud density (see CloudResidency): instances per sea tile, assets, the chunk directory and 4^3 page nodes whose
+    // entries name the finest mapped brick, the resident bricks and their R8 atlas, and the staging of newly loaded bricks.
+    StructuredBuffer<HSTRCloudInstance> hstrCloudInstances;
+    StructuredBuffer<HSTRCloudAsset> hstrCloudAssets;
+    StructuredBuffer<uint> hstrCloudDirectory;
+    StructuredBuffer<uint> hstrCloudNodes;
+    StructuredBuffer<HSTRCloudBrick> hstrCloudBricks;
+    Texture3D<float> hstrCloudAtlas;
+    RWTexture3D<unorm float> hstrCloudAtlasOutput;
+    StructuredBuffer<uint> hstrCloudStaging;                 ///< 512 residual codes (4 per word) per staged brick.
+    StructuredBuffer<HSTRCloudStaging> hstrCloudStagingInfo;
+    StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
+    StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
     Texture3D<float4> hstrCameraLighting;
     RWTexture3D<float4> hstrCameraLightingOutput;
 
@@ -185,6 +199,7 @@ struct HSTRCloudRenderer
 
     SamplerState hstrExtinctionSampler;
     SamplerState hstrLinearSampler;
+    SamplerState hstrLinearClampSampler;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
     RWTexture2D<float4> cutStats;
@@ -279,16 +294,152 @@ struct HSTRCloudRenderer
     // Field lookups. v denotes voxel coordinates relative to the grid minimum (voxel i is centred at
     // v = i) and leaf-space positions are v / hstrCellWidth.
 
+    /// Virtual instancing for a cloud sea. One VDB, hierarchy and cache stay resident while X/Z repeat around the camera.
+    float3 seaVoxel(float3 v)
+    {
+        if (params.seaMode == 0)
+            return v;
+        const float3 dims = float3(params.hstrExtinctionDims);
+        v.x -= floor(v.x / dims.x) * dims.x;
+        v.z -= floor(v.z / dims.z) * dims.z;
+        return v;
+    }
+
+    /// Transport extinction: the always-resident proxy (the scene grid's extinction, or the cloud sea domain's mean density).
     float extinctionAtVoxel(float3 v)
     {
+        v = seaVoxel(v);
         return hstrExtinction.SampleLevel(hstrExtinctionSampler, (v + 0.5f) / float3(params.hstrExtinctionDims), 0.f);
     }
+
+    /// Density of one resident brick at source position x (voxel centres at integers, i its voxel), before the density scale.
+    float cloudBrickDensity(uint brickIndex, float3 x, int3 i)
+    {
+        const HSTRCloudBrick brick = hstrCloudBricks[brickIndex];
+        if ((brick.info & kCloudBrickConstant) != 0)
+            return brick.minValue;
+        const uint level = brick.info & 15u;
+        const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
+        const int3 brickCoord = (i >> int(level)) >> 3;
+        const float3 local = clamp(levelPosition - float3(brickCoord * 8), -0.5f, 7.5f);
+        const uint shift = params.cloudAtlasShift;
+        const uint mask = (1u << shift) - 1u;
+        const uint3 slot = uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift));
+        const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + local;
+        const float t = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudAtlasInvSize, 0.f);
+        return brick.minValue + brick.range * t * t;
+    }
+
+    /// Camera extinction at domain voxel position v for a sample whose pixel footprint spans footprint world units: the finest
+    /// mapped brick no finer than the footprint needs, blended against its parent while it streams, else the proxy. fineVoxels
+    /// returns the sampled voxel edge in domain voxels (1 for the proxy), which bounds the next march step.
+    float cameraExtinctionAtVoxel(float3 v, float footprint, inout float fineVoxels)
+    {
+        // The sea fades out over the last 30% of the view distance, so tiles entering the window never pop in.
+        const float distanceFade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
+                                       ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
+                                       : 1.f;
+        return distanceFade * cameraExtinctionUnfaded(v, footprint, fineVoxels);
+    }
+
+    float cameraExtinctionUnfaded(float3 v, float footprint, inout float fineVoxels)
+    {
+        fineVoxels = 1.f;
+        const float proxy = extinctionAtVoxel(v);
+        if (params.cloudVirtual == 0)
+            return proxy;
+        const float tileVoxels = float(params.cloudTileVoxels);
+        const float2 worldTile = floor((v.xz + 0.5f) / tileVoxels);
+        const int2 tiles = int2(params.cloudTiles);
+        const int2 slot = (int2(worldTile) % tiles + tiles) % tiles;
+        const HSTRCloudInstance instance = hstrCloudInstances[slot.x + tiles.x * slot.y];
+        if (instance.occupied == 0)
+            return proxy;
+        const float footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
+        if (footprintLevel >= instance.proxyLevel)
+            return proxy;
+        const float3 p = float3(v.x - worldTile.x * tileVoxels, v.y, v.z - worldTile.y * tileVoxels);
+        const float3 x = float3(
+            dot(instance.row0.xyz, p) + instance.row0.w, dot(instance.row1.xyz, p) + instance.row1.w, dot(instance.row2.xyz, p) + instance.row2.w
+        );
+        const HSTRCloudAsset asset = hstrCloudAssets[instance.asset];
+        const int3 i = int3(floor(x + 0.5f));
+        if (any(i < 0) || any(i >= int3(asset.dims)))
+            return proxy;
+        const uint3 chunk = uint3(i) >> 7u;
+        uint entry = hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
+        if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+        {
+            const uint3 cell = (uint3(i) >> 5u) & 3u;
+            entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + cell.x + 4 * (cell.y + 4 * cell.z)];
+            if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+            {
+                const uint3 sub = (uint3(i) >> 3u) & 3u;
+                entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + sub.x + 4 * (sub.y + 4 * sub.z)];
+            }
+        }
+        if (entry == kCloudRefNone)
+            return proxy;
+        const uint desired = uint(max(footprintLevel, 0.f));
+        uint level = hstrCloudBricks[entry].info & 15u;
+        const float domainPerSource = instance.sourceVoxelWorld / params.seaVoxelSize.x;
+        if (desired < level)
+        {
+            // The mapped brick is coarser than the footprint asks for: where its child does not exist the density is zero.
+            const uint3 child = (uint3(i) >> (level + 2u)) & 1u;
+            const uint childBit = 1u << (child.x + 2u * child.y + 4u * child.z);
+            if (((hstrCloudBricks[entry].info >> 4) & childBit) == 0)
+            {
+                fineVoxels = float(1u << (level - 1u)) * domainPerSource;
+                return 0.f;
+            }
+        }
+        [loop]
+        for (uint k = 0; k < 15 && level < desired && hstrCloudBricks[entry].parent != kCloudRefNone; ++k)
+        {
+            entry = hstrCloudBricks[entry].parent;
+            level = hstrCloudBricks[entry].info & 15u;
+        }
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        const HSTRCloudBrick brick = hstrCloudBricks[entry];
+        float density = cloudBrickDensity(entry, x, i) * scale;
+        if (brick.fade < 1.f)
+            density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, x, i) * scale : proxy, density, brick.fade);
+        fineVoxels = float(1u << level) * domainPerSource;
+        return density;
+    }
+
+    float cameraExtinctionAtVoxel(float3 v, float footprint)
+    {
+        float fineVoxels;
+        return cameraExtinctionAtVoxel(v, footprint, fineVoxels);
+    }
+
+    /// Voxel displacement per world unit along a world direction.
+    float3 voxelDirection(float3 direction)
+    {
+        if (params.cloudDomain != 0)
+            return direction / params.seaVoxelSize;
+        return mul(gScene.getGridVolume(0).data.invTransform, float4(direction, 0.f)).xyz;
+    }
+
+    /// Whether voxel position v lies inside the medium's grid (the sea is unbounded in X/Z).
+    bool insideExtinctionGrid(float3 v)
+    {
+        if (params.seaMode != 0)
+            return v.y >= -1.f && v.y <= float(params.hstrExtinctionDims.y);
+        return all(v >= -1.f) && all(v <= float3(params.hstrExtinctionDims));
+    }
+
+    /// Wraps a sea position's X/Z into the domain so that long photon paths keep their precision.
+    float3 wrapSeaPosition(float3 v) { return params.seaMode != 0 ? seaVoxel(v) : v; }
 
     float extinctionAt(float3 leafPosition) { return extinctionAtVoxel(leafPosition * float(params.hstrCellWidth)); }
 
     /// Upper bound on the trilinear extinction within one majorant block of v in any direction.
     float majorantAt(float3 v)
     {
+        v = seaVoxel(v);
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
         return hstrMajorant.Load(int4(block, 0));
     }
@@ -297,6 +448,7 @@ struct HSTRCloudRenderer
     /// every block exit).
     float tightMajorantAt(float3 v)
     {
+        v = seaVoxel(v);
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
         return hstrTightMajorant.Load(int4(block, 0));
     }
@@ -323,37 +475,50 @@ struct HSTRCloudRenderer
     /// a voxel of cloud is many optical depths: the first sunNearVoxels voxels towards the sun are marched on the trilinear
     /// density (majorant-bounded steps of at most stepOpticalDepth), so lit skins, shadow edges and terminators follow the
     /// density below voxel scale, and the field is read only where the march leaves off. Past kSunDepthOpaque nothing is lit.
-    float sunDepthAt(float3 v)
+    /// footprint >= 0 (camera samples): the near march reads the camera's fine density with that pixel footprint.
+    float sunDepthAt(float3 v, float footprint = -1.f)
     {
+        v = seaVoxel(v);
         static const float kSunDepthOpaque = 12.f;
         const float3 direction = params.sunVoxelDirection;
         const float near = params.sunNearVoxels;
         if (near <= 0.f)
-            return hstrFineSun.SampleLevel(hstrLinearSampler, (v + direction + 0.5f) / float3(params.hstrFineDims), 0.f) +
-                   extinctionAtVoxel(v + 0.5f * direction) * params.sunVoxelWorldLength;
+        {
+            const float3 midpoint = v + 0.5f * direction;
+            const float sigma = footprint >= 0.f ? cameraExtinctionAtVoxel(midpoint, footprint) : extinctionAtVoxel(midpoint);
+            return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + direction) + 0.5f) / float3(params.hstrFineDims), 0.f) +
+                   sigma * params.sunVoxelWorldLength;
+        }
         float depth = 0.f;
         float t = 0.f;
+        float fineVoxels = 1.f;
         [loop]
         for (uint i = 0; i < 64 && t < near; ++i)
         {
             const float3 p = v + t * direction;
             const float majorant = majorantAt(p);
-            const float dt = min(clamp(params.stepOpticalDepth / max(1e-6f, majorant * params.sunVoxelWorldLength), 0.0625f, 1.f), near - t);
+            const float minimum = footprint >= 0.f ? clamp(fineVoxels, params.cloudFineMinVoxels, 0.0625f) : 0.0625f;
+            const float dt = min(clamp(params.stepOpticalDepth / max(1e-6f, majorant * params.sunVoxelWorldLength), minimum, 1.f), near - t);
             if (majorant > 0.f)
-                depth += extinctionAtVoxel(p + 0.5f * dt * direction) * dt * params.sunVoxelWorldLength;
+            {
+                const float3 midpoint = p + 0.5f * dt * direction;
+                const float sigma = footprint >= 0.f ? cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels) : extinctionAtVoxel(midpoint);
+                depth += sigma * dt * params.sunVoxelWorldLength;
+            }
             t += dt;
             if (depth > kSunDepthOpaque)
                 return depth;
         }
-        return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (v + t * direction + 0.5f) / float3(params.hstrFineDims), 0.f);
+        return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + t * direction) + 0.5f) / float3(params.hstrFineDims), 0.f);
     }
 
     /// Rasterized sun residual at v (before albedo): the sun optical depth attenuated per octave.
-    float3 residualAtVoxel(float3 v, float4 octaves) { return residualAtDepth(v, sunDepthAt(v), octaves); }
+    float3 residualAtVoxel(float3 v, float4 octaves, float footprint = -1.f) { return residualAtDepth(v, sunDepthAt(v, footprint), octaves); }
 
     /// residualAtVoxel for an already computed sun optical depth at v.
     float3 residualAtDepth(float3 v, float depth, float4 octaves)
     {
+        v = seaVoxel(v);
         if (all(octaves.yzw == 0.f))
             return params.residualStrength * params.sunRadiance * octaves.x * exp(-depth);
         // Octaves 1-3 are multiply scattered: they arrive from the scatterers around v, not along v's own sun ray.
@@ -397,7 +562,13 @@ struct HSTRCloudRenderer
         float4 sum = 0.f;
         for (int i = -radius; i <= radius; ++i)
         {
-            const int3 p = int3(cell) + i * axis;
+            int3 p = int3(cell) + i * axis;
+            if (params.seaMode != 0)
+            {
+                const int3 dims = int3(params.hstrOctaveDims);
+                p.x = (p.x % dims.x + dims.x) % dims.x;
+                p.z = (p.z % dims.z + dims.z) % dims.z;
+            }
             if (any(p < 0) || any(p >= int3(params.hstrOctaveDims)))
                 continue;
             sum += exp(-0.5f * float(i * i) / (params.octaveBlurSigma * params.octaveBlurSigma)) * hstrSunOctaves[uint3(p)];
@@ -585,25 +756,56 @@ struct HSTRCloudRenderer
         return normalize(ndc.x * gScene.camera.data.cameraU + ndc.y * gScene.camera.data.cameraV + gScene.camera.data.cameraW);
     }
 
+    /// Voxel position of a world position: the cloud sea domain (voxel i centred at seaOrigin + (i + 0.5) size), or the scene grid.
+    float3 worldToVoxel(float3 world, GridVolume volume)
+    {
+        if (params.cloudDomain != 0)
+            return (world - params.seaOrigin) / params.seaVoxelSize - 0.5f;
+        return mul(volume.data.invTransform, float4(world, 1.f)).xyz;
+    }
+
+    /// Ray parameters inside the medium: the cloud layer's slab (capped at seaViewDistance) for the sea, else the grid bounds.
+    bool mediumInterval(float3 origin, float3 direction, GridVolume volume, out float2 interval)
+    {
+        if (params.seaMode != 0)
+        {
+            const float bottom = params.seaOrigin.y;
+            const float top = params.seaOrigin.y + float(params.hstrExtinctionDims.y) * params.seaVoxelSize.y;
+            const float speed = length(direction);
+            if (abs(direction.y) < 1e-8f)
+            {
+                interval = float2(0.f, params.seaViewDistance / speed);
+                return origin.y >= bottom && origin.y <= top;
+            }
+            const float2 y = float2(bottom - origin.y, top - origin.y) / direction.y;
+            interval = float2(min(y.x, y.y), max(y.x, y.y));
+            interval.y = min(interval.y, max(0.f, interval.x) + params.seaViewDistance / speed);
+            return interval.y > max(0.f, interval.x);
+        }
+        const AABB bounds = volume.getBounds();
+        return intersectRayAABB(origin, direction, bounds.minPoint, bounds.maxPoint, interval);
+    }
+
     bool makeCutRay(float3 origin, float3 direction, GridVolume volume, out CutRay ray)
     {
         ray.position = 0.f;
         ray.direction = 0.f;
         ray.worldLength = 0.f;
+        ray.entryDistance = 0.f;
         ray.sunOctaves = 0.f;
         ray.viewDirection = normalize(direction);
         float2 interval;
-        const AABB bounds = volume.getBounds();
-        if (!intersectRayAABB(origin, direction, bounds.minPoint, bounds.maxPoint, interval))
+        if (!mediumInterval(origin, direction, volume, interval))
             return false;
         const float entry = max(0.f, interval.x);
         if (interval.y <= entry)
             return false;
-        const float3 entryIndex = mul(volume.data.invTransform, float4(origin + entry * direction, 1.f)).xyz;
-        const float3 exitIndex = mul(volume.data.invTransform, float4(origin + interval.y * direction, 1.f)).xyz;
+        const float3 entryIndex = worldToVoxel(origin + entry * direction, volume);
+        const float3 exitIndex = worldToVoxel(origin + interval.y * direction, volume);
         ray.position = (entryIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         ray.direction = (exitIndex - entryIndex) / float(params.hstrCellWidth);
         ray.worldLength = length(direction) * (interval.y - entry);
+        ray.entryDistance = length(direction) * entry;
         const float single = (params.hstComponents & kComponentSunSingle) != 0 ? 1.f : 0.f;
         const float multiple = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
         ray.sunOctaves = sunOctaveWeights(direction) * float4(single, multiple, multiple, multiple);
@@ -629,25 +831,29 @@ struct HSTRCloudRenderer
 
     /// Sample at ray parameter t. The stored cache R is smooth at cell scale, so it is looked up only at coarse segment ends
     /// (withCache); samples inside a coarse segment interpolate it and resolve only the extinction and the sun depths.
+    /// Pixel footprint in world units at ray parameter t.
+    float rayFootprint(CutRay ray, float t) { return (ray.entryDistance + t * ray.worldLength) * params.cloudPixelAngle; }
+
     MarchSample marchSampleAt(CutRay ray, float t, bool withSource, bool withSingle, bool withCache = true)
     {
         const float3 v = (ray.position + t * ray.direction) * float(params.hstrCellWidth);
+        const float footprint = rayFootprint(ray, t);
         MarchSample s;
         s.t = t;
-        s.sigma = extinctionAtVoxel(v);
+        s.sigma = cameraExtinctionAtVoxel(v, footprint);
         s.sunCache = 0.f;
         s.sunSingle = 0.f;
         s.cache = 0.f;
         if (withSource)
         {
             if (params.worldCacheModulation > 0.f)
-                s.sunCache = min(hstrFineSun.SampleLevel(hstrLinearSampler, (v + 0.5f) / float3(params.hstrFineDims), 0.f),
+                s.sunCache = min(hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f),
                                  params.worldCacheModulationDepth);
             if (withCache)
                 s.cache = worldCacheRadianceStored(v, ray.viewDirection);
         }
         if (withSingle)
-            s.sunSingle = sunDepthAt(v);
+            s.sunSingle = sunDepthAt(v, footprint);
         return s;
     }
 
@@ -824,19 +1030,21 @@ struct HSTRCloudRenderer
         float3 heldAt = 0.f;
         uint sinceLighting = ~0u;
         float t = segment.x;
+        // Voxel edge (domain voxels) of the density the last sample read: fine bricks shorten the minimum step to their voxels.
+        float fineVoxels = 1.f;
         [loop]
         while (t < segment.y && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
         {
             const float3 v = (ray.position + t * ray.direction) * cellWidth;
             const float majorant = majorantAt(v);
-            const float stepVoxels = clamp(
-                params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), params.minStepVoxels, params.maxStepVoxels
-            );
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
             const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
             if (majorant > 0.f)
             {
                 const float3 midpoint = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
-                const float alpha = 1.f - exp(-extinctionAtVoxel(midpoint) * dt * ray.worldLength);
+                const float footprint = rayFootprint(ray, t + 0.5f * dt);
+                const float alpha = 1.f - exp(-cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels) * dt * ray.worldLength);
                 if ((withSource || residual) && alpha > 1e-6f)
                 {
                     if (withSource)
@@ -855,7 +1063,7 @@ struct HSTRCloudRenderer
                         radiance += transmittance * alpha * held;
                     }
                     if (residual)
-                        residualRadiance += transmittance * alpha * residualAtVoxel(midpoint, ray.sunOctaves);
+                        residualRadiance += transmittance * alpha * residualAtVoxel(midpoint, ray.sunOctaves, footprint);
                 }
                 transmittance *= 1.f - alpha;
             }
@@ -1017,6 +1225,8 @@ struct HSTRCloudRenderer
 
     float voxelWorldLength(GridVolume volume)
     {
+        if (params.cloudDomain != 0)
+            return dot(params.seaVoxelSize, 1.f / 3.f);
         return (length(mul(volume.data.transform, float4(1.f, 0.f, 0.f, 0.f)).xyz) +
                 length(mul(volume.data.transform, float4(0.f, 1.f, 0.f, 0.f)).xyz) +
                 length(mul(volume.data.transform, float4(0.f, 0.f, 1.f, 0.f)).xyz)) /
@@ -1031,7 +1241,7 @@ struct HSTRCloudRenderer
         if (any(voxel >= params.hstrFineDims) || gScene.getGridVolumeCount() == 0)
             return;
         const GridVolume volume = gScene.getGridVolume(0);
-        const float3 sunIndex = mul(volume.data.invTransform, float4(normalize(params.sunDirection), 0.f)).xyz;
+        const float3 sunIndex = voxelDirection(normalize(params.sunDirection));
         const float voxelsPerWorld = length(sunIndex);
         const float3 direction = sunIndex / voxelsPerWorld;
         const float3 origin = float3(voxel);
@@ -1039,7 +1249,8 @@ struct HSTRCloudRenderer
         const float3 a = (-0.5f - origin) * inverseDirection;
         const float3 b = (float3(params.hstrExtinctionDims) - 0.5f - origin) * inverseDirection;
         const float3 far = max(a, b);
-        const float exitDistance = max(0.f, min(far.x, min(far.y, far.z)));
+        // The sea only ends at the top and bottom of the cloud layer: neighbouring tiles shadow each other.
+        const float exitDistance = max(0.f, params.seaMode != 0 ? far.y : min(far.x, min(far.y, far.z)));
         float opticalDepth = 0.f;
         float t = 0.f;
         uint steps = 0;
@@ -1161,8 +1372,6 @@ struct HSTRCloudRenderer
 
     float3 skyRadianceAt(float3 direction) { return params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y)); }
 
-    bool insideExtinctionGrid(float3 v) { return all(v >= -1.f) && all(v <= float3(params.hstrExtinctionDims)); }
-
     /// Distance (world units along the ray) to the exit of v's majorant block (edge 4 voxels, or 16 for the occupancy
     /// blocks); d is the voxel displacement per world unit.
     float majorantBlockExit(float3 v, float3 d, float edge = 4.f)
@@ -1179,7 +1388,9 @@ struct HSTRCloudRenderer
 
     /// Delta tracking with the piecewise-constant (undilated) block majorant, in the medium with extinction scaled by
     /// extinctionScale. Returns true at a real collision (v moved there).
-    bool sampleCollision(inout float3 v, float3 d, inout uint rng, float extinctionScale = 1.f)
+    /// Delta tracking in the transport medium (the proxy), or with fine set in the camera's medium (resident fine bricks at the
+    /// finest mapped level, bounded by the dilated majorant, which is built from the maximum source density).
+    bool sampleCollision(inout float3 v, float3 d, inout uint rng, float extinctionScale = 1.f, bool fine = false)
     {
         const float epsilon = 1e-3f;
         for (uint i = 0; i < 16384; ++i)
@@ -1187,13 +1398,13 @@ struct HSTRCloudRenderer
             if (!insideExtinctionGrid(v))
                 return false;
             // Empty 16-voxel blocks are crossed in one jump.
-            const int3 group = clamp(int3(floor(v / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
+            const int3 group = clamp(int3(floor(seaVoxel(v) / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
             if (hstrOccupancy.Load(int4(group, 0)) == 0)
             {
                 v += (majorantBlockExit(v, d, 16.f) + epsilon) * d;
                 continue;
             }
-            const float majorant = extinctionScale * tightMajorantAt(v);
+            const float majorant = extinctionScale * (fine ? majorantAt(v) : tightMajorantAt(v));
             const float exit = majorantBlockExit(v, d);
             if (majorant <= 0.f)
             {
@@ -1207,14 +1418,14 @@ struct HSTRCloudRenderer
                 continue;
             }
             v += flight * d;
-            if (randomFloat(rng) * majorant < extinctionScale * extinctionAtVoxel(v))
+            if (randomFloat(rng) * majorant < extinctionScale * (fine ? cameraExtinctionAtVoxel(v, 0.f) : extinctionAtVoxel(v)))
                 return true;
         }
         return false;
     }
 
     /// Ratio-tracking transmittance estimate from v to the grid boundary.
-    float ratioTrack(float3 v, float3 d, inout uint rng)
+    float ratioTrack(float3 v, float3 d, inout uint rng, bool fine = false)
     {
         const float epsilon = 1e-3f;
         float transmittance = 1.f;
@@ -1222,7 +1433,7 @@ struct HSTRCloudRenderer
         {
             if (!insideExtinctionGrid(v))
                 break;
-            const float majorant = tightMajorantAt(v);
+            const float majorant = fine ? majorantAt(v) : tightMajorantAt(v);
             const float exit = majorantBlockExit(v, d);
             if (majorant <= 0.f)
             {
@@ -1236,7 +1447,7 @@ struct HSTRCloudRenderer
                 continue;
             }
             v += flight * d;
-            transmittance *= max(0.f, 1.f - extinctionAtVoxel(v) / majorant);
+            transmittance *= max(0.f, 1.f - (fine ? cameraExtinctionAtVoxel(v, 0.f) : extinctionAtVoxel(v)) / majorant);
         }
         return transmittance;
     }
@@ -1278,29 +1489,30 @@ struct HSTRCloudRenderer
     ReferenceSample referencePath(float3 origin, float3 direction, GridVolume volume, inout uint rng)
     {
         float2 interval;
-        const AABB bounds = volume.getBounds();
-        if (!intersectRayAABB(origin, direction, bounds.minPoint, bounds.maxPoint, interval) || interval.y <= max(0.f, interval.x))
+        if (!mediumInterval(origin, direction, volume, interval) || interval.y <= max(0.f, interval.x))
         {
             ReferenceSample miss = {};
             miss.background = skyRadianceAt(direction);
             return miss;
         }
-        const float3 entryIndex = mul(volume.data.invTransform, float4(origin + max(0.f, interval.x) * direction, 1.f)).xyz;
-        return tracePath(entryIndex - float3(params.hstrGridMin), direction, volume, rng);
+        const float3 entryIndex = worldToVoxel(origin + max(0.f, interval.x) * direction, volume);
+        return tracePath(entryIndex - float3(params.hstrGridMin), direction, volume, rng, params.cloudDomain != 0);
     }
 
     /// Radiance arriving back along -direction at voxel position v, split into components by the number of scattering events
     /// after v. Direct sunlight at v itself is not included.
-    ReferenceSample tracePath(float3 v, float3 direction, GridVolume volume, inout uint rng)
+    /// fine: the reference sees the camera's medium (resident fine bricks); the world cache gather sees the transport proxy.
+    ReferenceSample tracePath(float3 v, float3 direction, GridVolume volume, inout uint rng, bool fine = false)
     {
         ReferenceSample result = {};
         const float3 sunDirection = normalize(params.sunDirection);
-        const float3 sunVoxel = mul(volume.data.invTransform, float4(sunDirection, 0.f)).xyz;
+        const float3 sunVoxel = voxelDirection(sunDirection);
         float3 throughput = 1.f;
         for (uint bounce = 0; bounce < 4096; ++bounce)
         {
-            const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
-            if (!sampleCollision(v, d, rng))
+            const float3 d = voxelDirection(direction);
+            v = wrapSeaPosition(v);
+            if (!sampleCollision(v, d, rng, 1.f, fine))
             {
                 // Escaping after `bounce` scattering events: unscattered background or scattered sky.
                 const float3 sky = throughput * skyRadianceAt(direction);
@@ -1312,7 +1524,7 @@ struct HSTRCloudRenderer
             }
             throughput *= volume.data.albedo;
             // Sun: directional irradiance through the ratio-tracked transmittance; this is scattering order bounce + 1.
-            const float3 sun = throughput * phaseHG(dot(sunDirection, direction)) * params.sunRadiance * ratioTrack(v, sunVoxel, rng);
+            const float3 sun = throughput * phaseHG(dot(sunDirection, direction)) * params.sunRadiance * ratioTrack(v, sunVoxel, rng, fine);
             if (bounce == 0)
                 result.sunSingle += sun;
             else
@@ -1504,13 +1716,20 @@ struct HSTRCloudRenderer
             const float fraction = tNext - t;
             // Cells with no medium within a majorant block of their centre are never read by the camera (its trilinear
             // lookups at medium points reach one cell): escaping photons would otherwise deposit all the way to the grid box.
-            if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)) &&
-                majorantAt((float3(cell) + 0.5f) * cellVoxels) > 0.f)
+            int3 storedCell = cell;
+            if (params.seaMode != 0)
             {
-                if (any(cell != acc.cell))
+                const int3 dims = int3(params.worldCacheDims);
+                storedCell.x = (cell.x % dims.x + dims.x) % dims.x;
+                storedCell.z = (cell.z % dims.z + dims.z) % dims.z;
+            }
+            if (fraction > 0.f && all(storedCell >= 0) && all(storedCell < int3(params.worldCacheDims)) &&
+                majorantAt((float3(storedCell) + 0.5f) * cellVoxels) > 0.f)
+            {
+                if (any(storedCell != acc.cell))
                 {
                     flushDeposits(acc, rng);
-                    acc.cell = cell;
+                    acc.cell = storedCell;
                 }
                 // Deposits are divided by the modulation at the middle of this cell's part of the flight.
                 const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
@@ -1544,6 +1763,9 @@ struct HSTRCloudRenderer
     /// L(d) = 0.675 + 0.325 d.y through side i - 3 (outward normal n), whose inward flux is A (0.675 pi + 0.325 (2 pi / 3) n.y).
     float photonSourcePower(uint i, float3 sun, float3 faceArea, float sunMean, float skyMean)
     {
+        // The sea's X/Z sides are periodic: light only enters through the top and bottom of the cloud layer.
+        if (params.seaMode != 0 && ((i < 3u) ? i : ((i - 3u) >> 1)) != 1u)
+            return 0.f;
         if (i < 3)
             return sunMean * abs(sun[i]) * faceArea[i];
         const uint axis = (i - 3) >> 1;
@@ -1579,7 +1801,8 @@ struct HSTRCloudRenderer
         DepositAccumulator acc = makeDepositAccumulator(fromSun ? 0u : 1u);
         for (uint bounce = 0; bounce < 4096; ++bounce)
         {
-            const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
+            const float3 d = voxelDirection(direction);
+            v = wrapSeaPosition(v);
             const float3 start = v;
             const bool similar = photonSimilar(bounce);
             const bool collided = sampleCollision(v, d, rng, similar ? 1.f - albedo * params.anisotropy : 1.f);
@@ -1650,7 +1873,8 @@ struct HSTRCloudRenderer
             float throughput = photon.directionThroughput.w;
             const uint bounce = photon.state & kPhotonBounceMask;
             const bool fromSun = (photon.state & kPhotonSky) == 0;
-            const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
+            const float3 d = voxelDirection(direction);
+            v = wrapSeaPosition(v);
             const float3 start = v;
             const bool similar = photonSimilar(bounce);
             const bool collided = sampleCollision(v, d, rng, similar ? 1.f - albedo * params.anisotropy : 1.f);
@@ -1809,10 +2033,34 @@ struct HSTRCloudRenderer
     /// deposits, which accumulate over every batch since the last restart.
     float worldCacheSlotMean(uint index, uint slot)
     {
-        // Photon weights are normalised by worldCachePhotons; a pool has emitted hstrPhotonEmitted[0] of them in total.
-        const float batches = params.worldCacheSegments > 0 ? float(max(hstrPhotonEmitted[0], 1u)) / float(params.worldCachePhotons)
-                                                            : float(max(params.worldCacheSamples, 1u));
+        // Photon weights are normalised by worldCachePhotons; a pool has emitted hstrPhotonEmitted[0] of them in total. In the sea
+        // every tile counts the batches since its cloud arrived.
+        float batches = params.worldCacheSegments > 0 ? float(max(hstrPhotonEmitted[0], 1u)) / float(params.worldCachePhotons)
+                                                      : float(max(params.worldCacheSamples, 1u));
+        if (params.cloudDomain != 0)
+            batches = max(hstrCloudTileBatches[worldCacheTile(index)], 1.f);
         return float(hstrWorldCacheDeposit[kWorldCacheSlots * index + slot]) / (batches * params.worldCacheDepositScale);
+    }
+
+    /// Sea tile slot of world cache cell index.
+    uint worldCacheTile(uint index)
+    {
+        const uint3 dims = params.worldCacheDims;
+        const uint2 cell = uint2(index % dims.x, index / (dims.x * dims.y));
+        const uint2 tile = min(cell * params.worldCacheCellVoxels / params.cloudTileVoxels, params.cloudTiles - 1u);
+        return tile.x + params.cloudTiles.x * tile.y;
+    }
+
+    /// Clears the deposits of world cache cells in sea tiles whose cloud changed.
+    void clearWorldCacheCell(uint3 cell)
+    {
+        if (any(cell >= params.worldCacheDims))
+            return;
+        const uint index = worldCacheIndex(cell);
+        if (hstrCloudTileReset[worldCacheTile(index)] == 0)
+            return;
+        for (uint slot = 0; slot < kWorldCacheSlots; ++slot)
+            hstrWorldCacheDeposit[kWorldCacheSlots * index + slot] = 0;
     }
 
     /// Writes one cell's cache means into the packed camera textures (light tracing only; the gather is read untextured).
@@ -1850,6 +2098,7 @@ struct HSTRCloudRenderer
     /// faces too dark and silhouettes/creases too bright at every g: sub-cell skin structure, not angular detail.
     float3 worldCacheRadianceTextured(float3 v, float3 w)
     {
+        v = seaVoxel(v);
         const float3 uvw = v / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
         const float g = params.anisotropy;
         const uint order = params.worldCacheOrder;
@@ -1945,7 +2194,7 @@ struct HSTRCloudRenderer
     {
         if (params.worldCacheModulation <= 0.f)
             return 1.f;
-        const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (v + 0.5f) / float3(params.hstrFineDims), 0.f);
+        const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
         return exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
     }
 
@@ -1953,6 +2202,7 @@ struct HSTRCloudRenderer
     /// 0-2 of the coloured total only.
     float3 worldCacheRadianceStored(float3 v, float3 w)
     {
+        v = seaVoxel(v);
         if (params.worldCacheTextured != 0 && params.worldCacheEstimator != 0)
             return worldCacheRadianceTextured(v, w);
         const float3 p = v / float(params.worldCacheCellVoxels) - 0.5f;
@@ -1967,7 +2217,14 @@ struct HSTRCloudRenderer
         {
             const uint3 offset = uint3(corner & 1, (corner >> 1) & 1, corner >> 2);
             const float3 weights = lerp(1.f - f, f, float3(offset));
-            const uint3 cell = uint3(clamp(int3(base) + int3(offset), int3(0), int3(params.worldCacheDims) - 1));
+            int3 unclamped = int3(base) + int3(offset);
+            if (params.seaMode != 0)
+            {
+                const int3 dims = int3(params.worldCacheDims);
+                unclamped.x = (unclamped.x % dims.x + dims.x) % dims.x;
+                unclamped.z = (unclamped.z % dims.z + dims.z) % dims.z;
+            }
+            const uint3 cell = uint3(clamp(unclamped, int3(0), int3(params.worldCacheDims) - 1));
             const float weight = worldCacheCellValid(cell) ? weights.x * weights.y * weights.z : 0.f;
             weightSum += weight;
             const uint index = worldCacheIndex(cell);
@@ -2523,7 +2780,7 @@ struct HSTRCloudRenderer
         const GridVolume volume = gScene.getGridVolume(0);
         const AABB bounds = volume.getBounds();
         const float3 origin = gScene.camera.data.posW;
-        if (all(origin > bounds.minPoint) && all(origin < bounds.maxPoint))
+        if (params.cloudDomain == 0 && all(origin > bounds.minPoint) && all(origin < bounds.maxPoint))
         {
             Ray ray;
             ray.origin = origin;
@@ -2577,10 +2834,10 @@ struct HSTRCloudRenderer
             {
                 const float dt = 0.5f / max(1.f, length(ray.direction) * cellWidth);
                 const float3 v = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
-                T *= exp(-extinctionAtVoxel(v) * dt * ray.worldLength);
+                T *= exp(-cameraExtinctionAtVoxel(v, rayFootprint(ray, t + 0.5f * dt)) * dt * ray.worldLength);
                 if (T <= 0.5f)
                 {
-                    debug = exp(-hstrFineSun.SampleLevel(hstrLinearSampler, (v + 0.5f) / float3(params.hstrFineDims), 0.f));
+                    debug = exp(-hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f));
                 }
                 t += dt;
             }
@@ -2848,7 +3105,10 @@ void sortTileCuts(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThread
 [numthreads(4, 4, 4)]
 void computeFineSun(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    gHSTRCloud.computeFineSun(dispatchThreadId);
+    const HSTRCloudParams params = gHSTRCloud.params;
+    if (any(params.fineSunSize > 0u) && any(dispatchThreadId >= params.fineSunSize))
+        return;
+    gHSTRCloud.computeFineSun(dispatchThreadId + params.fineSunOffset);
 }
 
 [numthreads(4, 4, 4)]
@@ -2867,6 +3127,80 @@ void blurSunOctaves(uint3 dispatchThreadId: SV_DispatchThreadID)
 void maskResidual(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.maskResidual(dispatchThreadId);
+}
+
+/// Atlas texel origin of a brick slot.
+uint3 cloudSlotOrigin(uint slot, uint shift)
+{
+    const uint mask = (1u << shift) - 1u;
+    return uint3(slot & mask, (slot >> shift) & mask, slot >> (2u * shift)) * kCloudBrickEdge;
+}
+
+/// Reconstructs the staged bricks of one level into their atlas slots (reconstructBrick in CloudFormat.h is the same rule):
+/// value = max(0, trilinear parent prediction + residual on the core), requantised as sqrt-spaced unorm. Thread (x, y, z) is
+/// value (x, y, z % 10) of staged brick cloudCommitOffset + z / 10; the parents were written by earlier dispatches.
+[numthreads(4, 4, 4)]
+void commitCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const HSTRCloudParams params = gHSTRCloud.params;
+    const uint local = dispatchThreadId.z / kCloudBrickEdge;
+    if (local >= params.cloudCommitCount || any(dispatchThreadId.xy >= kCloudBrickEdge))
+        return;
+    const uint staged = params.cloudCommitOffset + local;
+    const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[staged];
+    const uint3 texel = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudBrickEdge);
+
+    float prediction = 0.f;
+    if (info.parentSlot != kCloudRefNone)
+    {
+        const float3 parity = float3((info.parity & 1u) != 0 ? 1.f : 0.f, (info.parity & 2u) != 0 ? 1.f : 0.f, (info.parity & 4u) != 0 ? 1.f : 0.f);
+        const float3 position = 4.f * parity + (float3(texel) - 1.f + 0.5f) * 0.5f - 0.5f + 1.f;
+        const int3 base = int3(floor(position));
+        const float3 f = position - float3(base);
+        const uint3 parentOrigin = cloudSlotOrigin(info.parentSlot, params.cloudAtlasShift);
+        for (uint corner = 0; corner < 8; ++corner)
+        {
+            const uint3 offset = uint3(corner & 1u, (corner >> 1) & 1u, corner >> 2);
+            const float3 w = select(offset != 0u, f, 1.f - f);
+            const float t = gHSTRCloud.hstrCloudAtlasOutput[parentOrigin + uint3(base) + offset];
+            prediction += w.x * w.y * w.z * (info.parentMin + info.parentRange * t * t);
+        }
+    }
+    float residual = 0.f;
+    if (all(texel >= 1u) && all(texel <= 8u))
+    {
+        residual = info.residualMin;
+        if (info.bits > 0)
+        {
+            const uint3 core = texel - 1u;
+            const uint value = core.x + 8u * (core.y + 8u * core.z);
+            const uint code = (gHSTRCloud.hstrCloudStaging[staged * 128u + value / 4u] >> (8u * (value % 4u))) & 255u;
+            residual += info.residualStep * float(code);
+        }
+    }
+    const float density = max(0.f, prediction + residual);
+    const float t = info.valueRange > 0.f ? sqrt(saturate((density - info.valueMin) / info.valueRange)) : 0.f;
+    gHSTRCloud.hstrCloudAtlasOutput[cloudSlotOrigin(info.slot, params.cloudAtlasShift) + texel] = t;
+}
+
+/// Scales every world cache deposit by worldCacheKeep: after a sun change the old estimate fades as new photons arrive.
+[numthreads(4, 4, 4)]
+void decayWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId >= gHSTRCloud.params.worldCacheDims))
+        return;
+    const uint index = gHSTRCloud.worldCacheIndex(dispatchThreadId);
+    for (uint slot = 0; slot < kWorldCacheSlots; ++slot)
+    {
+        const uint i = kWorldCacheSlots * index + slot;
+        gHSTRCloud.hstrWorldCacheDeposit[i] = int(round(float(gHSTRCloud.hstrWorldCacheDeposit[i]) * gHSTRCloud.params.worldCacheKeep));
+    }
+}
+
+[numthreads(4, 4, 4)]
+void clearWorldCacheTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.clearWorldCacheCell(dispatchThreadId);
 }
 
 [numthreads(64, 1, 1)]

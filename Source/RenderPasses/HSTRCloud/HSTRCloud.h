@@ -6,8 +6,10 @@
 #include "Rendering/Volumes/HSTRHierarchy.h"
 #include "RenderGraph/RenderPass.h"
 #include "HSTRCloudTypes.slang"
+#include "CloudResidency.h"
 
 #include <array>
+#include <memory>
 
 using namespace Falcor;
 
@@ -57,6 +59,12 @@ private:
 
     void parseProperties(const Properties& props);
     void buildHierarchy();
+    void buildCloudDomain();
+    void uploadDomainExtinction(const std::vector<uint32_t>& slots);
+    void updateCloudDomain(RenderContext* pRenderContext);
+    void updateSunVoxelDirection();
+    void onLightingChanged(const HSTRCloudParams& previous);
+    void createSamplers();
     void updateHierarchy();
     void uploadHierarchy();
     void uploadExtinction();
@@ -64,6 +72,8 @@ private:
     void solveLighting();
     void dispatchLightingSolve();
     void dispatchResidualPages(RenderContext* pRenderContext);
+    bool mSunPagesDirty = false;
+    std::vector<uint32_t> mSunPageSlots; ///< Sea tiles whose sun pages are stale (all tiles when mResidualDirty).
     void bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass);
     void saveReference(RenderContext* pRenderContext, const std::string& path);
     void loadReference(RenderContext* pRenderContext, const std::string& path);
@@ -177,6 +187,38 @@ private:
     int3 mGridMax = int3(0);
     float3 mVoxelSize = float3(0.f);
     std::vector<float> mLeafDensity;
+    // Cloud sea: an endless procedural layer of library clouds (CloudSea) with virtualized fine density (CloudResidency).
+    std::string mCloudLibraryPath;
+    uint32_t mCloudProxyResolution = 64; ///< Domain voxels per sea tile edge.
+    uint32_t mCloudBrickPoolMB = 256;
+    uint32_t mCloudBrickLoadsPerFrame = 1024;
+    uint32_t mCloudSeaTiles = 8;
+    uint32_t mCloudSeaSeed = 1;
+    float mCloudSeaCoverage = 0.85f;
+    float mCloudLodPixels = 1.f;
+    uint32_t mCloudFadeFrames = 8;
+    bool mCloudVirtual = true;
+    std::string mCloudSeaKey;       ///< Settings the resident sea was built for.
+    std::string mCloudResidencyKey; ///< Settings the residency was built for.
+    std::unique_ptr<hstrcloud::CloudSea> mpCloudSea;
+    std::unique_ptr<hstrcloud::CloudResidency> mpCloudResidency;
+    bool mCloudInstancesUploaded = false;
+    uint32_t mCloudFrames = 0;
+    float mSeaViewDistance = 4000.f; ///< Requested view distance; the sea clamps it to its resident window.
+    float mCloudCacheKeep = 1.f;         ///< Pending decay of the world cache after sun changes.
+    std::vector<uint32_t> mSunPageQueue; ///< Sea tiles whose sun pages refresh over the next frames, nearest first.
+    uint32_t mCloudSunTilesPerFrame = 8; ///< Sea tiles whose sun pages are recomputed per frame after a sun change.
+    ref<ComputePass> mpDecayWorldCachePass;
+    std::vector<float> mCloudMeanBlocks; ///< Domain majorant blocks of the mean density (transport), unscaled.
+    std::vector<float> mCloudMaxBlocks;  ///< Domain majorant blocks of the maximum density (camera), unscaled.
+    std::vector<float> mCloudTileBatches;
+    std::vector<uint32_t> mCloudTileReset;
+    ref<Buffer> mpCloudTileBatches;
+    ref<Buffer> mpCloudTileReset;
+    ref<ComputePass> mpCommitCloudPass;
+    ref<ComputePass> mpClearWorldCacheTilesPass;
+    ref<Sampler> mpLinearClampSampler;
+    uint32_t mSamplerSeaMode = ~0u;
     std::vector<float> mHierarchyResidualBounds;
     std::vector<hstr::DenseMatrix> mLeafTransfers; ///< Root-to-leaf incident maps, reused by every lighting solve.
     std::vector<hstr::DenseMatrix> mLeafCorrections;

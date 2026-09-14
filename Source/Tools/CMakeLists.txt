@@ -1,3 +1,4 @@
 add_subdirectory(FalcorTest)
+add_subdirectory(HSTRCloudCompiler)
 add_subdirectory(ImageCompare)
 add_subdirectory(RenderGraphEditor)

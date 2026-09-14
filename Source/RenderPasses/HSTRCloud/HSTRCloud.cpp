@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <numeric>
 #include <thread>
 #include <unordered_map>
 
@@ -88,6 +89,22 @@ const char kAdaptiveMarch[] = "adaptiveMarch";
 const char kMarchTolerance[] = "marchTolerance";
 const char kMarchMinVoxels[] = "marchMinVoxels";
 const char kMarchCoarseVoxels[] = "marchCoarseVoxels";
+const char kSeaMode[] = "seaMode";
+const char kSeaViewDistance[] = "seaViewDistance";
+const char kCloudLibrary[] = "cloudLibrary";
+const char kCloudProxyResolution[] = "cloudProxyResolution";
+const char kCloudBrickPoolMB[] = "cloudBrickPoolMB";
+const char kCloudBrickLoadsPerFrame[] = "cloudBrickLoadsPerFrame";
+const char kCloudSeaTiles[] = "cloudSeaTiles";
+const char kCloudSeaSeed[] = "cloudSeaSeed";
+const char kCloudSeaCoverage[] = "cloudSeaCoverage";
+const char kCloudLodPixels[] = "cloudLodPixels";
+const char kCloudLodBias[] = "cloudLodBias";
+const char kCloudFadeFrames[] = "cloudFadeFrames";
+const char kCloudVirtual[] = "cloudVirtual";
+const char kCloudFineMinVoxels[] = "cloudFineMinVoxels";
+const char kCloudStats[] = "cloudStats";
+const char kCloudSunTilesPerFrame[] = "cloudSunTilesPerFrame";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
@@ -168,6 +185,8 @@ auto timed(const char* label, F&& f)
     LogTimer timer{label};
     return f();
 }
+
+void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Texture>& pTexture, const char* input);
 
 } // namespace
 
@@ -321,6 +340,36 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.marchMinVoxels = std::max(1e-3f, float(value));
         else if (key == kMarchCoarseVoxels)
             mParams.marchCoarseVoxels = std::max(0.1f, float(value));
+        else if (key == kSeaMode)
+            mParams.seaMode = bool(value) ? 1u : 0u;
+        else if (key == kSeaViewDistance)
+            mSeaViewDistance = mParams.seaViewDistance = std::max(1.f, float(value));
+        else if (key == kCloudLibrary)
+            mCloudLibraryPath = value.operator std::string();
+        else if (key == kCloudProxyResolution)
+            mCloudProxyResolution = (std::clamp(uint32_t(value), 16u, 256u) + 15u) / 16u * 16u;
+        else if (key == kCloudBrickPoolMB)
+            mCloudBrickPoolMB = std::clamp(uint32_t(value), 16u, 8192u);
+        else if (key == kCloudBrickLoadsPerFrame)
+            mCloudBrickLoadsPerFrame = std::clamp(uint32_t(value), 1u, 4096u);
+        else if (key == kCloudSeaTiles)
+            mCloudSeaTiles = std::clamp(uint32_t(value), 2u, 64u);
+        else if (key == kCloudSeaSeed)
+            mCloudSeaSeed = value;
+        else if (key == kCloudSeaCoverage)
+            mCloudSeaCoverage = std::clamp(float(value), 0.f, 1.f);
+        else if (key == kCloudLodPixels)
+            mCloudLodPixels = std::max(0.05f, float(value));
+        else if (key == kCloudLodBias)
+            mParams.cloudLodBias = value;
+        else if (key == kCloudFadeFrames)
+            mCloudFadeFrames = std::max(1u, uint32_t(value));
+        else if (key == kCloudVirtual)
+            mCloudVirtual = value;
+        else if (key == kCloudSunTilesPerFrame)
+            mCloudSunTilesPerFrame = std::max(1u, uint32_t(value));
+        else if (key == kCloudFineMinVoxels)
+            mParams.cloudFineMinVoxels = std::clamp(float(value), 1e-3f, 1.f);
         else if (key == kSaveReference)
             mSaveReferencePath = value.operator std::string();
         else if (key == kLoadReference)
@@ -339,7 +388,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.compareSubstitute = value;
         else if (key == kCompareTarget)
             mParams.compareTarget = value;
-        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction)
+        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction || key == kCloudStats)
             continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
@@ -350,9 +399,34 @@ void HSTRCloud::setProperties(const Properties& props)
 {
     const HSTRCloudParams previous = mParams;
     const float previousModulation = mWorldCacheModulation;
+    auto cloudSettings = [&]()
+    {
+        return fmt::format(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            mCloudLibraryPath,
+            mCloudProxyResolution,
+            mCloudBrickPoolMB,
+            mCloudBrickLoadsPerFrame,
+            mCloudSeaTiles,
+            mCloudSeaSeed,
+            mCloudSeaCoverage,
+            mCloudLodPixels,
+            mCloudFadeFrames,
+            mCloudVirtual
+        );
+    };
+    const std::string previousCloud = cloudSettings();
     parseProperties(props);
-    if (!mpScene || !mpLeafRadiance)
+    if (!mpScene || (!mpLeafRadiance && !mpCloudSea))
         return;
+    if (cloudSettings() != previousCloud)
+    {
+        buildHierarchy();
+        mCutDirty = true;
+        mBeamReusable = false;
+        mOptionsChanged = true;
+        return;
+    }
     const auto& p = mParams;
     const auto& q = previous;
     const bool operatorChanged = p.densityScale != q.densityScale || p.anisotropy != q.anisotropy ||
@@ -367,13 +441,12 @@ void HSTRCloud::setProperties(const Properties& props)
     if (operatorChanged)
         buildHierarchy();
     else if (lightingChanged)
-        solveLighting();
-    // The reference and the world cache solve the same lights and medium, so they restart with them.
+        onLightingChanged(previous);
+    // The reference and the world cache solve the same lights and medium, so they restart with them (the sea's cache decays instead).
     if (operatorChanged || lightingChanged)
-    {
         mParams.referenceSamples = 0;
+    if (operatorChanged || (lightingChanged && mParams.cloudDomain == 0))
         mParams.worldCacheSamples = 0;
-    }
     if (p.worldCacheCellVoxels != q.worldCacheCellVoxels || p.worldCacheEstimator != q.worldCacheEstimator ||
         p.worldCachePhotons != q.worldCachePhotons || p.worldCacheBands != q.worldCacheBands ||
         p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments ||
@@ -462,6 +535,38 @@ Properties HSTRCloud::getProperties() const
     props[kMarchTolerance] = mParams.marchTolerance;
     props[kMarchMinVoxels] = mParams.marchMinVoxels;
     props[kMarchCoarseVoxels] = mParams.marchCoarseVoxels;
+    props[kSeaMode] = mParams.seaMode != 0;
+    props[kSeaViewDistance] = mSeaViewDistance;
+    props[kCloudLibrary] = mCloudLibraryPath;
+    props[kCloudProxyResolution] = mCloudProxyResolution;
+    props[kCloudBrickPoolMB] = mCloudBrickPoolMB;
+    props[kCloudBrickLoadsPerFrame] = mCloudBrickLoadsPerFrame;
+    props[kCloudSeaTiles] = mCloudSeaTiles;
+    props[kCloudSeaSeed] = mCloudSeaSeed;
+    props[kCloudSeaCoverage] = mCloudSeaCoverage;
+    props[kCloudLodPixels] = mCloudLodPixels;
+    props[kCloudLodBias] = mParams.cloudLodBias;
+    props[kCloudFadeFrames] = mCloudFadeFrames;
+    props[kCloudVirtual] = mCloudVirtual;
+    props[kCloudFineMinVoxels] = mParams.cloudFineMinVoxels;
+    props[kCloudSunTilesPerFrame] = mCloudSunTilesPerFrame;
+    if (mpCloudResidency)
+    {
+        const auto& stats = mpCloudResidency->getStats();
+        Properties cloud;
+        cloud["loaded"] = stats.loaded;
+        cloud["mapped"] = stats.mapped;
+        cloud["desired"] = stats.desired;
+        cloud["pending"] = stats.pending;
+        cloud["committed"] = stats.committed;
+        cloud["slotsUsed"] = stats.slotsUsed;
+        cloud["nodesUsed"] = stats.nodesUsed;
+        cloud["pagesLoaded"] = stats.pagesLoaded;
+        cloud["residentMB"] = stats.residentMB;
+        cloud["cutMs"] = stats.cutMilliseconds;
+        cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
+        props[kCloudStats] = cloud;
+    }
     props[kBeamTolerance] = mParams.beamTolerance;
     props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
     props[kStoreExact] = mStoreExact;
@@ -574,6 +679,9 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamMarchPass = createPass("marchBeamPixels");
+    mpCommitCloudPass = createPass("commitCloudBricks");
+    mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
+    mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
 }
 
@@ -588,6 +696,17 @@ void HSTRCloud::buildHierarchy()
     const auto& grid = volume->getDensityGrid();
     if (!grid)
         return;
+
+    if (!mCloudLibraryPath.empty())
+    {
+        buildCloudDomain();
+        return;
+    }
+    mpCloudResidency.reset();
+    mpCloudSea.reset();
+    mParams.cloudDomain = 0;
+    mParams.cloudVirtual = 0;
+    mParams.seaMode = 0;
 
     constexpr uint32_t kCellWidth = 16;
     mGridMin = grid->getMinIndex();
@@ -960,21 +1079,393 @@ void HSTRCloud::uploadExtinction()
     mResidualDirty = true;
     mBasisDirty = true;
 
-    if (!mpExtinctionSampler)
+    createSamplers();
+}
+
+void HSTRCloud::createSamplers()
+{
+    if (mpExtinctionSampler && mSamplerSeaMode == mParams.seaMode)
+        return;
+    mSamplerSeaMode = mParams.seaMode;
+    // The sea wraps in X/Z. Density is zero outside the active-voxel bounds, so extinction lookups use a zero border elsewhere.
+    const auto side = mParams.seaMode != 0 ? TextureAddressingMode::Wrap : TextureAddressingMode::Border;
+    Sampler::Desc samplerDesc;
+    samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+    samplerDesc.setAddressingMode(side, TextureAddressingMode::Border, side);
+    samplerDesc.setBorderColor(float4(0.f));
+    mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+    const auto clampSide = mParams.seaMode != 0 ? TextureAddressingMode::Wrap : TextureAddressingMode::Clamp;
+    samplerDesc.setAddressingMode(clampSide, TextureAddressingMode::Clamp, clampSide);
+    mpLinearSampler = mpDevice->createSampler(samplerDesc);
+    samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+    mpLinearClampSampler = mpDevice->createSampler(samplerDesc);
+}
+
+void HSTRCloud::buildCloudDomain()
+{
+    const auto& volume = mpScene->getGridVolume(0);
+    const AABB bounds = volume->getBounds();
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    const std::string seaKey = fmt::format(
+        "{}|{}|{}|{}|{}|{}|{}",
+        mCloudLibraryPath,
+        mCloudSeaTiles,
+        mCloudSeaSeed,
+        mCloudSeaCoverage,
+        mCloudProxyResolution,
+        bounds.minPoint,
+        bounds.extent()
+    );
+    if (!mpCloudSea || seaKey != mCloudSeaKey)
     {
-        // Density is zero outside the active-voxel bounds, so extinction lookups use a zero border instead of clamping.
-        Sampler::Desc samplerDesc;
-        samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
-        samplerDesc.setAddressingMode(TextureAddressingMode::Border, TextureAddressingMode::Border, TextureAddressingMode::Border);
-        samplerDesc.setBorderColor(float4(0.f));
-        mpExtinctionSampler = mpDevice->createSampler(samplerDesc);
+        mpCloudResidency.reset();
+        mpCloudSea.reset();
+        hstrcloud::CloudLibrary library = timed("cloud library", [&] { return hstrcloud::loadCloudLibrary(mCloudLibraryPath); });
+        hstrcloud::CloudSeaDesc seaDesc;
+        // The scene's grid volume is only the carrier: its bounds give one tile's footprint and the cloud layer.
+        seaDesc.origin = bounds.minPoint;
+        seaDesc.tileWorld = bounds.extent().x;
+        seaDesc.layerHeight = bounds.extent().y;
+        seaDesc.tileVoxels = mCloudProxyResolution;
+        seaDesc.tiles = mCloudSeaTiles;
+        seaDesc.seed = mCloudSeaSeed;
+        seaDesc.coverage = mCloudSeaCoverage;
+        mpCloudSea = std::make_unique<hstrcloud::CloudSea>(std::move(library.assets), seaDesc);
+        timed("cloud sea window", [&] { mpCloudSea->fill(cameraPosition); });
+        mCloudSeaKey = seaKey;
+        mCloudInstancesUploaded = false;
+        mCloudMeanBlocks.clear();
     }
-    if (!mpLinearSampler)
+    const std::string residencyKey = fmt::format("{}|{}|{}|{}", mCloudBrickPoolMB, mCloudBrickLoadsPerFrame, mCloudLodPixels, mCloudFadeFrames);
+    if (!mCloudVirtual)
+        mpCloudResidency.reset();
+    else if (!mpCloudResidency || residencyKey != mCloudResidencyKey)
     {
-        Sampler::Desc samplerDesc;
-        samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
-        samplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-        mpLinearSampler = mpDevice->createSampler(samplerDesc);
+        mpCloudResidency.reset();
+        hstrcloud::CloudResidencyDesc residencyDesc;
+        residencyDesc.library = mCloudLibraryPath;
+        residencyDesc.poolMB = mCloudBrickPoolMB;
+        residencyDesc.loadsPerFrame = mCloudBrickLoadsPerFrame;
+        residencyDesc.lodPixels = mCloudLodPixels;
+        residencyDesc.fadeFrames = mCloudFadeFrames;
+        mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
+        mCloudResidencyKey = residencyKey;
+        mCloudInstancesUploaded = false;
+    }
+
+    const auto& desc = mpCloudSea->getDesc();
+    const uint3 dims = mpCloudSea->getDims();
+    const float voxel = mpCloudSea->getVoxelWorld();
+    mParams.cloudDomain = 1;
+    mParams.seaMode = 1;
+    mParams.cloudVirtual = mpCloudResidency ? 1u : 0u;
+    mParams.seaOrigin = desc.origin;
+    mParams.seaVoxelSize = float3(voxel);
+    mParams.cloudTiles = uint2(desc.tiles);
+    mParams.cloudTileVoxels = desc.tileVoxels;
+    mParams.cloudAtlasShift = mpCloudResidency ? mpCloudResidency->getAtlasShift() : 6u;
+    if (mpCloudResidency)
+    {
+        const auto& atlas = mpCloudResidency->getAtlas();
+        mParams.cloudAtlasInvSize = 1.f / float3(float(atlas->getWidth()), float(atlas->getHeight()), float(atlas->getDepth()));
+    }
+    mVoxelSize = float3(voxel);
+    constexpr uint32_t kCellWidth = 16;
+    mGridMin = int3(0);
+    mGridMax = int3(dims) - 1;
+    mActualLeafDims = dims / kCellWidth;
+    mParams.hstrLeafDims = mActualLeafDims;
+    mParams.hstrGridMin = int3(0);
+    mParams.hstrCellWidth = kCellWidth;
+    mParams.hstrExtinctionDims = dims;
+    mParams.hstrFineDims = dims;
+    mParams.hstrNodeCount = 0;
+    // The sea's frame is the world cache march (per pixel or through beam tiles), and each tile counts its own light-tracing
+    // batches, so the photon pool (which counts emitted photons globally) is not used.
+    if (mParams.debugView != kReferenceView && mParams.debugView != kWorldCacheView && mParams.debugView != kBeamView)
+    {
+        logWarning("HSTRCloud: the cloud sea renders through the world cache views; debugView {} becomes {}.", mParams.debugView, kBeamView);
+        mParams.debugView = kBeamView;
+    }
+    mParams.worldCacheSegments = 0;
+    // The window reaches at least tiles / 2 - 1 tiles from the camera in every direction; beyond, tiles are stale or wrapped.
+    mParams.seaViewDistance = std::min(mSeaViewDistance, std::max(1.f, float(desc.tiles / 2 - 1)) * desc.tileWorld);
+    const uint32_t tileCount = desc.tiles * desc.tiles;
+    mCloudTileBatches.assign(tileCount, 0.f);
+    mCloudTileReset.assign(tileCount, 0u);
+    mpCloudTileBatches = mpDevice->createStructuredBuffer(
+        sizeof(float), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileBatches.data(), false
+    );
+    mpCloudTileReset = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileReset.data(), false
+    );
+    std::vector<uint32_t> slots(tileCount);
+    std::iota(slots.begin(), slots.end(), 0u);
+    mCloudMeanBlocks.clear();
+    uploadDomainExtinction(slots);
+    updateSunVoxelDirection();
+    createSamplers();
+    mpLeafRadiance = nullptr;
+    mParams.worldCacheSamples = 0;
+    mParams.referenceSamples = 0;
+    mResidualDirty = true;
+    mBasisDirty = true;
+    mCutDirty = true;
+    mBeamReusable = false;
+    logInfo("HSTRCloud: cloud sea domain {} voxels of {:.2f} world units ({} fine density).", dims, voxel, mpCloudResidency ? "virtual" : "proxy");
+}
+
+void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
+{
+    const auto& sea = *mpCloudSea;
+    const uint3 dims = sea.getDims();
+    const uint32_t r = sea.getDesc().tileVoxels;
+    const uint32_t tiles = sea.getDesc().tiles;
+    const float scale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
+    const auto& mean = sea.getMean();
+    const auto& maximum = sea.getMax();
+    auto voxelIndex = [&](uint32_t x, uint32_t y, uint32_t z) { return size_t(x) + size_t(dims.x) * (size_t(y) + size_t(dims.y) * size_t(z)); };
+
+    // Proxy extinction, per changed tile.
+    const bool fullTexture =
+        !mpExtinction || mpExtinction->getWidth() != dims.x || mpExtinction->getHeight() != dims.y || mpExtinction->getDepth() != dims.z;
+    if (fullTexture)
+    {
+        std::vector<float16_t> extinction(mean.size());
+        for (size_t i = 0; i < mean.size(); ++i)
+            extinction[i] = float16_t(mean[i] * scale);
+        mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
+    }
+    else
+    {
+        std::vector<float16_t> tile(size_t(r) * dims.y * r);
+        for (uint32_t slot : slots)
+        {
+            const uint3 corner(slot % tiles * r, 0, slot / tiles * r);
+            for (uint32_t z = 0; z < r; ++z)
+                for (uint32_t y = 0; y < dims.y; ++y)
+                    for (uint32_t x = 0; x < r; ++x)
+                        tile[x + size_t(r) * (y + size_t(dims.y) * z)] = float16_t(mean[voxelIndex(corner.x + x, y, corner.z + z)] * scale);
+            mpDevice->getRenderContext()->updateSubresourceData(mpExtinction.get(), 0, tile.data(), corner, uint3(r, dims.y, r));
+        }
+    }
+
+    // Block maxima over 4^3 voxels plus the voxels one past the upper faces (trilinear support), wrapping in X/Z. A tile's change
+    // also reaches the blocks just before it.
+    constexpr uint32_t kBlock = 4;
+    const uint3 blockDims = dims / kBlock;
+    const size_t blockCount = size_t(blockDims.x) * blockDims.y * blockDims.z;
+    auto blockIndex = [&](uint3 b) { return size_t(b.x) + size_t(blockDims.x) * (size_t(b.y) + size_t(blockDims.y) * size_t(b.z)); };
+    std::vector<uint8_t> dirtyColumns(size_t(blockDims.x) * blockDims.z, 0);
+    if (mCloudMeanBlocks.size() != blockCount)
+    {
+        mCloudMeanBlocks.assign(blockCount, 0.f);
+        mCloudMaxBlocks.assign(blockCount, 0.f);
+        std::fill(dirtyColumns.begin(), dirtyColumns.end(), uint8_t(1));
+    }
+    else
+        for (uint32_t slot : slots)
+        {
+            const int32_t bx = int32_t(slot % tiles * r / kBlock);
+            const int32_t bz = int32_t(slot / tiles * r / kBlock);
+            for (int32_t z = bz - 1; z < bz + int32_t(r / kBlock); ++z)
+                for (int32_t x = bx - 1; x < bx + int32_t(r / kBlock); ++x)
+                {
+                    const uint32_t wx = uint32_t((x + int32_t(blockDims.x)) % int32_t(blockDims.x));
+                    const uint32_t wz = uint32_t((z + int32_t(blockDims.z)) % int32_t(blockDims.z));
+                    dirtyColumns[wx + size_t(blockDims.x) * wz] = 1;
+                }
+        }
+    parallelFor(
+        dirtyColumns.size(),
+        [&](size_t column)
+        {
+            if (!dirtyColumns[column])
+                return;
+            const uint32_t bx = uint32_t(column % blockDims.x);
+            const uint32_t bz = uint32_t(column / blockDims.x);
+            for (uint32_t by = 0; by < blockDims.y; ++by)
+            {
+                float meanValue = 0.f;
+                float maxValue = 0.f;
+                for (uint32_t z = 0; z <= kBlock; ++z)
+                    for (uint32_t y = by * kBlock; y <= std::min(by * kBlock + kBlock, dims.y - 1); ++y)
+                        for (uint32_t x = 0; x <= kBlock; ++x)
+                        {
+                            const size_t i = voxelIndex((bx * kBlock + x) % dims.x, y, (bz * kBlock + z) % dims.z);
+                            meanValue = std::max(meanValue, mean[i]);
+                            maxValue = std::max(maxValue, std::max(mean[i], maximum[i]));
+                        }
+                mCloudMeanBlocks[blockIndex(uint3(bx, by, bz))] = meanValue;
+                mCloudMaxBlocks[blockIndex(uint3(bx, by, bz))] = maxValue;
+            }
+        }
+    );
+
+    auto roundedUp = [](float value)
+    {
+        float16_t rounded(value);
+        if (float(rounded) < value)
+            rounded = float16_t(value * (1.f + 1.f / 1024.f));
+        return rounded;
+    };
+    // Camera majorant: maximum density dilated by one block (wrapping), so every march step of at most a block is bounded.
+    std::vector<float16_t> majorant(blockCount);
+    std::vector<float16_t> tight(blockCount);
+    parallelFor(
+        blockCount,
+        [&](size_t i)
+        {
+            const int3 b(int32_t(i % blockDims.x), int32_t((i / blockDims.x) % blockDims.y), int32_t(i / (size_t(blockDims.x) * blockDims.y)));
+            float value = 0.f;
+            for (int32_t z = -1; z <= 1; ++z)
+                for (int32_t y = -1; y <= 1; ++y)
+                    for (int32_t x = -1; x <= 1; ++x)
+                    {
+                        const int32_t ny = b.y + y;
+                        if (ny < 0 || ny >= int32_t(blockDims.y))
+                            continue;
+                        const uint3 n(
+                            uint32_t((b.x + x + int32_t(blockDims.x)) % int32_t(blockDims.x)),
+                            uint32_t(ny),
+                            uint32_t((b.z + z + int32_t(blockDims.z)) % int32_t(blockDims.z))
+                        );
+                        value = std::max(value, mCloudMaxBlocks[blockIndex(n)]);
+                    }
+            majorant[i] = roundedUp(value * scale);
+            tight[i] = roundedUp(mCloudMeanBlocks[i] * scale);
+        }
+    );
+    mParams.hstrMajorantDims = blockDims;
+    const uint3 occupancyDims = (blockDims + 3u) / 4u;
+    std::vector<uint8_t> occupancy(size_t(occupancyDims.x) * occupancyDims.y * occupancyDims.z, 0);
+    for (size_t i = 0; i < blockCount; ++i)
+        if (mCloudMaxBlocks[i] > 0.f)
+        {
+            const uint3 o = uint3(uint32_t(i % blockDims.x), uint32_t((i / blockDims.x) % blockDims.y), uint32_t(i / (size_t(blockDims.x) * blockDims.y))) / 4u;
+            occupancy[size_t(o.x) + size_t(occupancyDims.x) * (size_t(o.y) + size_t(occupancyDims.y) * o.z)] = 1;
+        }
+    auto* pRenderContext = mpDevice->getRenderContext();
+    auto upload = [&](ref<Texture>& texture, uint3 size, ResourceFormat format, const void* data)
+    {
+        if (!texture || texture->getWidth() != size.x || texture->getHeight() != size.y || texture->getDepth() != size.z)
+            texture = mpDevice->createTexture3D(size.x, size.y, size.z, format, 1, data);
+        else
+            pRenderContext->updateTextureData(texture.get(), data);
+    };
+    upload(mpMajorant, blockDims, ResourceFormat::R16Float, majorant.data());
+    upload(mpTightMajorant, blockDims, ResourceFormat::R16Float, tight.data());
+    upload(mpOccupancy, occupancyDims, ResourceFormat::R8Uint, occupancy.data());
+}
+
+void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "cloudSea");
+    const auto& camera = mpScene->getCamera();
+    std::vector<uint32_t> changed;
+    {
+        FALCOR_PROFILE(pRenderContext, "seaTiles");
+        changed = mpCloudSea->update(camera->getPosition());
+    }
+    if (!mCloudInstancesUploaded)
+    {
+        changed.resize(mCloudTileBatches.size());
+        std::iota(changed.begin(), changed.end(), 0u);
+        mCloudInstancesUploaded = true;
+    }
+    if (!changed.empty())
+    {
+        FALCOR_PROFILE(pRenderContext, "tileUpload");
+        uploadDomainExtinction(changed);
+        // The world cache of tiles whose cloud changed restarts; the rest keeps converging.
+        std::fill(mCloudTileReset.begin(), mCloudTileReset.end(), 0u);
+        for (uint32_t slot : changed)
+        {
+            mCloudTileReset[slot] = 1;
+            mCloudTileBatches[slot] = 0.f;
+        }
+        mpCloudTileReset->setBlob(mCloudTileReset.data(), 0, mCloudTileReset.size() * sizeof(uint32_t));
+        mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+        if (mpWorldCacheDeposit && all(mParams.worldCacheDims > uint3(0)))
+        {
+            bindRenderer(pRenderContext, mpClearWorldCacheTilesPass);
+            mpClearWorldCacheTilesPass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+            mpClearWorldCacheTilesPass->execute(pRenderContext, mParams.worldCacheDims);
+        }
+        mWorldCacheBakeDirty = true;
+        // Sun pages: the changed tiles and every tile whose sun rays cross them (up to the layer height along the sun).
+        const float3 sun = normalize(mParams.sunDirection);
+        const auto& seaDesc = mpCloudSea->getDesc();
+        const float reach = std::abs(sun.y) > 1e-3f ? seaDesc.layerHeight * length(sun.xz()) / std::abs(sun.y) : 1e9f;
+        const int32_t n = int32_t(seaDesc.tiles);
+        const int32_t steps = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
+        const float2 downwind = length(sun.xz()) > 1e-6f ? -normalize(sun.xz()) * (sun.y >= 0.f ? 1.f : -1.f) : float2(0.f);
+        std::vector<uint8_t> stale(mCloudTileBatches.size(), 0);
+        for (uint32_t slot : mSunPageSlots)
+            stale[slot] = 1;
+        for (uint32_t slot : changed)
+            for (int32_t k = 0; k <= steps; ++k)
+                for (int32_t side = -1; side <= 1; ++side)
+                {
+                    const float2 p = float2(float(slot % n), float(slot / n)) + downwind * float(k) + float2(-downwind.y, downwind.x) * float(side);
+                    const int32_t x = ((int32_t(std::floor(p.x + 0.5f)) % n) + n) % n;
+                    const int32_t z = ((int32_t(std::floor(p.y + 0.5f)) % n) + n) % n;
+                    stale[x + n * z] = 1;
+                }
+        mSunPageSlots.clear();
+        for (uint32_t slot = 0; slot < stale.size(); ++slot)
+            if (stale[slot])
+                mSunPageSlots.push_back(slot);
+        mSunPagesDirty = true;
+        mBeamReusable = false;
+    }
+    if (!mpCloudResidency)
+        return;
+    hstrcloud::CloudView view;
+    view.position = camera->getPosition();
+    view.viewProjection = camera->getViewProjMatrixNoJitter();
+    mParams.cloudPixelAngle = camera->getFrameHeight() / camera->getFocalLength() / float(std::max(1u, mParams.frameDim.y));
+    view.pixelAngle = mParams.cloudPixelAngle;
+    view.lodBias = mParams.cloudLodBias;
+    view.sunDirection = normalize(mParams.sunDirection);
+    view.sunReach = (mParams.sunNearVoxels + 1.f) * mpCloudSea->getVoxelWorld();
+    view.densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
+    view.maxDistance = mParams.seaViewDistance;
+    bool densityChanged = false;
+    {
+        FALCOR_PROFILE(pRenderContext, "residency");
+        densityChanged = mpCloudResidency->update(*mpCloudSea, view, changed);
+    }
+    // One reconstruction dispatch per level, coarsest first: every brick predicts from a parent already in the atlas.
+    if (!mpCloudResidency->getCommitGroups().empty())
+    {
+        FALCOR_PROFILE(pRenderContext, "commitBricks");
+        for (const auto& group : mpCloudResidency->getCommitGroups())
+        {
+            mParams.cloudCommitOffset = group.offset;
+            mParams.cloudCommitCount = group.count;
+            bindRenderer(pRenderContext, mpCommitCloudPass);
+            bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
+            mpCommitCloudPass->execute(pRenderContext, uint3(10, 10, 10 * group.count));
+        }
+        mParams.cloudCommitCount = 0;
+    }
+    if (densityChanged)
+        mBeamReusable = false;
+    if (++mCloudFrames % 240 == 0)
+    {
+        const auto& stats = mpCloudResidency->getStats();
+        logInfo(
+            "HSTRCloud: sea frame {}: {} desired, {} loaded, {} mapped, {} pending bricks, {} tiles pending, {:.0f} MB resident, cut {:.2f} ms.",
+            mCloudFrames,
+            stats.desired,
+            stats.loaded,
+            stats.mapped,
+            stats.pending,
+            mpCloudSea->pendingTiles(),
+            stats.residentMB,
+            stats.cutMilliseconds
+        );
     }
 }
 
@@ -1484,8 +1975,57 @@ void HSTRCloud::updateHierarchy()
     );
 }
 
+void HSTRCloud::updateSunVoxelDirection()
+{
+    // One voxel step towards the sun for the sub-voxel sun reconstruction (the grid axes are world aligned).
+    const float3 sunVoxels = normalize(mParams.sunDirection) / mVoxelSize;
+    mParams.sunVoxelDirection = sunVoxels / length(sunVoxels);
+    mParams.sunVoxelWorldLength = 1.f / length(sunVoxels);
+}
+
+void HSTRCloud::onLightingChanged(const HSTRCloudParams& previous)
+{
+    if (mParams.cloudDomain == 0 || !mpCloudSea)
+    {
+        solveLighting();
+        return;
+    }
+    // The sea amortizes lighting changes. Its cache holds unit sun and sky fields coloured at lookup, so colours need nothing; a
+    // new sun direction decays the cache by the angle turned (new photons replace the old estimate over the next frames) and
+    // refreshes the sun pages tile by tile, nearest first.
+    updateSunVoxelDirection();
+    const float cosine = dot(normalize(previous.sunDirection), normalize(mParams.sunDirection));
+    if (cosine > 0.999999f)
+        return;
+    const float angle = std::acos(std::clamp(cosine, -1.f, 1.f));
+    mCloudCacheKeep = std::min(mCloudCacheKeep, std::exp(-angle / 0.05f));
+    const auto& desc = mpCloudSea->getDesc();
+    const int32_t n = int32_t(desc.tiles);
+    const float3 camera = mpScene->getCamera()->getPosition();
+    const int2 cameraSlot(
+        ((int32_t(std::floor((camera.x - desc.origin.x) / desc.tileWorld)) % n) + n) % n,
+        ((int32_t(std::floor((camera.z - desc.origin.z) / desc.tileWorld)) % n) + n) % n
+    );
+    mSunPageQueue.resize(size_t(n) * n);
+    std::iota(mSunPageQueue.begin(), mSunPageQueue.end(), 0u);
+    auto torusDistance = [&](uint32_t slot)
+    {
+        const int32_t dx = std::abs(int32_t(slot % n) - cameraSlot.x);
+        const int32_t dz = std::abs(int32_t(slot / n) - cameraSlot.y);
+        return std::max(std::min(dx, n - dx), std::min(dz, n - dz));
+    };
+    std::stable_sort(mSunPageQueue.begin(), mSunPageQueue.end(), [&](uint32_t a, uint32_t b) { return torusDistance(a) < torusDistance(b); });
+}
+
 void HSTRCloud::solveLighting()
 {
+    if (mParams.cloudDomain != 0)
+    {
+        // The sea has no Schur hierarchy: its transport is the world cache and the sun pages, rebuilt for the new lights.
+        updateSunVoxelDirection();
+        mResidualDirty = true;
+        return;
+    }
     if (mHierarchy.getRoot() == hstr::HierarchyNode::kInvalid)
         return;
 
@@ -1518,10 +2058,7 @@ void HSTRCloud::solveLighting()
                 incident(face * mParams.hstrFaceDofs + mode, channel) = skyScale * mParams.skyRadiance[channel];
     }
     const float3 sun = normalize(mParams.sunDirection);
-    // One voxel step towards the sun for the sub-voxel sun reconstruction (the grid axes are world aligned).
-    const float3 sunVoxels = sun / mVoxelSize;
-    mParams.sunVoxelDirection = sunVoxels / length(sunVoxels);
-    mParams.sunVoxelWorldLength = 1.f / length(sunVoxels);
+    updateSunVoxelDirection();
     uint32_t sunAxis = 0;
     if (std::abs(sun.y) > std::abs(sun.x))
         sunAxis = 1;
@@ -1583,6 +2120,13 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrMajorant"] = mpMajorant;
     var["hstrTightMajorant"] = mpTightMajorant;
     var["hstrOccupancy"] = mpOccupancy;
+    if (mpCloudResidency)
+        mpCloudResidency->bind(var);
+    if (mpCloudTileBatches)
+    {
+        var["hstrCloudTileBatches"] = mpCloudTileBatches;
+        var["hstrCloudTileReset"] = mpCloudTileReset;
+    }
     var["hstrCameraLighting"] = mpCameraLighting;
     var["hstrFineSun"] = mpFineSun;
     var["hstrLeafResidual"] = mpLeafResidual;
@@ -1614,6 +2158,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrExactFrame"] = mpExactFrame;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
+    var["hstrLinearClampSampler"] = mpLinearClampSampler;
 }
 
 namespace
@@ -1637,15 +2182,37 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     if (!mpLeafResidual || mpLeafResidual->getElementCount() != leafCount)
         mpLeafResidual = mpDevice->createStructuredBuffer(sizeof(uint32_t), leafCount, flags, MemoryType::DeviceLocal, nullptr, false);
 
-    // Ballistic sun transmittance per residual cell, with per-leaf activation, then non-resident pages are cleared.
-    pRenderContext->clearUAV(mpLeafResidual->getUAV().get(), uint4(0));
-    bindRenderer(pRenderContext, mpFineSunPass);
-    bindOutput(mpFineSunPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
-    mpFineSunPass->execute(pRenderContext, fineDims);
-
-    bindRenderer(pRenderContext, mpResidualMaskPass);
-    bindOutput(mpResidualMaskPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
-    mpResidualMaskPass->execute(pRenderContext, fineDims);
+    if (mParams.cloudDomain != 0 && !mResidualDirty)
+    {
+        // Sea tiles whose cloud changed, and the tiles in their shadow, recompute their sun pages; the rest stays valid. The residual
+        // mask is an optimisation of the HST camera path, which the sea does not use.
+        const uint32_t r = mParams.cloudTileVoxels;
+        for (uint32_t slot : mSunPageSlots)
+        {
+            mParams.fineSunOffset = uint3(slot % mParams.cloudTiles.x * r, 0, slot / mParams.cloudTiles.x * r);
+            mParams.fineSunSize = uint3(r, fineDims.y, r);
+            bindRenderer(pRenderContext, mpFineSunPass);
+            bindOutput(mpFineSunPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
+            mpFineSunPass->execute(pRenderContext, mParams.fineSunSize);
+        }
+        mParams.fineSunOffset = uint3(0);
+        mParams.fineSunSize = uint3(0);
+    }
+    else
+    {
+        // Ballistic sun transmittance per residual cell, with per-leaf activation, then non-resident pages are cleared.
+        pRenderContext->clearUAV(mpLeafResidual->getUAV().get(), uint4(0));
+        bindRenderer(pRenderContext, mpFineSunPass);
+        bindOutput(mpFineSunPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
+        mpFineSunPass->execute(pRenderContext, fineDims);
+        if (mParams.cloudDomain == 0)
+        {
+            bindRenderer(pRenderContext, mpResidualMaskPass);
+            bindOutput(mpResidualMaskPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
+            mpResidualMaskPass->execute(pRenderContext, fineDims);
+        }
+    }
+    mSunPageSlots.clear();
 
     // Octaves 1-3: scatterer-weighted sun arrival on a 2-voxel grid, spread by a separable Gaussian.
     const uint3 octaveDims = (fineDims + 1u) / 2u;
@@ -1683,7 +2250,7 @@ void HSTRCloud::ensureCameraResources()
         mpTileCenters = mpDevice->createTexture2D(tileDims.x, tileDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
         mBasisDirty = true;
     }
-    if (!mpNodeProjection || mpNodeProjection->getElementCount() != nodeCount)
+    if (nodeCount > 0 && (!mpNodeProjection || mpNodeProjection->getElementCount() != nodeCount))
     {
         mpNodeProjection = mpDevice->createStructuredBuffer(sizeof(float4), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
         mpNodeDepth = mpDevice->createStructuredBuffer(sizeof(float2), nodeCount, flags, MemoryType::DeviceLocal, nullptr, false);
@@ -1779,13 +2346,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     mParams.frameDim = frameDim;
     mParams.hstrTileDims = (frameDim + mParams.hstrTileSize - 1u) / mParams.hstrTileSize;
     mParams.hstrLatticeDims = mParams.hstrTileDims + 1u;
-    if (!mpScene || !mpPass || !mpLeafRadiance)
+    if (!mpScene || !mpPass || (!mpLeafRadiance && !mpCloudSea))
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(error->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(cutStats->getUAV().get(), float4(0.f));
         return;
     }
+    if (mpCloudSea)
+        updateCloudDomain(pRenderContext);
 
     // Unbiased reference on the same medium and lights; accumulated over frames by the graph.
     if (!mpReferenceSum || mpReferenceSum->getWidth() != frameDim.x || mpReferenceSum->getHeight() != frameDim.y)
@@ -1842,12 +2411,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     // World space: residual pages depend on the sun and density only. The world cache's modulation reads them, so they come first.
-    if (mResidualDirty)
+    if (mParams.cloudDomain != 0 && !mSunPageQueue.empty() && !mResidualDirty)
+    {
+        const size_t count = std::min<size_t>(mCloudSunTilesPerFrame, mSunPageQueue.size());
+        for (size_t i = 0; i < count; ++i)
+            if (std::find(mSunPageSlots.begin(), mSunPageSlots.end(), mSunPageQueue[i]) == mSunPageSlots.end())
+                mSunPageSlots.push_back(mSunPageQueue[i]);
+        mSunPageQueue.erase(mSunPageQueue.begin(), mSunPageQueue.begin() + count);
+        mSunPagesDirty = true;
+    }
+    else if (mResidualDirty)
+        mSunPageQueue.clear();
+    if (mResidualDirty || mSunPagesDirty)
     {
         FALCOR_PROFILE(pRenderContext, "residualPages");
         dispatchResidualPages(pRenderContext);
         mResidualDirty = false;
+        mSunPagesDirty = false;
         mBasisDirty = true;
+        mBeamReusable = false; // The beam queries read the sun pages.
     }
 
     // The cache modulation's default is the diffusion attenuation per unit optical depth, sqrt(3 (1 - albedo) (1 - albedo g)):
@@ -1859,7 +2441,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     // World cache experiment: camera-independent gather passes accumulated while its view is shown.
-    const bool worldCacheFrame = mParams.debugView == kWorldCacheView || mParams.debugView == kBeamView;
+    const bool worldCacheFrame = mParams.debugView == kWorldCacheView || mParams.debugView == kBeamView || mParams.cloudDomain != 0;
     if (worldCacheFrame)
     {
         const uint32_t cellVoxels = mParams.worldCacheCellVoxels;
@@ -1908,6 +2490,18 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
         // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
         FALCOR_PROFILE(pRenderContext, "worldCache");
+        if (mCloudCacheKeep < 1.f && mpWorldCacheDeposit && mParams.worldCacheSamples > 0)
+        {
+            mParams.worldCacheKeep = mCloudCacheKeep;
+            bindRenderer(pRenderContext, mpDecayWorldCachePass);
+            mpDecayWorldCachePass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+            mpDecayWorldCachePass->execute(pRenderContext, dims);
+            for (float& batches : mCloudTileBatches)
+                batches *= mCloudCacheKeep;
+            mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+            mWorldCacheBakeDirty = true;
+        }
+        mCloudCacheKeep = 1.f;
         for (uint32_t i = 0; i < mWorldCacheUpdates; ++i)
         {
             if (mParams.worldCacheEstimator == 0)
@@ -1954,6 +2548,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // With textures, deposits accumulate across batches and the bake reads them directly: no per-batch clear or
                 // resolve. The buffer lookup still folds every batch into the float sums.
                 const bool accumulate = mParams.worldCacheTextured != 0;
+                if (mParams.worldCacheSamples == 0)
+                    std::fill(mCloudTileBatches.begin(), mCloudTileBatches.end(), 0.f);
                 if (!accumulate || mParams.worldCacheSamples == 0)
                     pRenderContext->clearUAV(mpWorldCacheDeposit->getUAV().get(), uint4(0));
                 bindRenderer(pRenderContext, mpWorldCachePhotonPass);
@@ -1965,6 +2561,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 }
             }
             ++mParams.worldCacheSamples;
+            if (!mCloudTileBatches.empty())
+            {
+                for (float& batches : mCloudTileBatches)
+                    batches += 1.f;
+                mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+            }
             ++mWorldCacheBakes; // Buffer lookups see every update.
             mWorldCacheBakeDirty = true;
         }
@@ -2358,6 +2960,7 @@ void HSTRCloud::loadReference(RenderContext* pRenderContext, const std::string& 
 
 void HSTRCloud::renderUI(Gui::Widgets& widget)
 {
+    const HSTRCloudParams previousUI = mParams;
     bool renderChanged = false;
     bool lightingChanged = false;
     bool operatorChanged = false;
@@ -2414,12 +3017,11 @@ void HSTRCloud::renderUI(Gui::Widgets& widget)
     if (operatorChanged)
         buildHierarchy();
     else if (lightingChanged)
-        solveLighting();
+        onLightingChanged(previousUI);
     if (operatorChanged || lightingChanged)
-    {
         mParams.referenceSamples = 0;
+    if (operatorChanged || (lightingChanged && mParams.cloudDomain == 0))
         mParams.worldCacheSamples = 0;
-    }
     mResidualDirty |= residualChanged;
     mOptionsChanged |= renderChanged || lightingChanged || operatorChanged || residualChanged;
     mCutDirty |= renderChanged || operatorChanged || residualChanged;

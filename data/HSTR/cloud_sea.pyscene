@@ -1,0 +1,20 @@
+from falcor import *
+
+# Carrier for the HSTRCloud cloud sea: the grid volume's bounds give one sea tile (X/Z) and the cloud layer (Y), its albedo,
+# anisotropy and density scale apply to every library cloud. HSTRCloud pages the clouds themselves from its cloud library cache.
+cloud = GridVolume("Cloud sea carrier")
+cloud.densityGrid = Grid.createBox(320.0, 160.0, 320.0, 10.0, 2.0)
+cloud.densityScale = 1.0
+cloud.albedo = float3(0.99)
+cloud.anisotropy = 0.85
+sceneBuilder.addGridVolume(cloud)
+
+# Above the layer (which spans y -80 to 80), looking out over it.
+camera = Camera()
+camera.position = float3(0.0, 140.0, 0.0)
+camera.target = float3(0.0, 40.0, 600.0)
+camera.up = float3(0.0, 1.0, 0.0)
+camera.focalLength = 28.0
+sceneBuilder.cameraSpeed = 250.0
+camera.farPlane = 20000.0
+sceneBuilder.addCamera(camera)
