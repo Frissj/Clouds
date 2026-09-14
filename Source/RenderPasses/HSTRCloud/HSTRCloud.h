@@ -157,6 +157,8 @@ private:
     std::array<ref<Buffer>, 2> mpCutState; ///< Per-node acceptance of the previous and current cut, for hysteresis.
     ref<Texture> mpExtinction;
     ref<Texture> mpMajorant;
+    ref<Texture> mpTightMajorant; ///< Undilated block maxima, for delta tracking.
+    ref<Texture> mpOccupancy;     ///< Non-empty 16-voxel blocks, for delta tracking's empty-space skipping.
     ref<Texture> mpCameraLighting;
     ref<Texture> mpCameraQueries;
     ref<Texture> mpTileCenters;

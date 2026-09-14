@@ -82,6 +82,15 @@ struct SegmentLight
 
 static const uint kMarchStack = 8; ///< Pending right halves of bisected segments.
 
+/// One photon's cache deposits in its current cell, summed in registers and flushed with atomics only when it leaves the cell:
+/// in a dense cloud a photon scatters many times per cell, and per-segment atomics dominated the tracing cost.
+struct DepositAccumulator
+{
+    int3 cell;       ///< Current cell (x < 0: none).
+    uint field;      ///< 0: sun, 1: sky.
+    float sums[16];  ///< Fixed-point sums of SH coefficients 0-8 and sun extension slots 9-15.
+};
+
 /// A primary ray restricted to the volume bounds, expressed in leaf space.
 /// position is the entry point (t = 0), direction the entry-to-exit vector (t = 1).
 struct CutRay
@@ -120,6 +129,8 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrTileNodes;
     Texture3D<float> hstrExtinction;
     Texture3D<float> hstrMajorant;
+    Texture3D<float> hstrTightMajorant; ///< Undilated block maxima: bound the trilinear extinction inside the block only.
+    Texture3D<uint> hstrOccupancy;      ///< 1 where a 16-voxel block holds any extinction.
     Texture3D<float4> hstrCameraLighting;
     RWTexture3D<float4> hstrCameraLightingOutput;
 
@@ -280,6 +291,14 @@ struct HSTRCloudRenderer
     {
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
         return hstrMajorant.Load(int4(block, 0));
+    }
+
+    /// Upper bound on the trilinear extinction inside v's majorant block (for delta and ratio tracking, which re-read it at
+    /// every block exit).
+    float tightMajorantAt(float3 v)
+    {
+        const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+        return hstrTightMajorant.Load(int4(block, 0));
     }
 
     float3 cameraLightingAt(float3 leafPosition)
@@ -1133,28 +1152,37 @@ struct HSTRCloudRenderer
 
     bool insideExtinctionGrid(float3 v) { return all(v >= -1.f) && all(v <= float3(params.hstrExtinctionDims)); }
 
-    /// Distance (world units along the ray) to the exit of v's majorant block; d is the voxel displacement per world unit.
-    float majorantBlockExit(float3 v, float3 d)
+    /// Distance (world units along the ray) to the exit of v's majorant block (edge 4 voxels, or 16 for the occupancy
+    /// blocks); d is the voxel displacement per world unit.
+    float majorantBlockExit(float3 v, float3 d, float edge = 4.f)
     {
-        const float3 lower = floor(v * 0.25f) * 4.f;
+        const float3 lower = floor(v / edge) * edge;
         const float3 inverse = 1.f / select(abs(d) < 1e-12f, float3(1e-12f), d);
         const float3 t0 = (lower - v) * inverse;
-        const float3 t1 = (lower + 4.f - v) * inverse;
+        const float3 t1 = (lower + edge - v) * inverse;
         // A ray lying on a block face with a tiny direction component cannot leave that face in float precision; ignore
         // zero-length exits (the dilated majorant still bounds the neighbouring block) so delta tracking cannot stall.
         const float3 far = select(max(t0, t1) > 1e-5f, max(t0, t1), float3(1e30f));
         return min(far.x, min(far.y, far.z));
     }
 
-    /// Delta tracking with the piecewise-constant block majorant. Returns true at a real collision (v moved there).
-    bool sampleCollision(inout float3 v, float3 d, inout uint rng)
+    /// Delta tracking with the piecewise-constant (undilated) block majorant, in the medium with extinction scaled by
+    /// extinctionScale. Returns true at a real collision (v moved there).
+    bool sampleCollision(inout float3 v, float3 d, inout uint rng, float extinctionScale = 1.f)
     {
         const float epsilon = 1e-3f;
         for (uint i = 0; i < 16384; ++i)
         {
             if (!insideExtinctionGrid(v))
                 return false;
-            const float majorant = majorantAt(v);
+            // Empty 16-voxel blocks are crossed in one jump.
+            const int3 group = clamp(int3(floor(v / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
+            if (hstrOccupancy.Load(int4(group, 0)) == 0)
+            {
+                v += (majorantBlockExit(v, d, 16.f) + epsilon) * d;
+                continue;
+            }
+            const float majorant = extinctionScale * tightMajorantAt(v);
             const float exit = majorantBlockExit(v, d);
             if (majorant <= 0.f)
             {
@@ -1168,7 +1196,7 @@ struct HSTRCloudRenderer
                 continue;
             }
             v += flight * d;
-            if (randomFloat(rng) * majorant < extinctionAtVoxel(v))
+            if (randomFloat(rng) * majorant < extinctionScale * extinctionAtVoxel(v))
                 return true;
         }
         return false;
@@ -1183,7 +1211,7 @@ struct HSTRCloudRenderer
         {
             if (!insideExtinctionGrid(v))
                 break;
-            const float majorant = majorantAt(v);
+            const float majorant = tightMajorantAt(v);
             const float exit = majorantBlockExit(v, d);
             if (majorant <= 0.f)
             {
@@ -1387,17 +1415,52 @@ struct HSTRCloudRenderer
         return majorantAt((float3(cell) + 0.5f) * float(params.worldCacheCellVoxels)) > 0.f;
     }
 
+    DepositAccumulator makeDepositAccumulator(uint field)
+    {
+        DepositAccumulator acc;
+        acc.cell = int3(-1);
+        acc.field = field;
+        [unroll]
+        for (uint k = 0; k < 16; ++k)
+            acc.sums[k] = 0.f;
+        return acc;
+    }
+
+    /// Adds the accumulated cell's sums to the cache, with stochastic rounding to keep the fixed-point sums unbiased.
+    void flushDeposits(inout DepositAccumulator acc, inout uint rng)
+    {
+        if (acc.cell.x >= 0)
+        {
+            const uint index = kWorldCacheSlots * worldCacheIndex(uint3(acc.cell));
+            const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
+            const uint extension = acc.field == 0 ? worldCacheSunExtension() : 0u;
+            [unroll]
+            for (uint k = 0; k < 16; ++k)
+            {
+                const bool used = k < 9 ? k < coefficients : k - 9 < extension;
+                if (used)
+                {
+                    const int quantized = int(floor(acc.sums[k] + randomFloat(rng)));
+                    if (quantized != 0)
+                        InterlockedAdd(hstrWorldCacheDeposit[index + (k < 9 ? 9 * acc.field + k : 18 + k - 9)], quantized);
+                }
+                acc.sums[k] = 0.f;
+            }
+        }
+        acc.cell = int3(-1);
+    }
+
     /// Light-tracing deposit of one straight flight from v0 to v1 (voxel coordinates): track length per crossed cell times
     /// the photon weight, projected on SH bands 0-worldCacheBands of the direction the light arrives from, plus the sun
-    /// extension slots for the sun field. field 0: sun, 1: sky.
-    void depositSegment(float3 v0, float3 v1, float3 look, float weight, uint field, inout uint rng)
+    /// extension slots for the sun field, into the photon's accumulator.
+    void depositSegment(float3 v0, float3 v1, float3 look, float weight, inout DepositAccumulator acc, inout uint rng)
     {
         const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
-        const uint extension = field == 0 ? worldCacheSunExtension() : 0u;
-        float extensionBasis[7];
+        const uint extension = acc.field == 0 ? worldCacheSunExtension() : 0u;
+        float basis[16];
         [unroll]
-        for (uint j = 0; j < 7; ++j)
-            extensionBasis[j] = j < extension ? worldCacheExtensionBasis(j, look) : 0.f;
+        for (uint k = 0; k < 16; ++k)
+            basis[k] = k < 9 ? (k < coefficients ? shBasis(k, look) : 0.f) : (k - 9 < extension ? worldCacheExtensionBasis(k - 9, look) : 0.f);
         const float cellVoxels = float(params.worldCacheCellVoxels);
         const float worldLength = length((v1 - v0) * params.worldVoxelSize);
         if (worldLength <= 0.f || weight <= 0.f)
@@ -1423,28 +1486,22 @@ struct HSTRCloudRenderer
         {
             const float tNext = min(min(tMax.x, tMax.y), min(tMax.z, 1.f));
             const float fraction = tNext - t;
-            if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)))
+            // Cells with no medium within a majorant block of their centre are never read by the camera (its trilinear
+            // lookups at medium points reach one cell): escaping photons would otherwise deposit all the way to the grid box.
+            if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)) &&
+                majorantAt((float3(cell) + 0.5f) * cellVoxels) > 0.f)
             {
-                const uint index = kWorldCacheSlots * worldCacheIndex(uint3(cell));
-                const uint base = index + 9 * field;
+                if (any(cell != acc.cell))
+                {
+                    flushDeposits(acc, rng);
+                    acc.cell = cell;
+                }
                 // Deposits are divided by the modulation at the middle of this cell's part of the flight.
                 const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
                 const float scale = perUnit * fraction * inverseModulation;
-                for (uint k = 0; k < coefficients; ++k)
-                {
-                    // Stochastic rounding keeps the fixed-point sum unbiased.
-                    const float value = shBasis(k, look) * scale;
-                    const int quantized = int(floor(value + randomFloat(rng)));
-                    if (quantized != 0)
-                        InterlockedAdd(hstrWorldCacheDeposit[base + k], quantized);
-                }
-                for (uint j = 0; j < extension; ++j)
-                {
-                    const float value = extensionBasis[j] * scale;
-                    const int quantized = int(floor(value + randomFloat(rng)));
-                    if (quantized != 0)
-                        InterlockedAdd(hstrWorldCacheDeposit[index + 18 + j], quantized);
-                }
+                [unroll]
+                for (uint k = 0; k < 16; ++k)
+                    acc.sums[k] += basis[k] * scale;
             }
             if (tNext >= 1.f)
                 break;
@@ -1495,17 +1552,18 @@ struct HSTRCloudRenderer
         // The medium is grey: one scalar albedo.
         const float albedo = dot(volume.data.albedo, 1.f / 3.f);
         float throughput = 1.f;
+        DepositAccumulator acc = makeDepositAccumulator(fromSun ? 0u : 1u);
         for (uint bounce = 0; bounce < 4096; ++bounce)
         {
             const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
             const float3 start = v;
-            const bool collided = sampleCollision(v, d, rng);
+            const bool similar = photonSimilar(bounce);
+            const bool collided = sampleCollision(v, d, rng, similar ? 1.f - albedo * params.anisotropy : 1.f);
             if (!fromSun || bounce > 0)
-                depositSegment(start, v, -direction, weight * throughput, fromSun ? 0u : 1u, rng);
+                depositSegment(start, v, -direction, weight * throughput, acc, rng);
             if (!collided)
                 break;
-            throughput *= albedo;
-            direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
+            photonScatter(similar, albedo, direction, throughput, rng);
             // Weight-bounded Russian roulette, as in tracePath.
             if (bounce >= 8)
             {
@@ -1514,6 +1572,31 @@ struct HSTRCloudRenderer
                     break;
                 throughput /= survive;
             }
+        }
+        flushDeposits(acc, rng);
+    }
+
+    /// Whether a photon's flight after `bounce` scatterings runs in the similar medium: after worldCacheSimilarity exact
+    /// scatterings the light is diffuse, and the isotropic medium with extinction sigma (1 - a g) and albedo a (1 - g) / (1 - a g)
+    /// carries it with the same diffusion and absorption lengths in about (1 - a g) of the scatterings.
+    bool photonSimilar(uint bounce) { return params.worldCacheSimilarity > 0 && bounce >= params.worldCacheSimilarity; }
+
+    /// Scatters a photon at a collision: HG with the medium's albedo, or isotropic with the similar albedo.
+    void photonScatter(bool similar, float albedo, inout float3 direction, inout float throughput, inout uint rng)
+    {
+        const float g = params.anisotropy;
+        if (similar)
+        {
+            throughput *= albedo * (1.f - g) / (1.f - albedo * g);
+            const float z = 1.f - 2.f * randomFloat(rng);
+            const float phi = 2.f * kPi * randomFloat(rng);
+            const float r = sqrt(max(0.f, 1.f - z * z));
+            direction = float3(r * cos(phi), r * sin(phi), z);
+        }
+        else
+        {
+            throughput *= albedo;
+            direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
         }
     }
 
@@ -1528,11 +1611,14 @@ struct HSTRCloudRenderer
         Photon photon = hstrPhotonPool[slot];
         uint rng = photon.rng != 0 ? photon.rng : hashUint(slot * 2654435761u + 1013u) ^ hashUint(params.worldCacheSamples * 9781u + 7919u);
         uint emitted = 0;
+        DepositAccumulator acc = makeDepositAccumulator((photon.state & kPhotonSky) != 0 ? 1u : 0u);
         for (uint segment = 0; segment < params.worldCacheSegments; ++segment)
         {
             if ((photon.state & kPhotonAlive) == 0)
             {
+                flushDeposits(acc, rng);
                 photon = spawnPhoton(rng);
+                acc.field = (photon.state & kPhotonSky) != 0 ? 1u : 0u;
                 ++emitted;
             }
             float3 v = photon.positionWeight.xyz;
@@ -1542,14 +1628,14 @@ struct HSTRCloudRenderer
             const bool fromSun = (photon.state & kPhotonSky) == 0;
             const float3 d = mul(volume.data.invTransform, float4(direction, 0.f)).xyz;
             const float3 start = v;
-            const bool collided = sampleCollision(v, d, rng);
+            const bool similar = photonSimilar(bounce);
+            const bool collided = sampleCollision(v, d, rng, similar ? 1.f - albedo * params.anisotropy : 1.f);
             if (!fromSun || bounce > 0)
-                depositSegment(start, v, -direction, photon.positionWeight.w * throughput, fromSun ? 0u : 1u, rng);
+                depositSegment(start, v, -direction, photon.positionWeight.w * throughput, acc, rng);
             bool alive = collided;
             if (collided)
             {
-                throughput *= albedo;
-                direction = sampleHG(direction, float2(randomFloat(rng), randomFloat(rng)));
+                photonScatter(similar, albedo, direction, throughput, rng);
                 if (bounce >= 8)
                 {
                     const float survive = min(1.f, throughput);
@@ -1561,6 +1647,7 @@ struct HSTRCloudRenderer
             photon.directionThroughput = float4(direction, throughput);
             photon.state = (photon.state & ~(kPhotonAlive | kPhotonBounceMask)) | (alive ? kPhotonAlive : 0u) | min(bounce + 1, kPhotonBounceMask);
         }
+        flushDeposits(acc, rng);
         photon.rng = rng;
         hstrPhotonPool[slot] = photon;
         const uint waveEmitted = WaveActiveSum(emitted);

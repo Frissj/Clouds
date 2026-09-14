@@ -189,7 +189,8 @@ struct HSTRCloudParams
                                ///< read the voxel-centre field; 0: one-voxel midpoint step onto the field (enough for the
                                ///< adaptive march, which integrates the sun attenuation analytically).
     uint padHSTR29 = 0;
-    uint padHSTR30 = 0;
+    uint worldCacheSimilarity = 4; ///< >0: photons scatter exactly this many times, then continue in the similar isotropic
+                                   ///< medium (extinction sigma (1 - a g), albedo a (1 - g) / (1 - a g)); 0: exact throughout.
 
     uint adaptiveMarch = 0; ///< 1: the cache views integrate camera segments analytically and bisect on estimated error
                             ///< (about twice the beam view's cost of the fixed march for ~0.001-0.002 less error).

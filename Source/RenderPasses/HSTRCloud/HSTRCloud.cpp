@@ -83,6 +83,7 @@ const char kWorldCacheZonalWindow[] = "worldCacheZonalWindow";
 const char kWorldCacheSunOrder[] = "worldCacheSunOrder";
 const char kSunNearVoxels[] = "sunNearVoxels";
 const char kMaxMarchSteps[] = "maxMarchSteps";
+const char kWorldCacheSimilarity[] = "worldCacheSimilarity";
 const char kAdaptiveMarch[] = "adaptiveMarch";
 const char kMarchTolerance[] = "marchTolerance";
 const char kMarchMinVoxels[] = "marchMinVoxels";
@@ -308,6 +309,8 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.worldCacheSunOrder = std::clamp(uint32_t(value), 2u, 3u);
         else if (key == kSunNearVoxels)
             mParams.sunNearVoxels = std::clamp(float(value), 0.f, 16.f);
+        else if (key == kWorldCacheSimilarity)
+            mParams.worldCacheSimilarity = value;
         else if (key == kMaxMarchSteps)
             mParams.maxMarchSteps = std::max(1u, uint32_t(value));
         else if (key == kAdaptiveMarch)
@@ -375,7 +378,8 @@ void HSTRCloud::setProperties(const Properties& props)
         p.worldCachePhotons != q.worldCachePhotons || p.worldCacheBands != q.worldCacheBands ||
         p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments ||
         mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth ||
-        p.worldCacheZonalBands != q.worldCacheZonalBands || p.worldCacheSunOrder != q.worldCacheSunOrder)
+        p.worldCacheZonalBands != q.worldCacheZonalBands || p.worldCacheSunOrder != q.worldCacheSunOrder ||
+        p.worldCacheSimilarity != q.worldCacheSimilarity)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -453,6 +457,7 @@ Properties HSTRCloud::getProperties() const
     props[kWorldCacheSunOrder] = mParams.worldCacheSunOrder;
     props[kSunNearVoxels] = mParams.sunNearVoxels;
     props[kMaxMarchSteps] = mParams.maxMarchSteps;
+    props[kWorldCacheSimilarity] = mParams.worldCacheSimilarity;
     props[kAdaptiveMarch] = mParams.adaptiveMarch != 0;
     props[kMarchTolerance] = mParams.marchTolerance;
     props[kMarchMinVoxels] = mParams.marchMinVoxels;
@@ -920,6 +925,35 @@ void HSTRCloud::uploadExtinction()
     );
     mParams.hstrMajorantDims = majorantDims;
     mpMajorant = mpDevice->createTexture3D(majorantDims.x, majorantDims.y, majorantDims.z, ResourceFormat::R16Float, 1, majorant.data());
+    // Delta tracking re-reads the majorant at every block exit, so it only needs each block's own maximum: far tighter
+    // than the dilated one next to dense cores, which spent most tentative collisions on null ones.
+    std::vector<float16_t> tightMajorant(majorantCount);
+    parallelFor(
+        majorantCount,
+        [&](size_t i)
+        {
+            float16_t rounded(blockMaximum[i]);
+            if (float(rounded) < blockMaximum[i])
+                rounded = float16_t(blockMaximum[i] * (1.f + 1.f / 1024.f));
+            tightMajorant[i] = rounded;
+        }
+    );
+    mpTightMajorant =
+        mpDevice->createTexture3D(majorantDims.x, majorantDims.y, majorantDims.z, ResourceFormat::R16Float, 1, tightMajorant.data());
+    // Occupancy of 4^3-block groups (16-voxel blocks), so delta tracking crosses empty space in 16-voxel jumps.
+    const uint3 occupancyDims = (majorantDims + 3u) / 4u;
+    std::vector<uint8_t> occupancy(size_t(occupancyDims.x) * occupancyDims.y * occupancyDims.z, 0);
+    for (size_t i = 0; i < majorantCount; ++i)
+    {
+        if (blockMaximum[i] <= 0.f)
+            continue;
+        const uint3 b(
+            uint32_t(i % majorantDims.x), uint32_t((i / majorantDims.x) % majorantDims.y), uint32_t(i / (majorantDims.x * majorantDims.y))
+        );
+        const uint3 o = b / 4u;
+        occupancy[size_t(o.x) + size_t(occupancyDims.x) * (size_t(o.y) + size_t(occupancyDims.y) * o.z)] = 1;
+    }
+    mpOccupancy = mpDevice->createTexture3D(occupancyDims.x, occupancyDims.y, occupancyDims.z, ResourceFormat::R8Uint, 1, occupancy.data());
 
     // Sun residual pages live at voxel resolution.
     mParams.hstrFineDims = dims;
@@ -1547,6 +1581,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrTileNodes"] = mpTileNodes;
     var["hstrExtinction"] = mpExtinction;
     var["hstrMajorant"] = mpMajorant;
+    var["hstrTightMajorant"] = mpTightMajorant;
+    var["hstrOccupancy"] = mpOccupancy;
     var["hstrCameraLighting"] = mpCameraLighting;
     var["hstrFineSun"] = mpFineSun;
     var["hstrLeafResidual"] = mpLeafResidual;
