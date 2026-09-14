@@ -313,7 +313,7 @@ void HSTRCloud::parseProperties(const Properties& props)
         else if (key == kAdaptiveMarch)
             mParams.adaptiveMarch = bool(value) ? 1u : 0u;
         else if (key == kMarchTolerance)
-            mParams.marchTolerance = std::max(1e-6f, float(value));
+            mParams.marchTolerance = std::max(0.f, float(value)); // 0: no refinement.
         else if (key == kMarchMinVoxels)
             mParams.marchMinVoxels = std::max(1e-3f, float(value));
         else if (key == kMarchCoarseVoxels)

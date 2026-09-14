@@ -191,7 +191,8 @@ struct HSTRCloudParams
     uint padHSTR29 = 0;
     uint padHSTR30 = 0;
 
-    uint adaptiveMarch = 1;          ///< 1: the cache views integrate camera segments analytically and bisect on estimated error.
+    uint adaptiveMarch = 0; ///< 1: the cache views integrate camera segments analytically and bisect on estimated error
+                            ///< (about twice the beam view's cost of the fixed march for ~0.001-0.002 less error).
     float marchTolerance = 0.01f;    ///< Accepted segment error relative to 1 + the pixel's expected radiance.
     float marchMinVoxels = 0.03f;    ///< Shortest bisected segment.
     float marchCoarseVoxels = 2.f;   ///< Shortest coarse segment in the medium (longer where the majorant allows).

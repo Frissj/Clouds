@@ -24,8 +24,8 @@ radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
         "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeDepth": 0.0}
-TRUTH = {"stepOpticalDepth": 0.25, "minStepVoxels": 0.5, "lightingStride": 1}
-FULL = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1}
+TRUTH = {"stepOpticalDepth": 0.25, "minStepVoxels": 0.5, "lightingStride": 1, "adaptiveMarch": False}
+FULL = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "adaptiveMarch": False}
 CHEAP = {"stepOpticalDepth": 1.0, "minStepVoxels": 2.0, "lightingStride": 2}
 MID = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 2}
 default_sun = (0.4319, 0.8639, 0.2699)
@@ -53,6 +53,13 @@ configs = [
     ("h16x3 mid .05", beam(16, 3, 0.05, MID)),
     ("h32x4 mid .05", beam(32, 4, 0.05, MID)),
     ("h16x3 truth", beam(16, 3, 0.02, TRUTH)),
+    # Changes since the beam commit, one at a time (properties unknown to older builds are ignored with a warning).
+    ("h16x3 full .05 nomod", dict(beam(16, 3, 0.05, FULL), worldCacheModulation=0.0)),
+    ("h16x3 full .05 nomod 512", dict(beam(16, 3, 0.05, FULL), worldCacheModulation=0.0, maxMarchSteps=512)),
+    ("h16x3 adaptive .05", dict(beam(16, 3, 0.05, FULL), adaptiveMarch=True, marchTolerance=0.01, marchCoarseVoxels=2.0)),
+    # Analytic steps between sample points, no refinement: one sample per step like the fixed march.
+    ("h16x3 analytic1 .05", dict(beam(16, 3, 0.05, FULL), adaptiveMarch=True, marchTolerance=0.0, marchCoarseVoxels=1.0)),
+    ("h16x3 analytic2 .05", dict(beam(16, 3, 0.05, FULL), adaptiveMarch=True, marchTolerance=0.0, marchCoarseVoxels=2.0)),
     # Per-pixel marching last: its heavy frames throttle the laptop GPU for the configurations after them.
     ("pixel cheap", dict(CHEAP, debugView=8)),
     ("pixel mid", dict(MID, debugView=8)),

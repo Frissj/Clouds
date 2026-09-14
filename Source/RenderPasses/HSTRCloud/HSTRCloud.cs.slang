@@ -706,6 +706,19 @@ struct HSTRCloudRenderer
                 haveB = true;
             }
             const float h = (b.t - a.t) * ray.worldLength;
+            if (params.marchTolerance <= 0.f)
+            {
+                // No refinement: one sample per step, as the fixed march, integrated analytically between the step's ends.
+                const SegmentLight whole = segmentLight(a, b, h, singleScale);
+                radiance += transmittance * whole.cache;
+                singleRadiance += transmittance * whole.single;
+                transmittance *= exp(-whole.depth);
+                a = b;
+                t = b.t;
+                haveB = false;
+                ++steps;
+                continue;
+            }
             MarchSample m = marchSampleAt(ray, 0.5f * (a.t + b.t), withSource, withSingle, false);
             m.cache = 0.5f * (a.cache + b.cache);
             ++steps;
