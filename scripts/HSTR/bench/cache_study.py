@@ -24,7 +24,8 @@ radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
         "worldCacheBakeInterval": 1, "stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "debugView": 8,
-        "worldCacheModulation": 0.0}  # Every configuration starts from these, so no setting leaks into the next.
+        "worldCacheModulation": 0.0, "worldCacheZonalBands": 0, "worldCacheZonalWindow": 0, "worldCacheSunOrder": 2}
+# Every configuration starts from these, so no setting leaks into the next.
 SUFFIX = ""  # Reference name suffix for non-default media.
 if os.environ.get("HSTR_ANISOTROPY"):
     base["anisotropy"] = float(os.environ["HSTR_ANISOTROPY"])
@@ -66,14 +67,31 @@ configs = [
     ("mod 0.25 4-voxel", {"worldCacheModulation": 0.25, "worldCacheCellVoxels": 4}, 512),
     ("mod 0.25 1-voxel", {"worldCacheModulation": 0.25, "worldCacheCellVoxels": 1}, 512),
     ("mod 0.25 no window", {"worldCacheModulation": 0.25, "worldCacheWindow": 0}, 512),
+    # Sun field angular resolution (auto modulation, 16x photons). The sun bands split into their zonal part about the sun
+    # direction and the rest; "zonal 2" windows both at order 2 (the plain cache), "rewindow 8" only windows the zonal part at
+    # order 8, "zonal N" adds zonal bands 3-N, "sun L3" adds all 7 band-3 functions instead.
+    ("zonal 2", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 2}, 512),
+    ("rewindow 8", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 2, "worldCacheZonalWindow": 8}, 512),
+    ("zonal 4", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 4}, 512),
+    ("zonal 6", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 6}, 512),
+    ("zonal 8", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 8}, 512),
+    ("sun L3", {"worldCacheModulation": -1.0, "worldCacheSunOrder": 3}, 512),
+    # 64x photons: what is left of each representation's error once photon noise is small.
+    ("auto 64x", {"worldCacheModulation": -1.0}, 2048),
+    ("zonal 4 64x", {"worldCacheModulation": -1.0, "worldCacheZonalBands": 4}, 2048),
+    ("sun L3 64x", {"worldCacheModulation": -1.0, "worldCacheSunOrder": 3}, 2048),
+    ("1-voxel 64x", {"worldCacheModulation": -1.0, "worldCacheCellVoxels": 1}, 2048),
+    ("no window 64x", {"worldCacheModulation": -1.0, "worldCacheWindow": 0}, 2048),
 ]
+MAP = float(os.environ.get("HSTR_MAP", "0"))  # >0: also capture each configuration's signed block log error map at this scale.
+tone = g.getPass("ToneMapper")
 if os.environ.get("HSTR_CONFIGS"):
     keep = os.environ["HSTR_CONFIGS"].split(",")
     configs = [c for c in configs if c[0] in keep]
 
 
-def measure(mask):
-    hstr.set_properties({"hstComponents": mask, "compareTarget": mask, "compareSubstitute": 0, "compareBlock": BLOCK})
+def measure(mask, block=BLOCK):
+    hstr.set_properties({"hstComponents": mask, "compareTarget": mask, "compareSubstitute": 0, "compareBlock": block})
     m.renderFrame()
     hstr.set_properties({"compareReference": True})
     m.renderFrame()
@@ -108,10 +126,22 @@ for name, position, sun in views:
         # The camera reads the cache's sun and sky fields baked together, so only their sum (the smooth term) is measurable.
         smooth = measure(12)
         full = measure(15)
+        pixel = measure(15, 1)
         lines.append(f"{name:10s} {label:24s} {BLOCK}x{BLOCK}-block log err: full {full[0]:.4f}  smooth {smooth[0]:.4f}  "
-                     f"(noise {full[1]:.4f})")
+                     f"(noise {full[1]:.4f})  per pixel: full {pixel[0]:.4f} (noise {pixel[1]:.4f})")
         m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}"
         m.frameCapture.capture()
+        if MAP > 0:
+            # Red: brighter than the reference, blue: darker, saturating at MAP; the tone mapper passes it through unchanged.
+            operator = tone.properties["operator"]
+            tone.set_properties({"operator": "Linear"})
+            hstr.set_properties({"hstComponents": 15, "compareTarget": 15, "compareSubstitute": 0, "compareBlock": BLOCK,
+                                 "compareMapScale": MAP, "compareReference": True})
+            m.renderFrame()
+            m.frameCapture.baseFilename = f"{TAG}_{name}_{label.split(' (')[0].replace(' ', '_')}_errmap"
+            m.frameCapture.capture()
+            hstr.set_properties({"compareReference": False, "compareMapScale": 0.0, "compareBlock": 1})
+            tone.set_properties({"operator": operator})
         with open(f"{OUT}/{TAG}_test.txt", "w") as f:
             f.write("\n".join(lines) + "\n")
 exit()

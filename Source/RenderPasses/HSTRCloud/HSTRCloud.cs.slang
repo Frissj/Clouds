@@ -1100,6 +1100,60 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// Real SH basis function m (0-6) of band 3 at unit direction d.
+    float shBasis3(uint m, float3 d)
+    {
+        switch (m)
+        {
+        case 0:
+            return 0.590044f * d.y * (3.f * d.x * d.x - d.y * d.y);
+        case 1:
+            return 2.890611f * d.x * d.y * d.z;
+        case 2:
+            return 0.457046f * d.y * (5.f * d.z * d.z - 1.f);
+        case 3:
+            return 0.373176f * d.z * (5.f * d.z * d.z - 3.f);
+        case 4:
+            return 0.457046f * d.x * (5.f * d.z * d.z - 1.f);
+        case 5:
+            return 1.445306f * d.z * (d.x * d.x - d.y * d.y);
+        default:
+            return 0.590044f * d.x * (d.x * d.x - 3.f * d.y * d.y);
+        }
+    }
+
+    /// Sun extension slots in use: all of band 3, or zonal bands 3-worldCacheZonalBands about the sun direction.
+    uint worldCacheSunExtension()
+    {
+        if (params.worldCacheSunOrder >= 3)
+            return 7u;
+        return params.worldCacheZonalBands > 2 ? min(params.worldCacheZonalBands, 8u) - 2u : 0u;
+    }
+
+    /// Basis of sun extension slot j at unit direction d: band 3 function j, or the zonal Y_l0 of band l = 3 + j about the sun,
+    /// sqrt((2 l + 1) / (4 pi)) P_l(d . sun).
+    float worldCacheExtensionBasis(uint j, float3 d)
+    {
+        if (params.worldCacheSunOrder >= 3)
+            return shBasis3(j, d);
+        const float mu = dot(d, normalize(params.sunDirection));
+        float previous = 1.f;
+        float current = mu;
+        for (uint l = 2; l <= j + 3; ++l)
+        {
+            const float next = ((2.f * l - 1.f) * mu * current - (l - 1.f) * previous) / float(l);
+            previous = current;
+            current = next;
+        }
+        return sqrt((2.f * (j + 3) + 1.f) / (4.f * kPi)) * current;
+    }
+
+    /// Hanning window of SH band l for a truncation at band order (1 without windowing).
+    float shWindow(uint l, uint order)
+    {
+        return params.worldCacheWindow != 0 ? 0.5f + 0.5f * cos(kPi * float(l) / float(order + 1)) : 1.f;
+    }
+
     uint worldCacheIndex(uint3 cell) { return cell.x + params.worldCacheDims.x * (cell.y + params.worldCacheDims.y * cell.z); }
 
     /// Whether a cell holds an estimate. The gather skips cells with no density within a majorant block of their centre;
@@ -1112,10 +1166,16 @@ struct HSTRCloudRenderer
     }
 
     /// Light-tracing deposit of one straight flight from v0 to v1 (voxel coordinates): track length per crossed cell times
-    /// the photon weight, projected on SH bands 0-worldCacheBands of the direction the light arrives from. field 0: sun, 1: sky.
+    /// the photon weight, projected on SH bands 0-worldCacheBands of the direction the light arrives from, plus the sun
+    /// extension slots for the sun field. field 0: sun, 1: sky.
     void depositSegment(float3 v0, float3 v1, float3 look, float weight, uint field, inout uint rng)
     {
         const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
+        const uint extension = field == 0 ? worldCacheSunExtension() : 0u;
+        float extensionBasis[7];
+        [unroll]
+        for (uint j = 0; j < 7; ++j)
+            extensionBasis[j] = j < extension ? worldCacheExtensionBasis(j, look) : 0.f;
         const float cellVoxels = float(params.worldCacheCellVoxels);
         const float worldLength = length((v1 - v0) * params.worldVoxelSize);
         if (worldLength <= 0.f || weight <= 0.f)
@@ -1143,7 +1203,8 @@ struct HSTRCloudRenderer
             const float fraction = tNext - t;
             if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)))
             {
-                const uint base = 18 * worldCacheIndex(uint3(cell)) + 9 * field;
+                const uint index = kWorldCacheSlots * worldCacheIndex(uint3(cell));
+                const uint base = index + 9 * field;
                 // Deposits are divided by the modulation at the middle of this cell's part of the flight.
                 const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
                 for (uint k = 0; k < coefficients; ++k)
@@ -1153,6 +1214,13 @@ struct HSTRCloudRenderer
                     const int quantized = int(floor(value + randomFloat(rng)));
                     if (quantized != 0)
                         InterlockedAdd(hstrWorldCacheDeposit[base + k], quantized);
+                }
+                for (uint j = 0; j < extension; ++j)
+                {
+                    const float value = extensionBasis[j] * perUnit * fraction * inverseModulation;
+                    const int quantized = int(floor(value + randomFloat(rng)));
+                    if (quantized != 0)
+                        InterlockedAdd(hstrWorldCacheDeposit[index + 18 + j], quantized);
                 }
             }
             if (tNext >= 1.f)
@@ -1355,8 +1423,8 @@ struct HSTRCloudRenderer
         [unroll]
         for (uint k = 0; k < 9; ++k)
         {
-            const float3 value = scale * (float(hstrWorldCacheDeposit[18 * index + k]) * params.sunRadiance +
-                                          float(hstrWorldCacheDeposit[18 * index + 9 + k]) * params.skyRadiance);
+            const float3 value = scale * (float(hstrWorldCacheDeposit[kWorldCacheSlots * index + k]) * params.sunRadiance +
+                                          float(hstrWorldCacheDeposit[kWorldCacheSlots * index + 9 + k]) * params.skyRadiance);
             [unroll]
             for (uint c = 0; c < 3; ++c)
             {
@@ -1403,24 +1471,17 @@ struct HSTRCloudRenderer
         }
     }
 
-    /// Mean of cache slot s = 3k + c of a cell. The textured light tracer bakes straight from its fixed-point deposits, which
-    /// accumulate over every batch since the last restart; the gather bakes from its float sums.
+    /// Mean of scalar cache slot s of a cell (unit-colour sun and sky fields), straight from the light tracer's fixed-point
+    /// deposits, which accumulate over every batch since the last restart.
     float worldCacheSlotMean(uint index, uint slot)
     {
-        const float inverseSamples = 1.f / float(max(params.worldCacheSamples, 1u));
-        if (params.worldCacheEstimator == 0)
-            return hstrWorldCache[27 * index + slot] * inverseSamples;
-        const uint k = slot / 3;
-        const uint c = slot % 3;
         // Photon weights are normalised by worldCachePhotons; a pool has emitted hstrPhotonEmitted[0] of them in total.
         const float batches = params.worldCacheSegments > 0 ? float(max(hstrPhotonEmitted[0], 1u)) / float(params.worldCachePhotons)
                                                             : float(max(params.worldCacheSamples, 1u));
-        const float scale = 1.f / (batches * params.worldCacheDepositScale);
-        return scale * (float(hstrWorldCacheDeposit[18 * index + k]) * params.sunRadiance[c] +
-                        float(hstrWorldCacheDeposit[18 * index + 9 + k]) * params.skyRadiance[c]);
+        return float(hstrWorldCacheDeposit[kWorldCacheSlots * index + slot]) / (batches * params.worldCacheDepositScale);
     }
 
-    /// Writes one cell's cache means into the packed camera textures.
+    /// Writes one cell's cache means into the packed camera textures (light tracing only; the gather is read untextured).
     void bakeWorldCacheCell(uint3 cell)
     {
         if (any(cell >= params.worldCacheDims))
@@ -1434,44 +1495,93 @@ struct HSTRCloudRenderer
             for (uint c = 0; c < 4; ++c)
             {
                 const uint slot = 4 * t + c;
-                if (slot < 27)
+                if (slot < kWorldCacheSlots)
                     texel[c] = worldCacheSlotMean(index, slot);
             }
             hstrWorldCacheTextureOutput[t][cell] = texel;
         }
     }
 
-    /// Textured form of worldCacheRadiance: one trilinear fetch per four slots, only for the evaluated bands.
+    /// Textured form of worldCacheRadiance: one trilinear fetch per four slots, only for the evaluated bands. The unit sun and
+    /// sky fields take their colours here. With worldCacheZonalBands, each sun band splits into its zonal part about the sun
+    /// direction s, f_l(s) P_l(w . s), windowed at the zonal order and continued by the zonal extension bands, and the rest,
+    /// windowed at order 2. With worldCacheSunOrder 3 the sun field is plain SH to band 3.
     float3 worldCacheRadianceTextured(float3 v, float3 w)
     {
         const float3 uvw = v / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
         const float g = params.anisotropy;
         const uint order = params.worldCacheOrder;
-        float3 result = 0.f;
+        const uint extension = order == 2 ? worldCacheSunExtension() : 0u;
+        const uint sunOrder = extension == 7 ? 3u : order;
+        const bool zonal = order == 2 && params.worldCacheSunOrder < 3 && params.worldCacheZonalBands > 0;
+        const uint zonalOrder = params.worldCacheZonalWindow != 0 ? params.worldCacheZonalWindow : max(params.worldCacheZonalBands, 2u);
+
         float4 texels[kWorldCacheTextures];
+        // Sun slots 0-8 and sky slots 9-17 of bands 0, 0-1 or 0-2 lie in textures {0, 2}, {0, 2, 3} or 0-4; the sun extension
+        // (slots 18-24) in textures 4-6.
+        const uint textures = (order == 0 ? 0x5u : (order == 1 ? 0xDu : 0x1Fu)) | (extension > 0 ? 0x70u : 0u);
         [unroll]
         for (uint t = 0; t < kWorldCacheTextures; ++t)
-            texels[t] = 0.f;
-        // Bands 0, 0-1 and 0-2 need slots 0-2, 0-11 and 0-26: textures 0, 0-2 and 0-6.
-        const uint textures = order == 0 ? 1u : (order == 1 ? 3u : 7u);
-        [unroll]
-        for (uint t = 0; t < kWorldCacheTextures; ++t)
-            if (t < textures)
-                texels[t] = hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f);
+            texels[t] = (textures & (1u << t)) != 0 ? hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f) : 0.f;
+
+        const float3 s = normalize(params.sunDirection);
+        float sun = 0.f;
+        float sky = 0.f;
+        float3 bandAtView = 0.f; // Sun band l at w and at s, for the zonal split.
+        float3 bandAtSun = 0.f;
         [unroll]
         for (uint k = 0; k < 9; ++k)
         {
             const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
             if (l > order)
                 continue;
-            const float window = params.worldCacheWindow != 0 ? 0.5f + 0.5f * cos(kPi * float(l) / float(order + 1)) : 1.f;
-            const float band = window * (l == 0 ? 1.f : (l == 1 ? g : g * g)) * shBasis(k, w);
-            const float3 c = float3(
-                texels[(3 * k) / 4][(3 * k) % 4], texels[(3 * k + 1) / 4][(3 * k + 1) % 4], texels[(3 * k + 2) / 4][(3 * k + 2) % 4]
-            );
-            result += band * c;
+            const float gl = l == 0 ? 1.f : (l == 1 ? g : g * g);
+            const float basis = shBasis(k, w);
+            sky += shWindow(l, order) * gl * basis * texels[(9 + k) / 4][(9 + k) % 4];
+            const float c = texels[k / 4][k % 4];
+            if (zonal)
+            {
+                bandAtView[l] += c * basis;
+                bandAtSun[l] += c * shBasis(k, s);
+            }
+            else
+                sun += shWindow(l, sunOrder) * gl * basis * c;
         }
-        return max(0.f, result);
+        if (zonal)
+        {
+            // Legendre recurrence in mu = w . s through band 8.
+            const float mu = dot(w, s);
+            float previous = 1.f;
+            float current = mu;
+            float gl = g;
+            [unroll]
+            for (uint l = 0; l <= 8; ++l)
+            {
+                const float legendre = l == 0 ? 1.f : current;
+                const float bandPower = l == 0 ? 1.f : gl;
+                if (l <= 2)
+                {
+                    const float zonalPart = bandAtSun[l] * legendre;
+                    sun += bandPower * (shWindow(l, 2) * (bandAtView[l] - zonalPart) + shWindow(l, zonalOrder) * zonalPart);
+                }
+                else if (l - 3 < extension)
+                    sun += bandPower * shWindow(l, zonalOrder) * sqrt((2.f * l + 1.f) / (4.f * kPi)) * legendre * texels[(15 + l) / 4][(15 + l) % 4];
+                if (l >= 1)
+                {
+                    const float next = ((2.f * (l + 1) - 1.f) * mu * current - float(l) * previous) / float(l + 1);
+                    previous = current;
+                    current = next;
+                    gl *= g;
+                }
+            }
+        }
+        else if (extension == 7)
+        {
+            [unroll]
+            for (uint m = 0; m < 7; ++m)
+                sun += shWindow(3, 3) * g * g * g * shBasis3(m, w) * texels[(18 + m) / 4][(18 + m) % 4];
+        }
+        return max(0.f, sun * params.sunRadiance + sky * params.skyRadiance);
     }
 
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
@@ -1491,10 +1601,11 @@ struct HSTRCloudRenderer
         return exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
     }
 
-    /// The cache as stored (divided by worldCacheModulation).
+    /// The cache as stored (divided by worldCacheModulation). The float sums (gather, or untextured light tracing) carry bands
+    /// 0-2 of the coloured total only.
     float3 worldCacheRadianceStored(float3 v, float3 w)
     {
-        if (params.worldCacheTextured != 0)
+        if (params.worldCacheTextured != 0 && params.worldCacheEstimator != 0)
             return worldCacheRadianceTextured(v, w);
         const float3 p = v / float(params.worldCacheCellVoxels) - 0.5f;
         const float3 base = floor(p);
@@ -2027,6 +2138,19 @@ struct HSTRCloudRenderer
                 0.5f * dot(abs(log(1.f + max(first, 0.f)) - log(1.f + max(second, 0.f))), 1.f / 3.f)
             );
             ++count;
+            if (params.compareMapScale > 0.f)
+            {
+                // Error map: the signed block log error, red where the frame is brighter than the reference and blue where
+                // darker, over the reference's log luminance in grey.
+                const float signedError = dot(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f)), 1.f / 3.f);
+                const float grey = 0.4f * saturate(log(1.f + dot(max(reference, 0.f), 1.f / 3.f)) / 3.f);
+                const float red = saturate(signedError / params.compareMapScale);
+                const float blue = saturate(-signedError / params.compareMapScale);
+                const float3 map = float3(grey + (1.f - grey) * red, grey * (1.f - max(red, blue)), grey + (1.f - grey) * blue);
+                for (uint y = 0; y < block; ++y)
+                    for (uint x = 0; x < block; ++x)
+                        color[uint2(bx, blockRow) * block + uint2(x, y)] = float4(map, 1.f);
+            }
         }
         hstrReferenceRowError[blockRow] = error / float(max(count, 1u));
     }

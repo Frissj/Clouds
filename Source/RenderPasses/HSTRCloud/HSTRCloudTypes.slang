@@ -13,7 +13,8 @@ static const uint kComponentSkyScattered = 8; ///< Sky light scattered one or mo
 static const uint kComponentCount = 4;
 
 static const uint kWorldCacheView = 8;     ///< debugView of the world-space radiance cache experiment.
-static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the 27 cache slots (SH coefficient k, channel c at 3k + c).
+static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: unit sun SH 0-8, unit sky SH 9-17, sun extension 18-24.
+static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
 
@@ -118,7 +119,7 @@ struct HSTRCloudParams
     float stepOpticalDepth = 0.5f; ///< Target optical depth per majorant-bounded march step.
     float minStepVoxels = 1.f;     ///< Midpoint quadrature of trilinear extinction is accurate at one-voxel steps at any density.
     float maxStepVoxels = 4.f;
-    float padHSTR9 = 0.f;
+    float compareMapScale = 0.f;   ///< >0: block comparisons overwrite the frame with their signed log error map, saturating here.
 
     // Sun transport carried by the voxel-resolution sun optical-depth pages: octave n scatters with energy a^n, extinction
     // b^n and phase anisotropy c^n g. Octave 0 is exact single scattering; the parameters are fitted to the path tracer.
@@ -176,6 +177,12 @@ struct HSTRCloudParams
     float worldCacheModulation = 0.f;       ///< b of the cache's exp(-b tau_sun) voxel-resolution modulation (0: off); set per frame.
     float worldCacheModulationDepth = 8.f;  ///< Sun optical depth at which the modulation stops falling.
     uint padHSTR26 = 0;
+
+    uint worldCacheZonalBands = 0;  ///< >0: the sun field's zonal part about the sun direction is windowed on its own and extended
+                                    ///< by zonal bands 3 up to this (at most 8); 0: off.
+    uint worldCacheZonalWindow = 0; ///< Window order of that zonal part (0: max(worldCacheZonalBands, 2)).
+    uint worldCacheSunOrder = 2;    ///< 3: the sun field carries all of band 3 (7 extension slots) instead of zonal bands.
+    uint padHSTR27 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

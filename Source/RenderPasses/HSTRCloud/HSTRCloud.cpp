@@ -75,8 +75,12 @@ const char kBeamLevels[] = "beamLevels";
 const char kBeamSegments[] = "beamSegments";
 const char kBeamTemporal[] = "beamTemporal";
 const char kCompareBlock[] = "compareBlock";
+const char kCompareMapScale[] = "compareMapScale";
 const char kWorldCacheModulation[] = "worldCacheModulation";
 const char kWorldCacheModulationDepth[] = "worldCacheModulationDepth";
+const char kWorldCacheZonalBands[] = "worldCacheZonalBands";
+const char kWorldCacheZonalWindow[] = "worldCacheZonalWindow";
+const char kWorldCacheSunOrder[] = "worldCacheSunOrder";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
@@ -284,10 +288,18 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamTemporal = bool(value) ? 1u : 0u;
         else if (key == kCompareBlock)
             mParams.compareBlock = std::max(1u, uint32_t(value));
+        else if (key == kCompareMapScale)
+            mParams.compareMapScale = std::max(0.f, float(value));
         else if (key == kWorldCacheModulation)
             mWorldCacheModulation = value;
         else if (key == kWorldCacheModulationDepth)
             mParams.worldCacheModulationDepth = std::max(0.f, float(value));
+        else if (key == kWorldCacheZonalBands)
+            mParams.worldCacheZonalBands = std::min(8u, uint32_t(value));
+        else if (key == kWorldCacheZonalWindow)
+            mParams.worldCacheZonalWindow = value;
+        else if (key == kWorldCacheSunOrder)
+            mParams.worldCacheSunOrder = std::clamp(uint32_t(value), 2u, 3u);
         else if (key == kSaveReference)
             mSaveReferencePath = value.operator std::string();
         else if (key == kLoadReference)
@@ -344,7 +356,8 @@ void HSTRCloud::setProperties(const Properties& props)
     if (p.worldCacheCellVoxels != q.worldCacheCellVoxels || p.worldCacheEstimator != q.worldCacheEstimator ||
         p.worldCachePhotons != q.worldCachePhotons || p.worldCacheBands != q.worldCacheBands ||
         p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments ||
-        mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth)
+        mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth ||
+        p.worldCacheZonalBands != q.worldCacheZonalBands || p.worldCacheSunOrder != q.worldCacheSunOrder)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -414,8 +427,12 @@ Properties HSTRCloud::getProperties() const
     props[kBeamSegments] = mParams.beamSegments;
     props[kBeamTemporal] = mParams.beamTemporal != 0;
     props[kCompareBlock] = mParams.compareBlock;
+    props[kCompareMapScale] = mParams.compareMapScale;
     props[kWorldCacheModulation] = mWorldCacheModulation;
     props[kWorldCacheModulationDepth] = mParams.worldCacheModulationDepth;
+    props[kWorldCacheZonalBands] = mParams.worldCacheZonalBands;
+    props[kWorldCacheZonalWindow] = mParams.worldCacheZonalWindow;
+    props[kWorldCacheSunOrder] = mParams.worldCacheSunOrder;
     props[kBeamTolerance] = mParams.beamTolerance;
     props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
     props[kStoreExact] = mStoreExact;
@@ -1811,7 +1828,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             );
             mParams.worldCacheSamples = 0;
         }
-        const size_t depositCount = size_t(dims.x) * dims.y * dims.z * 18;
+        const size_t depositCount = size_t(dims.x) * dims.y * dims.z * kWorldCacheSlots;
         if (mParams.worldCacheEstimator != 0 && (!mpWorldCacheDeposit || mpWorldCacheDeposit->getElementCount() != depositCount))
             mpWorldCacheDeposit = mpDevice->createStructuredBuffer(
                 sizeof(int32_t),
@@ -1901,7 +1918,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mWorldCacheBakeDirty = true;
         }
         const bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % mWorldCacheBakeInterval == 0;
-        if (mWorldCacheBakeDirty && mParams.worldCacheTextured != 0 && bakeDue)
+        if (mWorldCacheBakeDirty && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && bakeDue)
         {
             FALCOR_PROFILE(pRenderContext, "worldCacheBake");
             bindRenderer(pRenderContext, mpWorldCacheBakePass);
