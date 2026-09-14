@@ -53,6 +53,8 @@ if os.environ.get("HSTR_CONFIGS"):
     configs = [c for c in configs if c[0] in keep]
 BUDGETS = [float(b) for b in os.environ.get("HSTR_BUDGETS", "200,800").split(",")]  # Cumulative tracing GPU ms at each check.
 UPDATES = 4  # Cache updates per frame while accumulating.
+MAP = float(os.environ.get("HSTR_MAP", "0"))  # >0: capture frames and error maps at each budget, saturating at this log error.
+tone = g.getPass("ToneMapper")
 
 
 def measure():
@@ -105,6 +107,21 @@ for name, position, sun in views:
                 m.renderFrame()
             hstr.set_properties({"worldCacheUpdates": 0})
             results.append((budget, measure()))
+            if MAP > 0:
+                # The frame, then its signed 8x8-block log error map (red brighter, blue darker than the path tracer).
+                stem = f"{TAG}_{name}_{label.replace(' ', '_')}_{budget:.0f}ms"
+                m.renderFrame()
+                m.frameCapture.baseFilename = stem
+                m.frameCapture.capture()
+                operator = tone.properties["operator"]
+                tone.set_properties({"operator": "Linear"})
+                hstr.set_properties({"compareTarget": 15, "compareSubstitute": 0, "compareBlock": 8, "compareMapScale": MAP,
+                                     "compareReference": True})
+                m.renderFrame()
+                m.frameCapture.baseFilename = stem + "_errmap"
+                m.frameCapture.capture()
+                hstr.set_properties({"compareReference": False, "compareMapScale": 0.0, "compareBlock": 1})
+                tone.set_properties({"operator": operator})
             hstr.set_properties({"worldCacheUpdates": UPDATES})
         errors = "  ".join(f"{b:.0f} ms: {e:.4f}" for b, e in results)
         lines.append(f"{name:10s} {label:18s} {per_update:6.3f} ms/update  log err after tracing {errors}")

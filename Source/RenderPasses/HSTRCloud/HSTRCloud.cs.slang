@@ -1792,9 +1792,10 @@ struct HSTRCloudRenderer
     }
 
     /// Writes one cell's cache means into the packed camera textures (light tracing only; the gather is read untextured).
+    /// Cells without medium within a majorant block never receive deposits (depositSegment) and keep their cleared zeros.
     void bakeWorldCacheCell(uint3 cell)
     {
-        if (any(cell >= params.worldCacheDims))
+        if (any(cell >= params.worldCacheDims) || majorantAt((float3(cell) + 0.5f) * float(params.worldCacheCellVoxels)) <= 0.f)
             return;
         const uint index = worldCacheIndex(cell);
         [unroll]

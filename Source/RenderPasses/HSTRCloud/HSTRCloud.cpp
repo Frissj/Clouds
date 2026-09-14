@@ -1966,6 +1966,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mpWorldCacheTextures[0]->getDepth() != dims.z)
         {
             for (auto& texture : mpWorldCacheTextures)
+            {
                 texture = mpDevice->createTexture3D(
                     dims.x,
                     dims.y,
@@ -1975,6 +1976,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     nullptr,
                     ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
                 );
+                // The bake skips cells that never receive deposits; they stay at these zeros.
+                pRenderContext->clearUAV(texture->getUAV().get(), float4(0.f));
+            }
             mWorldCacheBakeDirty = true;
         }
         const bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % mWorldCacheBakeInterval == 0;
