@@ -75,6 +75,8 @@ const char kBeamLevels[] = "beamLevels";
 const char kBeamSegments[] = "beamSegments";
 const char kBeamTemporal[] = "beamTemporal";
 const char kCompareBlock[] = "compareBlock";
+const char kWorldCacheModulation[] = "worldCacheModulation";
+const char kWorldCacheModulationDepth[] = "worldCacheModulationDepth";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
@@ -282,6 +284,10 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamTemporal = bool(value) ? 1u : 0u;
         else if (key == kCompareBlock)
             mParams.compareBlock = std::max(1u, uint32_t(value));
+        else if (key == kWorldCacheModulation)
+            mWorldCacheModulation = value;
+        else if (key == kWorldCacheModulationDepth)
+            mParams.worldCacheModulationDepth = std::max(0.f, float(value));
         else if (key == kSaveReference)
             mSaveReferencePath = value.operator std::string();
         else if (key == kLoadReference)
@@ -310,6 +316,7 @@ void HSTRCloud::parseProperties(const Properties& props)
 void HSTRCloud::setProperties(const Properties& props)
 {
     const HSTRCloudParams previous = mParams;
+    const float previousModulation = mWorldCacheModulation;
     parseProperties(props);
     if (!mpScene || !mpLeafRadiance)
         return;
@@ -336,7 +343,8 @@ void HSTRCloud::setProperties(const Properties& props)
     }
     if (p.worldCacheCellVoxels != q.worldCacheCellVoxels || p.worldCacheEstimator != q.worldCacheEstimator ||
         p.worldCachePhotons != q.worldCachePhotons || p.worldCacheBands != q.worldCacheBands ||
-        p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments)
+        p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments ||
+        mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -406,6 +414,8 @@ Properties HSTRCloud::getProperties() const
     props[kBeamSegments] = mParams.beamSegments;
     props[kBeamTemporal] = mParams.beamTemporal != 0;
     props[kCompareBlock] = mParams.compareBlock;
+    props[kWorldCacheModulation] = mWorldCacheModulation;
+    props[kWorldCacheModulationDepth] = mParams.worldCacheModulationDepth;
     props[kBeamTolerance] = mParams.beamTolerance;
     props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
     props[kStoreExact] = mStoreExact;
@@ -1754,14 +1764,42 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         return;
     }
 
+    // World space: residual pages depend on the sun and density only. The world cache's modulation reads them, so they come first.
+    if (mResidualDirty)
+    {
+        FALCOR_PROFILE(pRenderContext, "residualPages");
+        dispatchResidualPages(pRenderContext);
+        mResidualDirty = false;
+        mBasisDirty = true;
+    }
+
+    // The cache modulation's default is the diffusion attenuation per unit optical depth, sqrt(3 (1 - albedo) (1 - albedo g)):
+    // multiply scattered light fades into the cloud at that rate, so the stored ratio is nearly flat at cell scale.
+    {
+        const float albedo = dot(mpScene->getGridVolume(0)->getAlbedo(), float3(1.f / 3.f));
+        const float diffusion = std::sqrt(std::max(0.f, 3.f * (1.f - albedo) * (1.f - albedo * mParams.anisotropy)));
+        mParams.worldCacheModulation = mWorldCacheModulation < 0.f ? diffusion : mWorldCacheModulation;
+    }
+
     // World cache experiment: camera-independent gather passes accumulated while its view is shown.
     const bool worldCacheFrame = mParams.debugView == kWorldCacheView || mParams.debugView == kBeamView;
     if (worldCacheFrame)
     {
         const uint32_t cellVoxels = mParams.worldCacheCellVoxels;
         const uint3 dims = (mParams.hstrExtinctionDims + cellVoxels - 1u) / cellVoxels;
+        if (any(dims != mParams.worldCacheDims))
+        {
+            mParams.worldCacheDims = dims;
+            mParams.worldCacheSamples = 0;
+            logInfo("HSTRCloud: world cache {} cells of {} voxels.", dims, cellVoxels);
+        }
+        // Float running sums are only used by the gather and by untextured light tracing; textured light tracing bakes from its
+        // fixed-point deposits.
+        const bool floatSums = mParams.worldCacheEstimator == 0 || mParams.worldCacheTextured == 0;
         const size_t floatCount = size_t(dims.x) * dims.y * dims.z * 27;
-        if (!mpWorldCache || any(dims != mParams.worldCacheDims) || mpWorldCache->getElementCount() != floatCount)
+        if (!floatSums)
+            mpWorldCache = nullptr;
+        else if (!mpWorldCache || mpWorldCache->getElementCount() != floatCount)
         {
             mpWorldCache = mpDevice->createStructuredBuffer(
                 sizeof(float),
@@ -1771,9 +1809,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 nullptr,
                 false
             );
-            mParams.worldCacheDims = dims;
             mParams.worldCacheSamples = 0;
-            logInfo("HSTRCloud: world cache {} cells of {} voxels ({:.1f} MB).", dims, cellVoxels, floatCount * 4.0 / (1 << 20));
         }
         const size_t depositCount = size_t(dims.x) * dims.y * dims.z * 18;
         if (mParams.worldCacheEstimator != 0 && (!mpWorldCacheDeposit || mpWorldCacheDeposit->getElementCount() != depositCount))
@@ -1879,15 +1915,6 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mWorldCacheBakeDirty = false;
             ++mWorldCacheBakes;
         }
-    }
-
-    // World space: residual pages depend on the sun and density only.
-    if (mResidualDirty)
-    {
-        FALCOR_PROFILE(pRenderContext, "residualPages");
-        dispatchResidualPages(pRenderContext);
-        mResidualDirty = false;
-        mBasisDirty = true;
     }
 
     // Camera space: nothing below re-solves transport; it reprojects the solved field. The world cache views integrate

@@ -106,6 +106,7 @@ private:
     bool mWorldCacheBakeDirty = true;
     uint32_t mWorldCacheBakeInterval = 1; ///< Batches between bakes of the camera textures while updating.
     uint32_t mWorldCacheUpdates = 1;      ///< Cache gather passes per frame in the world cache view.
+    float mWorldCacheModulation = -1.f;   ///< Cache modulation b; negative: the medium's diffusion attenuation.
     ref<ComputePass> mpBeamQueryPass;
     ref<ComputePass> mpBeamTilePass;
     ref<ComputePass> mpBeamArgsPass;

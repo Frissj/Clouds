@@ -139,11 +139,11 @@ struct HSTRCloudParams
 
     // World-space radiance cache experiment (debugView kWorldCacheView).
     uint3 worldCacheDims = { 0, 0, 0 };
-    uint worldCacheCellVoxels = 4; ///< Voxels per cache cell edge.
+    uint worldCacheCellVoxels = 2; ///< Voxels per cache cell edge.
 
     uint worldCacheSamples = 0;   ///< Estimator passes (gather passes or photon batches) accumulated into the cache.
     uint worldCacheOrder = 2;     ///< Highest SH band the camera evaluates (0-2; light tracing fills bands 0-1 only).
-    uint worldCacheEstimator = 0; ///< 0: one gather path per cell per pass; 1: light tracing with track-length deposition.
+    uint worldCacheEstimator = 1; ///< 0: one gather path per cell per pass; 1: light tracing with track-length deposition.
     uint worldCachePhotons = 262144; ///< Photons per light-tracing batch.
 
     float3 worldVoxelSize = float3(0.f);   ///< World size of one voxel (the grid axes are world aligned).
@@ -155,8 +155,8 @@ struct HSTRCloudParams
     uint beamLevels = 3;          ///< Beam tile levels; tiles that fail at the finest level are marched per pixel.
     float beamTolerance = 0.02f;  ///< log(1 + radiance) surplus at a tile centre above which the tile is refined.
 
-    uint worldCacheBands = 1; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
-    uint worldCacheWindow = 0; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
+    uint worldCacheBands = 2; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
+    uint worldCacheWindow = 1; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
     uint worldCacheTextured = 1; ///< 1: the camera reads the cache from baked, hardware-filtered 3D textures.
     uint lightingStride = 1;     ///< The camera march re-evaluates the cache every lightingStride steps and holds it between.
 
@@ -173,8 +173,8 @@ struct HSTRCloudParams
     uint beamTemporal = 0;          ///< 1: query every level in one pass over the tiles refined last frame (one frame of lag).
 
     uint compareBlock = 1; ///< Comparisons average compareBlock x compareBlock pixel blocks first (1: per pixel).
-    uint padHSTR24 = 0;
-    uint padHSTR25 = 0;
+    float worldCacheModulation = 0.f;       ///< b of the cache's exp(-b tau_sun) voxel-resolution modulation (0: off); set per frame.
+    float worldCacheModulationDepth = 8.f;  ///< Sun optical depth at which the modulation stops falling.
     uint padHSTR26 = 0;
 };
 

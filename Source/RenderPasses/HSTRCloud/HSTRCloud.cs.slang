@@ -1144,10 +1144,12 @@ struct HSTRCloudRenderer
             if (fraction > 0.f && all(cell >= 0) && all(cell < int3(params.worldCacheDims)))
             {
                 const uint base = 18 * worldCacheIndex(uint3(cell)) + 9 * field;
+                // Deposits are divided by the modulation at the middle of this cell's part of the flight.
+                const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
                 for (uint k = 0; k < coefficients; ++k)
                 {
                     // Stochastic rounding keeps the fixed-point sum unbiased.
-                    const float value = shBasis(k, look) * perUnit * fraction;
+                    const float value = shBasis(k, look) * perUnit * fraction * inverseModulation;
                     const int quantized = int(floor(value + randomFloat(rng)));
                     if (quantized != 0)
                         InterlockedAdd(hstrWorldCacheDeposit[base + k], quantized);
@@ -1475,7 +1477,22 @@ struct HSTRCloudRenderer
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
     /// the HG phase convolves SH band l by g^l. Trilinear over valid cell centres (cells without an estimate get no weight
     /// rather than black light); bands above worldCacheOrder are dropped.
-    float3 worldCacheRadiance(float3 v, float3 w)
+    float3 worldCacheRadiance(float3 v, float3 w) { return worldCacheModulation(v) * worldCacheRadianceStored(v, w); }
+
+    /// Voxel-resolution factor the cache is divided by when deposited and multiplied by when read: exp(-b tau_sun), with tau_sun
+    /// the fine sun optical depth (capped so deep interiors do not inflate the fixed-point deposits). Multiple scattering falls
+    /// off into the cloud with the sun depth, so the stored ratio is much smoother than the radiance at cell scale, and the
+    /// camera recovers the voxel-scale structure near lit surfaces from the fine sun field. b = 0 disables it.
+    float worldCacheModulation(float3 v)
+    {
+        if (params.worldCacheModulation <= 0.f)
+            return 1.f;
+        const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (v + 0.5f) / float3(params.hstrFineDims), 0.f);
+        return exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
+    }
+
+    /// The cache as stored (divided by worldCacheModulation).
+    float3 worldCacheRadianceStored(float3 v, float3 w)
     {
         if (params.worldCacheTextured != 0)
             return worldCacheRadianceTextured(v, w);

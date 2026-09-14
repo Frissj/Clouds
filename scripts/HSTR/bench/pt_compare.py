@@ -24,7 +24,11 @@ target = float3(-10.0, 73.0, -43.0)
 radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
-        "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeDepth": 0.0, "compareExact": False}
+        "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeDepth": 0.0, "compareExact": False, "worldCacheModulation": -1.0}
+SUFFIX = ""  # Reference name suffix for non-default media.
+if os.environ.get("HSTR_ANISOTROPY"):
+    base["anisotropy"] = float(os.environ["HSTR_ANISOTROPY"])
+    SUFFIX = f"_g{base['anisotropy']}"
 FULL = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1}
 CHEAP = {"stepOpticalDepth": 1.0, "minStepVoxels": 2.0, "lightingStride": 2}
 default_sun = (0.4319, 0.8639, 0.2699)
@@ -43,6 +47,9 @@ configs = [
     ("beam h16x3 .05", dict(FULL, debugView=9, beamTileSize=16, beamLevels=3, beamTolerance=0.05)),
     ("old HST", dict(CHEAP, debugView=0)),
 ]
+if os.environ.get("HSTR_CONFIGS"):
+    keep = os.environ["HSTR_CONFIGS"].split(",")
+    configs = [c for c in configs if c[0] in keep]
 # Split-model components against the same reference components: background, sun single, smooth (sun multiple + sky).
 components = [("background", 1), ("sun single", 2), ("smooth", 12)]
 
@@ -63,7 +70,7 @@ def measure(props, mask, block=1):
 
 def accumulate_reference(name):
     """Path-traced reference of the current view, resumed from and saved to the results folder (per camera, sun and size)."""
-    path = f"{OUT}/references/{name}_{W}x{H}"
+    path = f"{OUT}/references/{name}{SUFFIX}_{W}x{H}"
     os.makedirs(f"{OUT}/references", exist_ok=True)
     hstr.set_properties({"debugView": 6, "referenceShow": 15})
     m.renderFrame()
