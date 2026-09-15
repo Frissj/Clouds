@@ -28,9 +28,9 @@ g.addPass(createPass("HSTRCloud", {
     "worldCacheBakeInterval": 8,
     "sunNearVoxels": 2.0,
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
-    # against the per-pixel march (tolerance 0.05, mean 8-bit display error, GPU ms): near 16x3 0.52 / 97, 8x2 0.33 / 101,
-    # 4x1 0.21 / 113; far side 0.29 / 34, 0.24 / 36, 0.20 / 36; sea overview 0.22 / 78, 0.14 / 75, 0.08 / 76. The frame is
-    # dominated by the per-pixel transmittance, so the denser lattice costs little.
+    # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
+    # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:
+    # 16x3 183, 8x2 203, 4x1 285, the per-pixel march 333. A brute-force stopgap until the tile test sees sub-tile detail.
     "beamTileSize": 4,
     "beamLevels": 1,
     "beamTolerance": 0.05,
