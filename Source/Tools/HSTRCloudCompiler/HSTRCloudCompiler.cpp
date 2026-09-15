@@ -8,18 +8,20 @@
         Once per source cloud (skipped while the VDB is unchanged): its canonical cache <cloud>.hstrcloud holds the source's true
         level-0 brick samples (lossless at the atlas's precision), the means of the coarse levels, the proxies and the density hash.
 
-    HSTRCloudCompiler pack <cache directory> <output directory> [--quality E | --lambda L | --budget-mb N] [--max-error E]
+    HSTRCloudCompiler pack <cache directory> <output directory> [--quality E [--quality-tail T] | --lambda L | --budget-mb N] [--max-error E]
                            [--weight-floor F] [--density-scale S] [--transform haar|identity|cdf53|legacy] [--deadzone D]
                            [--sample R] [--clouds a,b,...] [--dry-run] [--force]
         Packaging from the canonical caches only, into <output directory>/<cloud>.hstrlib. Each brick's residual is transformed
         (3D Haar by default), quantised with the step that minimises weight * error + lambda * bytes, and GDeflate-compressed in
         pages. The error is the optical depth of the brick's reconstruction error; its weight is the brick's visibility from
-        outside the cloud, at least --weight-floor (1: unweighted). --max-error caps every brick's unweighted error regardless of
-        cost. The cloud's lambda is chosen by one of:
+        outside the cloud (over 26 directions), at least --weight-floor (default 0.01; 1: unweighted). The floor also protects
+        cloud interiors for cameras flying through. --max-error caps every brick's unweighted error regardless of cost. The
+        cloud's lambda is chosen by one of:
         --quality E (the default, kDefaultQuality): per cloud, the largest lambda whose close-up transmittance error meets E. The
            error is measured on the encoded density itself, without rendering: every voxel column of the chunks on each axis
            integrates the reconstruction a close view renders against the truth, and |e^-tau_true - e^-tau_coded| is attenuated
-           by the proxy's optical depth in front of the chunk. Its 99th percentile over --sample of the chunks meets E.
+           by the proxy's optical depth in front of the chunk. Its 99th percentile over --sample of the chunks meets E, and its
+           99.9th percentile meets --quality-tail (default kTailFactor * E).
            --density-scale is the extinction per unit of density per VDB world unit (the renderer's density scale times the sea's
            size scale); 1 by default.
         --lambda L: every cloud at L.
@@ -64,6 +66,9 @@ constexpr uint32_t kCodecVersion = 3;
 /// Default close-up transmittance error of pack (--quality): the 99th percentile of voxel-column errors a cloud's lambda meets.
 /// 0.02 and 0.05 both rendered indistinguishably from near-lossless on cloud_cumulus_1_size_1 (45 and 28 MB against 193 MB).
 constexpr float kDefaultQuality = 0.02f;
+/// Default 99.9th-percentile limit as a multiple of the 99th-percentile target (--quality-tail overrides). Packages that rendered
+/// like near-lossless had a tail of about 4.5 times their target: the limit only binds on clouds with unusually heavy tails.
+constexpr float kTailFactor = 5.f;
 
 /// The analysis measures package bytes at lambdas a factor 2.5 apart: 1e-8 to 9e-3 weighted optical depth per byte.
 constexpr uint32_t kLadderSize = 16;
@@ -350,7 +355,7 @@ struct CodecSettings
     float lambda = 1e-4f;          ///< Weighted optical-depth error one byte is worth.
     float maxError = 0.f;          ///< When positive, no brick's (unweighted) error exceeds it.
     float deadzone = 0.2f;         ///< Quantiser rounding offset towards zero (0: round to nearest).
-    float weightFloor = 0.05f;     ///< Least visibility weight of a brick's error (1: unweighted).
+    float weightFloor = 0.01f;     ///< Least visibility weight of a brick's error (1: unweighted).
     float densityScale = 1.f;      ///< Extinction per unit of density per VDB world unit, for visibility and transmittance.
     Transform transform = Transform::Haar;
 };
@@ -1465,37 +1470,68 @@ public:
         return std::max(std::exp(-depth * codec.densityScale), codec.weightFloor);
     }
 
-    /// From the proxy means (optical depths in density times world units, before the codec's density scale): per proxy cell the least
-    /// depth to outside the cloud along the six axes, and along each axis the depth of the cells before it and after it.
+    /// From the proxy means (optical depths in density times world units, before the codec's density scale):
+    /// - per proxy cell, the least depth from the cell's centre to outside the cloud over 26 directions (axes, face and body
+    ///   diagonals), so a cell visible from any of them keeps its weight. (Dilating it by a neighbouring cell, 4 bricks at this
+    ///   resolution, grew a package 45% for no measured gain: bricks already take the most exposed cell they overlap.)
+    /// - along each axis, the depth of the cells before and after each cell (measureTransmittance).
     void computeVisibility()
     {
         const size_t count = size_t(mProxyDims.x) * mProxyDims.y * mProxyDims.z;
         const float16_t* means = reinterpret_cast<const float16_t*>(mProxy.data());
         const float cell = float(1u << mProxyLevel) * entry.voxelWorld;
+        const int3 dims(mProxyDims);
+        auto index = [&](int3 p) { return size_t(p.x) + size_t(dims.x) * (size_t(p.y) + size_t(dims.y) * size_t(p.z)); };
+        auto density = [&](int3 p) { return std::max(0.f, float(means[index(p)])) * cell; };
+
         mExposure.assign(count, std::numeric_limits<float>::max());
-        auto index = [&](uint3 p) { return p.x + mProxyDims.x * (size_t(p.y) + mProxyDims.y * size_t(p.z)); };
+        parallelFor(
+            size_t(dims.z),
+            [&](size_t z)
+            {
+                for (int y = 0; y < dims.y; ++y)
+                    for (int x = 0; x < dims.x; ++x)
+                    {
+                        const int3 p(x, y, int(z));
+                        float best = std::numeric_limits<float>::max();
+                        for (int dz = -1; dz <= 1; ++dz)
+                            for (int dy = -1; dy <= 1; ++dy)
+                                for (int dx = -1; dx <= 1; ++dx)
+                                {
+                                    if (dx == 0 && dy == 0 && dz == 0)
+                                        continue;
+                                    const int3 d(dx, dy, dz);
+                                    const float length = std::sqrt(float(dx * dx + dy * dy + dz * dz));
+                                    float depth = 0.5f * density(p) * length;
+                                    for (int3 q = p + d; all(q >= int3(0)) && all(q < dims) && depth < best; q += d)
+                                        depth += density(q) * length;
+                                    best = std::min(best, depth);
+                                }
+                        mExposure[index(p)] = best;
+                    }
+            }
+        );
+
         for (uint32_t axis = 0; axis < 3; ++axis)
         {
             const uint32_t u = (axis + 1) % 3;
             const uint32_t v = (axis + 2) % 3;
             mDepthBefore[axis].assign(count, 0.f);
             mDepthAfter[axis].assign(count, 0.f);
-            for (uint32_t a = 0; a < mProxyDims[u]; ++a)
-                for (uint32_t b = 0; b < mProxyDims[v]; ++b)
+            for (int a = 0; a < dims[u]; ++a)
+                for (int b = 0; b < dims[v]; ++b)
                     for (int direction : {1, -1})
                     {
                         float sum = 0.f;
-                        for (uint32_t k = 0; k < mProxyDims[axis]; ++k)
+                        for (int k = 0; k < dims[axis]; ++k)
                         {
-                            uint3 p;
-                            p[axis] = direction > 0 ? k : mProxyDims[axis] - 1 - k;
+                            int3 p;
+                            p[axis] = direction > 0 ? k : dims[axis] - 1 - k;
                             p[u] = a;
                             p[v] = b;
                             const size_t i = index(p);
-                            const float d = std::max(0.f, float(means[i])) * cell;
-                            mExposure[i] = std::min(mExposure[i], sum + 0.5f * d);
                             (direction > 0 ? mDepthBefore : mDepthAfter)[axis][i] = sum;
-                            sum += d;
+                            sum += density(p);
                         }
                     }
         }
@@ -1905,10 +1941,10 @@ PackResult writePackage(Asset& asset, const CodecSettings& codec, const std::fil
     return result;
 }
 
-/// The largest lambda (smallest package) whose close-up transmittance error (the 99th percentile over every k-th chunk, the sample)
-/// is within the target: decade steps from 3e-4 until the target is bracketed, then bisection in log lambda to a factor 1.15.
-/// Probes encode without building pages.
-double searchLambda(Asset& asset, CodecSettings codec, float target, double sampleRate)
+/// The largest lambda (smallest package) whose close-up transmittance error over every k-th chunk (the sample) is within the
+/// target at the 99th percentile and within the tail target at the 99.9th: decade steps from 3e-4 until the targets are
+/// bracketed, then bisection in log lambda to a factor 1.15. Probes encode without building pages.
+double searchLambda(Asset& asset, CodecSettings codec, float target, float tailTarget, double sampleRate)
 {
     const auto start = std::chrono::steady_clock::now();
     const size_t stride = std::max<size_t>(1, size_t(std::lround(1.0 / sampleRate)));
@@ -1933,7 +1969,7 @@ double searchLambda(Asset& asset, CodecSettings codec, float target, double samp
             }
         );
         ++probes;
-        return stats.transmittancePercentile(0.99) <= target;
+        return stats.transmittancePercentile(0.99) <= target && stats.transmittancePercentile(0.999) <= tailTarget;
     };
     constexpr double kFinest = -8.0, kCoarsest = -1.0;
     double pass = std::numeric_limits<double>::quiet_NaN();
@@ -1989,7 +2025,8 @@ int main(int argc, char** argv)
     if (argc < 4 || (mode != "build" && mode != "pack"))
     {
         std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory>\n"
-                     "HSTRCloudCompiler pack <cache directory> <output directory> [--quality E | --lambda L | --budget-mb N] [--max-error E]\n"
+                     "HSTRCloudCompiler pack <cache directory> <output directory> [--quality E [--quality-tail T] | --lambda L | --budget-mb N]\n"
+                     "                       [--max-error E]\n"
                      "                       [--weight-floor F] [--density-scale S] [--transform haar|identity|cdf53|legacy] [--deadzone D]\n"
                      "                       [--sample R] [--clouds a,b,...] [--dry-run] [--force]\n";
         return 1;
@@ -2011,7 +2048,8 @@ int main(int argc, char** argv)
     const std::filesystem::path outputDirectory = argv[3];
     double budgetMB = 0.0;    // --budget-mb: one lambda for every cloud so the packages fit the budget.
     double fixedLambda = 0.0; // --lambda: every cloud at this rate-distortion trade-off.
-    float quality = kDefaultQuality; // Otherwise each cloud's lambda meets this close-up transmittance error.
+    float quality = kDefaultQuality; // Otherwise each cloud's lambda meets this close-up transmittance error,
+    float tail = 0.f;                // and this one at the 99.9th percentile (0: kTailFactor * quality).
     double sampleRate = 0.2;
     bool dryRun = false;
     bool force = false;
@@ -2036,6 +2074,8 @@ int main(int argc, char** argv)
             fixedLambda = std::max(1e-12, std::stod(argv[++i]));
         else if (option == "--quality")
             quality = std::max(1e-6f, std::stof(argv[++i]));
+        else if (option == "--quality-tail")
+            tail = std::max(1e-6f, std::stof(argv[++i]));
         else if (option == "--max-error")
             codec.maxError = std::max(0.f, std::stof(argv[++i]));
         else if (option == "--weight-floor")
@@ -2206,8 +2246,8 @@ int main(int argc, char** argv)
             std::cout << "lambda " << codec.lambda << " (fixed)\n";
         }
         else
-            std::cout << "per-cloud lambda for a close-up transmittance error of " << quality << " (99th percentile over "
-                      << sampleRate * 100.0 << "% of the chunks)\n";
+            std::cout << "per-cloud lambda for a close-up transmittance error of " << quality << " at the 99th percentile and "
+                      << (tail > 0.f ? tail : kTailFactor * quality) << " at the 99.9th (over " << sampleRate * 100.0 << "% of the chunks)\n";
 
         // 3. One package per cloud (a dry run only reports). A package whose key (source density and every setting) matches is up to
         // date; a cloud with the density of one packed in this run is a copy of its package.
@@ -2220,8 +2260,9 @@ int main(int argc, char** argv)
         {
             const std::string name = asset.source.stem().string();
             const std::filesystem::path path = outputDirectory / (name + ".hstrlib");
-            const uint64_t modeKey = budgetMB <= 0.0 && fixedLambda <= 0.0 ? fnv(fnv(1, floatBits(quality)), uint64_t(std::lround(sampleRate * 1e6)))
-                                                                           : fnv(2, floatBits(codec.lambda));
+            const uint64_t modeKey = budgetMB <= 0.0 && fixedLambda <= 0.0
+                                         ? fnv(fnv(fnv(1, floatBits(quality)), floatBits(tail)), uint64_t(std::lround(sampleRate * 1e6)))
+                                         : fnv(2, floatBits(codec.lambda));
             const uint64_t packKey = fnv(fnv(codecKey, modeKey), asset.densityHash);
             LibraryHeader existing;
             if (!dryRun && !force && readPackageHeader(path, existing) && existing.packKey == packKey)
@@ -2247,7 +2288,7 @@ int main(int argc, char** argv)
             asset.open(asset.source);
             CodecSettings cloudCodec = codec;
             if (budgetMB <= 0.0 && fixedLambda <= 0.0)
-                cloudCodec.lambda = float(searchLambda(asset, codec, quality, sampleRate));
+                cloudCodec.lambda = float(searchLambda(asset, codec, quality, tail > 0.f ? tail : kTailFactor * quality, sampleRate));
             const PackResult result = writePackage(asset, cloudCodec, path, dryRun, dryRun ? sampleRate : 1.0, packKey);
             const Asset::EncodeStats& stats = result.stats;
             totalBytes += result.bytes;
@@ -2258,7 +2299,8 @@ int main(int argc, char** argv)
                       << " source level-0 bricks, " << double(result.bytes) / 1048576.0 << " MB, " << seconds(assetStart) << " s\n"
                       << "  close-up transmittance error over " << stats.columns << " voxel columns: mean "
                       << stats.transmittanceSum / double(std::max<uint64_t>(stats.columns, 1)) << ", 99th percentile "
-                      << stats.transmittancePercentile(0.99) << ", max " << stats.transmittanceMax << "\n"
+                      << stats.transmittancePercentile(0.99) << ", 99.9th percentile " << stats.transmittancePercentile(0.999) << ", max "
+                      << stats.transmittanceMax << "\n"
                       << "  " << stats.predicted << " predicted; coded bricks average " << double(stats.nonzero) / coded << " non-zero coefficients, "
                       << double(stats.payloadBytes) / coded << " payload bytes before GDeflate\n"
                       << "  optical-depth error per brick: mean " << stats.error / double(std::max<uint64_t>(stats.bricks, 1)) << ", weighted mean "
