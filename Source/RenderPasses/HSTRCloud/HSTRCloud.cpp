@@ -110,6 +110,9 @@ const char kCloudSunTilesPerFrame[] = "cloudSunTilesPerFrame";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
+const char kBeamGuide[] = "beamGuide";
+const char kBeamGuideDepth[] = "beamGuideDepth";
+const char kBeamGuideSun[] = "beamGuideSun";
 const char kBeamEdgeContrast[] = "beamEdgeContrast";
 const char kStoreExact[] = "storeExact";
 const char kCompareExact[] = "compareExact";
@@ -382,6 +385,12 @@ void HSTRCloud::parseProperties(const Properties& props)
             mLoadReferencePath = value.operator std::string();
         else if (key == kBeamTolerance)
             mParams.beamTolerance = value;
+        else if (key == kBeamGuide)
+            mParams.beamGuide = std::min(uint32_t(value), 2u);
+        else if (key == kBeamGuideDepth)
+            mParams.beamGuideDepth = value;
+        else if (key == kBeamGuideSun)
+            mParams.beamGuideSun = value;
         else if (key == kBeamEdgeContrast)
             mParams.beamEdgeContrast = value;
         else if (key == kStoreExact)
@@ -577,6 +586,9 @@ Properties HSTRCloud::getProperties() const
         props[kCloudStats] = cloud;
     }
     props[kBeamTolerance] = mParams.beamTolerance;
+    props[kBeamGuide] = mParams.beamGuide;
+    props[kBeamGuideDepth] = mParams.beamGuideDepth;
+    props[kBeamGuideSun] = mParams.beamGuideSun;
     props[kBeamEdgeContrast] = mParams.beamEdgeContrast;
     props[kStoreExact] = mStoreExact;
     props[kCompareExact] = mParams.compareExact != 0;
@@ -688,6 +700,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamMarchPass = createPass("marchBeamPixels");
+    mpBeamGuidePass = createPass("beamGuide");
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
@@ -2175,6 +2188,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamPreviousLists"] = mpBeamLists[mBeamParity ^ 1u];
     var["hstrBeamPreviousCounts"] = mpBeamCounts[mBeamParity ^ 1u];
     var["hstrBeamHistory"] = mpBeamHistory[mBeamParity ^ 1u];
+    var["hstrBeamGuide"] = mpBeamGuide;
     var["hstrExactFrame"] = mpExactFrame;
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
@@ -2703,6 +2717,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 2, 1, nullptr, flags);
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+        // Full-resolution guide for the tile tests. Near view at 4K (one segment per query, moving camera), 4x1 tiles, mean 8-bit
+        // display error against the per-pixel march / GPU ms: off 0.16 / 175, beamGuide 1 at 0.2 0.14 / 244, 0.1 0.13 / 275,
+        // 0.05 0.10 / 315 (the guide itself ~38 ms). Off by default: what it refines is marched per pixel at the full lighting cost.
+        if (mParams.beamGuide != 0)
+        {
+            if (!mpBeamGuide || mpBeamGuide->getWidth() != frameDim.x || mpBeamGuide->getHeight() != frameDim.y)
+                mpBeamGuide = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+            FALCOR_PROFILE(pRenderContext, "beamGuide");
+            bindRenderer(pRenderContext, mpBeamGuidePass);
+            bindOutput(mpBeamGuidePass, "hstrBeamGuideOutput", mpBeamGuide, "hstrBeamGuide");
+            mpBeamGuidePass->execute(pRenderContext, uint3(frameDim, 1));
+        }
+        else
+            mpBeamGuide = nullptr;
         // List l (1-4) holds up to 4^(l-1) entries per coarsest tile; the list after the finest level is the march list.
         bool layoutChanged = false;
         for (uint32_t i = 0; i < 2; ++i)

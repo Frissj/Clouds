@@ -33,6 +33,9 @@ g.addPass(createPass("HSTRCloud", {
     # 16x3 183, 8x2 203, 4x1 285, the per-pixel march 333. A brute-force stopgap until the tile test sees sub-tile detail.
     "beamTileSize": 4,
     "beamLevels": 1,
+    # Whole query rays: split segments each start at unit transmittance, so those behind opaque cloud march on to the view
+    # distance. Near view at 4K, 4x1: queries 201 -> 85 ms, total 293 -> 175 ms, display error 0.21 -> 0.16.
+    "beamSegments": 1,
     "beamTolerance": 0.05,
     "beamTemporal": True,
 }), "HSTRCloud")

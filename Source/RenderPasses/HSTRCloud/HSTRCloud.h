@@ -124,6 +124,8 @@ private:
     ref<ComputePass> mpBeamMarchPass;
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
+    ref<ComputePass> mpBeamGuidePass;
+    ref<Texture> mpBeamGuide; ///< Full-resolution beam guide: optical depth, distance and sun depth where it reaches one.
     ref<ComputePass> mpBeamTemporalTilePass;
     std::array<ref<Buffer>, 2> mpBeamLists;    ///< Refined tiles per level, this frame's and last frame's by parity.
     std::array<ref<Buffer>, 2> mpBeamCounts;   ///< Refined tile count per level, by parity.

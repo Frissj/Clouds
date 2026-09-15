@@ -196,6 +196,9 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint> hstrBeamPreviousCounts;
     Texture2D<uint> hstrBeamHistory;
     RWTexture2D<uint> hstrBeamHistoryOutput;
+    // Full-resolution beam guide (beamGuidePixel).
+    Texture2D<float4> hstrBeamGuide;
+    RWTexture2D<float4> hstrBeamGuideOutput;
     Texture2D<float4> hstrExactFrame;
 
     SamplerState hstrExtinctionSampler;
@@ -2532,6 +2535,83 @@ struct HSTRCloudRenderer
         return hi - lo;
     }
 
+    /// Guide features of the pixels around pixel-corner position q (the 2 x 2 pixels sharing it): transmittance, then log distance
+    /// and the sun attenuations exp(-tau) and exp(-b tau) where the optical depth reaches one, averaged over the pixels that reach it
+    /// (valid only if all of them do).
+    struct BeamGuideFeatures
+    {
+        float transmittance;
+        float3 front; ///< log distance, exp(-tau_sun), exp(-b tau_sun).
+        bool valid;
+    };
+
+    BeamGuideFeatures beamGuideFeatures(float4 guide)
+    {
+        BeamGuideFeatures f;
+        f.transmittance = exp(-guide.x);
+        f.valid = guide.y > 0.f;
+        const float b = max(params.worldCacheModulation, 0.f);
+        f.front = f.valid ? float3(log(guide.y), exp(-guide.z), exp(-b * guide.z)) : 0.f;
+        return f;
+    }
+
+    BeamGuideFeatures beamGuideCorner(uint2 q)
+    {
+        BeamGuideFeatures sum = {};
+        sum.valid = true;
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint2 pixel = min(uint2(max(int2(q) - 1 + int2(k & 1u, k >> 1), 0)), params.frameDim - 1u);
+            const BeamGuideFeatures f = beamGuideFeatures(hstrBeamGuide[pixel]);
+            sum.transmittance += 0.25f * f.transmittance;
+            sum.front += 0.25f * f.front;
+            sum.valid = sum.valid && f.valid;
+        }
+        return sum;
+    }
+
+    /// Guide test of one tile: the resolve's corner-and-centre basis fitted to the full-resolution guide must reproduce the guide at
+    /// every pixel of the tile, so detail between the tile's queries (edges, billow fronts, sun shadows) cannot pass unseen.
+    bool beamTileGuideFails(uint level, uint2 tile)
+    {
+        const uint s = beamTileEdge(level);
+        const uint2 origin = tile * s;
+        const BeamGuideFeatures c00 = beamGuideCorner(origin);
+        const BeamGuideFeatures c10 = beamGuideCorner(origin + uint2(s, 0));
+        const BeamGuideFeatures c01 = beamGuideCorner(origin + uint2(0, s));
+        const BeamGuideFeatures c11 = beamGuideCorner(origin + uint2(s, s));
+        const BeamGuideFeatures cc = beamGuideCorner(origin + s / 2);
+        const float4 t = float4(c00.transmittance, c10.transmittance, c01.transmittance, c11.transmittance);
+        const float tBubble = cc.transmittance - 0.25f * (t.x + t.y + t.z + t.w);
+        const bool frontValid = c00.valid && c10.valid && c01.valid && c11.valid && cc.valid;
+        const float3 frontBubble = cc.front - 0.25f * (c00.front + c10.front + c01.front + c11.front);
+        const float3 frontTolerance = float3(params.beamGuideDepth, params.beamGuideSun, params.beamGuideSun);
+        const uint2 last = min(origin + s, params.frameDim);
+        for (uint y = origin.y; y < last.y; ++y)
+            for (uint x = origin.x; x < last.x; ++x)
+            {
+                const float2 f = (float2(uint2(x, y) - origin) + 0.5f) / float(s);
+                const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
+                const BeamGuideFeatures p = beamGuideFeatures(hstrBeamGuide[uint2(x, y)]);
+                const float tPredicted = lerp(lerp(t.x, t.y, f.x), lerp(t.z, t.w, f.x), f.y) + tBubble * bubble;
+                if (params.beamEdgeContrast > 0.f && abs(p.transmittance - tPredicted) > params.beamEdgeContrast)
+                    return true;
+                if (frontValid != p.valid)
+                {
+                    // A pixel reaches optical depth one where the corners do not, or the other way round: an edge of the
+                    // opaque cloud, which matters only if the transmittance fit is off there too.
+                    continue;
+                }
+                if (!p.valid)
+                    continue;
+                const float3 frontPredicted = lerp(lerp(c00.front, c10.front, f.x), lerp(c01.front, c11.front, f.x), f.y) + frontBubble * bubble;
+                // Front deviations matter in proportion to the opacity in front of the transmitted background.
+                if (any(abs(p.front - frontPredicted) * (1.f - p.transmittance) > frontTolerance))
+                    return true;
+            }
+        return false;
+    }
+
     /// Surplus test of one tile: the centre as the bilinear corner basis predicts it, against the exact centre query, in
     /// log(1 + radiance); and the silhouette test of beamTransmittanceRange against beamEdgeContrast.
     bool beamTileRefines(uint level, uint2 tile)
@@ -2554,6 +2634,8 @@ struct HSTRCloudRenderer
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
         if (!refine && params.beamEdgeContrast > 0.f)
             refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
+        if (!refine && (params.beamGuide == 1 || (params.beamGuide == 2 && level + 1 < params.beamLevels)))
+            refine = beamTileGuideFails(level, tile);
         return refine;
     }
 
@@ -2737,6 +2819,54 @@ struct HSTRCloudRenderer
         const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
+    }
+
+    /// Full-resolution guide of one beam pixel from an extinction-only march (the stepping of marchSegment, no lighting): x the
+    /// optical depth of the whole ray, y the world distance at which it reaches one (0: never), z the sun optical depth there.
+    void beamGuidePixel(uint2 pixel)
+    {
+        if (any(pixel >= params.frameDim))
+            return;
+        float4 guide = 0.f;
+        CutRay ray;
+        if (makeCutRay(gScene.camera.data.posW, cameraRayDirection(float2(pixel) + 0.5f), gScene.getGridVolume(0), ray))
+        {
+            const float cellWidth = float(params.hstrCellWidth);
+            const float voxelsPerUnit = length(ray.direction) * cellWidth;
+            const float worldPerVoxel = ray.worldLength / max(voxelsPerUnit, 1e-6f);
+            const float minDepth = -log(kMinTransmittance);
+            float depth = 0.f;
+            float t = 0.f;
+            float fineVoxels = 1.f;
+            uint steps = 0;
+            [loop]
+            while (voxelsPerUnit > 1e-6f && t < 1.f && depth < minDepth && steps < params.maxMarchSteps)
+            {
+                const float3 v = (ray.position + t * ray.direction) * cellWidth;
+                const float majorant = majorantAt(v);
+                const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+                const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+                const float dt = min(stepVoxels / voxelsPerUnit, 1.f - t);
+                if (majorant > 0.f)
+                {
+                    const float3 midpoint = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
+                    const float stepDepth = cameraExtinctionAtVoxel(midpoint, rayFootprint(ray, t + 0.5f * dt), fineVoxels) * dt * ray.worldLength;
+                    if (depth < 1.f && depth + stepDepth >= 1.f)
+                    {
+                        // Where the optical depth crosses one, linearly within the step.
+                        const float s = t + dt * (1.f - depth) / max(stepDepth, 1e-6f);
+                        guide.y = ray.entryDistance + s * ray.worldLength;
+                        const float3 p = (ray.position + s * ray.direction) * cellWidth;
+                        guide.z = sunDepthAt(p, rayFootprint(ray, s));
+                    }
+                    depth += stepDepth;
+                }
+                t += dt;
+                ++steps;
+            }
+            guide.x = depth;
+        }
+        hstrBeamGuideOutput[pixel] = guide;
     }
 
     /// compareReferenceRow on compareBlock x compareBlock pixel means: one row of blocks. Averaging removes most of the
@@ -3001,6 +3131,12 @@ void testBeamTilesTemporal(uint3 dispatchThreadId: SV_DispatchThreadID)
 void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.resolveBeamPixel(dispatchThreadId.xy);
+}
+
+[numthreads(8, 8, 1)]
+void beamGuide(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.beamGuidePixel(dispatchThreadId.xy);
 }
 
 [numthreads(64, 1, 1)]

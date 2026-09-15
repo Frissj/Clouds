@@ -235,15 +235,15 @@ struct HSTRCloudParams
     uint compareBlock = 1; ///< Comparisons average compareBlock x compareBlock pixel blocks first (1: per pixel).
     float worldCacheModulation = 0.f;       ///< b of the cache's exp(-b tau_sun) voxel-resolution modulation (0: off); set per frame.
     float worldCacheModulationDepth = 8.f;  ///< Sun optical depth at which the modulation stops falling.
-    uint padHSTR26 = 0;
+    uint beamGuide = 0; ///< Beam tiles also tested against the full-resolution guide (beamTileGuideFails): 1 at every level, 2 above the finest.
 
     uint worldCacheZonalBands = 0;  ///< >0: the sun field's zonal part about the sun direction is windowed on its own and extended
                                     ///< by zonal bands 3 up to this (at most 8); 0: off.
     uint worldCacheZonalWindow = 0; ///< Window order of that zonal part (0: max(worldCacheZonalBands, 2)).
     uint worldCacheSunOrder = 2;    ///< 3: the sun field carries all of band 3 (7 extension slots) instead of zonal bands.
-    uint padHSTR27 = 0;
+    float beamGuideDepth = 0.05f; ///< Guide test: log deviation of the distance at which a pixel's optical depth reaches one.
 
-    uint padHSTR28 = 0;
+    float beamGuideSun = 0.05f; ///< Guide test: deviation of the sun attenuations exp(-tau) and exp(-b tau) at that distance.
     float sunNearVoxels = 0.f; ///< Camera samples march the sun optical depth exactly over this many voxels towards the sun, then
                                ///< read the voxel-centre field; 0: one-voxel midpoint step onto the field (enough for the
                                ///< adaptive march, which integrates the sun attenuation analytically).
