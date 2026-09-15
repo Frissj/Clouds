@@ -94,6 +94,8 @@ const char kSeaViewDistance[] = "seaViewDistance";
 const char kCloudLibrary[] = "cloudLibrary";
 const char kCloudProxyResolution[] = "cloudProxyResolution";
 const char kCloudBrickPoolMB[] = "cloudBrickPoolMB";
+const char kCloudPayloadPoolMB[] = "cloudPayloadPoolMB";
+const char kCloudDirectStorage[] = "cloudDirectStorage";
 const char kCloudBrickLoadsPerFrame[] = "cloudBrickLoadsPerFrame";
 const char kCloudSeaTiles[] = "cloudSeaTiles";
 const char kCloudSeaSeed[] = "cloudSeaSeed";
@@ -350,6 +352,10 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudProxyResolution = (std::clamp(uint32_t(value), 16u, 256u) + 15u) / 16u * 16u;
         else if (key == kCloudBrickPoolMB)
             mCloudBrickPoolMB = std::clamp(uint32_t(value), 16u, 8192u);
+        else if (key == kCloudPayloadPoolMB)
+            mCloudPayloadPoolMB = std::clamp(uint32_t(value), 8u, 4096u);
+        else if (key == kCloudDirectStorage)
+            mCloudDirectStorage = value;
         else if (key == kCloudBrickLoadsPerFrame)
             mCloudBrickLoadsPerFrame = std::clamp(uint32_t(value), 1u, 4096u);
         else if (key == kCloudSeaTiles)
@@ -540,6 +546,8 @@ Properties HSTRCloud::getProperties() const
     props[kCloudLibrary] = mCloudLibraryPath;
     props[kCloudProxyResolution] = mCloudProxyResolution;
     props[kCloudBrickPoolMB] = mCloudBrickPoolMB;
+    props[kCloudPayloadPoolMB] = mCloudPayloadPoolMB;
+    props[kCloudDirectStorage] = mCloudDirectStorage;
     props[kCloudBrickLoadsPerFrame] = mCloudBrickLoadsPerFrame;
     props[kCloudSeaTiles] = mCloudSeaTiles;
     props[kCloudSeaSeed] = mCloudSeaSeed;
@@ -563,6 +571,7 @@ Properties HSTRCloud::getProperties() const
         cloud["nodesUsed"] = stats.nodesUsed;
         cloud["pagesLoaded"] = stats.pagesLoaded;
         cloud["residentMB"] = stats.residentMB;
+        cloud["payloadMB"] = stats.payloadMB;
         cloud["cutMs"] = stats.cutMilliseconds;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         props[kCloudStats] = cloud;
@@ -680,6 +689,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamMarchPass = createPass("marchBeamPixels");
     mpCommitCloudPass = createPass("commitCloudBricks");
+    mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
@@ -1121,6 +1131,7 @@ void HSTRCloud::buildCloudDomain()
         mpCloudResidency.reset();
         mpCloudSea.reset();
         hstrcloud::CloudLibrary library = timed("cloud library", [&] { return hstrcloud::loadCloudLibrary(mCloudLibraryPath); });
+        mCloudLibraryFiles = library.files;
         hstrcloud::CloudSeaDesc seaDesc;
         // The scene's grid volume is only the carrier: its bounds give one tile's footprint and the cloud layer.
         seaDesc.origin = bounds.minPoint;
@@ -1136,18 +1147,22 @@ void HSTRCloud::buildCloudDomain()
         mCloudInstancesUploaded = false;
         mCloudMeanBlocks.clear();
     }
-    const std::string residencyKey = fmt::format("{}|{}|{}|{}", mCloudBrickPoolMB, mCloudBrickLoadsPerFrame, mCloudLodPixels, mCloudFadeFrames);
+    const std::string residencyKey = fmt::format(
+        "{}|{}|{}|{}|{}|{}", mCloudBrickPoolMB, mCloudBrickLoadsPerFrame, mCloudLodPixels, mCloudFadeFrames, mCloudPayloadPoolMB, mCloudDirectStorage
+    );
     if (!mCloudVirtual)
         mpCloudResidency.reset();
     else if (!mpCloudResidency || residencyKey != mCloudResidencyKey)
     {
         mpCloudResidency.reset();
         hstrcloud::CloudResidencyDesc residencyDesc;
-        residencyDesc.library = mCloudLibraryPath;
+        residencyDesc.files = mCloudLibraryFiles;
         residencyDesc.poolMB = mCloudBrickPoolMB;
         residencyDesc.loadsPerFrame = mCloudBrickLoadsPerFrame;
         residencyDesc.lodPixels = mCloudLodPixels;
         residencyDesc.fadeFrames = mCloudFadeFrames;
+        residencyDesc.payloadPoolMB = mCloudPayloadPoolMB;
+        residencyDesc.directStorage = mCloudDirectStorage;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mCloudResidencyKey = residencyKey;
         mCloudInstancesUploaded = false;
@@ -1436,10 +1451,15 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         FALCOR_PROFILE(pRenderContext, "residency");
         densityChanged = mpCloudResidency->update(*mpCloudSea, view, changed);
     }
-    // One reconstruction dispatch per level, coarsest first: every brick predicts from a parent already in the atlas.
+    // The staged bricks' residuals decode from the payload pool in one dispatch; then one reconstruction dispatch per level,
+    // coarsest first: every brick predicts from a parent already in the atlas.
     if (!mpCloudResidency->getCommitGroups().empty())
     {
         FALCOR_PROFILE(pRenderContext, "commitBricks");
+        mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
+        bindRenderer(pRenderContext, mpDecodeCloudPass);
+        mpDecodeCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
+        mParams.cloudStagedCount = 0;
         for (const auto& group : mpCloudResidency->getCommitGroups())
         {
             mParams.cloudCommitOffset = group.offset;

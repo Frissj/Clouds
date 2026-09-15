@@ -185,6 +185,19 @@ if(NOT SETUP_CONFIGURATION_TYPES)
     endif()
 endif()
 
+# Some CMake and MSVC combinations (packman's CMake 3.24 with MSVC 19.5x) leave the per-configuration flags empty, which builds
+# Release without optimisation. Restore CMake's usual MSVC defaults when that happens.
+if(MSVC)
+    foreach(lang C CXX)
+        if(NOT CMAKE_${lang}_FLAGS_RELEASE MATCHES "/O[12x]")
+            set(CMAKE_${lang}_FLAGS_RELEASE "/O2 /Ob2 /DNDEBUG" CACHE STRING "Flags used by the compiler during release builds." FORCE)
+        endif()
+        if(NOT CMAKE_${lang}_FLAGS_DEBUG MATCHES "/Od")
+            set(CMAKE_${lang}_FLAGS_DEBUG "/Ob0 /Od /RTC1" CACHE STRING "Flags used by the compiler during debug builds." FORCE)
+        endif()
+    endforeach()
+endif()
+
 set(FALCOR_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(FALCOR_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 

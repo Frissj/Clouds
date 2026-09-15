@@ -17,7 +17,6 @@ namespace
 constexpr uint32_t kAtlasBricksXY = 64; ///< Atlas bricks per X and Y axis (getAtlasShift).
 constexpr uint32_t kNodeBlock = 256;
 constexpr uint32_t kBrickBlock = 4096;
-constexpr uint32_t kStagingWords = kCoreValues / 4;
 
 uint64_t recordKey(uint32_t level, uint32_t coord)
 {
@@ -52,6 +51,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mNodeBlocksDirty.assign((nodeCapacity + kNodeBlock - 1) / kNodeBlock, 0);
     mBrickBlocksDirty.assign((brickCapacity + kBrickBlock - 1) / kBrickBlock, 0);
 
+    mpPayload = std::make_unique<CloudPayloadPool>(mpDevice, mDesc.files, mDesc.payloadPoolMB, mDesc.directStorage);
     std::vector<HSTRCloudAsset> gpuAssets;
     for (uint32_t a = 0; a < assets.size(); ++a)
     {
@@ -64,10 +64,16 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         state.chunkStores.assign(chunkCount, kNone);
         state.chunkBrick.assign(chunkCount, kNoHandle);
         mAssets.push_back(std::move(state));
+        // The coarse pages are always resident; their payloads upload once.
         DecodedPage coarse;
-        if (!decodePage(asset.coarsePage, coarse))
+        if (!decodeMeta(asset.coarseMeta, uint32_t(asset.coarsePayload.size()), coarse))
             FALCOR_THROW("HSTRCloud: corrupt coarse page of cloud '{}'.", asset.name);
-        const uint32_t store = createStore(StoreKind::Coarse, a, kNone, std::move(coarse), kNoHandle);
+        const uint32_t payloadBytes = uint32_t(asset.coarsePayload.size());
+        const uint32_t payloadWord = payloadBytes > 0 ? mpPayload->allocate(payloadBytes) : CloudPayloadPool::kNone;
+        if (payloadBytes > 0 && payloadWord == CloudPayloadPool::kNone)
+            FALCOR_THROW("HSTRCloud: the {} MB cloud payload pool cannot hold the coarse pages.", mDesc.payloadPoolMB);
+        mpPayload->upload(payloadWord, asset.coarsePayload);
+        const uint32_t store = createStore(StoreKind::Coarse, a, kNone, std::move(coarse), kNoHandle, payloadWord, payloadBytes);
         mAssets[a].coarseStore = store;
         for (uint32_t i = 0; i < mStores[store]->bricks.size(); ++i)
         {
@@ -113,9 +119,10 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
-    mStaging.assign(size_t(mDesc.loadsPerFrame) * kStagingWords, 0);
     mStagingInfo.resize(mDesc.loadsPerFrame);
-    mpStaging = mpDevice->createStructuredBuffer(sizeof(uint32_t), uint32_t(mStaging.size()), shaderResource, MemoryType::DeviceLocal, nullptr, false);
+    mpResiduals = mpDevice->createStructuredBuffer(
+        sizeof(float), mDesc.loadsPerFrame * kCoreValues, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+    );
     mpStagingInfo = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudStaging), uint32_t(mStagingInfo.size()), shaderResource, MemoryType::DeviceLocal, nullptr, false
     );
@@ -142,7 +149,15 @@ CloudResidency::~CloudResidency()
         thread.join();
 }
 
-uint32_t CloudResidency::createStore(StoreKind kind, uint32_t asset, uint32_t chunk, DecodedPage page, uint64_t parentHandle)
+uint32_t CloudResidency::createStore(
+    StoreKind kind,
+    uint32_t asset,
+    uint32_t chunk,
+    DecodedPage page,
+    uint64_t parentHandle,
+    uint32_t payloadWord,
+    uint32_t payloadBytes
+)
 {
     uint32_t index;
     if (!mFreeStores.empty())
@@ -163,7 +178,8 @@ uint32_t CloudResidency::createStore(StoreKind kind, uint32_t asset, uint32_t ch
     store.chunk = chunk;
     store.generation = generation;
     store.lastUsedFrame = mFrame;
-    store.payload = std::move(page.payload);
+    store.payloadWord = payloadWord;
+    store.payloadBytes = payloadBytes;
     store.pages = std::move(page.pages);
     store.pageStores.assign(store.pages.size(), kNone);
     std::unordered_map<uint64_t, uint32_t> lookup;
@@ -220,6 +236,7 @@ void CloudResidency::releaseStore(uint32_t index)
         mAssets[store.asset].chunkStores[store.chunk] = kNone;
     else if (store.kind == StoreKind::Page && store.parentStore != kNone)
         mStores[store.parentStore]->pageStores[store.parentPage] = kNone;
+    mpPayload->free(store.payloadWord, store.payloadBytes);
     const uint32_t generation = store.generation;
     mStores[index] = std::make_unique<Store>();
     mStores[index]->generation = generation;
@@ -228,7 +245,7 @@ void CloudResidency::releaseStore(uint32_t index)
 
 void CloudResidency::ioWorker()
 {
-    std::ifstream file(mDesc.library, std::ios::binary);
+    std::vector<std::ifstream> files(mDesc.files.size());
     std::vector<uint8_t> raw;
     for (;;)
     {
@@ -245,7 +262,23 @@ void CloudResidency::ioWorker()
         }
         Completion completion;
         completion.request = request;
-        completion.ok = readBlob(file, request.blob, raw) && decodePage(raw, completion.page);
+        // The meta decompresses here; the payload loads with DirectStorage into its pool range, or decompresses here to upload.
+        const BlobRef& payload = request.blobs.payload;
+        const uint32_t fileIndex = mAssetRecords[request.asset]->file;
+        std::ifstream& file = files[fileIndex];
+        if (!file.is_open())
+            file.open(mDesc.files[fileIndex], std::ios::binary);
+        completion.ok = readBlob(file, request.blobs.meta, raw) && decodeMeta(raw, payload.raw, completion.page);
+        if (completion.ok && payload.raw > 0)
+        {
+            if (mpPayload->isDirect())
+            {
+                completion.ticket = mpPayload->beginLoad(fileIndex, payload, request.payloadWord);
+                completion.ok = completion.ticket != CloudPayloadPool::kNone;
+            }
+            else
+                completion.ok = readBlob(file, payload, completion.payload);
+        }
         std::lock_guard lock(mIoMutex);
         mCompletions.push_back(std::move(completion));
         --mInFlight;
@@ -254,6 +287,7 @@ void CloudResidency::ioWorker()
 
 void CloudResidency::resetPending(const Request& request)
 {
+    mpPayload->free(request.payloadWord, request.blobs.payload.raw);
     if (request.page == kNone)
     {
         uint32_t& store = mAssets[request.asset].chunkStores[request.chunk];
@@ -280,14 +314,27 @@ void CloudResidency::enqueue(std::vector<Request> requests)
     std::sort(requests.begin(), requests.end(), [](const Request& a, const Request& b) { return a.priority > b.priority; });
     if (requests.size() > capacity)
         requests.resize(capacity);
-    for (const Request& request : requests)
+    std::vector<Request> accepted;
+    accepted.reserve(requests.size());
+    for (Request& request : requests)
     {
+        // The payload's pool range is reserved now, so loading can write it; a full pool releases unused stores.
+        if (request.blobs.payload.raw > 0)
+        {
+            request.payloadWord = mpPayload->allocate(request.blobs.payload.raw);
+            if (request.payloadWord == CloudPayloadPool::kNone)
+            {
+                mReleaseStores = true;
+                continue;
+            }
+        }
         if (request.page == kNone)
             mAssets[request.asset].chunkStores[request.chunk] = kPendingStore;
         else
             mStores[request.store]->pageStores[request.page] = kPendingStore;
+        accepted.push_back(request);
     }
-    mQueue = std::move(requests);
+    mQueue = std::move(accepted);
     std::make_heap(mQueue.begin(), mQueue.end());
     mIoWake.notify_all();
 }
@@ -407,44 +454,77 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         std::vector<Completion> completions;
         {
             std::lock_guard lock(mIoMutex);
-            completions.swap(mCompletions);
+            for (Completion& completion : mCompletions)
+                mWaiting.push_back(std::move(completion));
+            mCompletions.clear();
+        }
+        // Pages whose payload is in GPU memory (DirectStorage finished, or uploaded now) are ready.
+        for (size_t i = 0; i < mWaiting.size();)
+        {
+            Completion& completion = mWaiting[i];
+            if (completion.ticket != CloudPayloadPool::kNone)
+            {
+                const int state = mpPayload->pollLoad(completion.ticket);
+                if (state == 0)
+                {
+                    ++i;
+                    continue;
+                }
+                completion.ticket = CloudPayloadPool::kNone;
+                completion.ok &= state > 0;
+            }
+            else if (completion.ok)
+                mpPayload->upload(completion.request.payloadWord, completion.payload);
+            completions.push_back(std::move(completion));
+            mWaiting[i] = std::move(mWaiting.back());
+            mWaiting.pop_back();
         }
         for (Completion& completion : completions)
         {
             const Request& request = completion.request;
+            const uint32_t payloadBytes = request.blobs.payload.raw;
+            bool stored = false;
             if (request.page == kNone)
             {
                 uint32_t& chunkStore = mAssets[request.asset].chunkStores[request.chunk];
-                if (chunkStore != kPendingStore)
-                    continue;
-                chunkStore = kNone;
-                if (completion.ok)
+                if (chunkStore == kPendingStore)
                 {
-                    const uint32_t store =
-                        createStore(StoreKind::Chunk, request.asset, request.chunk, std::move(completion.page), mAssets[request.asset].chunkBrick[request.chunk]);
-                    mAssets[request.asset].chunkStores[request.chunk] = store;
+                    chunkStore = kNone;
+                    if (completion.ok)
+                    {
+                        const uint32_t store = createStore(
+                            StoreKind::Chunk, request.asset, request.chunk, std::move(completion.page), mAssets[request.asset].chunkBrick[request.chunk],
+                            request.payloadWord, payloadBytes
+                        );
+                        mAssets[request.asset].chunkStores[request.chunk] = store;
+                        stored = true;
+                    }
                 }
-                continue;
             }
-            if (request.store >= mStores.size() || mStores[request.store]->generation != request.generation ||
-                mStores[request.store]->pageStores[request.page] != kPendingStore)
-                continue;
-            mStores[request.store]->pageStores[request.page] = kNone;
-            if (!completion.ok)
-                continue;
-            // The level-2 brick's parent: the level-3 brick above it in the chunk store.
-            Store& chunkStore = *mStores[request.store];
-            const uint3 parentCoord = BrickHeader{chunkStore.pages[request.page].coord}.brick() / 2u;
-            uint64_t parent = kNoHandle;
-            for (uint32_t i = 0; i < chunkStore.bricks.size(); ++i)
-                if (all(chunkStore.bricks[i].record.brick() == parentCoord))
-                    parent = makeHandle(request.store, i);
-            if (parent == kNoHandle)
-                continue;
-            const uint32_t store = createStore(StoreKind::Page, request.asset, request.chunk, std::move(completion.page), parent);
-            mStores[store]->parentStore = request.store;
-            mStores[store]->parentPage = request.page;
-            mStores[request.store]->pageStores[request.page] = store;
+            else if (request.store < mStores.size() && mStores[request.store]->generation == request.generation &&
+                     mStores[request.store]->pageStores[request.page] == kPendingStore)
+            {
+                mStores[request.store]->pageStores[request.page] = kNone;
+                // The level-2 brick's parent: the level-3 brick above it in the chunk store.
+                Store& chunkStore = *mStores[request.store];
+                const uint3 parentCoord = BrickHeader{chunkStore.pages[request.page].coord}.brick() / 2u;
+                uint64_t parent = kNoHandle;
+                for (uint32_t b = 0; b < chunkStore.bricks.size(); ++b)
+                    if (all(chunkStore.bricks[b].record.brick() == parentCoord))
+                        parent = makeHandle(request.store, b);
+                if (completion.ok && parent != kNoHandle)
+                {
+                    const uint32_t store = createStore(
+                        StoreKind::Page, request.asset, request.chunk, std::move(completion.page), parent, request.payloadWord, payloadBytes
+                    );
+                    mStores[store]->parentStore = request.store;
+                    mStores[store]->parentPage = request.page;
+                    mStores[request.store]->pageStores[request.page] = store;
+                    stored = true;
+                }
+            }
+            if (!stored)
+                mpPayload->free(request.payloadWord, payloadBytes);
         }
     }
 
@@ -531,7 +611,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                 continue;
             const uint32_t chunk = asset.chunkIndex(b.record.brick());
             const uint32_t chunkStore = mAssets[store.asset].chunkStores[chunk];
-            if (asset.chunks[chunk].compressed == 0)
+            if (asset.chunks[chunk].meta.raw == 0)
                 continue;
             if (chunkStore == kNone || chunkStore == kPendingStore)
             {
@@ -539,7 +619,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                 request.priority = entry.priority + 1.f; // Pages precede the bricks they unlock.
                 request.asset = store.asset;
                 request.chunk = chunk;
-                request.blob = asset.chunks[chunk];
+                request.blobs = asset.chunks[chunk];
                 requests.push_back(request);
                 continue;
             }
@@ -562,7 +642,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                     request.store = storeIndex;
                     request.generation = store.generation;
                     request.page = page;
-                    request.blob = store.pages[page].blob;
+                    request.blobs = store.pages[page].blobs;
                     requests.push_back(request);
                     continue;
                 }
@@ -616,19 +696,16 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         std::stable_sort(
             order.begin(), order.end(), [&](uint32_t a, uint32_t c) { return brick(mStaged[a]).record.level > brick(mStaged[c]).record.level; }
         );
-        std::vector<uint32_t> words(mStaged.size() * kStagingWords);
         std::vector<HSTRCloudStaging> infos(mStaged.size());
         mCommitGroups.clear();
         for (uint32_t i = 0; i < order.size(); ++i)
         {
-            std::copy_n(mStaging.begin() + size_t(order[i]) * kStagingWords, kStagingWords, words.begin() + size_t(i) * kStagingWords);
             infos[i] = mStagingInfo[order[i]];
             const uint32_t level = brick(mStaged[order[i]]).record.level;
             if (i == 0 || level != brick(mStaged[order[i - 1]]).record.level)
                 mCommitGroups.push_back({i, 0});
             ++mCommitGroups.back().count;
         }
-        std::copy(words.begin(), words.end(), mStaging.begin());
         std::copy(infos.begin(), infos.end(), mStagingInfo.begin());
     }
 
@@ -669,13 +746,16 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mMappedList.pop_back();
     }
 
-    // Page and chunk stores nothing has used for a while are released (pages before their chunks).
-    if (mFrame % 60 == 0)
+    // Page and chunk stores nothing has used for a while are released (pages before their chunks); at once when the payload pool
+    // filled, down to those used this frame.
+    const bool releaseNow = mReleaseStores;
+    mReleaseStores = false;
+    if (mFrame % 60 == 0 || releaseNow)
         for (StoreKind kind : {StoreKind::Page, StoreKind::Chunk})
             for (uint32_t s = 0; s < mStores.size(); ++s)
             {
                 Store& store = *mStores[s];
-                if (store.kind != kind || store.bricks.empty() || store.loaded > 0 || store.lastUsedFrame + 120 > mFrame)
+                if (store.kind != kind || store.bricks.empty() || store.loaded > 0 || store.lastUsedFrame + (releaseNow ? 1 : 120) > mFrame)
                     continue;
                 bool busy = false;
                 for (const Brick& b : store.bricks)
@@ -698,8 +778,9 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         waiting += (brick(handle).flags & kLoaded) ? 0 : 1;
     {
         std::lock_guard lock(mIoMutex);
-        mStats.pending = uint32_t(mQueue.size() + mCompletions.size()) + mInFlight + waiting;
+        mStats.pending = uint32_t(mQueue.size() + mCompletions.size() + mWaiting.size()) + mInFlight + waiting;
     }
+    mStats.payloadMB = double(mpPayload->getUsedBytes()) / (1024.0 * 1024.0);
     mStats.nodesUsed = uint32_t(mNodes.size() / 64 - mFreeNodes.size());
     mStats.pagesLoaded = 0;
     for (const auto& store : mStores)
@@ -740,21 +821,15 @@ bool CloudResidency::commit(uint64_t handle)
     info.slot = b.slot;
     info.parentSlot = parent ? parent->slot : kCloudRefNone;
     info.parity = parity.x | (parity.y << 1) | (parity.z << 2);
-    info.bits = predicted ? 0u : b.record.bits;
-    info.residualMin = predicted ? 0.f : b.record.residualMin;
-    info.residualStep = predicted ? 0.f : b.record.residualStep;
+    // The coefficients are already in the payload pool; decodeCloudResiduals reads them from there.
+    info.coded = !predicted && b.record.payloadBytes > 0 && store.payloadWord != kNone ? 1u : 0u;
+    info.step = b.record.step;
+    info.payloadWord = info.coded ? store.payloadWord + b.record.payloadOffset / 4 : 0u;
+    info.transform = b.record.transform;
     info.parentMin = parent ? parent->record.valueMin : 0.f;
     info.parentRange = parent ? parent->record.valueRange : 0.f;
     info.valueMin = b.record.valueMin;
     info.valueRange = b.record.valueRange;
-    uint32_t* words = &mStaging[size_t(n) * kStagingWords];
-    std::fill_n(words, kStagingWords, 0u);
-    if (info.bits > 0)
-    {
-        const uint8_t* payload = store.payload.data() + b.record.payloadOffset;
-        for (uint32_t i = 0; i < kCoreValues; ++i)
-            words[i / 4] |= residualCode(payload, info.bits, i) << (8 * (i % 4));
-    }
 
     b.flags |= kLoaded;
     if (parent)
@@ -1054,10 +1129,7 @@ void CloudResidency::upload()
         mBrickBlocksDirty[block] = 0;
     }
     if (!mStaged.empty())
-    {
-        mpStaging->setBlob(mStaging.data(), 0, mStaged.size() * kStagingWords * sizeof(uint32_t));
         mpStagingInfo->setBlob(mStagingInfo.data(), 0, mStaged.size() * sizeof(HSTRCloudStaging));
-    }
 }
 
 void CloudResidency::bind(const ShaderVar& var) const
@@ -1068,7 +1140,8 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudNodes"] = mpNodes;
     var["hstrCloudBricks"] = mpBricks;
     var["hstrCloudAtlas"] = mpAtlas;
-    var["hstrCloudStaging"] = mpStaging;
+    var["hstrCloudPayload"] = mpPayload->getBuffer();
+    var["hstrCloudResiduals"] = mpResiduals;
     var["hstrCloudStagingInfo"] = mpStagingInfo;
 }
 } // namespace hstrcloud

@@ -12,6 +12,9 @@
 /external/packman/
 /tools/.packman/
 
+# Dependencies downloaded at configure time.
+/external/directstorage-*/
+
 # IDE folders.
 /.vs/
 /.vscode/

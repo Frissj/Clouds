@@ -530,3 +530,50 @@ endif()
 set(RTXDI_DIR ${PACKMAN_DIR}/rtxdi)
 add_library(rtxdi INTERFACE)
 target_include_directories(rtxdi INTERFACE ${RTXDI_DIR}/rtxdi-sdk/include)
+
+# -----------------------------------------------------------------------------
+# Downloaded dependencies
+# -----------------------------------------------------------------------------
+
+# DirectStorage: GDeflate compression, and GPU decompression (RTX IO on NVIDIA GPUs) with a CPU fallback. Not in packman: the NuGet
+# package is downloaded from nuget.org on the first configure, checked against its hash, and extracted into external/.
+if(FALCOR_WINDOWS)
+    set(DIRECTSTORAGE_VERSION 1.3.0)
+    set(DIRECTSTORAGE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/directstorage-${DIRECTSTORAGE_VERSION})
+    if(NOT EXISTS ${DIRECTSTORAGE_DIR}/native/include/dstorage.h)
+        message(STATUS "Downloading DirectStorage ${DIRECTSTORAGE_VERSION} from nuget.org ...")
+        set(DIRECTSTORAGE_PACKAGE ${CMAKE_CURRENT_BINARY_DIR}/directstorage-${DIRECTSTORAGE_VERSION}.zip)
+        file(DOWNLOAD
+            https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/${DIRECTSTORAGE_VERSION}/microsoft.direct3d.directstorage.${DIRECTSTORAGE_VERSION}.nupkg
+            ${DIRECTSTORAGE_PACKAGE}
+            EXPECTED_HASH SHA256=8ab6c1082537565388b79050d94fdd7f5f437cd0f1d909e7b19f786042b97177
+            STATUS DIRECTSTORAGE_STATUS
+        )
+        list(GET DIRECTSTORAGE_STATUS 0 DIRECTSTORAGE_CODE)
+        if(DIRECTSTORAGE_CODE EQUAL 0)
+            file(ARCHIVE_EXTRACT INPUT ${DIRECTSTORAGE_PACKAGE} DESTINATION ${DIRECTSTORAGE_DIR})
+        else()
+            message(WARNING "DirectStorage download failed (${DIRECTSTORAGE_STATUS}); cloud libraries need it.")
+        endif()
+    endif()
+    if(EXISTS ${DIRECTSTORAGE_DIR}/native/include/dstorage.h)
+        add_library(directstorage SHARED IMPORTED GLOBAL)
+        set_target_properties(directstorage PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES ${DIRECTSTORAGE_DIR}/native/include
+            IMPORTED_IMPLIB ${DIRECTSTORAGE_DIR}/native/lib/x64/dstorage.lib
+            IMPORTED_LOCATION ${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll
+        )
+        # dstorage.dll loads dstoragecore.dll from its own directory: both are copied next to the executables.
+        add_custom_target(deploy_directstorage ALL
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${FALCOR_OUTPUT_DIRECTORY}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DIRECTSTORAGE_DIR}/native/bin/x64/dstorage.dll
+                ${DIRECTSTORAGE_DIR}/native/bin/x64/dstoragecore.dll ${FALCOR_OUTPUT_DIRECTORY}
+        )
+        set_target_properties(deploy_directstorage PROPERTIES FOLDER "Misc")
+        set(FALCOR_HAS_DIRECTSTORAGE ON PARENT_SCOPE)
+    else()
+        set(FALCOR_HAS_DIRECTSTORAGE OFF PARENT_SCOPE)
+    endif()
+else()
+    set(FALCOR_HAS_DIRECTSTORAGE OFF PARENT_SCOPE)
+endif()

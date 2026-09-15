@@ -188,9 +188,12 @@ private:
     float3 mVoxelSize = float3(0.f);
     std::vector<float> mLeafDensity;
     // Cloud sea: an endless procedural layer of library clouds (CloudSea) with virtualized fine density (CloudResidency).
-    std::string mCloudLibraryPath;
+    std::string mCloudLibraryPath; ///< A cloud package, or a directory of them.
+    std::vector<std::filesystem::path> mCloudLibraryFiles;
     uint32_t mCloudProxyResolution = 64; ///< Domain voxels per sea tile edge.
     uint32_t mCloudBrickPoolMB = 256;
+    uint32_t mCloudPayloadPoolMB = 128; ///< GPU memory of the packed coefficients of resident pages.
+    bool mCloudDirectStorage = true;    ///< Load page payloads with DirectStorage (GPU GDeflate, RTX IO); false: CPU decompression.
     uint32_t mCloudBrickLoadsPerFrame = 1024;
     uint32_t mCloudSeaTiles = 8;
     uint32_t mCloudSeaSeed = 1;
@@ -216,6 +219,7 @@ private:
     ref<Buffer> mpCloudTileBatches;
     ref<Buffer> mpCloudTileReset;
     ref<ComputePass> mpCommitCloudPass;
+    ref<ComputePass> mpDecodeCloudPass;
     ref<ComputePass> mpClearWorldCacheTilesPass;
     ref<Sampler> mpLinearClampSampler;
     uint32_t mSamplerSeaMode = ~0u;

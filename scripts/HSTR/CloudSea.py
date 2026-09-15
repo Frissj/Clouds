@@ -3,11 +3,12 @@ from pathlib import Path
 from falcor import *
 
 # Interactive cloud sea: an endless procedural layer of a compiled cloud library, rendered through the beam view with fine density
-# paged in around the camera. The package is compiled offline from the VDBs, once into canonical caches, then packed:
+# paged in around the camera. The clouds are compiled offline from the VDBs, once into canonical caches, then packed one file per
+# cloud into a library directory (--quality picks each cloud's compression; --budget-mb N fits a total instead):
 #   HSTRCloudCompiler.exe build <clouds_hr/vdb> <clouds_hr/cache>
-#   HSTRCloudCompiler.exe pack <clouds_hr/cache> <clouds_hr/clouds_1gb.hstrlib> --budget-mb 1000
-# Environment overrides: HSTR_CLOUD_LIBRARY (the .hstrlib), HSTR_CLOUD_POOL_MB, HSTR_CLOUD_LOADS, HSTR_SEA_TILES.
-library = Path(os.environ.get("HSTR_CLOUD_LIBRARY", str(Path.home() / "Downloads" / "clouds_hr" / "clouds_1gb.hstrlib")))
+#   HSTRCloudCompiler.exe pack <clouds_hr/cache> <clouds_hr/library>
+# Environment overrides: HSTR_CLOUD_LIBRARY (a library directory or one .hstrlib), HSTR_CLOUD_POOL_MB, HSTR_CLOUD_LOADS, HSTR_SEA_TILES.
+library = Path(os.environ.get("HSTR_CLOUD_LIBRARY", str(Path.home() / "Downloads" / "clouds_hr" / "library")))
 tiles = int(os.environ.get("HSTR_SEA_TILES", "8"))
 
 g = RenderGraph("CloudSea")

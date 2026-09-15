@@ -6,7 +6,7 @@ from falcor import *
 # Cloud codec A/B: the same views rendered from several compilations of the same clouds. The first library is the baseline:
 # its path-traced reference is accumulated (and saved), then every library's beam render is measured against that one
 # reference, so the difference between libraries is the image cost of their compression alone.
-#   HSTR_LIBRARIES   comma-separated .hstrlib paths, baseline (near-lossless) first
+#   HSTR_LIBRARIES   comma-separated library directories (or .hstrlib packages), baseline (near-lossless) first
 #   HSTR_VIEWS       JSON list of [name, [px, py, pz], [tx, ty, tz]]
 #   HSTR_SPP, HSTR_W, HSTR_H, HSTR_TAG, HSTR_LIBRARY_COUNT (first n libraries only), HSTR_PROPS
 OUT = "C:/Users/Friss/Documents/HSTR_results"
@@ -76,7 +76,7 @@ def measure(block):
 for name, position, target in views:
     reference = f"{OUT}/references/{TAG}_{name}_{W}x{H}"
     for index, library in enumerate(libraries):
-        label = os.path.splitext(os.path.basename(library))[0]
+        label = os.path.basename(library) if os.path.isdir(library) else os.path.splitext(os.path.basename(library))[0]
         if hstr.properties["cloudLibrary"] != library:
             hstr.set_properties({"cloudLibrary": library})
         cam.position = float3(*position)

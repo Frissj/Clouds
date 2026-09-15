@@ -141,7 +141,8 @@ struct HSTRCloudRenderer
     StructuredBuffer<HSTRCloudBrick> hstrCloudBricks;
     Texture3D<float> hstrCloudAtlas;
     RWTexture3D<unorm float> hstrCloudAtlasOutput;
-    StructuredBuffer<uint> hstrCloudStaging;                 ///< 512 residual codes (4 per word) per staged brick.
+    StructuredBuffer<uint> hstrCloudPayload;                 ///< Packed coefficients of resident pages (DirectStorage writes them).
+    RWStructuredBuffer<float> hstrCloudResiduals;            ///< Decoded residuals, 512 per staged brick (decodeCloudResiduals).
     StructuredBuffer<HSTRCloudStaging> hstrCloudStagingInfo;
     StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
     StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
@@ -3208,20 +3209,94 @@ void commitCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
         }
     }
     float residual = 0.f;
-    if (all(texel >= 1u) && all(texel <= 8u))
+    if (info.coded != 0 && all(texel >= 1u) && all(texel <= 8u))
     {
-        residual = info.residualMin;
-        if (info.bits > 0)
-        {
-            const uint3 core = texel - 1u;
-            const uint value = core.x + 8u * (core.y + 8u * core.z);
-            const uint code = (gHSTRCloud.hstrCloudStaging[staged * 128u + value / 4u] >> (8u * (value % 4u))) & 255u;
-            residual += info.residualStep * float(code);
-        }
+        const uint3 core = texel - 1u;
+        residual = gHSTRCloud.hstrCloudResiduals[staged * 512u + core.x + 8u * (core.y + 8u * core.z)];
     }
     const float density = max(0.f, prediction + residual);
     const float t = info.valueRange > 0.f ? sqrt(saturate((density - info.valueMin) / info.valueRange)) : 0.f;
     gHSTRCloud.hstrCloudAtlasOutput[cloudSlotOrigin(info.slot, params.cloudAtlasShift) + texel] = t;
+}
+
+/// Byte k of the packed coefficients starting at payload word p.
+uint cloudPayloadByte(uint p, uint k)
+{
+    return (gHSTRCloud.hstrCloudPayload[p + (k >> 2)] >> (8u * (k & 3u))) & 255u;
+}
+
+/// Inverse orthonormal Haar step of residual values base + offset + k * stride, k < n (haarStepInverse in CloudFormat.h).
+void cloudHaarStepInverse(uint base, uint offset, uint stride, uint n)
+{
+    float temp[8];
+    const float s = 0.70710678f;
+    for (uint k = 0; k < n / 2; ++k)
+    {
+        const float a = gHSTRCloud.hstrCloudResiduals[base + offset + k * stride];
+        const float d = gHSTRCloud.hstrCloudResiduals[base + offset + (n / 2 + k) * stride];
+        temp[2 * k] = (a + d) * s;
+        temp[2 * k + 1] = (a - d) * s;
+    }
+    for (uint k = 0; k < n; ++k)
+        gHSTRCloud.hstrCloudResiduals[base + offset + k * stride] = temp[k];
+}
+
+/// Decodes the residual of every staged brick into hstrCloudResiduals (512 per staged brick) before the level dispatches of
+/// commitCloudBricks: the packed coefficients (packCoefficients in CloudFormat.h: significance bitmap, zigzag varints in scan
+/// order) dequantised by the brick's step, then the inverse transform (haarInverse). One thread per brick.
+[numthreads(16, 1, 1)]
+void decodeCloudResiduals(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint staged = dispatchThreadId.x;
+    if (staged >= gHSTRCloud.params.cloudStagedCount)
+        return;
+    const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[staged];
+    if (info.coded == 0)
+        return;
+    const uint base = staged * 512u;
+    const uint p = info.payloadWord;
+    const uint lo[4] = { 0, 1, 2, 4 };
+    const uint hi[4] = { 1, 2, 4, 8 };
+    uint s = 0;
+    uint k = 64;
+    for (uint band = 0; band < 4; ++band)
+        for (uint z = 0; z < hi[band]; ++z)
+            for (uint y = 0; y < hi[band]; ++y)
+                for (uint x = 0; x < hi[band]; ++x)
+                {
+                    if (max(x, max(y, z)) < lo[band])
+                        continue;
+                    float value = 0.f;
+                    if ((cloudPayloadByte(p, s / 8u) & (1u << (s % 8u))) != 0)
+                    {
+                        uint u = 0;
+                        for (uint shift = 0; shift < 35; shift += 7)
+                        {
+                            const uint byte = cloudPayloadByte(p, k++);
+                            u |= (byte & 0x7Fu) << shift;
+                            if ((byte & 0x80u) == 0)
+                                break;
+                        }
+                        const int q = int(u >> 1) ^ -int(u & 1u);
+                        value = float(q) * info.step;
+                    }
+                    gHSTRCloud.hstrCloudResiduals[base + x + 8u * (y + 8u * z)] = value;
+                    ++s;
+                }
+    if (info.transform != kCloudTransformHaar)
+        return;
+    for (uint n = 2; n <= 8; n *= 2)
+    {
+        for (uint y = 0; y < n; ++y)
+            for (uint x = 0; x < n; ++x)
+                cloudHaarStepInverse(base, x + 8u * y, 64u, n);
+        for (uint z = 0; z < n; ++z)
+            for (uint x = 0; x < n; ++x)
+                cloudHaarStepInverse(base, x + 64u * z, 8u, n);
+        for (uint z = 0; z < n; ++z)
+            for (uint y = 0; y < n; ++y)
+                cloudHaarStepInverse(base, 8u * (y + 8u * z), 1u, n);
+    }
 }
 
 /// Scales every world cache deposit by worldCacheKeep: after a sun change the old estimate fades as new photons arrive.

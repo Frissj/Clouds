@@ -36,6 +36,7 @@ static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 
 static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
 static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
 static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
+static const uint kCloudTransformHaar = 1;     ///< HSTRCloudStaging.transform: CloudFormat.h kTransformHaar.
 
 /// One tile of the cloud sea domain: a library asset placed with a quarter-turn rotation, mirror, scale and offset.
 struct HSTRCloudInstance
@@ -73,17 +74,17 @@ struct HSTRCloudBrick
 struct HSTRCloudStaging
 {
     uint slot;
-    uint parentSlot; ///< kCloudRefNone: the prediction is zero.
-    uint parity;     ///< Brick coordinate & 1 per axis (bits 0-2).
-    uint bits;       ///< 0: the residual is residualMin everywhere.
-    float residualMin;
-    float residualStep;
+    uint parentSlot;  ///< kCloudRefNone: the prediction is zero.
+    uint parity;      ///< Brick coordinate & 1 per axis (bits 0-2).
+    uint coded;       ///< 0: predicted only (no residual).
+    float step;       ///< Coefficient = quantised value * step.
+    uint payloadWord; ///< First word of the packed coefficients in hstrCloudPayload.
     float parentMin;
     float parentRange;
     float valueMin;
     float valueRange;
-    uint pad0;
-    uint pad1;
+    uint transform; ///< CloudFormat.h kTransform*.
+    uint pad;
 };
 
 struct HSTRCloudParams
@@ -273,7 +274,7 @@ struct HSTRCloudParams
     uint cloudCommitCount = 0; ///< Staged bricks the current commit dispatch reconstructs, from cloudCommitOffset.
     float cloudFineMinVoxels = 0.05f; ///< Shortest camera step inside fine bricks, in domain voxels.
     uint cloudCommitOffset = 0;
-    uint padHSTRCloud1 = 0;
+    uint cloudStagedCount = 0; ///< Staged bricks whose residuals decodeCloudResiduals decodes this frame.
 
     uint3 fineSunOffset = { 0, 0, 0 }; ///< First voxel of the sun page region computeFineSun updates.
     uint padHSTRCloud2 = 0;
