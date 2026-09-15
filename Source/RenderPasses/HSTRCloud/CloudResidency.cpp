@@ -416,6 +416,8 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, Brick& b
     // The image error a brick's missing detail causes is its voxels' screen size scaled by how much of it reaches the camera: the
     // transmittance from the camera through the always-resident proxy (measured for coarse bricks, inherited by finer ones, and
     // re-measured once the camera moved by a tenth of the distance), and a small share outside the frustum swept towards the sun.
+    // The most visible of the brick's nearest point and corners counts: a silhouette brick's nearest point is often behind the
+    // cloud's surface while its outer part is seen against the sky, and left coarse it rendered as spikes of clipped coarse density.
     const float3 sweep = view.sunDirection * view.sunReach;
     const bool inside = inFrustum(view, min(lo, lo + sweep), max(hi, hi + sweep));
     if (inside && level >= 3)
@@ -423,7 +425,13 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, Brick& b
         const float3 moved = view.position - b.visibilityCamera;
         if (dot(moved, moved) > 0.01f * distance * distance + 1.f)
         {
-            b.visibility = transmittance(sea, view, nearest);
+            float best = transmittance(sea, view, nearest);
+            for (uint32_t corner = 0; corner < 8 && best < 0.99f; ++corner)
+            {
+                const float3 p((corner & 1) ? hi.x : lo.x, (corner & 2) ? hi.y : lo.y, (corner & 4) ? hi.z : lo.z);
+                best = std::max(best, transmittance(sea, view, p));
+            }
+            b.visibility = best;
             b.visibilityCamera = view.position;
         }
         visibility = b.visibility;
