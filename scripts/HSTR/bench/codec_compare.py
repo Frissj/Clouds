@@ -7,7 +7,7 @@ from falcor import *
 # its path-traced reference is accumulated (and saved), then every library's beam render is measured against that one
 # reference, so the difference between libraries is the image cost of their compression alone.
 #   HSTR_LIBRARIES   comma-separated library directories (or .hstrlib packages), baseline (near-lossless) first
-#   HSTR_VIEWS       JSON list of [name, [px, py, pz], [tx, ty, tz]]
+#   HSTR_VIEWS       JSON list of [name, [px, py, pz], [tx, ty, tz]] with an optional up vector [ux, uy, uz]
 #   HSTR_SPP, HSTR_W, HSTR_H, HSTR_TAG, HSTR_LIBRARY_COUNT (first n libraries only), HSTR_PROPS
 OUT = "C:/Users/Friss/Documents/HSTR_results"
 TAG = os.environ.get("HSTR_TAG", "codec")
@@ -73,7 +73,7 @@ def measure(block):
     return float(p["referenceLogError"]), float(p["referenceNoiseLogError"])
 
 
-for name, position, target in views:
+for name, position, target, *up in views:
     reference = f"{OUT}/references/{TAG}_{name}_{W}x{H}"
     for index, library in enumerate(libraries):
         label = os.path.basename(library) if os.path.isdir(library) else os.path.splitext(os.path.basename(library))[0]
@@ -81,7 +81,7 @@ for name, position, target in views:
             hstr.set_properties({"cloudLibrary": library})
         cam.position = float3(*position)
         cam.target = float3(*target)
-        cam.up = float3(0.0, 1.0, 0.0)
+        cam.up = float3(*(up[0] if up else [0.0, 1.0, 0.0]))
         frames = settle()
         s = stats()
         if index == 0:

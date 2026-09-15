@@ -35,6 +35,7 @@
 */
 #include "RenderPasses/HSTRCloud/CloudFormat.h"
 #include "Utils/Math/Float16.h"
+#include "Utils/Image/Bitmap.h"
 #include "Core/Platform/OS.h"
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -48,6 +49,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -1315,7 +1317,15 @@ public:
 
     /// Levels 3 to 0 of one chunk, top-down from its level-4 reconstruction; droppable bricks without stored descendants vanish.
     /// Without pages, only the chunk's transmittance error is measured (for the quality search).
-    ChunkResult encodeChunk(size_t c, const CodecSettings& codec, const Reconstruction& level4, bool parallelLevels, bool pages = true) const
+    /// level0, when given, receives the chunk's level-0 coordinates and reconstructions.
+    ChunkResult encodeChunk(
+        size_t c,
+        const CodecSettings& codec,
+        const Reconstruction& level4,
+        bool parallelLevels,
+        bool pages = true,
+        std::vector<std::pair<uint32_t, Reconstruction>>* level0 = nullptr
+    ) const
     {
         const ChunkLevels* cached = cachedLevels(c);
         ChunkLevels read;
@@ -1352,6 +1362,9 @@ public:
         ChunkResult result;
         result.stats.encodeSeconds = encodeSeconds;
         measureTransmittance(c, levels[0], encoded[0], codec, result.stats);
+        if (level0)
+            for (size_t i = 0; i < encoded[0].size(); ++i)
+                level0->emplace_back(levels[0].coords[i], encoded[0][i].reconstruction);
         if (!pages)
             return result;
         // Bottom-up: a brick is kept if it is needed itself or a descendant is kept.
@@ -1794,6 +1807,106 @@ std::vector<std::string> splitList(const std::string& list)
     return items;
 }
 
+/// Diagnostic: the opacity 1 - e^-tau of a canonical cache's level-0 density projected along each axis (VDB world units, density
+/// scale 1), as <prefix>_x.png, _y.png and _z.png, white on black with the second image axis pointing up. Shows the source
+/// density itself, without the renderer; with a codec (lambda > 0), the level-0 reconstruction the encoder expects the GPU to
+/// build instead.
+void projectCache(const std::filesystem::path& cache, const std::string& prefix, const CodecSettings* codec, bool coarseOnly)
+{
+    Asset asset;
+    asset.source = cache;
+    asset.open(cache);
+    const std::optional<Asset::CoarseResult> coarse = codec ? std::optional<Asset::CoarseResult>(asset.encodeCoarse(*codec)) : std::nullopt;
+    const uint3 dims(asset.entry.dims[0], asset.entry.dims[1], asset.entry.dims[2]);
+    const float voxel = asset.entry.voxelWorld;
+    // Image axes (u, v) per projection axis: along x (z, y), along y (x, z), along z (x, y).
+    const uint32_t imageAxes[3][2] = {{2, 1}, {0, 2}, {0, 1}};
+    std::array<std::vector<float>, 3> depth;
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        depth[axis].assign(size_t(dims[imageAxes[axis][0]]) * dims[imageAxes[axis][1]], 0.f);
+    std::mutex mutex;
+    if (coarseOnly && coarse)
+    {
+        // The level-4 reconstructions: each value covers 16^3 source voxels.
+        for (const auto& [coord, r] : coarse->level4)
+        {
+            const uint3 base = BrickHeader{coord}.brick() * 128u;
+            for (uint32_t z = 0; z < 8; ++z)
+                for (uint32_t y = 0; y < 8; ++y)
+                    for (uint32_t x = 0; x < 8; ++x)
+                    {
+                        const float d = atlasValue(r.codes[(x + 1) + 10 * ((y + 1) + 10 * (z + 1))], r.valueMin, r.valueRange) * voxel * 16.f;
+                        const uint3 p = base + uint3(x, y, z) * 16u;
+                        for (uint32_t axis = 0; axis < 3; ++axis)
+                        {
+                            const uint32_t u = imageAxes[axis][0], v = imageAxes[axis][1];
+                            for (uint32_t b = 0; b < 16; ++b)
+                                for (uint32_t a = 0; a < 16; ++a)
+                                    if (p[u] + a < dims[u] && p[v] + b < dims[v])
+                                        depth[axis][p[u] + a + size_t(dims[u]) * (p[v] + b)] += d;
+                        }
+                    }
+        }
+    }
+    parallelFor(
+        coarseOnly ? 0 : asset.chunkCount(),
+        [&](size_t c)
+        {
+            Asset::ChunkLevels levels;
+            std::vector<std::pair<uint32_t, Reconstruction>> reconstructed;
+            if (codec)
+                asset.encodeChunk(c, *codec, coarse->level4.at(asset.chunkCoord(c)), false, false, &reconstructed);
+            else
+                asset.readChunk(c, levels, nullptr, nullptr);
+            const size_t count = codec ? reconstructed.size() : levels[0].coords.size();
+            std::lock_guard lock(mutex);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const uint3 base = BrickHeader{codec ? reconstructed[i].first : levels[0].coords[i]}.brick() * 8u;
+                for (uint32_t z = 0; z < 8; ++z)
+                    for (uint32_t y = 0; y < 8; ++y)
+                        for (uint32_t x = 0; x < 8; ++x)
+                        {
+                            const uint3 p = base + uint3(x, y, z);
+                            float value;
+                            if (codec)
+                            {
+                                const Reconstruction& r = reconstructed[i].second;
+                                value = atlasValue(r.codes[(x + 1) + 10 * ((y + 1) + 10 * (z + 1))], r.valueMin, r.valueRange);
+                            }
+                            else
+                                value = levels[0].cores[i][x + 8 * (y + 8 * z)];
+                            const float d = value * voxel;
+                            for (uint32_t axis = 0; axis < 3; ++axis)
+                            {
+                                const uint32_t u = imageAxes[axis][0], v = imageAxes[axis][1];
+                                depth[axis][p[u] + size_t(dims[u]) * p[v]] += d;
+                            }
+                        }
+            }
+        }
+    );
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        const uint32_t width = dims[imageAxes[axis][0]], height = dims[imageAxes[axis][1]];
+        std::vector<uint8_t> pixels(size_t(width) * height * 4);
+        for (uint32_t row = 0; row < height; ++row)
+            for (uint32_t u = 0; u < width; ++u)
+            {
+                const float opacity = 1.f - std::exp(-depth[axis][u + size_t(width) * (height - 1 - row)]);
+                uint8_t* px = &pixels[(size_t(row) * width + u) * 4];
+                px[0] = px[1] = px[2] = uint8_t(std::lround(std::clamp(opacity, 0.f, 1.f) * 255.f));
+                px[3] = 255;
+            }
+        const std::string path = prefix + "_" + "xyz"[axis] + ".png";
+        Falcor::Bitmap::saveImage(
+            path, width, height, Falcor::Bitmap::FileFormat::PngFile, Falcor::Bitmap::ExportFlags::None, Falcor::ResourceFormat::RGBA8Unorm, true,
+            pixels.data()
+        );
+        std::cout << "wrote " << path << " (" << width << " x " << height << ")\n";
+    }
+}
+
 uint64_t floatBits(float value)
 {
     uint32_t bits;
@@ -2022,14 +2135,34 @@ int main(int argc, char** argv)
         }
     );
     const std::string mode = argc > 1 ? argv[1] : "";
-    if (argc < 4 || (mode != "build" && mode != "pack"))
+    if (argc < 4 || (mode != "build" && mode != "pack" && mode != "project"))
     {
         std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory>\n"
+                     "HSTRCloudCompiler project <cache.hstrcloud> <output prefix> [lambda]   (opacity images of the source density, or of its\n"
+                     "                       reconstruction at lambda)\n"
                      "HSTRCloudCompiler pack <cache directory> <output directory> [--quality E [--quality-tail T] | --lambda L | --budget-mb N]\n"
                      "                       [--max-error E]\n"
                      "                       [--weight-floor F] [--density-scale S] [--transform haar|identity|cdf53|legacy] [--deadzone D]\n"
                      "                       [--sample R] [--clouds a,b,...] [--dry-run] [--force]\n";
         return 1;
+    }
+    if (mode == "project")
+    {
+        try
+        {
+            // An optional lambda projects the reconstruction at that lambda (weight floor 1).
+            CodecSettings codec;
+            codec.weightFloor = 1.f;
+            if (argc > 4)
+                codec.lambda = std::stof(argv[4]);
+            projectCache(argv[2], argv[3], argc > 4 ? &codec : nullptr, argc > 5 && std::string(argv[5]) == "coarse");
+            return 0;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "error: " << e.what() << "\n";
+            return 1;
+        }
     }
     if (mode == "build")
     {
