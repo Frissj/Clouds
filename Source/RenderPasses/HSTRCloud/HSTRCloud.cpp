@@ -105,6 +105,7 @@ const char kCloudLodBias[] = "cloudLodBias";
 const char kCloudFadeFrames[] = "cloudFadeFrames";
 const char kCloudVirtual[] = "cloudVirtual";
 const char kCloudFineMinVoxels[] = "cloudFineMinVoxels";
+const char kCloudEmptySkip[] = "cloudEmptySkip";
 const char kCloudStats[] = "cloudStats";
 const char kCloudSunTilesPerFrame[] = "cloudSunTilesPerFrame";
 const char kSaveReference[] = "saveReference";
@@ -377,6 +378,8 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudVirtual = value;
         else if (key == kCloudSunTilesPerFrame)
             mCloudSunTilesPerFrame = std::max(1u, uint32_t(value));
+        else if (key == kCloudEmptySkip)
+            mParams.cloudEmptySkip = bool(value) ? 1u : 0u;
         else if (key == kCloudFineMinVoxels)
             mParams.cloudFineMinVoxels = std::clamp(float(value), 1e-3f, 1.f);
         else if (key == kSaveReference)
@@ -566,6 +569,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudFadeFrames] = mCloudFadeFrames;
     props[kCloudVirtual] = mCloudVirtual;
     props[kCloudFineMinVoxels] = mParams.cloudFineMinVoxels;
+    props[kCloudEmptySkip] = mParams.cloudEmptySkip != 0;
     props[kCloudSunTilesPerFrame] = mCloudSunTilesPerFrame;
     if (mpCloudResidency)
     {
@@ -703,6 +707,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamGuidePass = createPass("beamGuide");
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
+    mpOccupancyCloudPass = createPass("occupancyCloudBricks");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
@@ -1482,6 +1487,14 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             mpCommitCloudPass->execute(pRenderContext, uint3(10, 10, 10 * group.count));
         }
         mParams.cloudCommitCount = 0;
+        // Then their occupancy, from the reconstructed atlas texels, for the camera marches' empty-cell skipping.
+        mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
+        bindRenderer(pRenderContext, mpOccupancyCloudPass);
+        ShaderVar occupancyVar = mpOccupancyCloudPass->getRootVar()["CB"]["gHSTRCloud"];
+        occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
+        occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
+        mpOccupancyCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
+        mParams.cloudStagedCount = 0;
     }
     if (densityChanged)
         mBeamReusable = false;

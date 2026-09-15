@@ -75,6 +75,7 @@ public:
 
     void bind(const ShaderVar& var) const;
     ref<Texture> getAtlas() const { return mpAtlas; }
+    ref<Buffer> getOccupancy() const { return mpOccupancy; }
     /// Bricks staged this frame (decodeCloudResiduals runs over them before the commit groups).
     uint32_t getStagedCount() const { return uint32_t(mStaged.size()); }
     const std::vector<CommitGroup>& getCommitGroups() const { return mCommitGroups; }
@@ -224,6 +225,7 @@ private:
     ref<Buffer> mpNodes;
     ref<Buffer> mpBricks;
     ref<Texture> mpAtlas;
+    ref<Buffer> mpOccupancy; ///< Two words per GPU brick (occupancyCloudBricks).
     ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
     ref<Buffer> mpStagingInfo;
     std::unique_ptr<CloudPayloadPool> mpPayload;

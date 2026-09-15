@@ -84,7 +84,7 @@ struct HSTRCloudStaging
     float valueMin;
     float valueRange;
     uint transform; ///< CloudFormat.h kTransform*.
-    uint pad;
+    uint brick;     ///< GPU brick index (its occupancy in hstrCloudOccupancy).
 };
 
 struct HSTRCloudParams
@@ -247,7 +247,7 @@ struct HSTRCloudParams
     float sunNearVoxels = 0.f; ///< Camera samples march the sun optical depth exactly over this many voxels towards the sun, then
                                ///< read the voxel-centre field; 0: one-voxel midpoint step onto the field (enough for the
                                ///< adaptive march, which integrates the sun attenuation analytically).
-    uint padHSTR29 = 0;
+    uint cloudEmptySkip = 1; ///< 1: camera marches jump over brick cells and child octants whose density is exactly zero.
     uint worldCacheSimilarity = 4; ///< >0: photons scatter exactly this many times, then continue in the similar isotropic
                                    ///< medium (extinction sigma (1 - a g), albedo a (1 - g) / (1 - a g)); 0: exact throughout.
 

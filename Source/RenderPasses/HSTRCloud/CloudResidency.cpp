@@ -119,6 +119,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
+    mpOccupancy = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), brickCapacity * 2, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+    );
     mStagingInfo.resize(mDesc.loadsPerFrame);
     mpResiduals = mpDevice->createStructuredBuffer(
         sizeof(float), mDesc.loadsPerFrame * kCoreValues, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
@@ -834,6 +837,7 @@ bool CloudResidency::commit(uint64_t handle)
     info.step = b.record.step;
     info.payloadWord = info.coded ? store.payloadWord + b.record.payloadOffset / 4 : 0u;
     info.transform = b.record.transform;
+    info.brick = b.gpu;
     info.parentMin = parent ? parent->record.valueMin : 0.f;
     info.parentRange = parent ? parent->record.valueRange : 0.f;
     info.valueMin = b.record.valueMin;
@@ -1148,6 +1152,7 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudNodes"] = mpNodes;
     var["hstrCloudBricks"] = mpBricks;
     var["hstrCloudAtlas"] = mpAtlas;
+    var["hstrCloudOccupancy"] = mpOccupancy;
     var["hstrCloudPayload"] = mpPayload->getBuffer();
     var["hstrCloudResiduals"] = mpResiduals;
     var["hstrCloudStagingInfo"] = mpStagingInfo;

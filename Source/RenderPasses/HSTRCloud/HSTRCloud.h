@@ -222,6 +222,7 @@ private:
     ref<Buffer> mpCloudTileReset;
     ref<ComputePass> mpCommitCloudPass;
     ref<ComputePass> mpDecodeCloudPass;
+    ref<ComputePass> mpOccupancyCloudPass;
     ref<ComputePass> mpClearWorldCacheTilesPass;
     ref<Sampler> mpLinearClampSampler;
     uint32_t mSamplerSeaMode = ~0u;
