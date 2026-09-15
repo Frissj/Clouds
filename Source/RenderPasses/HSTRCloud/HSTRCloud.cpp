@@ -108,7 +108,7 @@ const char kCloudSunTilesPerFrame[] = "cloudSunTilesPerFrame";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
-const char kBeamEdgeDepth[] = "beamEdgeDepth";
+const char kBeamEdgeContrast[] = "beamEdgeContrast";
 const char kStoreExact[] = "storeExact";
 const char kCompareExact[] = "compareExact";
 const char kBeamMarchedFraction[] = "beamMarchedFraction";
@@ -376,8 +376,8 @@ void HSTRCloud::parseProperties(const Properties& props)
             mLoadReferencePath = value.operator std::string();
         else if (key == kBeamTolerance)
             mParams.beamTolerance = value;
-        else if (key == kBeamEdgeDepth)
-            mParams.beamEdgeDepth = value;
+        else if (key == kBeamEdgeContrast)
+            mParams.beamEdgeContrast = value;
         else if (key == kStoreExact)
             mStoreExact = value;
         else if (key == kCompareExact)
@@ -568,7 +568,7 @@ Properties HSTRCloud::getProperties() const
         props[kCloudStats] = cloud;
     }
     props[kBeamTolerance] = mParams.beamTolerance;
-    props[kBeamEdgeDepth] = mParams.beamEdgeDepth;
+    props[kBeamEdgeContrast] = mParams.beamEdgeContrast;
     props[kStoreExact] = mStoreExact;
     props[kCompareExact] = mParams.compareExact != 0;
     props[kBeamMarchedFraction] = mBeamMarchedFraction;

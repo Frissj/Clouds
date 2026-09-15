@@ -33,7 +33,7 @@ views = [
     ("sunbehind", (target.x + 0.8 * radius * math.cos(2.2), 180.0, target.z + 0.8 * radius * math.sin(2.2)), back_sun),
 ]
 configs = [
-    # label, tile, levels, segments, tolerance, edge depth
+    # label, tile, levels, segments, tolerance, edge contrast (transmittance range)
     ("flat 8", 8, 1, 4, 0.02, 0.0),
     ("flat 16", 16, 1, 4, 0.02, 0.0),
     ("h16x3", 16, 3, 4, 0.02, 0.0),
@@ -94,7 +94,7 @@ for name, position, sun in views:
         m.frameCapture.capture()
     for label, tile, levels, segments, tolerance, edge in configs:
         hstr.set_properties({"debugView": 9, "beamTileSize": tile, "beamLevels": levels, "beamSegments": segments, "beamTolerance": tolerance,
-                             "beamEdgeDepth": edge, "compareExact": False})
+                             "beamEdgeContrast": edge, "compareExact": False})
         m.renderFrame()
         m.renderFrame()
         log_error, over02, over10, marched = compare()

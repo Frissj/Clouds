@@ -2486,8 +2486,53 @@ struct HSTRCloudRenderer
         return albedo * (phase * single + cache) + background;
     }
 
+    /// Transmittance range of the lattice queries around a tile. A silhouette can cross a tile between its own five queries, but
+    /// then reaches one of these: at the coarsest level the corners and centres of the tile and its eight neighbours (all queried),
+    /// at a finer level the thirteen queries of its parent (corners, edge midpoints, centre and the children's centres).
+    float beamTransmittanceRange(uint level, uint2 tile)
+    {
+        float lo = 1.f;
+        float hi = 0.f;
+        if (level == 0)
+        {
+            const uint s = params.beamTileSize;
+            const int2 first = max(int2(tile) - 1, 0);
+            const int2 corners = int2(params.beamTileDims);
+            for (int y = first.y; y <= min(int(tile.y) + 2, corners.y); ++y)
+                for (int x = first.x; x <= min(int(tile.x) + 2, corners.x); ++x)
+                {
+                    const float t = exp(-beamLatticeAt(uint2(x, y) * s, 0).a);
+                    lo = min(lo, t);
+                    hi = max(hi, t);
+                }
+            for (int y = first.y; y <= min(int(tile.y) + 1, corners.y - 1); ++y)
+                for (int x = first.x; x <= min(int(tile.x) + 1, corners.x - 1); ++x)
+                {
+                    const float t = exp(-beamLatticeAt(uint2(x, y) * s + s / 2, 0).a);
+                    lo = min(lo, t);
+                    hi = max(hi, t);
+                }
+            return hi - lo;
+        }
+        const uint s = beamTileEdge(level - 1);
+        const uint2 origin = (tile / 2u) * s;
+        const uint h = s / 2;
+        const uint k = s / 4;
+        const uint2 offsets[13] = {
+            uint2(0, 0), uint2(s, 0), uint2(0, s), uint2(s, s), uint2(h, 0), uint2(0, h), uint2(s, h),
+            uint2(h, s), uint2(h, h), uint2(k, k), uint2(h + k, k), uint2(k, h + k), uint2(h + k, h + k),
+        };
+        for (uint i = 0; i < 13; ++i)
+        {
+            const float t = exp(-beamLatticeAt(origin + offsets[i], 0).a);
+            lo = min(lo, t);
+            hi = max(hi, t);
+        }
+        return hi - lo;
+    }
+
     /// Surplus test of one tile: the centre as the bilinear corner basis predicts it, against the exact centre query, in
-    /// log(1 + radiance); optionally also a straddled beamEdgeDepth.
+    /// log(1 + radiance); and the silhouette test of beamTransmittanceRange against beamEdgeContrast.
     bool beamTileRefines(uint level, uint2 tile)
     {
         const uint s = beamTileEdge(level);
@@ -2506,12 +2551,8 @@ struct HSTRCloudRenderer
         const float3 exactCentre = beamRadiance(ac.rgb, bc.rgb, ac.a, wc, albedo);
         const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
-        if (params.beamEdgeDepth > 0.f)
-        {
-            const float minimumDepth = min(min(min(a00.a, a10.a), min(a01.a, a11.a)), ac.a);
-            const float maximumDepth = max(max(max(a00.a, a10.a), max(a01.a, a11.a)), ac.a);
-            refine = refine || (minimumDepth < params.beamEdgeDepth && maximumDepth >= params.beamEdgeDepth);
-        }
+        if (!refine && params.beamEdgeContrast > 0.f)
+            refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
         return refine;
     }
 

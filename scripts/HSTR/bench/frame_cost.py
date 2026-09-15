@@ -21,7 +21,7 @@ target = float3(-10.0, 73.0, -43.0)
 radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCacheBakeInterval": 1,
-        "stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "beamSegments": 1, "beamEdgeDepth": 0.0,
+        "stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "beamSegments": 1,
         "debugView": 9, "beamTileSize": 16, "beamLevels": 3, "beamTolerance": 0.05}
 default_sun = (0.4319, 0.8639, 0.2699)
 back_sun = (-0.5, 0.6, 0.62)

@@ -21,7 +21,7 @@ radius = 510.0
 FULL = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1}
 base = dict(FULL, hstComponents=15, residualStrength=1.0, worldCacheCellVoxels=2, worldCacheBands=2, worldCacheOrder=2, worldCacheWindow=1,
             worldCacheEstimator=1, worldCacheTextured=1, worldCacheSegments=0, worldCachePhotons=65536, worldCacheBakeInterval=1,
-            beamSegments=1, beamEdgeDepth=0.0, beamTileSize=16, beamLevels=3, beamTolerance=0.05, compareExact=False)
+            beamSegments=1, beamTileSize=16, beamLevels=3, beamTolerance=0.05, compareExact=False)
 
 
 def place(angle):

@@ -24,7 +24,7 @@ target = float3(-10.0, 73.0, -43.0)
 radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
-        "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeDepth": 0.0, "compareExact": False, "worldCacheModulation": -1.0}
+        "worldCacheBakeInterval": 1, "beamSegments": 1, "compareExact": False, "worldCacheModulation": -1.0}
 SUFFIX = ""  # Reference name suffix for non-default media.
 if os.environ.get("HSTR_ANISOTROPY"):
     base["anisotropy"] = float(os.environ["HSTR_ANISOTROPY"])

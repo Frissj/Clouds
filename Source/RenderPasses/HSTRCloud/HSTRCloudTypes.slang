@@ -222,7 +222,7 @@ struct HSTRCloudParams
     uint2 beamTileDims = { 0, 0 };    ///< Coarsest beam tiles.
     uint2 beamLatticeDims = { 0, 0 }; ///< Query lattice, one texel per beamLatticeStep pixels; every tile corner and centre is a texel.
 
-    float beamEdgeDepth = 0.f; ///< When positive, tiles whose queries straddle this optical depth (silhouettes) are refined.
+    float beamEdgeContrast = 0.05f; ///< Transmittance range of the queries around a tile above which it is refined (silhouettes); 0: off.
     uint compareExact = 0;     ///< 1: the comparison measures against the stored exact frame instead of the reference.
     uint beamSegments = 4;     ///< Threads that march consecutive segments of one query ray in parallel (divides 64).
     uint beamPassLevel = 0;    ///< Tile level the current beam query or tile pass processes.

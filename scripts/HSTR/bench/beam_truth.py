@@ -23,7 +23,7 @@ target = float3(-10.0, 73.0, -43.0)
 radius = 510.0
 base = {"hstComponents": 15, "residualStrength": 1.0, "worldCacheCellVoxels": 2, "worldCacheBands": 2, "worldCacheOrder": 2,
         "worldCacheWindow": 1, "worldCacheEstimator": 1, "worldCacheTextured": 1, "worldCacheSegments": 0, "worldCachePhotons": 65536,
-        "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeDepth": 0.0}
+        "worldCacheBakeInterval": 1, "beamSegments": 1, "beamEdgeContrast": 0.0}
 TRUTH = {"stepOpticalDepth": 0.25, "minStepVoxels": 0.5, "lightingStride": 1, "adaptiveMarch": False}
 FULL = {"stepOpticalDepth": 0.5, "minStepVoxels": 1.0, "lightingStride": 1, "adaptiveMarch": False}
 CHEAP = {"stepOpticalDepth": 1.0, "minStepVoxels": 2.0, "lightingStride": 2}
@@ -47,6 +47,11 @@ configs = [
     ("flat8 full", beam(8, 1, 0.02, FULL)),
     ("h16x3 full", beam(16, 3, 0.02, FULL)),
     ("h16x3 full .05", beam(16, 3, 0.05, FULL)),
+    # Silhouette refinement: transmittance range of the queries around each tile.
+    ("h16x3 full .05 edge.02", dict(beam(16, 3, 0.05, FULL), beamEdgeContrast=0.02)),
+    ("h16x3 full .05 edge.05", dict(beam(16, 3, 0.05, FULL), beamEdgeContrast=0.05)),
+    ("h16x3 full .05 edge.1", dict(beam(16, 3, 0.05, FULL), beamEdgeContrast=0.1)),
+    ("h16x3 full 0", beam(16, 3, 0.0, FULL)),
     ("h32x4 full", beam(32, 4, 0.02, FULL)),
     ("h32x4 full .05", beam(32, 4, 0.05, FULL)),
     ("h16x3 mid", beam(16, 3, 0.02, MID)),
