@@ -552,6 +552,15 @@ struct HSTRCloudParams
     /// previous load, so it is a dependent chain whose latency no arithmetic saving shortens. Fewer samples, or fewer DEPENDENT
     /// fetches per sample - a flatter index that answers "which brick, where in it" in one independent load.
     ///
+    /// EXCEPT THAT NONE OF THAT IS WORTH BUILDING, and the stage probes say so before anything was written. Mode 5 minus mode 3 puts
+    /// the directory/node/node descent at 1.4% of the frame - 0.14 ms - so a spatial page table replaces almost nothing. The parent
+    /// climb looked like the rest of it at about 1.03 ms, but that delta was not schedule-clean, and marchProbe 28/29 settle it: the
+    /// climb runs on 1.3% of the sea's brick samples and 0.1% of the near view's, one step each, 0.12 iterations a pixel. So an
+    /// ancestor table keyed on (entry, desired level) is worth microseconds, and the 1.03 ms belongs to the octant test and to the
+    /// schedule change mode 6 causes. Three structural proposals - the spatial page table, hoisting cloudInstanceAt with a sea-tile
+    /// DDA (0.13 ms), and the ancestor table - each measured dead before being implemented. What is left in that 6.8 ms is the
+    /// occupancy read, and its NET value is already positive: turning cloudEmptySkip off costs 0.68 ms.
+    ///
     /// AND THE INTERVAL CODEC HAS A CEILING OF ABOUT 1.2x, measured before choosing a representation (marchProbe 26/27). What one
     /// compact interval operation could stand for is the CONTRIBUTING run, not the samples per brick visit: the empty and faint ones
     /// in a visit are nearly free, so replacing them buys nothing. The sea takes 4.38 contributing brick samples a pixel over 1.98

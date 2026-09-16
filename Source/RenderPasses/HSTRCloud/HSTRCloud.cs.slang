@@ -130,6 +130,7 @@ struct CloudSample
     uint entry;
     uint level;
     uint desired;
+    uint mappedLevel; ///< Level of the brick the descent found, BEFORE the parent climb: level - mappedLevel is what the climb walked.
 };
 
 /// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
@@ -687,6 +688,7 @@ struct HSTRCloudRenderer
             return false;
         sample.brick = true;
         uint level = hstrCloudBricks[entry].info & 15u;
+        sample.mappedLevel = level;
         if (desired < level)
         {
             // The mapped brick is coarser than the footprint asks for: where its child does not exist the density is zero, for every
@@ -1856,6 +1858,11 @@ struct HSTRCloudRenderer
                 // one: 26 counts brick samples that change the pixel, 27 the distinct brick entries that hold at least one. Their
                 // ratio is how many expensive events one interval operation could stand for, and if it is near 1 no interval
                 // representation can pay however good its encoding.
+                // How far the parent climb in cloudAssetBrickAt actually walks, which is what an ancestor table keyed on
+                // (entry, desired level) would replace. sample.level is where the climb ended and sample.desired what was asked, so
+                // their difference bounds the iterations: zero means the mapped brick already answered and the loop never ran.
+                result += mode == 28 && sample.brick && sample.level > sample.mappedLevel ? float(sample.level - sample.mappedLevel) : 0.f;
+                result += mode == 29 && sample.brick && sample.level > sample.mappedLevel ? 1.f : 0.f;
                 const bool contributes = sample.brick && !sample.empty && alpha > 1e-6f;
                 result += mode == 26 && contributes ? 1.f : 0.f;
                 result += mode == 27 && contributes && (sample.entry != lastLiveEntry || sample.instance != lastLiveInstance) ? 1.f : 0.f;
