@@ -736,6 +736,10 @@ struct HSTRCloudRenderer
         float footprintLevel;
         if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel))
             return proxy;
+        // 3 stops with the instance resolved and its transform applied, so mode 3 minus mode 1 is what cloudInstanceAt costs - the
+        // sea tile modulo, the instance load and the domain-to-asset transform - and full minus 3 is the sparse walk proper.
+        if (params.cloudCostProbe == 3)
+            return proxy;
         const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
         const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
         // Thin cells: the optical depth along a level-0 cell's diagonal (2 sqrt(3) source voxels) at the bound is cloudThinDepth.

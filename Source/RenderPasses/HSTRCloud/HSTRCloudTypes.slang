@@ -485,6 +485,30 @@ struct HSTRCloudParams
     ///     sea   full ~10.0   no atlas ~10.0   proxy only ~4.0     so atlas ~0 ms, hierarchy ~6.0 ms
     ///     near  full ~12.2   no atlas  ~9.1   proxy only ~3.2     so atlas ~3.0 ms, hierarchy ~6.0 ms
     ///
+    /// Mode 3 then splits that 6 ms, and the two halves are nothing alike between the views:
+    ///
+    ///                    proxy + fixed   cloudInstanceAt   sparse walk   atlas      full
+    ///     sea                 3.94            2.77            3.70        ~0.1      10.5
+    ///     near                3.18            0.51            4.79        3.95      12.4
+    ///
+    /// Both columns sum to the measured frame. The instance figure is the soundest number here: modes 1 and 3 produce bit-identical
+    /// images and identical marched fractions (5.5% sea, 7.7% near), so their difference is free of the schedule perturbation that
+    /// taints the rest - unlike full against no-atlas, where refinement moves 3.9% to 4.5%.
+    ///
+    /// cloudInstanceAt costs the sea 2.77 ms, a quarter of its frame, and the near view 0.51: the asymmetry is the instance grid, not
+    /// the tree. It is the sea tile modulo, the instance load and the domain-to-asset transform, recomputed per density sample, and
+    /// all of it is invariant along a ray's stay inside one 64-voxel sea tile. Hoisting it by walking sea tiles with a 2D DDA and
+    /// transforming the ray once per tile interval is not the brick-context experiment that failed: that carried a speculative cache
+    /// in every lane's registers and lost on occupancy, where this segments the loop structurally and carries nothing. Time the live
+    /// sun path as well as the cached one when trying it - restructuring this march has hit a codegen cliff before.
+    ///
+    /// The sparse walk, 3.70 sea and 4.79 near, is what a flat resolved page table would attack, and the chain is deeper than the
+    /// node descent suggests: cloudAssetBrickAt goes directory, node, node, brick info, then a parent walk of up to fifteen dependent
+    /// .parent and .info loads when the mapped brick is finer than the footprint asked for. A table keyed on (position, desired level)
+    /// that stores the brick the residency cut says should answer removes the descent AND that loop. Weigh it against the note above
+    /// residualAtVoxel first, which found these reads are cache hits: a table shortens a chain of hits rather than removing misses,
+    /// but unlike the context cache it costs no persistent registers, so it does not lose the same way.
+    ///
     /// Reading the density is free on the sea; the walk to find it is six of ten milliseconds. That also settles the floor properly:
     /// proxy-only runs all 12.19 samples a pixel in 4.0 ms, about 0.167 ms per proxy sample per pixel against the 0.575 average, so
     /// the sea's 3.31 proxy samples cost about 0.55 ms and a brick-only codec floors near 2.4 ms - under the target, not above it.
@@ -510,6 +534,12 @@ struct HSTRCloudParams
     /// matters - none can be worth more than about 1.6 ms - and it attacks the same events as the longitudinal oracle, so the two do
     /// not stack. What is NOT bounded by any of this is the number of rays: the per-sample cost is close to irreducible, the sample
     /// count is not.
+    ///
+    /// Except that the per-sample cost is NOT close to irreducible, which the split above shows and an earlier reading here denied.
+    /// The frame factorises as events times cost per event, and every lever measured before this - the lattice, the faint and zero
+    /// samples, an interval codec, the oracle - attacks only the events. The instance hoist and the page table attack the cost, so
+    /// they are orthogonal to all of them and to each other. On the sea that is 2.77 + most of 3.70 against a 10.5 ms frame before
+    /// the oracle's 1.5x applies to what is left, which is the first route to 3 ms that does not depend on something unbuilt.
     uint cloudCostProbe = 0;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
     uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.

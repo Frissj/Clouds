@@ -436,7 +436,7 @@ void HSTRCloud::parseProperties(const Properties& props)
         else if (key == kCloudTightReject)
             mParams.cloudTightReject = std::min(uint32_t(value), 2u);
         else if (key == kCloudCostProbe)
-            mParams.cloudCostProbe = std::min(uint32_t(value), 2u);
+            mParams.cloudCostProbe = std::min(uint32_t(value), 3u);
         else if (key == kCloudTrapezoid)
             mParams.cloudTrapezoid = bool(value) ? 1u : 0u;
         else if (key == kCloudLocalStep)
