@@ -431,7 +431,11 @@ struct HSTRCloudParams
     /// faint third is worth 0.7 ms at usable quality and 1.7 ms at any quality (cloudThinDepth), and the zero third is worth 0.01 ms,
     /// because an empty sample short-circuits in the directory and never reaches the atlas (cloudTightReject). The time is in the 4.4
     /// samples a pixel that do contribute, at roughly 1.6 ms per sample per pixel.
-    uint cloudZeroSkip = 1;
+    /// DEFAULTED TO 8 on 2026-09-16 after re-measuring it against a drift anchor. The earlier reading here - 9.23 ms at one block
+    /// against 10.39 at eight - put the eight-block arm late in a run whose baseline drifted from 9.7 to 10.9, so the whole 1.16 ms
+    /// it appeared to lose was thermal. Measured with the first test repeated after every later one, the ratio is 0.866 at one block
+    /// against 0.854 at eight for the same image: about 1%, small but free.
+    uint cloudZeroSkip = 8;
     /// 1: a camera step whose sample is provably zero skips the brick walk that would find that out (0: off).
     ///
     /// The march steps on the dilated majorant, which bounds the trilinear extinction anywhere in a 4-voxel block INCLUDING the half
@@ -713,8 +717,14 @@ struct HSTRCloudParams
     /// which reuses about every second query): near 42.8 -> 42.3 ms, sea 30.4 -> 33.0 ms - nothing. Halving the sun fetches does not
     /// pay, the same way the brick context did not: what a sample costs is the sample, not the fetches inside it.
     float cloudSunReuse = 0.f;
-    /// Camera transmittance at which a march stops (the rest of the ray is behind opaque cloud). MEASURED (4K c15, 0.001 -> 0.02):
-    /// near 42.6 -> 38.8 ms, sea 28.6 -> 30.4 ms, so the long-tailed rays are not what the frame waits for either.
+    /// Camera transmittance at which a march stops (the rest of the ray is behind opaque cloud). An earlier reading here - near
+    /// 42.6 -> 38.8 ms, sea 28.6 -> 30.4 - concluded that "the long-tailed rays are not what the frame waits for", and it was wrong
+    /// twice over: both figures are the per-pixel view, which is the yardstick and not the shipping path, and the sea rose because
+    /// the run drifted. RE-MEASURED on the beam path against a drift anchor: 0.02 is x0.938 of the frame for 0.111% -> 0.117% over
+    /// 0.02, and 0.05 is x0.915 for 0.415%. The near view's 9% was in the comment the whole time, next to a sea number that buried it.
+    ///
+    /// Left at 1e-3 because it is not free - 0.02 is the cheapest quality the sea sells anywhere, but it is quality. Set it with
+    /// cloudThinDepth 0.05 for about 13% together at 0.140%.
     float cloudMinTransmittance = 1e-3f;
     /// cloudTiles - 1 where the tile count is a power of two, else ~0u (the counts are square, so one scalar covers both axes).
     /// The sea wraps a possibly negative tile coordinate into the instance grid, which costs two integer modulos per density sample,
@@ -727,6 +737,24 @@ struct HSTRCloudParams
     /// silently read the wrong ones - every probe mode stopped working and every beam image came out identical and wrong. Add
     /// parameters by taking a pad slot or appending, never by inserting into a full row.
     uint cloudTileMask = ~0u;
+    /// World Y of the lowest and highest majorant block holding any density, dilated by one block (the whole grid's height where
+    /// nothing is resident). mediumInterval used the extinction grid's own floor and ceiling, so a sea ray began and ended in empty
+    /// sky and spent most of its steps there - 17.81 of 30 a pixel are majorant-zero crossings. Clamping the slab to the band deletes
+    /// those from the ray rather than skipping them a block at a time, and changes no pixel: outside the band there is no density to
+    /// integrate. Unlike every step-length lever, this one is free of quality by construction.
+    float2 seaContentY = float2(-1e30f, 1e30f);
+    /// 0: march the whole grid height again, for measuring what the band is worth. MEASURED (sea, 4K, beam view, drift-anchored,
+    /// first test repeated at the end): 9.92 -> 9.50 ms, x0.962, with the error identical to every digit including the maximum -
+    /// 0.111% over 0.02, p99.9 2.15e-02 - which is what "lossless by construction" is supposed to look like and the reason to prefer
+    /// this over every other lever measured today.
+    ///
+    /// It first measured 19% SLOWER, and the cause was a latent bug it exposed rather than the clamp: mediumInterval capped the ray
+    /// at max(0, interval.x) + seaViewDistance, so the view distance ran from where the ray met the slab and not from the camera.
+    /// While the slab was the whole grid and the camera sat inside it, interval.x was negative and the two agreed. Clamping to the
+    /// content band made interval.x the positive distance to the band, and every ray then marched a view distance BEYOND it. The
+    /// same bug would have bitten a camera flying above the grid with no clamp at all, which is the intended use of this renderer.
+    uint cloudSlabClamp = 1;
+    uint padHSTRCloud10 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

@@ -651,7 +651,12 @@ struct HSTRCloudRenderer
     ///
     /// MEASURED (4K near, cloudThinDepth 0.001): density samples 28.85 -> 28.13 per pixel, of which the ones too faint to change the
     /// pixel (alpha <= 1e-6) only fell 25.0% -> 23.8%. Those samples are not in thin cells: they are the trilinear tails of cells
-    /// that also hold dense texels, so a cell bound cannot reject them. cloudThinDepth stays 0 by default.
+    /// that also hold dense texels, so a cell bound cannot reject them.
+    ///
+    /// That is true and it is not the whole story, because 0.001 is a tolerance far below anything that matters. RE-MEASURED on the
+    /// sea's beam path against a drift anchor: 0.05 is x0.942 of the frame for 0.111% -> 0.129% over 0.02. An earlier sweep priced
+    /// this at 0.70 ms by reading raw milliseconds from positions four and five of an eight-test run, which is halfway up a 12%
+    /// thermal ramp. Still 0 by default - it costs quality - but it is one of the two cheapest things the sea sells.
     bool cloudAssetBrickAt(HSTRCloudAsset asset, float3 x, uint desired, bool settledOnly, float thinDensity, out CloudSample sample)
     {
         sample = {};
@@ -674,6 +679,11 @@ struct HSTRCloudRenderer
             }
         }
         if (entry == kCloudRefNone)
+            return false;
+        // 5 stops with the directory/node descent done and nothing after it, so mode 5 minus mode 3 is the descent alone - the part a
+        // flat page table would replace - and mode 2 minus mode 5 is the parent climb, the octant test and the occupancy read, which
+        // it would not. Returning false sends the caller to the proxy, which is what the other cost modes do.
+        if (params.cloudCostProbe == 5)
             return false;
         sample.brick = true;
         uint level = hstrCloudBricks[entry].info & 15u;
@@ -700,6 +710,9 @@ struct HSTRCloudRenderer
         }
         sample.entry = entry;
         sample.level = level;
+        // 6 adds the octant test and the parent climb to mode 5 but stops before the occupancy read, splitting the rest in two.
+        if (params.cloudCostProbe == 6)
+            return false;
         if (params.cloudEmptySkip != 0 && (!settledOnly || hstrCloudBricks[entry].fade >= 1.f))
         {
             // An empty 2-voxel cell of the brick: every trilinear texel it can read is zero. Voxels of the cell whose finest mapped
@@ -1259,8 +1272,13 @@ struct HSTRCloudRenderer
     {
         if (params.seaMode != 0)
         {
-            const float bottom = params.seaOrigin.y;
-            const float top = params.seaOrigin.y + float(params.hstrExtinctionDims.y) * params.seaVoxelSize.y;
+            // The occupied band rather than the grid's floor and ceiling (cloudSlabClamp): outside it there is no density, so the
+            // interval it removes is empty sky the march would otherwise cross a majorant block at a time.
+            // Branch-free on purpose. The same clamp written as a ternary on a parameter cost 19% of the frame uniformly across every
+            // scope, for a bit-identical image and strictly less marching - a codegen cliff, not work. seaContentY carries the whole
+            // grid's height when the clamp is off, so the toggle lives on the CPU and this stays two instructions.
+            const float bottom = max(params.seaOrigin.y, params.seaContentY.x);
+            const float top = min(params.seaOrigin.y + float(params.hstrExtinctionDims.y) * params.seaVoxelSize.y, params.seaContentY.y);
             const float speed = length(direction);
             if (abs(direction.y) < 1e-8f)
             {
@@ -1269,7 +1287,12 @@ struct HSTRCloudRenderer
             }
             const float2 y = float2(bottom - origin.y, top - origin.y) / direction.y;
             interval = float2(min(y.x, y.y), max(y.x, y.y));
-            interval.y = min(interval.y, max(0.f, interval.x) + params.seaViewDistance / speed);
+            // The view distance is measured from the CAMERA, not from where the ray enters the slab. It was written as
+            // max(0, interval.x) + seaViewDistance, which was the same thing only while the slab was the whole grid and the camera
+            // sat inside it, so interval.x was negative. Clamping the slab to the content band made interval.x the positive distance
+            // to the band, and every ray then marched a view distance BEYOND it - a longer interval, not a shorter one, which is why
+            // the clamp first measured 19% slower for a bit-identical image.
+            interval.y = min(interval.y, params.seaViewDistance / speed);
             return interval.y > max(0.f, interval.x);
         }
         const AABB bounds = volume.getBounds();

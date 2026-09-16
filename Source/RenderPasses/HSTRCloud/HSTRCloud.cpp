@@ -118,6 +118,7 @@ const char kCloudZeroSkip[] = "cloudZeroSkip";
 const char kCloudSunReuse[] = "cloudSunReuse";
 const char kCloudTightReject[] = "cloudTightReject";
 const char kCloudCostProbe[] = "cloudCostProbe";
+const char kCloudSlabClamp[] = "cloudSlabClamp";
 const char kCloudTrapezoid[] = "cloudTrapezoid";
 const char kCloudLocalStep[] = "cloudLocalStep";
 const char kCloudStepFootprint[] = "cloudStepFootprint";
@@ -436,7 +437,15 @@ void HSTRCloud::parseProperties(const Properties& props)
         else if (key == kCloudTightReject)
             mParams.cloudTightReject = std::min(uint32_t(value), 2u);
         else if (key == kCloudCostProbe)
-            mParams.cloudCostProbe = std::min(uint32_t(value), 3u);
+            mParams.cloudCostProbe = std::min(uint32_t(value), 6u);
+        else if (key == kCloudSlabClamp)
+        {
+            // The shader has no flag for this: the clamp is two branch-free instructions on seaContentY, and writing the whole grid's
+            // height there is what "off" means. A ternary on a parameter here instead cost 19% of the frame.
+            mParams.cloudSlabClamp = bool(value) ? 1u : 0u;
+            mParams.seaContentY = mParams.cloudSlabClamp != 0 ? mSeaContentBand
+                                                              : float2(-std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+        }
         else if (key == kCloudTrapezoid)
             mParams.cloudTrapezoid = bool(value) ? 1u : 0u;
         else if (key == kCloudLocalStep)
@@ -664,6 +673,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
     props[kCloudCostProbe] = mParams.cloudCostProbe;
+    props[kCloudSlabClamp] = mParams.cloudSlabClamp != 0;
     props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
     props[kCloudLocalStep] = mParams.cloudLocalStep != 0;
     props[kCloudStepFootprint] = mParams.cloudStepFootprint;
@@ -1505,6 +1515,35 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         }
     );
     mParams.hstrMajorantDims = blockDims;
+    // The occupied vertical band, in world units, dilated by one block to cover the camera majorant's own dilation. A sea ray was
+    // marched between the floor and ceiling of the whole extinction grid, so every ray crossed the empty sky above and below the
+    // clouds to reach the domain boundary. majorantZeroExit skips that at 16-voxel granularity, which costs one texture load per
+    // block rather than a step per voxel - 17.81 of the sea's 30 steps a pixel - but clamping the slab removes the blocks from the
+    // ray instead of skipping them, and it cannot change a pixel: there is no density outside the band by construction.
+    uint32_t lowBlock = blockDims.y, highBlock = 0;
+    for (size_t i = 0; i < blockCount; ++i)
+        if (mCloudMaxBlocks[i] > 0.f)
+        {
+            const uint32_t y = uint32_t((i / blockDims.x) % blockDims.y);
+            lowBlock = std::min(lowBlock, y);
+            highBlock = std::max(highBlock, y);
+        }
+    const float gridTopY = mParams.seaOrigin.y + float(mParams.hstrExtinctionDims.y) * mParams.seaVoxelSize.y;
+    if (lowBlock > highBlock) // No density anywhere: leave the slab alone rather than inverting it.
+        mSeaContentBand = float2(mParams.seaOrigin.y, gridTopY);
+    else
+    {
+        const float blockVoxels = 4.f; // A majorant block is four DOMAIN voxels: majorantAt indexes with floor(v * 0.25).
+        const float low = float(lowBlock > 0 ? lowBlock - 1 : 0) * blockVoxels;
+        const float high = float(std::min(highBlock + 2u, blockDims.y)) * blockVoxels;
+        mSeaContentBand = mParams.seaOrigin.y + float2(low, high) * mParams.seaVoxelSize.y;
+    }
+    mParams.seaContentY = mSeaContentBand;
+    logInfo(
+        "HSTRCloud: sea content band y {} to {} of {} to {} ({} of the grid's height).", mSeaContentBand.x, mSeaContentBand.y,
+        mParams.seaOrigin.y, gridTopY,
+        (mSeaContentBand.y - mSeaContentBand.x) / std::max(1e-6f, gridTopY - mParams.seaOrigin.y)
+    );
     const uint3 occupancyDims = (blockDims + 3u) / 4u;
     std::vector<uint8_t> occupancy(size_t(occupancyDims.x) * occupancyDims.y * occupancyDims.z, 0);
     for (size_t i = 0; i < blockCount; ++i)

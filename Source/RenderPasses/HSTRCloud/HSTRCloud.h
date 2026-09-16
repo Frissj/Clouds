@@ -234,6 +234,9 @@ private:
     ref<ComputePass> mpDecayWorldCachePass;
     std::vector<float> mCloudMeanBlocks; ///< Domain majorant blocks of the mean density (transport), unscaled.
     std::vector<float> mCloudMaxBlocks;  ///< Domain majorant blocks of the maximum density (camera), unscaled.
+    /// World Y of the occupied band, from the majorant blocks, dilated by one. mParams.seaContentY carries this when cloudSlabClamp
+    /// is on and an unbounded range when it is off, so the shader clamps without a branch.
+    float2 mSeaContentBand = float2(-std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
     std::vector<float> mCloudTileBatches;
     std::vector<uint32_t> mCloudTileReset;
     ref<Buffer> mpCloudTileBatches;
