@@ -401,7 +401,55 @@ struct HSTRCloudParams
     /// differently - 656 frames with 88498 bakes still waiting, inheriting the near view's cut, against 1160 frames with 44964
     /// waiting when the sea settles alone - and the same 4-voxel configuration measured 8.52 ms in one and 5.82 ms in the other.
     /// Only compare within one process, one settle, with a repeat of the first test at the end to measure the drift.
+    ///
+    /// Nor is the error metric as sharp as it looks. referenceLogP999 is read out of a histogram binned four to the octave, so it
+    /// moves only in 19% steps and two quite different images routinely report the same number. Price changes on the mean log error
+    /// and the shares over 0.02 and 0.1, which are continuous, and treat a single-bin move in p99.9 as a direction, not a size.
+    ///
+    /// Where the density samples are decides what any codec can be worth. The sea takes 12.19 samples a pixel, 8.88 of them in
+    /// bricks and the remaining 3.31 in the proxy. Make every brick sample free and the fit still gives 1.84 + 0.575 * 3.31 = 3.74 ms,
+    /// so a codec that amortises brick integration alone cannot reach 3 ms however good it is - the 3 ms budget is 2.0 samples a pixel
+    /// in total. Either the proxy march shrinks with it or the ray count does. (Those counts come from a run that settled the short
+    /// way, 656 frames with 88498 bakes waiting, so fewer bricks were mapped than in a clean settle: the brick share is if anything
+    /// understated and the bound tighter.) Of the 12.19, a third read exactly zero and another third are non-empty but too faint to
+    /// change the pixel (alpha <= 1e-6), so 64% of the sea's density sampling buys no image at all.
+    ///
+    /// That 64% is not, however, 64% of the time, and the fit above must not be read as saying it is - it averages over samples whose
+    /// costs differ by an order of magnitude. Both halves were then measured directly and both are nearly worthless to attack: the
+    /// faint third is worth 0.7 ms at usable quality and 1.7 ms at any quality (cloudThinDepth), and the zero third is worth 0.01 ms,
+    /// because an empty sample short-circuits in the directory and never reaches the atlas (cloudTightReject). The time is in the 4.4
+    /// samples a pixel that do contribute, at roughly 1.6 ms per sample per pixel.
     uint cloudZeroSkip = 1;
+    /// 1: a camera step whose sample is provably zero skips the brick walk that would find that out (0: off).
+    ///
+    /// The march steps on the dilated majorant, which bounds the trilinear extinction anywhere in a 4-voxel block INCLUDING the half
+    /// voxel of a neighbouring block its support reaches. hstrTightMajorant is the same grid undilated, so where it is zero the
+    /// block's own texels are all zero, and a sample at least half a voxel inside every face of that block reads only those texels:
+    /// its density is exactly zero, and the directory walk and atlas read that returned zero were the price of the dilation.
+    ///
+    /// The test is conservative and exact - no error of any kind - which is what distinguishes it from cloudThinDepth. It costs one
+    /// Texture3D load against a brick walk, and if it pays, hstrMajorant and hstrTightMajorant share dimensions and can be packed
+    /// into one float2 so the march fetches both in the load it already does per step.
+    ///
+    /// MEASURED as a count first (marchProbe 24/25, min == max step 2): the sea takes 4.96 samples a pixel in a tight-zero block, of
+    /// which 2.13 are far enough inside to reject (16.6% of all its density samples, 52% of the 4.08 that read exactly zero); the
+    /// near view 5.65 and 2.33. The rest sit in the boundary shell where the dilation is doing real work - which is why the tight-zero
+    /// count exceeds the exactly-empty count: a boundary sample in a tight-zero block can still read density from its neighbour.
+    ///
+    /// AND IT IS WORTH NOTHING. Sea, 4K, beam view, min == max step 2, one settle (10.02 ms against 10.04 re-measured at the end):
+    /// off 10.02, the load and the test with the answer thrown away 10.43, the test acted on 10.44. The rejection saves 0.01 ms -
+    /// zero - and the entire 0.42 is the extra fetch. Packing the two majorants into one float2 would make the fetch free and buy
+    /// nothing, so it is not worth doing. The error is bit-identical across all three, to every digit including the maximum, so the
+    /// interior test is right and really is rejecting only zeros; there is simply nothing behind them.
+    ///
+    /// What that establishes is worth more than the parameter. An exactly empty density sample already costs almost nothing: the
+    /// directory walk short-circuits on an empty cell code and never reaches the atlas. So "ms ~ 1.84 + 0.575 * density samples" is
+    /// an average over samples of very different cost and must not be used to price a change that removes a particular KIND of
+    /// sample. The sea's 12.19 samples a pixel are a third exactly zero and a third too faint to change the pixel, and neither third
+    /// is where the time goes - cloudThinDepth buys 0.7 ms of usable time from the faint ones and this buys none from the zeros. The
+    /// roughly 7 ms of density work sits in the 4.4 samples a pixel that actually read the atlas and contribute, about 1.6 ms each,
+    /// which is also where the longitudinal oracle and any transfer or moment codec would act. Attack the contributing samples.
+    uint cloudTightReject = 0;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
     uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.
     /// Fraction of a step's length folded into its density sample's footprint (0: off). minStepVoxels above one samples the density
@@ -507,23 +555,55 @@ struct HSTRCloudParams
     /// runtime - only its position changes - so it is the cheapest possible attack on the source-variation error that survives an
     /// exact optical depth (see cloudQuadrature, where tau is only about 30% of a long step's error).
     ///
-    /// MEASURED with 16 observations per step (4K, beam view, against the per-pixel 1-voxel march). At a fixed step the pair halves
-    /// the error: on the sea a 4-voxel step goes p99.9 0.061 -> 0.030 and an 8-voxel step 0.344 -> 0.102. The marched share never
-    /// moves (3.9-4.1%), so none of that is bought by refining more of the image.
+    /// MEASURED with 16 observations per step (4K, beam view, against the per-pixel 1-voxel march, min == max step, one settle per
+    /// view with the first test repeated at the end: sea 9.76 against 9.78 ms, near 12.14 against 12.17). The marched share never
+    /// moves (sea 3.9-4.0%, near 5.2-5.3%), so none of the gain is bought by refining more of the image.
     ///
-    /// Expressed as step length it is worth about 1.5 to 1.7 times, not the doubling an earlier run appeared to show. Against the
-    /// sea's own error curve - 0.015, 0.022, 0.061, 0.344, 0.689 at steps 1, 2, 4, 8 and 16 - the pair's 0.030 at four voxels sits
-    /// where the plain march is at about 2.6, and its 0.102 at eight sits at about 4.8. Priced through the cost fit beside
-    /// cloudZeroSkip, matching today's 2-voxel quality would take a 2.6-voxel step at about 7.2 ms against 5.8 ms for four voxels
-    /// with the pair, so about 1.25x at equal quality even if the two scalars were free.
+    /// DO NOT PRICE THIS ON p99.9. referenceLogP999 is read out of a histogram binned four to the octave (kCompareBinFloor * 2^(b/4)
+    /// in HSTRCloud.cpp), so it moves in steps of 19% and cannot resolve anything finer. It is why the sea and the near view report
+    /// an identical 3.44e-01 at an 8-voxel step and an identical 2.56e-02 with the pair at four - two different images landing in one
+    /// bin, not a coincidence. Every earlier reading of this parameter - the doubling, then 1.5-1.7x, then 1.25x at equal quality -
+    /// was computed from that quantised number. Use the mean log error and the >0.02 and >0.1 shares, which are continuous.
+    ///
+    ///     sea, 4-voxel step   plain 1.00e-03 / 0.850% / 0.017%   tau only 8.11e-04 / 0.512% / 0.017%   pair 6.20e-04 / 0.168% / 0%
+    ///     sea, 2-voxel plain  3.29e-04 / 0.111% / 0.001%    (mean log error / share over 0.02 / share over 0.1)
+    ///     near, 4-voxel step  plain 2.33e-03 / 2.111% / 0.137%   tau only 1.74e-03 / 1.254% / 0.008%   pair 1.30e-03 / 0.221% / 0%
+    ///     near, 2-voxel plain 5.72e-04 / 0.247% / 0.000%
+    ///
+    /// The metrics disagree about what it is worth, and the disagreement is the result. Against each view's own error curve the pair
+    /// at four voxels matches a plain step of 2.97 voxels on the mean but 2.30 on the >0.02 share - 1.35x against 1.74x - because it
+    /// does not improve the bulk of the image and the tail equally. On the near view, where a step carries more source variation, it
+    /// is worth 2.07x: its 0.221% at four voxels is better than a plain two-voxel step's 0.247%.
+    ///
+    /// Where it really lands is the worst pixels. At an 8-voxel step the share over 0.1 goes 1.343% -> 0.011% on the sea and
+    /// 3.764% -> 0.015% on the near view, two orders of magnitude, while the mean moves by a third. This is a fix for the blocky
+    /// artefacts a long step leaves, not a uniform gain - which follows from the mechanism, since a misplaced source evaluation costs
+    /// nothing where the source is flat and everything where it is not.
+    ///
+    /// Priced at equal quality on the >0.02 share, through each view's own cost curve and with the two scalars free: the sea would
+    /// take a 3.48-voxel step at about 6.5 ms against 9.76, and the near view a 4.14-voxel step at about 7.1 ms against 12.14. So
+    /// about 1.5x on the sea and 1.7x on the near view.
     ///
     /// The run that read a full doubling held maxStepVoxels at 8 while varying minStepVoxels, so its "2-voxel step" was really 2 to
     /// 8 voxels chosen by the majorant rule and only its 8 was a true fixed step. Pin minStepVoxels == maxStepVoxels when the step
     /// length is the variable.
     ///
-    /// The split matters as much as the total. The optical depth is about a third of the gap and the centroid is the rest, so the
-    /// source error that survives an exact tau is mostly a question of where the step's one source evaluation is placed, not of
-    /// fine structure the step cannot represent. That is what makes the result worth anything: two scalars per position and
+    /// The first implementation moved tSample and midpoint to the centroid but left `sample` at the centre observation, and three
+    /// consumers read a sample against the position it was taken at: sample.t (cloudLocalStep's next step), cloudEmptyExit (a box
+    /// measured from sample.x, returned as an offset from the t it is given - so a centroid ahead of the observation skips past where
+    /// density returns) and sunDepthAt (near field from the sample's brick entry, far field from the position). The source read a sun
+    /// depth belonging to a point up to half a step away, in the direction the centroid had just decided the light was not. Fixing it
+    /// moved the sea's p99.9 one bin at both four and eight voxels, in the right direction at both - which is all a metric binned four
+    /// to the octave can say, and the reason the readings above are taken on the continuous ones instead.
+    ///
+    /// The split matters as much as the total, and it is not the same split in the bulk as in the tail. Over the whole image the two
+    /// contribute about equally - of the 4-voxel gain, the optical depth carries 50% of the mean and 50% of the >0.02 share on the
+    /// sea, 57% and 45% on the near view. An earlier reading of "a third" came from p99.9 and did not survive the continuous metrics.
+    /// In the tail they separate completely: at four voxels the share over 0.1 is 0.017% plain, 0.017% with an exact optical depth
+    /// alone - unchanged, to three figures, on both views - and 0.000% once the centroid moves the source. So the error that makes a
+    /// long step look broken is entirely a question of where the step's one source evaluation is placed, and not of fine structure
+    /// the step cannot represent; the optical depth buys an even share of the ordinary error and none of the worst of it. That is
+    /// what makes the result worth anything: two scalars per position and
     /// direction - the longitudinal optical depth and the opacity centroid within it - are enough, where a transfer operator
     /// carrying the source itself was measured dead (cloudTransferClasses). Both are properties of the density alone, so unlike a
     /// transfer operator they survive every change of sun, cache and phase, and bakeCloudSun is already a per-voxel directional line

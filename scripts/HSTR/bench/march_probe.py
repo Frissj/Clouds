@@ -57,7 +57,7 @@ for name, position, target in views:
     hstr.set_properties({"storeExact": True})
     m.renderFrame()
     hstr.set_properties({"hstComponents": 3})
-    k = {mode: mean_of(mode) for mode in range(1, 24) if mode != 19}
+    k = {mode: mean_of(mode) for mode in range(1, 26) if mode != 19}
     q = max(k[1], 1e-9)
     log(f"{name}: {k[1]:6.2f} sun queries per pixel: own bake {100 * k[2] / q:5.1f}%, ancestor's bake {100 * k[18] / q:5.1f}%, proxy {100 * k[3] / q:5.1f}%, "
         f"live: finer than asked {100 * k[4] / q:5.1f}%, no bake {100 * k[5] / q:5.1f}%, empty {100 * k[6] / q:5.1f}%")
@@ -67,6 +67,11 @@ for name, position, target in views:
         f"alpha > 0.5 {100 * k[14] / d:5.1f}%; mean step {k[15] / d:5.2f} sampled voxels; pixels terminated {100 * k[16]:5.1f}%")
     log(f"{name}: brick samples {k[21]:6.2f}/px in {k[20]:5.2f} brick visits/px ({k[21] / max(k[20], 1e-9):5.2f} samples per visit); "
         f"pixels still marching after 32 steps {100 * k[22]:5.1f}%, after 64 steps {100 * k[23]:5.1f}%")
+    # The price of dilating the majorant: samples the march takes because a neighbouring block holds density, in a block that holds
+    # none itself. Mode 25 is the share of those a conservative tight test could reject without a brick walk - the rest sit within
+    # half a voxel of a block face, where the trilinear support crosses into the neighbour and the dilation is doing real work.
+    log(f"{name}: tight-zero samples {k[24]:6.2f}/px ({100 * k[24] / d:5.1f}% of density samples), of which rejectable "
+        f"{k[25]:6.2f}/px ({100 * k[25] / d:5.1f}%); exactly empty {k[13]:6.2f}/px for comparison")
     # What a transfer cache would face on the path that ships: brick crossings it could serve against the distinct (asset brick,
     # source-space direction class, entry cell) entries it would have to produce. Break-even is Z / (Z - 1) with Z the events per
     # crossing above, so about 1.45. The beam view traces far fewer rays than there are pixels, which is the whole question.

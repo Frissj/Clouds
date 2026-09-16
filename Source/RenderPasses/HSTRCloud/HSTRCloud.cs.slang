@@ -1536,8 +1536,30 @@ struct HSTRCloudRenderer
                 // it - the caller scales minStepVoxels with the node count to hold the taps per voxel fixed - so this asks whether
                 // the coarse-step error is quadrature error or aliasing. The centre-most node stands for the step downstream: the
                 // lighting, the sun lookup and the empty-cell skip all vary smoothly across one step.
+                // Provably zero without asking the bricks (cloudTightReject): the step's sample lies inside a majorant block whose
+                // undilated maximum is zero, and far enough inside that its trilinear support cannot reach the neighbour the dilated
+                // majorant was covering. Left off for the quadrature and oracle paths, which take their own taps at their own places.
+                // Mode 2 does the load and the test and then throws the answer away, which separates the two halves of the cost: the
+                // extra fetch every sample pays against the brick walks the rejections save. Packing hstrTightMajorant into
+                // hstrMajorant as a second channel would buy exactly the difference.
+                bool tightZero = false;
+                if (params.cloudTightReject != 0 && params.cloudQuadrature <= 1 && params.cloudLongitudinalOracle <= 1)
+                {
+                    const float3 block = seaVoxel(midpoint) * 0.25f;
+                    const float3 frac = block - floor(block);
+                    tightZero = all(frac > 0.125f) && all(frac < 0.875f) && tightMajorantAt(midpoint) <= 0.f &&
+                                params.cloudTightReject == 1;
+                }
                 float sigma;
-                if (params.cloudQuadrature > 1)
+                if (tightZero)
+                {
+                    // sample stays zero-initialised, so it claims neither a brick nor an empty box: no cell skip, no transfer record,
+                    // and the step advances by dt as it would have. fineVoxels goes back to the coarsest, the block holding nothing
+                    // that could bound the next step shorter.
+                    sigma = 0.f;
+                    fineVoxels = 1.f;
+                }
+                else if (params.cloudQuadrature > 1)
                 {
                     // Gauss-Legendre nodes and weights on [0, 1] for two and three points.
                     const float3 nodes = params.cloudQuadrature == 2 ? float3(0.21132487f, 0.78867513f, 0.f)
@@ -1601,11 +1623,25 @@ struct HSTRCloudRenderer
                     oracleCentroid = moment0 > 1e-9f ? moment1 / moment0 : 0.5f;
                 }
                 const float depth = (trapezoid ? 0.5f * (heldSigma + sigma) : sigma) * dt * ray.worldLength;
+                // Where the step's one source evaluation sits, and the sample that describes that place. These are kept apart from
+                // tSample/midpoint/sample - the observation the step's density came from - because three consumers read a sample's
+                // metadata against the position it was taken at, and the centroid moves the source by up to half a step:
+                //   sample.t   is the ray parameter cloudLocalStep measures the next step from;
+                //   cloudEmptyExit takes its box from sample.x/lo/hi and returns the exit as an offset from the t it is passed, so a
+                //     centroid ahead of the observation would skip past where density returns (and the case where they part company
+                //     furthest is precisely an empty observation among dense taps, which is the case that skips);
+                //   sunDepthAt reads the near field from sample.entry/x and continues the far field from the position given.
+                // The centroid's own sample is re-read rather than borrowed. That costs a density sample, which this oracle is free
+                // to spend - it measures what the quantity would be worth if it were free, not a way to make it free.
+                float3 sourcePoint = midpoint;
+                CloudSample sourceSample = sample;
                 if (params.cloudLongitudinalOracle > 1 && params.cloudOracleCentroid != 0)
                 {
-                    // Move the single source evaluation to where the step's own extinction says the light comes from.
-                    tSample = t + oracleCentroid * dt;
-                    midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                    const float tSource = t + oracleCentroid * dt;
+                    sourcePoint = (ray.position + tSource * ray.direction) * cellWidth;
+                    float sourceVoxels = 1.f;
+                    cameraExtinctionAtVoxel(sourcePoint, rayFootprint(ray, tSource), sourceVoxels, sourceSample);
+                    sourceSample.t = tSource;
                 }
                 heldSigma = ends ? sigma : -1.f;
                 sample.t = tSample;
@@ -1636,12 +1672,12 @@ struct HSTRCloudRenderer
                     {
                         // The cache is smooth at cell scale: it is re-evaluated every lightingStride contributing steps, and
                         // whenever the march has moved a cache cell since, so a held value never crosses a gap between puffs.
-                        const float3 moved = midpoint - heldAt;
+                        const float3 moved = sourcePoint - heldAt;
                         const float cellVoxels = float(params.worldCacheCellVoxels);
                         if (!cached || sinceLighting >= params.lightingStride || dot(moved, moved) > cellVoxels * cellVoxels)
                         {
-                            held = cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
-                            heldAt = midpoint;
+                            held = cached ? worldCacheRadiance(sourcePoint, ray.viewDirection) : sourceAtVoxel(sourcePoint);
+                            heldAt = sourcePoint;
                             sinceLighting = 0;
                         }
                         ++sinceLighting;
@@ -1658,15 +1694,15 @@ struct HSTRCloudRenderer
                         // The sun depth is smooth along the ray: cloudSunReuse holds one for the samples within that distance. A step
                         // whose end sample is empty still carries the light of its start (trapezoid), and an empty sample has no bake
                         // to read - it would take the live march - so it keeps the last depth instead.
-                        const float3 moved = midpoint - sunAt;
+                        const float3 moved = sourcePoint - sunAt;
                         const bool stale = params.cloudSunReuse <= 0.f || dot(moved, moved) > params.cloudSunReuse * params.cloudSunReuse;
-                        if (stale && !(sample.empty && sunAt.x < 1e29f))
+                        if (stale && !(sourceSample.empty && sunAt.x < 1e29f))
                         {
-                            heldSun = sunDepthAt(midpoint, footprint, sample);
-                            sunAt = midpoint;
+                            heldSun = sunDepthAt(sourcePoint, footprint, sourceSample);
+                            sunAt = sourcePoint;
                         }
                         const float sunDepth = heldSun;
-                        const float3 residualEnd = residualAtDepth(midpoint, sunDepth, ray.sunOctaves);
+                        const float3 residualEnd = residualAtDepth(sourcePoint, sunDepth, ray.sunOctaves);
                         if (params.cloudSourceLinear != 0)
                         {
                             residualRadiance +=
@@ -1704,7 +1740,8 @@ struct HSTRCloudRenderer
     /// on bricks coarser than asked, 18 an ancestor's bake. Per density sample: 7 all, 10 at the minimum step, 11 at the maximum step,
     /// 12 non-empty with alpha <= 1e-6, 13 exactly empty, 14 alpha > 0.5, 15 step length in sampled voxels. Per step: 17 majorant
     /// zero. Per density sample: 20 on a different brick than the last brick sample (brick visits), 21 read a brick. Per pixel: 16
-    /// terminated by transmittance, 22 more than 32 steps, 23 more than 64 steps.
+    /// terminated by transmittance, 22 more than 32 steps, 23 more than 64 steps, 24 in a block whose undilated majorant is zero,
+    /// 25 the same and far enough inside the block that a tight test could reject them.
     float probeMarch(CutRay ray, uint mode)
     {
         const float cellWidth = float(params.hstrCellWidth);
@@ -1740,6 +1777,18 @@ struct HSTRCloudRenderer
                 result += mode == 13 && sample.empty ? 1.f : 0.f;
                 result += mode == 14 && alpha > 0.5f ? 1.f : 0.f;
                 result += mode == 15 ? dt * voxelsPerUnit / max(fineVoxels, 1e-3f) : 0.f;
+                // How much of the density sampling a tight majorant could reject outright. Both majorants sit on the same 4-voxel
+                // block grid, so where the undilated maximum is zero the block's own texels are all zero, and a sample at least half
+                // a voxel inside every face reads only those texels - its trilinear support cannot leave the block, so its density is
+                // exactly zero and the brick walk that found it out was wasted. Mode 24 counts the samples in a tight-zero block
+                // (the whole pool the dilation costs us), 25 the interior ones a conservative test could actually reject.
+                if (mode == 24 || mode == 25)
+                {
+                    const float3 bv = seaVoxel(midpoint) * 0.25f;
+                    const float3 frac = bv - floor(bv);
+                    const bool interior = all(frac > 0.125f) && all(frac < 0.875f);
+                    result += tightMajorantAt(midpoint) <= 0.f && (mode == 24 || interior) ? 1.f : 0.f;
+                }
                 result += mode == 20 && sample.brick && (sample.entry != lastEntry || sample.instance != lastInstance) ? 1.f : 0.f;
                 result += mode == 21 && sample.brick ? 1.f : 0.f;
                 if (sample.brick)
