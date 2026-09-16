@@ -377,6 +377,23 @@ struct HSTRCloudParams
     float cloudThinDepth = 0.f; ///< Camera marches treat brick cells whose density bound gives at most this optical depth across as empty.
     /// 1: camera steps with a zero majorant cross the whole zero 16-voxel block (hstrMajorantZero). MEASURED (4K c15): sea 32.0 ->
     /// 29.1 ms, near 38.2 -> 40.7 ms - it pays where a view crosses a lot of empty sea and costs a little where it does not.
+    /// Above 1, how many consecutive empty blocks one step may cross. The sea marches 30.00 steps a pixel of which 17.81 are these
+    /// zero crossings, and no step length touches them - which is why every per-step result that paid on the near view barely moved
+    /// the sea, and why this is the sea's own lever.
+    /// MEASURED first as a second, 64-voxel level tested before the 16-voxel one, and that lost: sea 9.22 -> 11.07 ms against a
+    /// baseline that drifted to 10.86 in the same run, for a bit-identical image, and no effect at all on the near view. The reason
+    /// is a number that should have been checked first - cloudTileVoxels is 64, so a 64-voxel block is exactly one sea tile and
+    /// nearly always holds some cloud. The coarse test almost never succeeded and every zero crossing paid an extra load for it.
+    /// MEASURED again as this run walk, and it gives nothing either: sea 9.23 ms at one block against 10.39 at eight, where the
+    /// same baseline re-measured at the end of the run had drifted to 10.92, so somewhere between nothing and 5%. The image stays
+    /// bit-identical at every run length, which is the traversal being correct rather than the change doing anything. What it
+    /// falsifies is the premise: a zero crossing costs its texture load, not the loop around it, and walking a run removes the loop.
+    ///
+    /// The step-count share was misleading and the cost share is what matters. Fitting the sea's frame against its density samples
+    /// per pixel over step lengths 2, 4 and 8 gives about 5.40 ms + 0.346 ms per sample, so at a 2-voxel step only 4.2 ms of a
+    /// 9.6 ms frame is density sampling and 5.4 ms is not - the zero crossings among it, but also the sky, the resolve, the lattice
+    /// setup and the compositing. Empty traversal is perhaps 1.5-2 ms, not the 59% of the frame its 17.81 of 30.00 steps suggest.
+    /// That floor is why the sea shrugged off every per-sample result that paid on the near view: they all attack the 4.2 ms.
     uint cloudZeroSkip = 1;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
     uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.

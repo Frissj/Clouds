@@ -425,7 +425,7 @@ void HSTRCloud::parseProperties(const Properties& props)
         else if (key == kCloudThinDepth)
             mParams.cloudThinDepth = std::max(0.f, float(value));
         else if (key == kCloudZeroSkip)
-            mParams.cloudZeroSkip = bool(value) ? 1u : 0u;
+            mParams.cloudZeroSkip = std::min(uint32_t(value), 2u);
         else if (key == kCloudSunReuse)
             mParams.cloudSunReuse = std::max(0.f, float(value));
         else if (key == kCloudTrapezoid)
@@ -651,7 +651,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSunCache] = mParams.cloudSunCache != 0;
     props[kMarchProbe] = mParams.marchProbe;
     props[kCloudThinDepth] = mParams.cloudThinDepth;
-    props[kCloudZeroSkip] = mParams.cloudZeroSkip != 0;
+    props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
     props[kCloudLocalStep] = mParams.cloudLocalStep != 0;
