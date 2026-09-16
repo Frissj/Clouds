@@ -726,6 +726,11 @@ struct HSTRCloudRenderer
         // Read up front even where a brick answers: fetching it only on the proxy paths made sunDepthAt's live march 5x slower (DXC),
         // and saved nothing measurable in the camera march.
         const float proxy = extinctionAtVoxel(v);
+        // Timing oracle (cloudCostProbe), not an image: 1 stops here, so every sample costs what a proxy-resolved one costs, and
+        // 2 walks the instance and the sparse hierarchy but never reads the atlas. The frame is wrong in both; the differences
+        // decompose a sample into proxy fetch, virtual lookup and atlas filtering, which the all-sample cost fit cannot.
+        if (params.cloudCostProbe == 1)
+            return proxy;
         uint instanceIndex;
         float3 x;
         float footprintLevel;
@@ -742,6 +747,10 @@ struct HSTRCloudRenderer
         fineVoxels = float(1u << sample.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x;
         if (sample.empty)
             return 0.f;
+        // The hierarchy has been walked and sample is written, so the caller's skipping and stepping still depend on it and none of
+        // that work folds away; only the atlas fetch and its filtering are missing.
+        if (params.cloudCostProbe == 2)
+            return proxy;
         const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
         const int3 i = int3(floor(x + 0.5f));
         float density = cloudBrickDensity(sample.entry, x, i) * scale;
@@ -1741,7 +1750,8 @@ struct HSTRCloudRenderer
     /// 12 non-empty with alpha <= 1e-6, 13 exactly empty, 14 alpha > 0.5, 15 step length in sampled voxels. Per step: 17 majorant
     /// zero. Per density sample: 20 on a different brick than the last brick sample (brick visits), 21 read a brick. Per pixel: 16
     /// terminated by transmittance, 22 more than 32 steps, 23 more than 64 steps, 24 in a block whose undilated majorant is zero,
-    /// 25 the same and far enough inside the block that a tight test could reject them.
+    /// 25 the same and far enough inside the block that a tight test could reject them, 26 brick samples that change the pixel,
+    /// 27 the distinct brick entries holding at least one of those (26 over 27 is the contributing run length).
     float probeMarch(CutRay ray, uint mode)
     {
         const float cellWidth = float(params.hstrCellWidth);
@@ -1756,6 +1766,8 @@ struct HSTRCloudRenderer
         uint steps = 0;
         uint lastEntry = kCloudRefNone - 1u;
         uint lastInstance = 0;
+        uint lastLiveEntry = kCloudRefNone - 1u;
+        uint lastLiveInstance = 0;
         [loop]
         while (t < 1.f && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
         {
@@ -1795,6 +1807,20 @@ struct HSTRCloudRenderer
                 {
                     lastEntry = sample.entry;
                     lastInstance = sample.instance;
+                }
+                // What a compact interval representation would actually replace. Samples per brick visit (21 over 20) counts every
+                // sample in the visit, and most of those are empty or too faint to change the pixel - both now measured to be nearly
+                // free (cloudTightReject, cloudThinDepth), so replacing them buys nothing. The run that matters is the CONTRIBUTING
+                // one: 26 counts brick samples that change the pixel, 27 the distinct brick entries that hold at least one. Their
+                // ratio is how many expensive events one interval operation could stand for, and if it is near 1 no interval
+                // representation can pay however good its encoding.
+                const bool contributes = sample.brick && !sample.empty && alpha > 1e-6f;
+                result += mode == 26 && contributes ? 1.f : 0.f;
+                result += mode == 27 && contributes && (sample.entry != lastLiveEntry || sample.instance != lastLiveInstance) ? 1.f : 0.f;
+                if (contributes)
+                {
+                    lastLiveEntry = sample.entry;
+                    lastLiveInstance = sample.instance;
                 }
                 if (alpha > 1e-6f)
                 {

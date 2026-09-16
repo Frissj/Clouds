@@ -57,7 +57,7 @@ for name, position, target in views:
     hstr.set_properties({"storeExact": True})
     m.renderFrame()
     hstr.set_properties({"hstComponents": 3})
-    k = {mode: mean_of(mode) for mode in range(1, 26) if mode != 19}
+    k = {mode: mean_of(mode) for mode in range(1, 28) if mode != 19}
     q = max(k[1], 1e-9)
     log(f"{name}: {k[1]:6.2f} sun queries per pixel: own bake {100 * k[2] / q:5.1f}%, ancestor's bake {100 * k[18] / q:5.1f}%, proxy {100 * k[3] / q:5.1f}%, "
         f"live: finer than asked {100 * k[4] / q:5.1f}%, no bake {100 * k[5] / q:5.1f}%, empty {100 * k[6] / q:5.1f}%")
@@ -72,6 +72,10 @@ for name, position, target in views:
     # half a voxel of a block face, where the trilinear support crosses into the neighbour and the dilation is doing real work.
     log(f"{name}: tight-zero samples {k[24]:6.2f}/px ({100 * k[24] / d:5.1f}% of density samples), of which rejectable "
         f"{k[25]:6.2f}/px ({100 * k[25] / d:5.1f}%); exactly empty {k[13]:6.2f}/px for comparison")
+    # The run a compact interval representation would stand for. Samples per brick visit counts the empty and faint ones too, and
+    # those are nearly free, so the length that decides whether an interval can pay is the contributing one. Near 1 means it cannot.
+    log(f"{name}: contributing brick samples {k[26]:6.2f}/px over {k[27]:5.2f} contributing entries/px = "
+        f"{k[26] / max(k[27], 1e-9):5.2f} per entry (against {k[21] / max(k[20], 1e-9):5.2f} counting every sample in the visit)")
     # What a transfer cache would face on the path that ships: brick crossings it could serve against the distinct (asset brick,
     # source-space direction class, entry cell) entries it would have to produce. Break-even is Z / (Z - 1) with Z the events per
     # crossing above, so about 1.45. The beam view traces far fewer rays than there are pixels, which is the whole question.

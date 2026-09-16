@@ -117,6 +117,7 @@ const char kCloudThinDepth[] = "cloudThinDepth";
 const char kCloudZeroSkip[] = "cloudZeroSkip";
 const char kCloudSunReuse[] = "cloudSunReuse";
 const char kCloudTightReject[] = "cloudTightReject";
+const char kCloudCostProbe[] = "cloudCostProbe";
 const char kCloudTrapezoid[] = "cloudTrapezoid";
 const char kCloudLocalStep[] = "cloudLocalStep";
 const char kCloudStepFootprint[] = "cloudStepFootprint";
@@ -429,11 +430,13 @@ void HSTRCloud::parseProperties(const Properties& props)
             // A run length for the shader's bounded walk, not a flag. The clamp was 2 from when this selected a second, coarser zero
             // level (the 64-voxel test that lost); the run-walk measurement recorded beside the parameter goes to eight blocks, and
             // could not be reproduced from the property while the clamp stood.
-            mParams.cloudZeroSkip = std::clamp(uint32_t(value), 1u, 16u);
+            mParams.cloudZeroSkip = std::clamp(uint32_t(value), 0u, 16u);
         else if (key == kCloudSunReuse)
             mParams.cloudSunReuse = std::max(0.f, float(value));
         else if (key == kCloudTightReject)
             mParams.cloudTightReject = std::min(uint32_t(value), 2u);
+        else if (key == kCloudCostProbe)
+            mParams.cloudCostProbe = std::min(uint32_t(value), 2u);
         else if (key == kCloudTrapezoid)
             mParams.cloudTrapezoid = bool(value) ? 1u : 0u;
         else if (key == kCloudLocalStep)
@@ -660,6 +663,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
+    props[kCloudCostProbe] = mParams.cloudCostProbe;
     props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
     props[kCloudLocalStep] = mParams.cloudLocalStep != 0;
     props[kCloudStepFootprint] = mParams.cloudStepFootprint;

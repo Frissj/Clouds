@@ -270,6 +270,17 @@ struct HSTRCloudParams
     /// accepts, so level 0 costs 2.9 ms and level 1 another 2.5 against 4.5 ms for the one flat lattice, and the hierarchy pays for
     /// both. A level only earns its lattice where tiles that size accept, and in a sea of high-frequency cloud they do not.
     /// CloudSea.py therefore keeps 4 pixels at one level.
+    ///
+    /// MEASURED again on the sea against the continuous metrics, one settle, drift 9.81 -> 9.89 ms: 4x1 9.81 ms at >0.02 0.111%,
+    /// 8x1 7.96 at 0.287%, 8x2 8.51 at 0.306%, 16x2 8.24 at 0.801%, 16x3 8.41 at 0.815%, and 8x1 with the tolerance tightened to
+    /// 0.02 8.78 at 0.183%. Quartering the lattice takes queries from 4.9 to 2.0 ms and hands 1.1 ms back to resolve as the marched
+    /// share goes 3.9% -> 5.7%, so the net is 1.85 ms for 2.6x the error, and buying the quality back with the tolerance leaves 1 ms
+    /// against a still worse image. Queries and resolve are 4.9 / 4.9: work moved out of one lands in the other.
+    ///
+    /// That is a result about UNIFORM tilings only. Every configuration above applies one tile size to the whole frame, and the near
+    /// view's preference for 8x2 against the sea's for 4x1 is itself evidence that the best size is a property of the content under
+    /// the tile, not of the frame. Nothing here tests admitting tiles at different sizes in different regions, and this must not be
+    /// read as closing that.
     uint beamTileSize = 16;
     uint beamLevels = 3;          ///< Beam tile levels; tiles that fail at the finest level are marched per pixel.
     float beamTolerance = 0.02f;  ///< log(1 + radiance) surplus at a tile centre above which the tile is refined.
@@ -407,11 +418,12 @@ struct HSTRCloudParams
     /// and the shares over 0.02 and 0.1, which are continuous, and treat a single-bin move in p99.9 as a direction, not a size.
     ///
     /// Where the density samples are decides what any codec can be worth. The sea takes 12.19 samples a pixel, 8.88 of them in
-    /// bricks and the remaining 3.31 in the proxy. Make every brick sample free and the fit still gives 1.84 + 0.575 * 3.31 = 3.74 ms,
-    /// so a codec that amortises brick integration alone cannot reach 3 ms however good it is - the 3 ms budget is 2.0 samples a pixel
-    /// in total. Either the proxy march shrinks with it or the ray count does. (Those counts come from a run that settled the short
-    /// way, 656 frames with 88498 bakes waiting, so fewer bricks were mapped than in a clean settle: the brick share is if anything
-    /// understated and the bound tighter.) Of the 12.19, a third read exactly zero and another third are non-empty but too faint to
+    /// bricks and the remaining 3.31 resolved by the proxy. What those 3.31 cost is NOT known from this fit and must not be taken
+    /// from it: an attempt here to floor a brick-only codec at 1.84 + 0.575 * 3.31 = 3.74 ms was wrong, because it charged a
+    /// proxy-resolved sample the all-sample average when cameraExtinctionUnfaded reads the proxy unconditionally and returns on it,
+    /// so a proxy sample pays a fetch and a failed cloudInstanceAt while a brick sample pays that and the whole hierarchy and atlas
+    /// on top. cloudCostProbe measures the three parts separately. (Those counts come from a run that settled the short way, 656
+    /// frames with 88498 bakes waiting, so fewer bricks were mapped than in a clean settle and the brick share is understated.) Of the 12.19, a third read exactly zero and another third are non-empty but too faint to
     /// change the pixel (alpha <= 1e-6), so 64% of the sea's density sampling buys no image at all.
     ///
     /// That 64% is not, however, 64% of the time, and the fit above must not be read as saying it is - it averages over samples whose
@@ -450,6 +462,55 @@ struct HSTRCloudParams
     /// roughly 7 ms of density work sits in the 4.4 samples a pixel that actually read the atlas and contribute, about 1.6 ms each,
     /// which is also where the longitudinal oracle and any transfer or moment codec would act. Attack the contributing samples.
     uint cloudTightReject = 0;
+    /// Timing oracle decomposing what one camera density sample costs (0: off, the real image). 1 returns the proxy extinction the
+    /// moment it is read, so every sample costs what a proxy-resolved sample costs; 2 walks cloudInstanceAt and the sparse hierarchy
+    /// and writes the sample, but returns before cloudBrickDensity, so the atlas fetch and its filtering are the only thing missing.
+    /// Both render the wrong image deliberately - pin minStepVoxels == maxStepVoxels so the step schedule and the ray count cannot
+    /// move, and read only the times.
+    ///
+    /// This exists because "ms ~ 1.84 + 0.575 * density samples" is an average over samples whose costs differ by an order of
+    /// magnitude (see cloudTightReject), and so cannot price a change that removes one CLASS of sample. It was used that way once
+    /// here - to put a 3.74 ms floor under a brick-only codec by charging the sea's 3.31 proxy-resolved samples 0.575 ms each - and
+    /// that was wrong in its own commit's terms. cameraExtinctionUnfaded reads the proxy unconditionally before it looks for a brick,
+    /// so a brick sample pays the proxy's cost and everything after it, while a proxy sample pays only the fetch and a failed
+    /// cloudInstanceAt. The floor needs the proxy's own cost, which is what mode 1 measures.
+    ///
+    /// MEASURED (4K, beam view, min == max step 2, two independent processes). The arms reproduce closely - near 3.17 and 3.17
+    /// proxy-only, 9.11 and 9.16 without the atlas; sea 3.88 and 4.03, 10.31 and 9.96 - which is what the reading rests on, because
+    /// the baselines drifted badly in the second run (sea 9.89 to 10.89, 10%) and the attempt to hold the ray count fixed by raising
+    /// beamTolerance did NOT work: the marched fraction came back identical, so tolerance is not what gates refinement here. The
+    /// probe modes do move it (sea 3.9% full, 5.5% proxy-only, 4.5% no-atlas), and since proxy-only refines MOST its time is
+    /// overstated, so everything attributed to the hierarchy below is understated.
+    ///
+    ///     sea   full ~10.0   no atlas ~10.0   proxy only ~4.0     so atlas ~0 ms, hierarchy ~6.0 ms
+    ///     near  full ~12.2   no atlas  ~9.1   proxy only ~3.2     so atlas ~3.0 ms, hierarchy ~6.0 ms
+    ///
+    /// Reading the density is free on the sea; the walk to find it is six of ten milliseconds. That also settles the floor properly:
+    /// proxy-only runs all 12.19 samples a pixel in 4.0 ms, about 0.167 ms per proxy sample per pixel against the 0.575 average, so
+    /// the sea's 3.31 proxy samples cost about 0.55 ms and a brick-only codec floors near 2.4 ms - under the target, not above it.
+    ///
+    /// And it says which codec. A representation compressing what is INSIDE a brick - moments, Gabor, Haar, analytic intervals -
+    /// attacks the atlas fetch, which the sea measures at nothing. Caching the resolved brick context across a run attacks address
+    /// arithmetic, and that was tried on 2026-09-15 (the note above residualAtVoxel): exact to 6e-9, 80% of lookups removed, and
+    /// SLOWER at 46.5 -> 52.9 ms, because the context's registers cost more occupancy than the lookups cost latency. What is left is
+    /// the shape of the walk. cloudAssetBrickAt chases directory -> node -> node -> brick with each address coming out of the
+    /// previous load, so it is a dependent chain whose latency no arithmetic saving shortens. Fewer samples, or fewer DEPENDENT
+    /// fetches per sample - a flatter index that answers "which brick, where in it" in one independent load.
+    ///
+    /// AND THE INTERVAL CODEC HAS A CEILING OF ABOUT 1.2x, measured before choosing a representation (marchProbe 26/27). What one
+    /// compact interval operation could stand for is the CONTRIBUTING run, not the samples per brick visit: the empty and faint ones
+    /// in a visit are nearly free, so replacing them buys nothing. The sea takes 4.38 contributing brick samples a pixel over 1.98
+    /// distinct contributing entries - a run of 2.21 - and the near view 7.13 over 2.80, a run of 2.54, against 3.24 and 3.78
+    /// counting every sample in the visit. An ideal codec costs one operation per entry, so it saves 2.40 events a pixel on the sea,
+    /// and at the ~0.67 ms per brick sample per pixel implied above (6 ms of hierarchy over 8.94 brick samples) that is about 1.6 ms:
+    /// 10.0 -> 8.4. The cause is geometric and not fixable by encoding - a brick is 8^3 at the sampled level, a 2-voxel step crosses
+    /// it in about four steps, and only 2.2 of those contribute, so there is not enough depth along the ray to amortise against. It
+    /// is the same answer d* = sqrt(r/z) = 0.87 gave from the other side (cloudTransferClasses): the brick is already the best unit,
+    /// and the best unit is too small. So the choice between preintegrated (tau, centroid), Gabor, Haar moments and the rest barely
+    /// matters - none can be worth more than about 1.6 ms - and it attacks the same events as the longitudinal oracle, so the two do
+    /// not stack. What is NOT bounded by any of this is the number of rays: the per-sample cost is close to irreducible, the sample
+    /// count is not.
+    uint cloudCostProbe = 0;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
     uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.
     /// Fraction of a step's length folded into its density sample's footprint (0: off). minStepVoxels above one samples the density
