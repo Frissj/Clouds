@@ -75,6 +75,7 @@ const char kBeamTileSize[] = "beamTileSize";
 const char kBeamLevels[] = "beamLevels";
 const char kBeamSegments[] = "beamSegments";
 const char kBeamTemporal[] = "beamTemporal";
+const char kBeamAdaptiveRoot[] = "beamAdaptiveRoot";
 const char kCompareBlock[] = "compareBlock";
 const char kCompareMapScale[] = "compareMapScale";
 const char kWorldCacheModulation[] = "worldCacheModulation";
@@ -118,6 +119,8 @@ const char kCloudSunReuse[] = "cloudSunReuse";
 const char kCloudTrapezoid[] = "cloudTrapezoid";
 const char kCloudLocalStep[] = "cloudLocalStep";
 const char kCloudStepFootprint[] = "cloudStepFootprint";
+const char kCloudQuadrature[] = "cloudQuadrature";
+const char kCloudSourceLinear[] = "cloudSourceLinear";
 const char kCloudSunLiveMarch[] = "cloudSunLiveMarch";
 const char kCloudCameraKernel[] = "cloudCameraKernel";
 const char kCloudMinTransmittance[] = "cloudMinTransmittance";
@@ -348,6 +351,8 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamSegments = nextPowerOfTwo(std::clamp(uint32_t(value), 1u, 64u));
         else if (key == kBeamTemporal)
             mParams.beamTemporal = bool(value) ? 1u : 0u;
+        else if (key == kBeamAdaptiveRoot)
+            mParams.beamAdaptiveRoot = bool(value) ? 1u : 0u;
         else if (key == kCompareBlock)
             mParams.compareBlock = std::max(1u, uint32_t(value));
         else if (key == kCompareMapScale)
@@ -426,6 +431,10 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLocalStep = bool(value) ? 1u : 0u;
         else if (key == kCloudStepFootprint)
             mParams.cloudStepFootprint = std::max(0.f, float(value));
+        else if (key == kCloudQuadrature)
+            mParams.cloudQuadrature = std::clamp(uint32_t(value), 1u, 3u);
+        else if (key == kCloudSourceLinear)
+            mParams.cloudSourceLinear = bool(value) ? 1u : 0u;
         else if (key == kCloudSunLiveMarch)
             mCloudSunLiveMarch = value;
         else if (key == kCloudCameraKernel)
@@ -595,6 +604,7 @@ Properties HSTRCloud::getProperties() const
     props[kBeamLevels] = mParams.beamLevels;
     props[kBeamSegments] = mParams.beamSegments;
     props[kBeamTemporal] = mParams.beamTemporal != 0;
+    props[kBeamAdaptiveRoot] = mParams.beamAdaptiveRoot != 0;
     props[kCompareBlock] = mParams.compareBlock;
     props[kCompareMapScale] = mParams.compareMapScale;
     props[kWorldCacheModulation] = mWorldCacheModulation;
@@ -637,6 +647,8 @@ Properties HSTRCloud::getProperties() const
     props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
     props[kCloudLocalStep] = mParams.cloudLocalStep != 0;
     props[kCloudStepFootprint] = mParams.cloudStepFootprint;
+    props[kCloudQuadrature] = mParams.cloudQuadrature;
+    props[kCloudSourceLinear] = mParams.cloudSourceLinear != 0;
     props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
@@ -2964,6 +2976,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
             else
             {
+                // The per-level build keeps the refinement history too: beamAdaptiveRoot reads the previous frame's finest-level
+                // bits to decide which root tiles to skip, and that prediction has to exist whether or not the queries are temporal.
+                mBeamParity ^= 1u;
+                if (!mBeamHistoryValid)
+                    pRenderContext->clearUAV(mpBeamHistory[mBeamParity ^ 1u]->getUAV().get(), uint4(0));
+                pRenderContext->clearUAV(mpBeamHistory[mBeamParity]->getUAV().get(), uint4(0));
                 pRenderContext->clearUAV(mpBeamCounts[mBeamParity]->getUAV().get(), uint4(0));
                 for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                 {
@@ -2987,12 +3005,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     }
                     bindRenderer(pRenderContext, mpBeamTilePass);
                     bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                    mpBeamTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
                     if (level == 0)
                         mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
                     else
                         mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
                 }
-                mBeamHistoryValid = false;
+                mBeamHistoryValid = true;
             }
             writeArgs(mParams.beamLevels);
             mBeamReusable = true;

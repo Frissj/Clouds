@@ -300,6 +300,23 @@ struct HSTRCloudParams
     uint2 beamLevelDims = { 0, 0 }; ///< Level map, one texel per finest tile.
     uint beamLatticeStep = 2;       ///< Pixels between lattice texels: half the finest tile.
     uint beamTemporal = 0;          ///< 1: query every level in one pass over the tiles refined last frame (one frame of lag).
+    /// 1: a coarsest tile whose region was marched per pixel last frame refines straight to the next level, paying neither its centre
+    /// query nor its own test. Its corners are still marched - they are the outer corners of its children, which query only edge
+    /// midpoints and child centres - so this saves the centre half of the root lattice, not all of it. The tiling that wins is
+    /// content-dependent (see beamTileSize):
+    /// coarse tiles with levels pay off over one smooth cloud and lose over a sea of small ones, because there almost every coarse
+    /// tile fails and the frame pays the coarse lattice before paying the fine one anyway. Choosing the entry level per region rather
+    /// than per frame is what makes a coarse root safe to offer at all. The prediction is a pure function of the previous frame that
+    /// the query pass and the tile pass both evaluate, so it can only cost rays, never correctness (see beamRootDifficult).
+    ///
+    /// MEASURED, and it does not pay (4K, 8-pixel roots over two levels, temporal off): near 9.39 -> 9.36 ms and sea 9.66 -> 10.83,
+    /// the image bit-identical in both - same marched share, same error to every digit - which is the design working and the cost
+    /// going the wrong way. The arithmetic is against it. Only about 4% of pixels are marched per pixel, so only about a tenth of
+    /// root tiles are predicted difficult, and their centres are a twentieth of the root lattice; that is less than the four history
+    /// reads the prediction costs at every centre query and every root test. The tiles it forces to refine would have failed their
+    /// own test anyway, which is why the image never moves. The near view's win at 8x2 (11.12 -> 9.39) is the tiling itself, not the
+    /// adaptivity. A cheaper predictor could turn the sea's loss into a wash, but the ceiling on the whole idea is that twentieth.
+    uint beamAdaptiveRoot = 0;
 
     uint compareBlock = 1; ///< Comparisons average compareBlock x compareBlock pixel blocks first (1: per pixel).
     float worldCacheModulation = 0.f;       ///< b of the cache's exp(-b tau_sun) voxel-resolution modulation (0: off); set per frame.
@@ -381,7 +398,50 @@ struct HSTRCloudParams
     /// frame is simply wrong. Leave it at 0; the longitudinal sampling problem needs a filter along the ray, which the isotropic
     /// brick pyramid cannot express.
     float cloudStepFootprint = 0.f;
-    uint padHSTRCloud11 = 0;
+    /// Density taps per camera march step (1: the midpoint rule), placed at Gauss-Legendre nodes. Raising minStepVoxels with it holds
+    /// the taps per voxel fixed, which is the controlled test of whether a coarse step's error is quadrature error that a better
+    /// estimator can remove at the same cost.
+    ///
+    /// MEASURED, and it is not (4K, beam view, one thread per ray, temporal off, against the per-pixel 1-voxel march; maxStepVoxels
+    /// raised with minStepVoxels, which otherwise clamps the step to 4). The error tracks the step length and ignores everything
+    /// else. Near: 1 tap over 2 voxels gives p99.9 0.036, and then 4-voxel steps give 0.122 whether they carry one tap or two, and
+    /// 6- and 8-voxel steps give 0.205 at two or three taps alike. Sea: 0.022 at 1 tap over 2 voxels, 0.061 at one tap over 4 and
+    /// 0.043 at two over 4 - extra nodes help a little there but nothing like enough. At a fixed tap budget the plain midpoint at
+    /// the shorter step wins on both axes every time: sea q1 s2 8.98 ms at p99.9 0.022 against q2 s4 10.85 ms at 0.043, the latter
+    /// slower despite equal taps because the node loop costs per-step overhead of its own.
+    ///
+    /// The reason more nodes cannot help is that the optical-depth integral is not what a long step gets wrong. A step composites
+    /// radiance += T * (1 - exp(-tau)) * source(centre), and were the source constant across the step that would be exact once tau
+    /// is - the exponential already carries the transmittance's variation within the step. What a long step actually loses is the
+    /// source varying under the extinction weighting, C = integral of T(s) sigma(s) S(s) ds, which no amount of sampling of sigma
+    /// touches. The two views separate the two error terms cleanly: near, one tap and two over a 4-voxel step both give p99.9 0.122,
+    /// so the source term is the whole of it there; sea, two taps take 0.061 to 0.043, so some genuine tau quadrature error exists
+    /// as well, and it is the smaller half. So error goes as the step length and cost goes as the taps, a 2-tap step is strictly
+    /// beaten by two 1-tap steps of half the length, and every within-step estimator of sigma is dominated - an exact analytic
+    /// integral of the trilinear density would land on the same curve. Cheaper rays have to come from compositing events that each
+    /// still stand for a short interval: an extinction-weighted source basis over the step (cloudSourceLinear), pre-integrated
+    /// transfer along the ray, which this asset does not carry, or fewer rays.
+    uint cloudQuadrature = 1;
+    /// 1: a step composites its source as an extinction-weighted blend of the values at its two ends instead of one value standing
+    /// for the whole interval. That is the error term cloudQuadrature isolated, and it costs nothing: the sample already sits at the
+    /// step's end, so this step's end source is the next step's start source and there is still one evaluation per step. It is the
+    /// runtime rehearsal of what a transfer codec would bake - the same basis, with the weights precomputed over a macro-segment
+    /// rather than derived from one step's own tau.
+    ///
+    /// MEASURED, and it loses on both axes (4K, beam view, against the per-pixel 1-voxel march). Near: p99.9 0.036 -> 0.051 at
+    /// 2-voxel steps and 0.122 -> 0.122 at 4, the time unchanged. Sea: 8.84 -> 11.10 ms and p99.9 0.026 -> 0.030 at 2 voxels,
+    /// 6.90 -> 10.14 ms at 4. Two separate mechanisms, both attributable. The accuracy went backwards because needing the sample at
+    /// the step's end switches the optical depth from the midpoint rule to the trapezoid, whose error is twice as large and of the
+    /// opposite sign, and the source basis gained about what that lost. The time went backwards because a sample at the step's end
+    /// weakens the empty-cell skip, which is the same effect that made the trapezoid 1.8x slower when it was first tried.
+    ///
+    /// The result does not settle the codec question, and it is worth being precise about why: these weights assume sigma constant
+    /// across the step, whereas the whole point of a baked W_k = integral of T sigma b_k is that it carries the correlation between
+    /// the extinction and the source at fine scale, which a constant-sigma weight throws away. So this says a cheap runtime version
+    /// of the basis does not pay; it does not say a baked one cannot. What it does confirm is that the source's variation across a
+    /// step is not low-order - a linear basis with reasonable weights recovers none of it - and any transfer representation has to
+    /// carry the fine structure, not a smooth fit to it.
+    uint cloudSourceLinear = 0;
     /// Domain voxels a camera march may move before it queries the sun depth again (0: every sample). MEASURED (4K c15, 0.1 voxels,
     /// which reuses about every second query): near 42.8 -> 42.3 ms, sea 30.4 -> 33.0 ms - nothing. Halving the sun fetches does not
     /// pay, the same way the brick context did not: what a sample costs is the sample, not the fetches inside it.

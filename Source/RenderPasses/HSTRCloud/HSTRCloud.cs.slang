@@ -1436,6 +1436,9 @@ struct HSTRCloudRenderer
         float3 heldAt = 0.f;
         float heldSun = 0.f;
         float3 sunAt = float3(1e30f);
+        float3 heldSource = 0.f;   ///< Source at the previous step's end, which is this step's start (cloudSourceLinear).
+        float3 heldResidual = 0.f; ///< The same for the single-scattered residual.
+        bool heldEnds = false;     ///< Whether those two hold a value from a step that ended where this one starts.
         float heldSigma = -1.f; ///< The previous step's end extinction, or negative where the march jumped (cloudTrapezoid).
         float heldStep = -1.f;  ///< Step the previous sample's density bounds allow (cloudLocalStep), or negative for the majorant rule.
         uint sinceLighting = ~0u;
@@ -1461,15 +1464,49 @@ struct HSTRCloudRenderer
                 // step's start, so both cost one density sample per step, but the trapezoid is exact wherever the extinction is
                 // linear and lets the steps grow (the sample count is what the march costs).
                 // Local stepping samples the step's end so the bounds it reads are the ones the next step runs through.
-                const bool ends = params.cloudTrapezoid != 0 || params.cloudLocalStep != 0;
+                // cloudSourceLinear needs the sample, and so the source, at the step's end, which is the next step's start.
+                const bool ends = params.cloudTrapezoid != 0 || params.cloudLocalStep != 0 || params.cloudSourceLinear != 0;
                 const bool trapezoid = ends && heldSigma >= 0.f;
                 tSample = ends ? t + dt : t + 0.5f * dt;
-                const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
                 // The sample stands for the whole step, so its footprint is the wider of the pixel's and the step's (cloudStepFootprint).
                 const float footprint = params.cloudStepFootprint > 0.f
                                             ? max(rayFootprint(ray, tSample), params.cloudStepFootprint * dt * ray.worldLength)
                                             : rayFootprint(ray, tSample);
-                const float sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
+                // Higher-order quadrature of the step (cloudQuadrature): the density is minValue + range * t^2 on a trilinear t, so
+                // inside one interpolation cell it is a polynomial of degree at most six in the ray parameter, which Gauss-Legendre
+                // integrates far better than the midpoint does. The nodes replace the step's own subdivision rather than adding to
+                // it - the caller scales minStepVoxels with the node count to hold the taps per voxel fixed - so this asks whether
+                // the coarse-step error is quadrature error or aliasing. The centre-most node stands for the step downstream: the
+                // lighting, the sun lookup and the empty-cell skip all vary smoothly across one step.
+                float sigma;
+                if (params.cloudQuadrature > 1)
+                {
+                    // Gauss-Legendre nodes and weights on [0, 1] for two and three points.
+                    const float3 nodes = params.cloudQuadrature == 2 ? float3(0.21132487f, 0.78867513f, 0.f)
+                                                                    : float3(0.11270167f, 0.5f, 0.88729833f);
+                    const float3 weights = params.cloudQuadrature == 2 ? float3(0.5f, 0.5f, 0.f)
+                                                                       : float3(0.27777778f, 0.44444444f, 0.27777778f);
+                    const uint centre = params.cloudQuadrature / 2u;
+                    sigma = 0.f;
+                    for (uint q = 0; q < params.cloudQuadrature; ++q)
+                    {
+                        const float tq = t + nodes[q] * dt;
+                        const float3 vq = (ray.position + tq * ray.direction) * cellWidth;
+                        CloudSample node = {};
+                        float nodeVoxels = 1.f;
+                        sigma += weights[q] * cameraExtinctionAtVoxel(vq, rayFootprint(ray, tq), nodeVoxels, node);
+                        if (q == centre)
+                        {
+                            sample = node;
+                            fineVoxels = nodeVoxels;
+                            tSample = tq;
+                            midpoint = vq;
+                        }
+                    }
+                }
+                else
+                    sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
                 const float depth = (trapezoid ? 0.5f * (heldSigma + sigma) : sigma) * dt * ray.worldLength;
                 heldSigma = ends ? sigma : -1.f;
                 sample.t = tSample;
@@ -1477,6 +1514,18 @@ struct HSTRCloudRenderer
                                ? cloudLocalStep(ray, sample, params.stepOpticalDepth, gScene.getGridVolume(0).data.densityScale * params.densityScale)
                                : -1.f;
                 const float alpha = 1.f - exp(-depth);
+                // Extinction-weighted linear source across the step (cloudSourceLinear). Compositing radiance += T * alpha * S(centre)
+                // treats one source value as standing for the whole interval, and that - not the optical depth - is what a long step
+                // gets wrong (see cloudQuadrature). With S linear from the step's start to its end and sigma constant across it,
+                //   C = S0 * (1 - A) + (S1 - S0) * (1 - A - tau A) / tau,   A = exp(-tau),
+                // which is exact and costs nothing extra: the sample already sits at the step's end, so this step's S1 is the next
+                // step's S0 and there is still one source evaluation per step. weightEnd is that second term's coefficient, rising to
+                // alpha/2 for a thin step, where the two ends weigh equally, and falling towards zero for a thick one, where the
+                // front of the step is all that is seen.
+                const float weightEnd = params.cloudSourceLinear != 0
+                                            ? (depth > 1e-4f ? (alpha - depth * (1.f - alpha)) / depth : 0.5f * depth)
+                                            : 0.f;
+                const float weightStart = alpha - weightEnd;
                 if ((withSource || residual) && alpha > 1e-6f)
                 {
                     if (withSource)
@@ -1492,7 +1541,13 @@ struct HSTRCloudRenderer
                             sinceLighting = 0;
                         }
                         ++sinceLighting;
-                        radiance += transmittance * alpha * held;
+                        if (params.cloudSourceLinear != 0)
+                        {
+                            radiance += transmittance * ((heldEnds ? heldSource : held) * weightStart + held * weightEnd);
+                            heldSource = held;
+                        }
+                        else
+                            radiance += transmittance * alpha * held;
                     }
                     if (residual)
                     {
@@ -1507,8 +1562,17 @@ struct HSTRCloudRenderer
                             sunAt = midpoint;
                         }
                         const float sunDepth = heldSun;
-                        residualRadiance += transmittance * alpha * residualAtDepth(midpoint, sunDepth, ray.sunOctaves);
+                        const float3 residualEnd = residualAtDepth(midpoint, sunDepth, ray.sunOctaves);
+                        if (params.cloudSourceLinear != 0)
+                        {
+                            residualRadiance +=
+                                transmittance * ((heldEnds ? heldResidual : residualEnd) * weightStart + residualEnd * weightEnd);
+                            heldResidual = residualEnd;
+                        }
+                        else
+                            residualRadiance += transmittance * alpha * residualEnd;
                     }
+                    heldEnds = params.cloudSourceLinear != 0;
                 }
                 transmittance *= 1.f - alpha;
             }
@@ -1517,11 +1581,13 @@ struct HSTRCloudRenderer
                                    ? min(max(t + dt, majorantZeroExit(ray, t)), segment.y)
                                    : (sample.empty && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y)
                                                                                  : t + dt);
-            // A step that took no sample at its end, or that jumped, leaves no start value for the next trapezoid or local step.
+            // A step that took no sample at its end, or that jumped, leaves no start value for the next trapezoid, local step or
+            // source basis: the next step begins somewhere else, so its start source is its own.
             if (majorant <= 0.f || next > t + dt)
             {
                 heldSigma = -1.f;
                 heldStep = -1.f;
+                heldEnds = false;
             }
             t = next;
             ++steps;
@@ -2979,6 +3045,12 @@ struct HSTRCloudRenderer
             if (any(point >= grid))
                 return false;
             position = point * s + (centre ? s / 2 : 0u);
+            // Only the centre belongs to the root tile alone. Its corners are the outer corners of its children too - a refined
+            // tile's own eight queries are the edge midpoints and the child centres, nothing else - so a skipped corner would
+            // leave those children interpolating a stale lattice. Corners are always marched; a tile predicted to fail its own
+            // level (beamRootDifficult) saves its centre ray and its test.
+            if (params.beamAdaptiveRoot != 0 && params.beamLevels >= 2 && centre)
+                return !beamRootDifficult(point);
             return true;
         }
         const uint entry = q / 8;
@@ -3193,12 +3265,35 @@ struct HSTRCloudRenderer
         uint slot;
         InterlockedAdd(hstrBeamCounts[level + 1], 1u, slot);
         hstrBeamLists[beamListOffset(level + 1) + slot] = packBeamTile(tile);
-        if (params.beamTemporal != 0)
+        // The temporal queries read this, and so does the adaptive root level; neither pays for it when both are off.
+        if (params.beamTemporal != 0 || params.beamAdaptiveRoot != 0)
         {
             const uint2 cell = tile * beamTileEdge(level) / beamTileEdge(params.beamLevels - 1);
             if (all(cell < params.beamLevelDims))
                 InterlockedOr(hstrBeamHistoryOutput[cell], 1u << level);
         }
+    }
+
+    /// Whether a coarsest tile is predicted to fail its own level, from the finest-level refinements of the frame before: a cell
+    /// carrying that bit was marched per pixel last frame. Both the query pass and the tile pass read this same function of the
+    /// previous frame, which is what keeps them consistent - a tile predicted difficult never reads its own basis, so the lattice
+    /// points only it would have used are never marched. A wrong prediction costs rays, never correctness: call a hard region smooth
+    /// and its own surplus test still refines it this frame; call a smooth region hard and it merely spends the finer level's rays.
+    bool beamRootDifficult(uint2 tile)
+    {
+        if (params.beamAdaptiveRoot == 0 || params.beamLevels < 2)
+            return false;
+        const uint finest = params.beamLevels - 1;
+        const uint cells = beamTileEdge(0) / beamTileEdge(finest);
+        const uint2 first = tile * cells;
+        for (uint y = 0; y < cells; ++y)
+            for (uint x = 0; x < cells; ++x)
+            {
+                const uint2 cell = first + uint2(x, y);
+                if (all(cell < params.beamLevelDims) && (hstrBeamHistory[cell] & (1u << finest)) != 0)
+                    return true;
+            }
+        return false;
     }
 
     /// Whether this frame queried the children of a level tile: it was refined last frame.
@@ -3245,7 +3340,8 @@ struct HSTRCloudRenderer
         }
         if (any(tile * beamTileEdge(level) >= params.frameDim))
             return;
-        if (!beamTileRefines(level, tile))
+        // A root tile the previous frame refined all the way down skips its own test: its lattice points were not marched.
+        if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile))
         {
             writeBeamLevel(level, tile, level);
             return;
@@ -3275,7 +3371,7 @@ struct HSTRCloudRenderer
             const uint level = stackLevel[depth];
             if (any(tile * beamTileEdge(level) >= params.frameDim))
                 continue;
-            if (!beamTileRefines(level, tile))
+            if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile))
             {
                 writeBeamLevel(level, tile, level);
                 continue;
