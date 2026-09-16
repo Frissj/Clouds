@@ -389,11 +389,18 @@ struct HSTRCloudParams
     /// bit-identical at every run length, which is the traversal being correct rather than the change doing anything. What it
     /// falsifies is the premise: a zero crossing costs its texture load, not the loop around it, and walking a run removes the loop.
     ///
-    /// The step-count share was misleading and the cost share is what matters. Fitting the sea's frame against its density samples
-    /// per pixel over step lengths 2, 4 and 8 gives about 5.40 ms + 0.346 ms per sample, so at a 2-voxel step only 4.2 ms of a
-    /// 9.6 ms frame is density sampling and 5.4 ms is not - the zero crossings among it, but also the sky, the resolve, the lattice
-    /// setup and the compositing. Empty traversal is perhaps 1.5-2 ms, not the 59% of the frame its 17.81 of 30.00 steps suggest.
-    /// That floor is why the sea shrugged off every per-sample result that paid on the near view: they all attack the 4.2 ms.
+    /// The step-count share is not the cost share, and the two must not be conflated: a density sample costs several times a zero
+    /// crossing, so 17.81 of 30.00 steps is nowhere near 59% of the frame. Fitting the sea's frame against its density samples per
+    /// pixel across step lengths 1, 2, 4, 8 and 16 in one settle gives
+    ///     ms  ~  1.84 + 0.575 * (density samples per pixel)
+    /// which predicts 8.76 ms at a 2-voxel step against 8.85 measured. So about 7 ms of that 8.85 ms frame is density sampling and
+    /// only about 1.8 ms is not - the zero crossings among it, with the sky, the resolve, the lattice setup and the compositing.
+    /// Empty traversal is a small part of a small remainder, which is why neither attempt on it moved anything.
+    ///
+    /// An earlier two-point fit here read 5.40 + 0.346 and was wrong by three times. It was taken across runs whose sea had settled
+    /// differently - 656 frames with 88498 bakes still waiting, inheriting the near view's cut, against 1160 frames with 44964
+    /// waiting when the sea settles alone - and the same 4-voxel configuration measured 8.52 ms in one and 5.82 ms in the other.
+    /// Only compare within one process, one settle, with a repeat of the first test at the end to measure the drift.
     uint cloudZeroSkip = 1;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
     uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.
