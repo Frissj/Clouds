@@ -507,12 +507,19 @@ struct HSTRCloudParams
     /// runtime - only its position changes - so it is the cheapest possible attack on the source-variation error that survives an
     /// exact optical depth (see cloudQuadrature, where tau is only about 30% of a long step's error).
     ///
-    /// MEASURED with 16 observations per step (4K, beam view, against the per-pixel 1-voxel march), and the answer is that the pair
-    /// buys one doubling of the step at equal quality, consistently, on both views. Sea: a 4-voxel step is p99.9 0.072 as it stands,
-    /// 0.051 with the exact optical depth, and 0.026 with the centroid as well - which is exactly the 2-voxel step's 0.026. Near:
-    /// 0.122, 0.072, 0.026 against the 2-voxel step's 0.036, so slightly better than the baseline. Doubling again keeps the pattern:
-    /// an 8-voxel step with both lands on 0.072 on each view, which is what a 4-voxel step costs without them. The marched share
-    /// never moves (3.9-4.0% sea, 5.2-5.3% near), so none of this is bought by refining more of the image.
+    /// MEASURED with 16 observations per step (4K, beam view, against the per-pixel 1-voxel march). At a fixed step the pair halves
+    /// the error: on the sea a 4-voxel step goes p99.9 0.061 -> 0.030 and an 8-voxel step 0.344 -> 0.102. The marched share never
+    /// moves (3.9-4.1%), so none of that is bought by refining more of the image.
+    ///
+    /// Expressed as step length it is worth about 1.5 to 1.7 times, not the doubling an earlier run appeared to show. Against the
+    /// sea's own error curve - 0.015, 0.022, 0.061, 0.344, 0.689 at steps 1, 2, 4, 8 and 16 - the pair's 0.030 at four voxels sits
+    /// where the plain march is at about 2.6, and its 0.102 at eight sits at about 4.8. Priced through the cost fit beside
+    /// cloudZeroSkip, matching today's 2-voxel quality would take a 2.6-voxel step at about 7.2 ms against 5.8 ms for four voxels
+    /// with the pair, so about 1.25x at equal quality even if the two scalars were free.
+    ///
+    /// The run that read a full doubling held maxStepVoxels at 8 while varying minStepVoxels, so its "2-voxel step" was really 2 to
+    /// 8 voxels chosen by the majorant rule and only its 8 was a true fixed step. Pin minStepVoxels == maxStepVoxels when the step
+    /// length is the variable.
     ///
     /// The split matters as much as the total. The optical depth is about a third of the gap and the centroid is the rest, so the
     /// source error that survives an exact tau is mostly a question of where the step's one source evaluation is placed, not of
