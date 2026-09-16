@@ -1548,7 +1548,49 @@ struct HSTRCloudRenderer
                 }
                 else
                     sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
+                // Longitudinal oracle: resolve the step's interior at the pixel's own footprint, and with it the optical depth the
+                // step really carries and the place its extinction deposits the light. M0 accumulates the sub-step opacities under
+                // their running transmittance and M1 the same weighted by distance along the step, so M1 / M0 is the opacity
+                // centroid. The centre observation keeps the sample the lighting and the skip logic read, as the quadrature does.
+                float oracleCentroid = 0.5f;
+                if (params.cloudLongitudinalOracle > 1)
+                {
+                    const uint taps = params.cloudLongitudinalOracle;
+                    const float sub = dt / float(taps);
+                    const uint centre = taps / 2u;
+                    float oracleDepth = 0.f;
+                    float moment0 = 0.f;
+                    float moment1 = 0.f;
+                    float running = 1.f;
+                    for (uint o = 0; o < taps; ++o)
+                    {
+                        const float to = t + (float(o) + 0.5f) * sub;
+                        const float3 vo = (ray.position + to * ray.direction) * cellWidth;
+                        CloudSample tap = {};
+                        float tapVoxels = 1.f;
+                        const float sigmaO = cameraExtinctionAtVoxel(vo, rayFootprint(ray, to), tapVoxels, tap);
+                        const float depthO = sigmaO * sub * ray.worldLength;
+                        const float alphaO = 1.f - exp(-depthO);
+                        moment0 += running * alphaO;
+                        moment1 += running * alphaO * (float(o) + 0.5f) / float(taps);
+                        running *= 1.f - alphaO;
+                        oracleDepth += depthO;
+                        if (o == centre)
+                        {
+                            sample = tap;
+                            fineVoxels = tapVoxels;
+                        }
+                    }
+                    sigma = oracleDepth / max(dt * ray.worldLength, 1e-12f);
+                    oracleCentroid = moment0 > 1e-9f ? moment1 / moment0 : 0.5f;
+                }
                 const float depth = (trapezoid ? 0.5f * (heldSigma + sigma) : sigma) * dt * ray.worldLength;
+                if (params.cloudLongitudinalOracle > 1 && params.cloudOracleCentroid != 0)
+                {
+                    // Move the single source evaluation to where the step's own extinction says the light comes from.
+                    tSample = t + oracleCentroid * dt;
+                    midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                }
                 heldSigma = ends ? sigma : -1.f;
                 sample.t = tSample;
                 if (params.cloudTransferClasses > 0 && sample.brick && !sample.empty && sample.entry != lastEntry)

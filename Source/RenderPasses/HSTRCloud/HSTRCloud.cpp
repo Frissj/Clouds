@@ -122,6 +122,8 @@ const char kCloudStepFootprint[] = "cloudStepFootprint";
 const char kCloudQuadrature[] = "cloudQuadrature";
 const char kCloudSourceLinear[] = "cloudSourceLinear";
 const char kCloudTransferClasses[] = "cloudTransferClasses";
+const char kCloudLongitudinalOracle[] = "cloudLongitudinalOracle";
+const char kCloudOracleCentroid[] = "cloudOracleCentroid";
 const char kCloudSunLiveMarch[] = "cloudSunLiveMarch";
 const char kCloudCameraKernel[] = "cloudCameraKernel";
 const char kCloudMinTransmittance[] = "cloudMinTransmittance";
@@ -436,6 +438,10 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudQuadrature = std::clamp(uint32_t(value), 1u, 3u);
         else if (key == kCloudSourceLinear)
             mParams.cloudSourceLinear = bool(value) ? 1u : 0u;
+        else if (key == kCloudLongitudinalOracle)
+            mParams.cloudLongitudinalOracle = std::min(uint32_t(value), 32u);
+        else if (key == kCloudOracleCentroid)
+            mParams.cloudOracleCentroid = bool(value) ? 1u : 0u;
         else if (key == kCloudTransferClasses)
             mParams.cloudTransferClasses = std::min(uint32_t(value), 64u);
         else if (key == kCloudSunLiveMarch)
@@ -653,6 +659,8 @@ Properties HSTRCloud::getProperties() const
     props[kCloudQuadrature] = mParams.cloudQuadrature;
     props[kCloudSourceLinear] = mParams.cloudSourceLinear != 0;
     props[kCloudTransferClasses] = mParams.cloudTransferClasses;
+    props[kCloudLongitudinalOracle] = mParams.cloudLongitudinalOracle;
+    props[kCloudOracleCentroid] = mParams.cloudOracleCentroid != 0;
     props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
@@ -2967,6 +2975,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // log error against the per-pixel march staying between 0.018 and 0.036. So the beam view's real budget is split about
         // evenly between the query rays and the per-pixel refinement of the tiles that fail, and any timing of it taken with the
         // camera parked is a best case, not the frame cost.
+        // The query rays run the same march as the refinement, so they need the same permutation, and they need it before they are
+        // dispatched: setting it with the march pass below left a frame's queries compiled against the previous value of
+        // cloudSunLiveMarch whenever it changed.
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -3058,7 +3070,6 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         bindRenderer(pRenderContext, mpBeamMarchPass);
         // The beam's per-pixel refinement runs the same camera march, so it drops the live sun march with it.
         mpBeamMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         mpBeamMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
         mpBeamMarchPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * mParams.beamLevels);
     }

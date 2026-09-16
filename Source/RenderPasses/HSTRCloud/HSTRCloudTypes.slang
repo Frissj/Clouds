@@ -472,6 +472,36 @@ struct HSTRCloudParams
     /// and R = r/d the gain z d / (1 + z d^2 / r) peaks at d = sqrt(r/z) = 0.87, so the brick is already the best unit and a node
     /// would give 1.03x. Precomposition needs reuse, reuse needs many rays through one entry, and a beam path with a two-pixel entry
     /// resolution does not have them.
+    /// Fine density observations inside one camera step, taken at the pixel's own footprint (0: off). The step keeps its length; only
+    /// its interior is resolved, which is the one-dimensional filter the ray actually needs, as against cloudStepFootprint's request
+    /// for a coarser brick - a four-voxel footprint asks for a 4x4x4 low pass where the integration wants 1x1x4, and erasing the
+    /// transverse detail is what left every beam query agreeing and no tile refining. Deliberately slow: it measures what the step
+    /// would be worth if the quantity were free, not a way to make it free.
+    uint cloudLongitudinalOracle = 0;
+    /// 1: the step's source is evaluated at the opacity centroid M1/M0 of those observations rather than at the geometric midpoint.
+    /// The centroid is where the step's extinction actually deposits its light, and moving one evaluation there costs nothing at
+    /// runtime - only its position changes - so it is the cheapest possible attack on the source-variation error that survives an
+    /// exact optical depth (see cloudQuadrature, where tau is only about 30% of a long step's error).
+    ///
+    /// MEASURED with 16 observations per step (4K, beam view, against the per-pixel 1-voxel march), and the answer is that the pair
+    /// buys one doubling of the step at equal quality, consistently, on both views. Sea: a 4-voxel step is p99.9 0.072 as it stands,
+    /// 0.051 with the exact optical depth, and 0.026 with the centroid as well - which is exactly the 2-voxel step's 0.026. Near:
+    /// 0.122, 0.072, 0.026 against the 2-voxel step's 0.036, so slightly better than the baseline. Doubling again keeps the pattern:
+    /// an 8-voxel step with both lands on 0.072 on each view, which is what a 4-voxel step costs without them. The marched share
+    /// never moves (3.9-4.0% sea, 5.2-5.3% near), so none of this is bought by refining more of the image.
+    ///
+    /// The split matters as much as the total. The optical depth is about a third of the gap and the centroid is the rest, so the
+    /// source error that survives an exact tau is mostly a question of where the step's one source evaluation is placed, not of
+    /// fine structure the step cannot represent. That is what makes the result worth anything: two scalars per position and
+    /// direction - the longitudinal optical depth and the opacity centroid within it - are enough, where a transfer operator
+    /// carrying the source itself was measured dead (cloudTransferClasses). Both are properties of the density alone, so unlike a
+    /// transfer operator they survive every change of sun, cache and phase, and bakeCloudSun is already a per-voxel directional line
+    /// integral at full transverse resolution - the template for computing them.
+    ///
+    /// What this does not establish is the price. Halving the compositing events does not halve the frame: the query lattice, the
+    /// resolve and the per-pixel refinement do not scale with step length, and the observed 2-voxel to 4-voxel saving has ranged
+    /// from 1.14x to 1.64x across runs on a laptop that throttles. Measure that scaling on a cool machine before costing any bake.
+    uint cloudOracleCentroid = 0;
     uint cloudTransferClasses = 0;
     uint cloudTransferWords = 0; ///< Size of that buffer; its last word is the crossing counter.
     /// Domain voxels a camera march may move before it queries the sun depth again (0: every sample). MEASURED (4K c15, 0.1 voxels,
