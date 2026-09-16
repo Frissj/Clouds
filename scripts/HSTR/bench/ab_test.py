@@ -4,13 +4,16 @@ from falcor import *
 
 # A/B of HSTRCloud properties at 4K on settled views: GPU ms of the base (A) and test (B) properties per configuration, and B's frame
 # against A's (mean, share over 0.02 and 0.1, 99.9th percentile and max of the per-pixel log error). Defaults: the baked sun depth
-# (A the live sun march, B the cache). HSTR_BASE must set every property HSTR_TEST sets: the views settle with the base, and nothing
-# puts a property back afterwards.
+# (A the live sun march, B the cache). HSTR_BASE must set every property any test sets: the views settle with the base, and nothing
+# puts a property back afterwards. HSTR_TESTS holds several named tests to measure against the one base, which is what a sweep
+# wants - the settle is the slow part, and A and its stored frame are then shared by every variant. Nothing is put back between
+# tests either, so every test must set every key the others set.
 OUT = "C:/Users/Friss/Documents/HSTR_results"
 TAG = os.environ.get("HSTR_TAG", "ab")
 os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/Users/Friss/Downloads/clouds_hr/codec/v6_default")
 BASE = json.loads(os.environ.get("HSTR_BASE", '{"cloudSunCache": false}'))
 TEST = json.loads(os.environ.get("HSTR_TEST", '{"cloudSunCache": true}'))
+TESTS = json.loads(os.environ.get("HSTR_TESTS", "[]")) or [["B", TEST]]
 m.script("scripts/HSTR/CloudSea.py")
 m.resizeFrameBuffer(3840, 2160)
 hstr = m.activeGraph.getPass("HSTRCloud")
@@ -87,15 +90,19 @@ for name, position, target in views:
         hstr.set_properties({"storeExact": True})
         m.renderFrame()
         capture(f"{TAG}_{name}_{label.replace(' ', '_')}_A")
-        hstr.set_properties(TEST)
-        b = gpu_times()
-        hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
-        m.renderFrame()
-        p = hstr.properties
-        hstr.set_properties({"compareReference": False, "compareExact": False})
-        capture(f"{TAG}_{name}_{label.replace(' ', '_')}_B")
-        parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
-        log(f"{name} {label:10s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms ({parts}); B vs A: "
-            f"log {float(p['referenceLogError']):.2e}, >0.02 {100 * float(p['referenceNoiseError']):.3f}%, >0.1 {100 * float(p['referenceNoiseLogError']):.3f}%, "
-            f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}")
+        # Every test is measured against the same A and the same stored frame, so their times and errors are comparable.
+        for test, properties in TESTS:
+            hstr.set_properties(properties)
+            b = gpu_times()
+            hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+            m.renderFrame()
+            p = hstr.properties
+            hstr.set_properties({"compareReference": False, "compareExact": False})
+            capture(f"{TAG}_{name}_{label.replace(' ', '_')}_{test.replace(' ', '_')}")
+            parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
+            marched = float(p["beamMarchedFraction"])
+            log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms ({parts}); "
+                f"marched {100 * marched:4.1f}%; B vs A: log {float(p['referenceLogError']):.2e}, "
+                f">0.02 {100 * float(p['referenceNoiseError']):.3f}%, >0.1 {100 * float(p['referenceNoiseLogError']):.3f}%, "
+                f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}")
 exit()

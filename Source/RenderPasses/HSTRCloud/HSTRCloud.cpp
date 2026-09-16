@@ -116,6 +116,10 @@ const char kCloudThinDepth[] = "cloudThinDepth";
 const char kCloudZeroSkip[] = "cloudZeroSkip";
 const char kCloudSunReuse[] = "cloudSunReuse";
 const char kCloudTrapezoid[] = "cloudTrapezoid";
+const char kCloudLocalStep[] = "cloudLocalStep";
+const char kCloudStepFootprint[] = "cloudStepFootprint";
+const char kCloudSunLiveMarch[] = "cloudSunLiveMarch";
+const char kCloudCameraKernel[] = "cloudCameraKernel";
 const char kCloudMinTransmittance[] = "cloudMinTransmittance";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
@@ -418,6 +422,14 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunReuse = std::max(0.f, float(value));
         else if (key == kCloudTrapezoid)
             mParams.cloudTrapezoid = bool(value) ? 1u : 0u;
+        else if (key == kCloudLocalStep)
+            mParams.cloudLocalStep = bool(value) ? 1u : 0u;
+        else if (key == kCloudStepFootprint)
+            mParams.cloudStepFootprint = std::max(0.f, float(value));
+        else if (key == kCloudSunLiveMarch)
+            mCloudSunLiveMarch = value;
+        else if (key == kCloudCameraKernel)
+            mCloudCameraKernel = value;
         else if (key == kCloudMinTransmittance)
             mParams.cloudMinTransmittance = std::clamp(float(value), 1e-4f, 0.5f);
         else if (key == kCloudSunTilesPerFrame)
@@ -623,6 +635,10 @@ Properties HSTRCloud::getProperties() const
     props[kCloudZeroSkip] = mParams.cloudZeroSkip != 0;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
+    props[kCloudLocalStep] = mParams.cloudLocalStep != 0;
+    props[kCloudStepFootprint] = mParams.cloudStepFootprint;
+    props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
+    props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
     if (mpCloudResidency)
     {
@@ -644,6 +660,10 @@ Properties HSTRCloud::getProperties() const
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
+        // Beam tiles refined into each level, and so the query rays the level costs; the last entry is the per-pixel march list.
+        for (uint32_t level = 1; level <= mParams.beamLevels; ++level)
+            cloud[level < mParams.beamLevels ? ("beamLevel" + std::to_string(level)) : std::string("beamMarchTiles")] =
+                mBeamLevelCounts[level];
         props[kCloudStats] = cloud;
     }
     props[kBeamTolerance] = mParams.beamTolerance;
@@ -739,6 +759,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
         return ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
     };
     mpPass = createPass("main");
+    mpCameraPass = createPass("renderCloudCamera");
     mpSolvePass = createPass("solveLeaves");
     mpCameraLightingPass = createPass("updateCameraLighting");
     mpProjectPass = createPass("projectCutNodes");
@@ -2901,6 +2922,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mpBeamArgsPass->execute(pRenderContext, uint3(1));
         };
         // Temporal: with the camera and the cache unchanged since the last build, its queries and tile levels are still exact.
+        // MEASURED (4K, cloud sea library, minStepVoxels 2, baked sun): a frozen camera takes this reuse path and pays no query
+        // cost at all, which is what the settled A/B timings of the beam view were measuring - 5.7 ms near, 4.4 ms sea. The moment
+        // the camera or the sun moves the queries come back and the frame costs 11-13 ms (near: 12.3 static, 11.3 and 12.7 through
+        // slow and fast sun sweeps, 13.1 and 27.8 flying at 4 and 1 units a frame). Quality holds through all of it, p99.9 of the
+        // log error against the per-pixel march staying between 0.018 and 0.036. So the beam view's real budget is split about
+        // evenly between the query rays and the per-pixel refinement of the tiles that fail, and any timing of it taken with the
+        // camera parked is a best case, not the frame cost.
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -2983,18 +3011,32 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpBeamResolvePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
         FALCOR_PROFILE(pRenderContext, "march");
         bindRenderer(pRenderContext, mpBeamMarchPass);
+        // The beam's per-pixel refinement runs the same camera march, so it drops the live sun march with it.
+        mpBeamMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         mpBeamMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
         mpBeamMarchPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * mParams.beamLevels);
     }
     else
     {
         FALCOR_PROFILE(pRenderContext, "resolve");
-        bindRenderer(pRenderContext, mpPass);
-        ShaderVar var = mpPass->getRootVar()["CB"]["gHSTRCloud"];
+        // The steady-state camera pixel has its own entry point, which the other views, the probes and the reference display are not
+        // part of; both programs also drop sunDepthAt's live march when the bakes are to answer every query.
+        const bool cameraOnly = mCloudCameraKernel && mParams.debugView == kWorldCacheView && mParams.marchProbe == 0 &&
+                                mParams.cloudDomain != 0 && !mpScene->getGridVolumes().empty();
+        const ref<ComputePass>& pPass = cameraOnly ? mpCameraPass : mpPass;
+        pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+        bindRenderer(pRenderContext, pPass);
+        ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
         var["color"] = color;
         var["transportError"] = error;
         var["cutStats"] = cutStats;
-        mpPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+        if (cameraOnly)
+        {
+            pRenderContext->clearUAV(error->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(cutStats->getUAV().get(), float4(0.f));
+        }
+        pPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
     }
 
     if (mStoreExact)
@@ -3016,6 +3058,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
             const uint32_t marchedTiles = mpBeamCounts[mBeamParity]->getElement<uint32_t>(mParams.beamLevels);
             mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
+            for (uint32_t level = 0; level <= mParams.beamLevels; ++level)
+                mBeamLevelCounts[level] = mpBeamCounts[mBeamParity]->getElement<uint32_t>(level);
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);
         ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];

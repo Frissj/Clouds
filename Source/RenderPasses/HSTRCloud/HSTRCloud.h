@@ -145,6 +145,9 @@ private:
     ref<Texture> mpExactFrame;         ///< Stored frame that compareExact measures against.
     bool mStoreExact = false;          ///< Copy the next frame into mpExactFrame.
     float mBeamMarchedFraction = -1.f; ///< Share of pixels the beam view marched per pixel, read with the comparison.
+    uint32_t mBeamLevelCounts[kBeamMaxLevels + 1] = {}; ///< Tiles entering each level, read with the comparison; the last is the
+                                                        ///< per-pixel march list. Eight queries per entry, so these are what the
+                                                        ///< query pass costs.
     std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.
     std::string mLoadReferencePath;    ///< When set, the reference sums are read from <path>_s<slice>.exr at the start of the frame.
     float3 mReferencePosition = float3(0.f);
@@ -222,6 +225,9 @@ private:
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
+    bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
+    bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
+    ref<ComputePass> mpCameraPass;            ///< That entry point.
     ref<ComputePass> mpDecayWorldCachePass;
     std::vector<float> mCloudMeanBlocks; ///< Domain majorant blocks of the mean density (transport), unscaled.
     std::vector<float> mCloudMaxBlocks;  ///< Domain majorant blocks of the maximum density (camera), unscaled.

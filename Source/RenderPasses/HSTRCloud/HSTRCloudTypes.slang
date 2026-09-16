@@ -83,7 +83,9 @@ struct HSTRCloudBrick
     uint padBrick1;
 };
 
-static const uint kCloudCellWords = 8;        ///< hstrCloudOccupancy words per brick: a 4-bit code per 2-voxel cell (cloudCellCode).
+/// hstrCloudOccupancy words per brick: a 4-bit density bound per 2-voxel cell (cloudCellCode) in words 0-7, then the bound of each of
+/// the brick's eight 4-voxel octants in word 8 (the brick's own bound is the maximum of those eight).
+static const uint kCloudCellWords = 9;
 static const uint kCloudSunAncestors = 2;    ///< Levels a sample of an unbaked brick climbs for a baked ancestor before the live march.
 static const uint kCloudSunBakesPerBrick = 8; ///< Orientation classes one brick keeps baked sun depth for (hstrCloudSunSlots).
 
@@ -212,6 +214,11 @@ struct HSTRCloudParams
     /// count is what the march costs. 1 -> 2 voxels: 29.2 -> 16.8 samples per pixel, near 39.0 -> 24.2 ms and sea 29.9 -> 18.8 ms, at
     /// 0.26% of pixels over 0.02 log error (p99.9 0.036, max 0.14). 1 -> 4 voxels: 10.8 samples, near 15.2 ms and sea 11.4 ms, but
     /// 2.2% over 0.02 (p99.9 0.12, max 0.34): too coarse for midpoint quadrature.
+    /// MEASURED again on the beam view, which is the path that ships (4K, sea library, one thread per ray, temporal off, baked sun,
+    /// against the per-pixel 1-voxel march): 2 voxels gives sea 8.63 ms at p99.9 0.022 and near 10.76 ms at p99.9 0.036; 4 voxels
+    /// gives sea 5.39 ms at p99.9 0.061 and near 6.55 ms at p99.9 0.122. The near view degrades about twice as hard, which is what
+    /// the aliasing reading predicts: close up the pixel footprint is fine, so a 4-voxel step is furthest above the rate the density
+    /// needs, while in the distance the footprint already exceeds the step and nothing changes.
     float minStepVoxels = 1.f;
     float maxStepVoxels = 4.f;
     float compareMapScale = 0.f;   ///< >0: block comparisons overwrite the frame with their signed log error map, saturating here.
@@ -247,7 +254,23 @@ struct HSTRCloudParams
 
     uint worldCacheSegments = 0; ///< 0: every batch traces whole photon paths; >0: a persistent photon pool advances this many
                                  ///< flight segments per photon per update, respawning photons as they die.
-    uint beamTileSize = 16;       ///< Pixels per edge of the coarsest beam tiles.
+    /// Pixels per edge of the coarsest beam tiles. This sets a floor on the frame that no content can lower: the level-0 lattice is
+    /// one corner and one centre per tile whatever the image holds. CloudSea.py runs 4 pixels at one level, which at 4K is about
+    /// 1.04M rays - 12.5% of the frame - before a single pixel is refined. MEASURED (4K, sea library, minStepVoxels 2, one thread
+    /// per ray, temporal off): that lattice costs 4.4 ms of the sea's 8.63 ms frame and 5.3 ms of the near view's 10.76 ms, against
+    /// a per-pixel march of 27.17 and 38.32 ms. Per ray the queries are ordinary - 4.2 ns against 3.3 ns for an average camera pixel
+    /// - while the 4-5% of pixels the tiles fail on cost 11.4 ns each, being the longest rays in the frame. So the frame is about
+    /// 1.37M rays, and it is the lattice, not the refinement, that a coarser tiling with more levels has to trade against.
+    ///
+    /// MEASURED trading it, and the answer depends on the content, so there is no tiling to prefer here. Coarser tiles with levels
+    /// (minStepVoxels 2, temporal off, against the per-pixel 1-voxel march) on the near view, one smooth cloud filling the screen:
+    /// 4x1 10.92 ms at p99.9 0.036, 8x2 8.17 ms at p99.9 0.036, 16x3 9.32 ms at p99.9 0.051 - a quarter off for nothing at 8x2.
+    /// On the sea, small distant clouds everywhere: 4x1 8.83 ms at p99.9 0.022, 8x2 10.23 ms at p99.9 0.036, 16x3 11.08 ms at
+    /// p99.9 0.051 - the flat lattice wins on both axes. The reason is in the query lanes: on the sea an 8-pixel tile almost never
+    /// accepts, so level 0 costs 2.9 ms and level 1 another 2.5 against 4.5 ms for the one flat lattice, and the hierarchy pays for
+    /// both. A level only earns its lattice where tiles that size accept, and in a sea of high-frequency cloud they do not.
+    /// CloudSea.py therefore keeps 4 pixels at one level.
+    uint beamTileSize = 16;
     uint beamLevels = 3;          ///< Beam tile levels; tiles that fail at the finest level are marched per pixel.
     float beamTolerance = 0.02f;  ///< log(1 + radiance) surplus at a tile centre above which the tile is refined.
 
@@ -261,7 +284,17 @@ struct HSTRCloudParams
 
     float beamEdgeContrast = 0.05f; ///< Transmittance range of the queries around a tile above which it is refined (silhouettes); 0: off.
     uint compareExact = 0;     ///< 1: the comparison measures against the stored exact frame instead of the reference.
-    uint beamSegments = 4;     ///< Threads that march consecutive segments of one query ray in parallel (divides 64).
+    /// Threads that march consecutive segments of one query ray in parallel (divides 64). Every segment starts from unit
+    /// transmittance, so splitting a ray defeats the march's early termination: segment 0 stops inside the first dense cloud it
+    /// meets and segments 1..n march the rest of the ray in full, at full density, only for the composition to multiply what they
+    /// return by a transmittance near zero. MEASURED (4K, sea library, beam view, minStepVoxels 2, baked sun, temporal off) going
+    /// 4 -> 1: near 18.04 -> 10.99 ms and sea 13.68 -> 8.69 ms, with the query pass itself 11.0 -> 5.4 ms. The threads it was
+    /// buying are not worth the work they duplicate; one thread per ray keeps the early termination that makes a camera pixel
+    /// cheap. CloudSea.py had already overridden this to 1, so that is a correction to the default here rather than a saving on
+    /// the sea path. What is left is not a small dispatch and not latency-bound: at CloudSea.py's 4-pixel tiles the level-0 lattice
+    /// is about 1.04M rays (see beamTileSize), and at 4.2 ns each they run at much the same rate as ordinary camera pixels. The
+    /// query pass costs what it costs because of how many rays the lattice asks for, not because of how they are scheduled.
+    uint beamSegments = 1;
     uint beamPassLevel = 0;    ///< Tile level the current beam query or tile pass processes.
 
     uint2 beamLevelDims = { 0, 0 }; ///< Level map, one texel per finest tile.
@@ -329,6 +362,26 @@ struct HSTRCloudParams
     /// 29.1 ms, near 38.2 -> 40.7 ms - it pays where a view crosses a lot of empty sea and costs a little where it does not.
     uint cloudZeroSkip = 1;
     uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
+    uint cloudLocalStep = 0; ///< 1: camera steps are as long as the sample's own cell, octant and brick density bounds allow.
+    /// Fraction of a step's length folded into its density sample's footprint (0: off). minStepVoxels above one samples the density
+    /// below its Nyquist rate along the ray, so coarse steps lose detail rather than merely integrating it coarsely, and the brick
+    /// pyramid already holds filtered levels that would not. MEASURED (4K, sea library, beam view, minStepVoxels 4, full step): the
+    /// rays do get much cheaper - sea 8.63 -> 1.17 ms and near 10.76 -> 1.25 ms - but the frame is wrong, 16-25% of pixels past 0.02
+    /// log error with p99.9 near 0.7, and no tile refines at all because every query has been smoothed into agreement. The pyramid
+    /// filters isotropically while the sampling problem is only along the ray, so a full step's width throws away that much detail
+    /// across the ray as well.
+    ///
+    /// MEASURED over fractions, to see what the transverse blur would bear, and there is no setting that pays: every nonzero
+    /// fraction lands on the same p99.9 - 0.689 near and 0.819 sea - at 0.25 and 0.5 with 4-voxel steps and at 0.5 with 2-voxel
+    /// steps alike, which is saturation rather than a trade. Worse, the partial settings are slower than no footprint at all: near
+    /// s4 goes 6.66 -> 12.61 ms at fraction 0.25 and sea s4 5.56 -> 10.81 ms, because the marched share explodes (near 5.4% ->
+    /// 18.3%, sea 4.0% -> 10.8%). That is the beam hierarchy's own constraint showing: a tile is tested by comparing its centre
+    /// query against a prediction from the corner queries, so an estimator that shifts by an amount varying per ray makes
+    /// neighbouring queries disagree and every tile refine. Only at full blur do they agree again, and then nothing refines and the
+    /// frame is simply wrong. Leave it at 0; the longitudinal sampling problem needs a filter along the ray, which the isotropic
+    /// brick pyramid cannot express.
+    float cloudStepFootprint = 0.f;
+    uint padHSTRCloud11 = 0;
     /// Domain voxels a camera march may move before it queries the sun depth again (0: every sample). MEASURED (4K c15, 0.1 voxels,
     /// which reuses about every second query): near 42.8 -> 42.3 ms, sea 30.4 -> 33.0 ms - nothing. Halving the sun fetches does not
     /// pay, the same way the brick context did not: what a sample costs is the sample, not the fetches inside it.
