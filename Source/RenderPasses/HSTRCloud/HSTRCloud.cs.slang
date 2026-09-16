@@ -103,6 +103,37 @@ struct CutRay
     float3 viewDirection; ///< Unit world-space direction of the camera ray.
 };
 
+/// Where a cloud density sample at asset source position x read: brick is set when it read the fine bricks of instance (entry at
+/// level, for the footprint level desired). empty is set when the density there is exactly zero within the source-voxel box [lo, hi).
+struct CloudSample
+{
+    bool brick;
+    bool empty;
+    bool cell;     ///< empty is a skippable cell of brick entry (cellCode: codes below it are skippable), not a missing octant.
+    uint cellCode;
+    float3 x;
+    float3 lo;
+    float3 hi;
+    uint instance;
+    uint entry;
+    uint level;
+    uint desired;
+};
+
+/// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
+/// 15 unbounded.
+uint cloudCellCode(float maximum)
+{
+    if (maximum <= 0.f)
+        return 0u;
+    return uint(clamp(ceil((log2(maximum) + 30.f) * 0.5f), 1.f, 15.f));
+}
+
+float cloudCellBound(uint code)
+{
+    return code >= 15u ? 1e30f : pow(2.f, 2.f * float(code) - 30.f);
+}
+
 struct HSTRCloudRenderer
 {
     HSTRCloudParams params;
@@ -132,6 +163,7 @@ struct HSTRCloudRenderer
     Texture3D<float> hstrMajorant;
     Texture3D<float> hstrTightMajorant; ///< Undilated block maxima: bound the trilinear extinction inside the block only.
     Texture3D<uint> hstrOccupancy;      ///< 1 where a 16-voxel block holds any extinction.
+    Texture3D<uint> hstrMajorantZero;   ///< 0 where every majorant block of a 16-voxel block is zero (camera marches cross it at once).
     // Virtual cloud density (see CloudResidency): instances per sea tile, assets, the chunk directory and 4^3 page nodes whose
     // entries name the finest mapped brick, the resident bricks and their R8 atlas, and the staging of newly loaded bricks.
     StructuredBuffer<HSTRCloudInstance> hstrCloudInstances;
@@ -148,6 +180,11 @@ struct HSTRCloudRenderer
     // density (occupancyCloudBricks).
     StructuredBuffer<uint> hstrCloudOccupancy;
     RWStructuredBuffer<uint> hstrCloudOccupancyOutput;
+    // Baked sun optical depth per atlas texel (same slots as the density atlas) and this frame's bakes (bakeCloudSun).
+    Texture3D<float> hstrCloudSunAtlas;
+    RWTexture3D<float> hstrCloudSunAtlasOutput;
+    StructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakes;
+    StructuredBuffer<uint> hstrCloudSunSlots; ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun atlas slot).
     StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
     StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
     Texture3D<float4> hstrCameraLighting;
@@ -173,6 +210,7 @@ struct HSTRCloudRenderer
     // 2 * component + half, rgb sum and sample count), and per-row comparison against the HST frame.
     RWTexture2DArray<float4> hstrReferenceSum;
     RWStructuredBuffer<float4> hstrReferenceRowError;
+    RWStructuredBuffer<float> hstrReferenceRowHistogram; ///< Exact comparisons: per row, kCompareBins - 1 log error bins, then the row's maximum.
     // World-space radiance cache experiment: 9 SH coefficients x RGB running sums per cell, and the light-tracing
     // batch's fixed-point deposits (9 SH coefficients for a unit sun, then 9 for a unit-colour sky, per cell).
     RWStructuredBuffer<float> hstrWorldCache;
@@ -338,27 +376,78 @@ struct HSTRCloudRenderer
         return brick.minValue + brick.range * t * t;
     }
 
-    /// Source-voxel box [lo, hi) of one instance around sample position x in which the camera extinction is exactly zero.
-    struct CloudEmptyBox
-    {
-        bool valid;
-        float3 x;
-        float3 lo;
-        float3 hi;
-        uint instance;
-    };
-
     /// Ray parameter up to which the camera extinction stays zero after a sample at ray parameter t returned box: the box's exit
     /// along the ray, but no further than where the footprint selects another level (or the proxy), where the zero no longer holds.
-    float cloudEmptyExit(CutRay ray, float t, CloudEmptyBox box)
+    /// Ray parameter (per unit of dx, from box.x) where a skippable cell box of a brick's 4^3 cells stops being followed by skippable
+    /// cells of the same brick along source direction dx: the entry of the first cell that is not, or the brick's exit.
+    ///
+    /// MEASURED (4K near): worth almost nothing on its own - empty samples stayed at 26.8% of the density samples, so an empty cell
+    /// is nearly always followed by an occupied one (a 2-voxel cell at the footprint's level is about a pixel wide, and the empty
+    /// ones are the cloud's own surface). It costs one buffer read per empty sample and keeps the exit exact, so it stays.
+    float cloudCellRunExit(CloudSample box, float3 dx)
+    {
+        const float size = box.hi.x - box.lo.x; // Cell edge in source voxels.
+        const float3 origin = floor((box.lo + 0.5f) / (4.f * size)) * (4.f * size) - 0.5f;   // The brick's first cell corner.
+        int3 cell = int3(floor((box.lo - origin) / size + 0.5f));
+        const int3 stepDirection = int3(sign(dx));
+        float3 next = 1e30f;
+        float3 delta = 1e30f;
+        for (uint a = 0; a < 3; ++a)
+            if (abs(dx[a]) > 1e-12f)
+            {
+                next[a] = ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a];
+                delta[a] = size / abs(dx[a]);
+            }
+        const uint base = box.entry * kCloudCellWords;
+        float exit = 0.f;
+        [loop]
+        for (uint k = 0; k < 10; ++k)
+        {
+            const uint a = next.x <= next.y && next.x <= next.z ? 0u : (next.y <= next.z ? 1u : 2u);
+            exit = next[a];
+            cell[a] += stepDirection[a];
+            if (cell[a] < 0 || cell[a] > 3 || exit >= 1e29f)
+                return exit;
+            const uint index = uint(cell.x + 4 * cell.y + 16 * cell.z);
+            if (((hstrCloudOccupancy[base + (index >> 3u)] >> ((index & 7u) * 4u)) & 15u) >= box.cellCode)
+                return exit;
+            next[a] += delta[a];
+        }
+        return exit;
+    }
+
+    /// Ray parameter where a camera step from t whose majorant is zero may meet density again: the exit of t's 16-voxel block when every
+    /// majorant block of it is zero (hstrMajorantZero), else t. Only in the sea's vertical range (its X/Z wrap).
+    ///
+    /// MEASURED (4K): zero-majorant steps 21.0 -> 14.1 per pixel on the near view and 27.0 -> 17.9 on the sea view, and pixels still
+    /// marching after 32 steps 62% -> 49% (near) and 74% -> 41% (sea). Exact: the dilated majorant already covers the trilinear
+    /// support, so a block of zero majorant blocks holds no density a sample could read.
+    float majorantZeroExit(CutRay ray, float t)
+    {
+        const float3 v = seaVoxel((ray.position + t * ray.direction) * float(params.hstrCellWidth));
+        const uint3 dims = (params.hstrMajorantDims + 3u) / 4u;
+        const int3 block = int3(floor(v / 16.f));
+        if (params.cloudZeroSkip == 0 || any(block < 0) || any(block >= int3(dims)) || hstrMajorantZero.Load(int4(block, 0)) != 0)
+            return t;
+        const float3 dv = ray.direction * float(params.hstrCellWidth);
+        const float3 lo = float3(block) * 16.f;
+        float exit = 1e30f;
+        for (uint a = 0; a < 3; ++a)
+            if (abs(dv[a]) > 1e-12f)
+                exit = min(exit, ((dv[a] > 0.f ? lo[a] + 16.f : lo[a]) - v[a]) / dv[a]);
+        return t + max(exit, 0.f);
+    }
+
+    float cloudEmptyExit(CutRay ray, float t, CloudSample box)
     {
         const HSTRCloudInstance instance = hstrCloudInstances[box.instance];
         const float3 dv = ray.direction * float(params.hstrCellWidth);
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
-        float exit = 1e30f;
-        for (uint a = 0; a < 3; ++a)
-            if (abs(dx[a]) > 1e-12f)
-                exit = min(exit, ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a]);
+        float exit = box.cell ? cloudCellRunExit(box, dx) : 1e30f;
+        if (!box.cell)
+            for (uint a = 0; a < 3; ++a)
+                if (abs(dx[a]) > 1e-12f)
+                    exit = min(exit, ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a]);
         exit = max(exit, 0.f);
         if (params.cloudPixelAngle > 0.f && ray.worldLength > 0.f)
         {
@@ -378,47 +467,72 @@ struct HSTRCloudRenderer
     /// returns the sampled voxel edge in domain voxels (1 for the proxy), which bounds the next march step.
     float cameraExtinctionAtVoxel(float3 v, float footprint, inout float fineVoxels)
     {
-        CloudEmptyBox box;
-        return cameraExtinctionAtVoxel(v, footprint, fineVoxels, box);
+        CloudSample sample;
+        return cameraExtinctionAtVoxel(v, footprint, fineVoxels, sample);
     }
 
-    /// cameraExtinctionAtVoxel that also returns, where the density is exactly zero, the source-space box around v in which it stays
-    /// zero at v's footprint level (cloudEmptyExit turns it into a ray parameter).
-    float cameraExtinctionAtVoxel(float3 v, float footprint, inout float fineVoxels, out CloudEmptyBox box)
+    /// cameraExtinctionAtVoxel that also returns where the sample read (the brick lookup sunDepthAt reuses) and, where the density is
+    /// exactly zero, the source-space box around v in which it stays zero at v's footprint level (cloudEmptyExit).
+    float cameraExtinctionAtVoxel(float3 v, float footprint, inout float fineVoxels, out CloudSample sample)
     {
         // The sea fades out over the last 30% of the view distance, so tiles entering the window never pop in.
         const float distanceFade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
                                        ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
                                        : 1.f;
-        return distanceFade * cameraExtinctionUnfaded(v, footprint, fineVoxels, box);
+        return distanceFade * cameraExtinctionUnfaded(v, footprint, fineVoxels, sample);
     }
 
-    float cameraExtinctionUnfaded(float3 v, float footprint, inout float fineVoxels, out CloudEmptyBox box)
+    /// The sea tile instance around domain position v and v's asset source position x, for a sample whose footprint selects
+    /// footprintLevel. false in the proxy regime: no virtual density, an empty tile, or a footprint as coarse as the proxy.
+    bool cloudInstanceAt(float3 v, float footprint, out uint instanceIndex, out float3 x, out float footprintLevel)
     {
-        box = {};
-        fineVoxels = 1.f;
-        const float proxy = extinctionAtVoxel(v);
+        instanceIndex = 0;
+        x = 0.f;
+        footprintLevel = 0.f;
         if (params.cloudVirtual == 0)
-            return proxy;
+            return false;
         const float tileVoxels = float(params.cloudTileVoxels);
         const float2 worldTile = floor((v.xz + 0.5f) / tileVoxels);
         const int2 tiles = int2(params.cloudTiles);
         const int2 slot = (int2(worldTile) % tiles + tiles) % tiles;
-        const uint instanceIndex = slot.x + tiles.x * slot.y;
+        instanceIndex = slot.x + tiles.x * slot.y;
         const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
         if (instance.occupied == 0)
-            return proxy;
-        const float footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
+            return false;
+        footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
         if (footprintLevel >= instance.proxyLevel)
-            return proxy;
+            return false;
         const float3 p = float3(v.x - worldTile.x * tileVoxels, v.y, v.z - worldTile.y * tileVoxels);
-        const float3 x = float3(
-            dot(instance.row0.xyz, p) + instance.row0.w, dot(instance.row1.xyz, p) + instance.row1.w, dot(instance.row2.xyz, p) + instance.row2.w
-        );
-        const HSTRCloudAsset asset = hstrCloudAssets[instance.asset];
+        x = float3(dot(instance.row0.xyz, p) + instance.row0.w, dot(instance.row1.xyz, p) + instance.row1.w, dot(instance.row2.xyz, p) + instance.row2.w);
+        return true;
+    }
+
+    /// The brick a sample of asset at source position x with footprint level desired reads: the finest mapped brick no finer than
+    /// desired (sample.entry, sample.level; sample.instance is left to the caller). false outside the asset (the proxy applies).
+    /// Where the density is exactly zero sample.empty is set and sample.level is the level of the zero region's voxels: a missing
+    /// child octant of a coarser brick, or an empty cell of the brick (checked only for settled bricks when settledOnly, since a
+    /// fading brick also reads its parent).
+    bool cloudAssetBrickAt(HSTRCloudAsset asset, float3 x, uint desired, bool settledOnly, out CloudSample sample)
+    {
+        return cloudAssetBrickAt(asset, x, desired, settledOnly, 0.f, sample);
+    }
+
+    /// cloudAssetBrickAt that also counts as empty the thin cells: those whose stored density bound is at most thinDensity / 2^level
+    /// (thinDensity: the bound whose optical depth across a level-0 cell is the tolerance; cells of coarser levels are longer).
+    /// thinDensity 0: only exactly empty cells.
+    ///
+    /// MEASURED (4K near, cloudThinDepth 0.001): density samples 28.85 -> 28.13 per pixel, of which the ones too faint to change the
+    /// pixel (alpha <= 1e-6) only fell 25.0% -> 23.8%. Those samples are not in thin cells: they are the trilinear tails of cells
+    /// that also hold dense texels, so a cell bound cannot reject them. cloudThinDepth stays 0 by default.
+    bool cloudAssetBrickAt(HSTRCloudAsset asset, float3 x, uint desired, bool settledOnly, float thinDensity, out CloudSample sample)
+    {
+        sample = {};
+        sample.x = x;
+        sample.desired = desired;
+        sample.entry = kCloudRefNone;
         const int3 i = int3(floor(x + 0.5f));
         if (any(i < 0) || any(i >= int3(asset.dims)))
-            return proxy;
+            return false;
         const uint3 chunk = uint3(i) >> 7u;
         uint entry = hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
         if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
@@ -432,25 +546,22 @@ struct HSTRCloudRenderer
             }
         }
         if (entry == kCloudRefNone)
-            return proxy;
-        const uint desired = uint(max(footprintLevel, 0.f));
+            return false;
+        sample.brick = true;
         uint level = hstrCloudBricks[entry].info & 15u;
-        const float domainPerSource = instance.sourceVoxelWorld / params.seaVoxelSize.x;
         if (desired < level)
         {
-            // The mapped brick is coarser than the footprint asks for: where its child does not exist the density is zero.
+            // The mapped brick is coarser than the footprint asks for: where its child does not exist the density is zero, for every
+            // voxel of the missing child's octant (no descendant of an unmapped child is mapped).
             const uint3 child = (uint3(i) >> (level + 2u)) & 1u;
             const uint childBit = 1u << (child.x + 2u * child.y + 4u * child.z);
             if (((hstrCloudBricks[entry].info >> 4) & childBit) == 0)
             {
-                fineVoxels = float(1u << (level - 1u)) * domainPerSource;
-                // Zero for every voxel of the missing child's octant (no descendant of an unmapped child is mapped).
-                box.valid = true;
-                box.x = x;
-                box.lo = float3((uint3(i) >> (level + 2u)) << (level + 2u)) - 0.5f;
-                box.hi = box.lo + float(1u << (level + 2u));
-                box.instance = instanceIndex;
-                return 0.f;
+                sample.empty = true;
+                sample.lo = float3((uint3(i) >> (level + 2u)) << (level + 2u)) - 0.5f;
+                sample.hi = sample.lo + float(1u << (level + 2u));
+                sample.level = level - 1u;
+                return true;
             }
         }
         [loop]
@@ -459,9 +570,9 @@ struct HSTRCloudRenderer
             entry = hstrCloudBricks[entry].parent;
             level = hstrCloudBricks[entry].info & 15u;
         }
-        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
-        const HSTRCloudBrick brick = hstrCloudBricks[entry];
-        if (params.cloudEmptySkip != 0 && brick.fade >= 1.f)
+        sample.entry = entry;
+        sample.level = level;
+        if (params.cloudEmptySkip != 0 && (!settledOnly || hstrCloudBricks[entry].fade >= 1.f))
         {
             // An empty 2-voxel cell of the brick: every trilinear texel it can read is zero. Voxels of the cell whose finest mapped
             // brick is a descendant walk back up to this brick, so the whole cell reads it.
@@ -469,23 +580,104 @@ struct HSTRCloudRenderer
             const float3 brickOrigin = float3(((uint3(i) >> level) >> 3u) * 8u);
             const float3 local = clamp((x + 0.5f) / levelScale - 0.5f - brickOrigin, -0.5f, 7.4999f);
             const uint3 cell = uint3(clamp(int3(floor((local + 0.5f) * 0.5f)), 0, 3));
-            const uint bit = cell.x + 4u * cell.y + 16u * cell.z;
-            if (((hstrCloudOccupancy[entry * 2u + (bit >> 5u)] >> (bit & 31u)) & 1u) == 0)
+            const uint index = cell.x + 4u * cell.y + 16u * cell.z;
+            const uint code = (hstrCloudOccupancy[entry * kCloudCellWords + (index >> 3u)] >> ((index & 7u) * 4u)) & 15u;
+            // Codes below cellCode are skippable: bound(q) = 2^(2q - 30) <= thin  <=>  q <= (log2(thin) + 30) / 2.
+            const float thin = thinDensity / levelScale;
+            sample.cellCode = thin > 0.f ? uint(clamp(floor((log2(thin) + 30.f) * 0.5f) + 1.f, 1.f, 15.f)) : 1u;
+            if (code < sample.cellCode)
             {
-                fineVoxels = levelScale * domainPerSource;
-                box.valid = true;
-                box.x = x;
-                box.lo = (brickOrigin + 2.f * float3(cell)) * levelScale - 0.5f;
-                box.hi = box.lo + 2.f * levelScale;
-                box.instance = instanceIndex;
-                return 0.f;
+                sample.empty = true;
+                sample.cell = true;
+                sample.lo = (brickOrigin + 2.f * float3(cell)) * levelScale - 0.5f;
+                sample.hi = sample.lo + 2.f * levelScale;
             }
         }
-        float density = cloudBrickDensity(entry, x, i) * scale;
+        return true;
+    }
+
+    float cameraExtinctionUnfaded(float3 v, float footprint, inout float fineVoxels, out CloudSample sample)
+    {
+        sample = {};
+        fineVoxels = 1.f;
+        // Read up front even where a brick answers: fetching it only on the proxy paths made sunDepthAt's live march 5x slower (DXC),
+        // and saved nothing measurable in the camera march.
+        const float proxy = extinctionAtVoxel(v);
+        uint instanceIndex;
+        float3 x;
+        float footprintLevel;
+        if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel))
+            return proxy;
+        const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        // Thin cells: the optical depth along a level-0 cell's diagonal (2 sqrt(3) source voxels) at the bound is cloudThinDepth.
+        const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
+        const bool found = cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+        sample.instance = instanceIndex;
+        if (!found)
+            return proxy;
+        fineVoxels = float(1u << sample.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x;
+        if (sample.empty)
+            return 0.f;
+        const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
+        const int3 i = int3(floor(x + 0.5f));
+        float density = cloudBrickDensity(sample.entry, x, i) * scale;
         if (brick.fade < 1.f)
             density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, x, i) * scale : proxy, density, brick.fade);
-        fineVoxels = float(1u << level) * domainPerSource;
         return density;
+    }
+
+    /// Sun atlas slot holding a brick's bake for key ((sun generation << 4) | orientation class), kCloudRefNone if there is none.
+    /// While a new sun direction bakes, the newest older bake of the class answers (cloudSunOldestGeneration: nothing but the direction
+    /// has changed since that generation, and bakes rebake in their own slot most important first).
+    uint cloudSunSlotOf(uint brickIndex, uint sunClass)
+    {
+        const uint base = brickIndex * 2u * kCloudSunBakesPerBrick;
+        const uint generation = params.cloudSunGeneration;
+        const uint current = (generation << 4) | sunClass;
+        uint found = kCloudRefNone;
+        uint best = kCloudRefNone;
+        uint bestGeneration = 0;
+        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            const uint key = hstrCloudSunSlots[base + 2u * k];
+            const uint slot = hstrCloudSunSlots[base + 2u * k + 1u];
+            const uint keyGeneration = key >> 4;
+            found = key == current ? slot : found;
+            const bool older = key != kCloudRefNone && (key & 15u) == sunClass && keyGeneration >= params.cloudSunOldestGeneration &&
+                               keyGeneration < generation && (best == kCloudRefNone || keyGeneration > bestGeneration);
+            best = older ? slot : best;
+            bestGeneration = older ? keyGeneration : bestGeneration;
+        }
+        return found != kCloudRefNone ? found : best;
+    }
+
+    /// Sun atlas slot of the bake a sample reading brick entry uses for key: the brick's own, else its nearest baked ancestor's (up to
+    /// kCloudSunAncestors levels coarser; the sun slot pool keeps the most important bakes, so evicted bricks answer from coarser
+    /// density rather than the live march). entry returns the brick whose bake it is.
+    uint cloudSunSlotUp(inout uint entry, uint sunClass)
+    {
+        uint sunSlot = cloudSunSlotOf(entry, sunClass);
+        for (uint k = 0; k < kCloudSunAncestors && sunSlot == kCloudRefNone && hstrCloudBricks[entry].parent != kCloudRefNone; ++k)
+        {
+            entry = hstrCloudBricks[entry].parent;
+            sunSlot = cloudSunSlotOf(entry, sunClass);
+        }
+        return sunSlot;
+    }
+
+    /// Baked sun optical depth of a brick at source position x from its bake in sun atlas slot sunSlot, in source voxel lengths.
+    float cloudBrickSun(uint brickIndex, uint sunSlot, float3 x)
+    {
+        const uint level = hstrCloudBricks[brickIndex].info & 15u;
+        const int3 i = int3(floor(x + 0.5f));
+        const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
+        const float3 local = clamp(levelPosition - float3(((i >> int(level)) >> 3) * 8), -0.5f, 7.5f);
+        const uint shift = params.cloudAtlasShift;
+        const uint mask = (1u << shift) - 1u;
+        const uint3 slot = uint3(sunSlot & mask, (sunSlot >> shift) & mask, sunSlot >> (2u * shift));
+        const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + local;
+        return hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudSunAtlasInvSize, 0.f);
     }
 
     float cameraExtinctionAtVoxel(float3 v, float footprint)
@@ -555,12 +747,66 @@ struct HSTRCloudRenderer
     /// density (majorant-bounded steps of at most stepOpticalDepth), so lit skins, shadow edges and terminators follow the
     /// density below voxel scale, and the field is read only where the march leaves off. Past kSunDepthOpaque nothing is lit.
     /// footprint >= 0 (camera samples): the near march reads the camera's fine density with that pixel footprint.
-    float sunDepthAt(float3 v, float footprint = -1.f)
+    /// Sun depth of a camera sample that read the proxy (no fine brick there at its footprint): the proxy is the density the
+    /// voxel-resolution sun field integrates, so a near march over it would only re-integrate that field. Half a voxel of proxy
+    /// extinction towards the sun, then the field.
+    float sunDepthProxy(float3 v)
     {
         v = seaVoxel(v);
-        static const float kSunDepthOpaque = 12.f;
         const float3 direction = params.sunVoxelDirection;
-        const float near = params.sunNearVoxels;
+        return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + direction) + 0.5f) / float3(params.hstrFineDims), 0.f) +
+               extinctionAtVoxel(v + 0.5f * direction) * params.sunVoxelWorldLength;
+    }
+
+    float sunDepthAt(float3 v, float footprint = -1.f)
+    {
+        CloudSample sample = {};
+        uint instanceIndex;
+        float3 x;
+        float footprintLevel;
+        if (footprint >= 0.f && cloudInstanceAt(seaVoxel(v), footprint, instanceIndex, x, footprintLevel))
+        {
+            cloudAssetBrickAt(hstrCloudAssets[hstrCloudInstances[instanceIndex].asset], x, uint(max(footprintLevel, 0.f)), true, sample);
+            sample.instance = instanceIndex;
+        }
+        return sunDepthAt(v, footprint, sample);
+    }
+
+    /// sunDepthAt for a camera sample whose density lookup at v returned sample. Samples of the fine bricks march a reach fixed in
+    /// the asset's source voxels (sunNearVoxels at instance scale 1), so every instance of an orientation class computes the same sun
+    /// depth within an asset brick, and a brick baked for the sample's class and level (bakeCloudSun) answers with one lookup.
+    ///
+    /// MEASURED (4K, per-pixel view, settled, 2026-09-15) against this function's live march: near 348 -> 41 ms, farside 197 -> 37 ms,
+    /// sea 218 -> 27 ms; beam view near 409 -> 18 ms, farside 93 -> 10 ms, sea 311 -> 12 ms. Log error mean 1.0e-4 / 8.7e-4 / 1.5e-4
+    /// with p99.9 0.013 / 0.036 / 0.022 (farside, which reads the coarsest bricks, is the worst). Every query is answered from a bake
+    /// in all three views (96% / 95% / 77% the brick's own, the rest an ancestor's); the live march below is the fallback for bricks
+    /// whose bake is missing or stale, not a steady-state path.
+    float sunDepthAt(float3 v, float footprint, CloudSample sample)
+    {
+        if (footprint >= 0.f && !sample.brick && params.cloudVirtual != 0 && params.cloudSunCache != 0)
+            return sunDepthProxy(v);
+        v = seaVoxel(v);
+        static const float kSunDepthOpaque = kCloudSunDepthOpaque;
+        const float3 direction = params.sunVoxelDirection;
+        float near = params.sunNearVoxels;
+        if (near > 0.f && footprint >= 0.f && sample.brick)
+        {
+            const HSTRCloudInstance instance = hstrCloudInstances[sample.instance];
+            near = params.sunNearVoxels * instance.sourceVoxelWorld / hstrCloudAssets[instance.asset].sourceVoxelWorld;
+            // A brick coarser than the footprint asks for (not streamed finer here) answers with its own level's bake: the density the
+            // sample itself read. The live march would read finer bricks further towards the sun where those are mapped.
+            uint bakedEntry = sample.entry;
+            const uint sunSlot = params.cloudSunCache != 0 && !sample.empty && sample.level >= sample.desired
+                                     ? cloudSunSlotUp(bakedEntry, instance.sunClass)
+                                     : kCloudRefNone;
+            if (sunSlot != kCloudRefNone)
+            {
+                const float depth = cloudBrickSun(bakedEntry, sunSlot, sample.x) * instance.sourceVoxelWorld;
+                if (depth > kSunDepthOpaque)
+                    return depth;
+                return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + near * direction) + 0.5f) / float3(params.hstrFineDims), 0.f);
+            }
+        }
         if (near <= 0.f)
         {
             const float3 midpoint = v + 0.5f * direction;
@@ -590,6 +836,14 @@ struct HSTRCloudRenderer
         }
         return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + t * direction) + 0.5f) / float3(params.hstrFineDims), 0.f);
     }
+
+    // A brick context experiment lived here (2026-09-15): a camera ray resolved its brick once - instance, directory walk, atlas
+    // address, cell codes, sun slot - and later samples inside that brick, level and tile read it straight from registers until the
+    // ray left it. It was exact (6e-9 log error against the full lookup) and removed ~80% of the lookups: 4.2 brick visits per pixel
+    // with 5.6 samples each on the near view at 4K. It was also SLOWER - 46.5 -> 52.9 ms with lighting, 29.2 -> 32.8 ms without - and
+    // merely carrying its code raised the march's cost when switched off. The context's registers cost more occupancy than the
+    // lookups cost latency: the directory, node and brick reads are cache hits, and this march is bound by fetch latency, occupancy
+    // and divergence, not by address arithmetic. Fewer samples (minStepVoxels) and fewer fetches per sample are the levers that pay.
 
     /// Rasterized sun residual at v (before albedo): the sun optical depth attenuated per octave.
     float3 residualAtVoxel(float3 v, float4 octaves, float footprint = -1.f) { return residualAtDepth(v, sunDepthAt(v, footprint), octaves); }
@@ -1107,24 +1361,36 @@ struct HSTRCloudRenderer
         }
         float3 held = 0.f;
         float3 heldAt = 0.f;
+        float heldSun = 0.f;
+        float3 sunAt = float3(1e30f);
+        float heldSigma = -1.f; ///< The previous step's end extinction, or negative where the march jumped (cloudTrapezoid).
         uint sinceLighting = ~0u;
         float t = segment.x;
         // Voxel edge (domain voxels) of the density the last sample read: fine bricks shorten the minimum step to their voxels.
         float fineVoxels = 1.f;
         [loop]
-        while (t < segment.y && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
+        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
         {
             const float3 v = (ray.position + t * ray.direction) * cellWidth;
             const float majorant = majorantAt(v);
             const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
             const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
             const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
-            CloudEmptyBox empty = {};
+            CloudSample sample = {};
+            float tSample = t + 0.5f * dt; ///< Where the step's density sample sits: cloudEmptyExit measures its box from there.
             if (majorant > 0.f)
             {
-                const float3 midpoint = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
-                const float footprint = rayFootprint(ray, t + 0.5f * dt);
-                const float alpha = 1.f - exp(-cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, empty) * dt * ray.worldLength);
+                // Midpoint quadrature (cloudTrapezoid 0), or the trapezoid rule on the step's ends: the previous step's end is this
+                // step's start, so both cost one density sample per step, but the trapezoid is exact wherever the extinction is
+                // linear and lets the steps grow (the sample count is what the march costs).
+                const bool trapezoid = params.cloudTrapezoid != 0 && heldSigma >= 0.f;
+                tSample = params.cloudTrapezoid != 0 ? t + dt : t + 0.5f * dt;
+                const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                const float footprint = rayFootprint(ray, tSample);
+                const float sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
+                const float depth = (trapezoid ? 0.5f * (heldSigma + sigma) : sigma) * dt * ray.worldLength;
+                heldSigma = params.cloudTrapezoid != 0 ? sigma : -1.f;
+                const float alpha = 1.f - exp(-depth);
                 if ((withSource || residual) && alpha > 1e-6f)
                 {
                     if (withSource)
@@ -1143,14 +1409,122 @@ struct HSTRCloudRenderer
                         radiance += transmittance * alpha * held;
                     }
                     if (residual)
-                        residualRadiance += transmittance * alpha * residualAtVoxel(midpoint, ray.sunOctaves, footprint);
+                    {
+                        // The sun depth is smooth along the ray: cloudSunReuse holds one for the samples within that distance. A step
+                        // whose end sample is empty still carries the light of its start (trapezoid), and an empty sample has no bake
+                        // to read - it would take the live march - so it keeps the last depth instead.
+                        const float3 moved = midpoint - sunAt;
+                        const bool stale = params.cloudSunReuse <= 0.f || dot(moved, moved) > params.cloudSunReuse * params.cloudSunReuse;
+                        if (stale && !(sample.empty && sunAt.x < 1e29f))
+                        {
+                            heldSun = sunDepthAt(midpoint, footprint, sample);
+                            sunAt = midpoint;
+                        }
+                        const float sunDepth = heldSun;
+                        residualRadiance += transmittance * alpha * residualAtDepth(midpoint, sunDepth, ray.sunOctaves);
+                    }
                 }
                 transmittance *= 1.f - alpha;
             }
-            // Past an exactly empty cell or octant in one step: the next step starts where density can return.
-            t = empty.valid && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, t + 0.5f * dt, empty)), segment.y) : t + dt;
+            // Past an exactly empty cell or octant, or a zero 16-voxel block, in one step: the next step starts where density can return.
+            const float next = majorant <= 0.f
+                                   ? min(max(t + dt, majorantZeroExit(ray, t)), segment.y)
+                                   : (sample.empty && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y)
+                                                                                 : t + dt);
+            // A step that took no sample at its end, or that jumped, leaves no start value for the next trapezoid.
+            if (majorant <= 0.f || next > t + dt)
+                heldSigma = -1.f;
+            t = next;
             ++steps;
         }
+    }
+
+    /// Counts along marchSegment's camera march (marchProbe; scripts read the frame mean through an exact comparison with a black
+    /// stored frame). Per sun query (alpha > 1e-6): 1 all, 2 own bake, 3 proxy, 4 live because the brick is finer than asked, 5 live
+    /// because no bake (own or ancestor) matches, 6 live on an empty sample, 8 unbaked on bricks with no bake of any class, 9 unbaked
+    /// on bricks coarser than asked, 18 an ancestor's bake. Per density sample: 7 all, 10 at the minimum step, 11 at the maximum step,
+    /// 12 non-empty with alpha <= 1e-6, 13 exactly empty, 14 alpha > 0.5, 15 step length in sampled voxels. Per step: 17 majorant
+    /// zero. Per density sample: 20 on a different brick than the last brick sample (brick visits), 21 read a brick. Per pixel: 16
+    /// terminated by transmittance, 22 more than 32 steps, 23 more than 64 steps.
+    float probeMarch(CutRay ray, uint mode)
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return 0.f;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        float t = 0.f;
+        float fineVoxels = 1.f;
+        float transmittance = 1.f;
+        float result = 0.f;
+        uint steps = 0;
+        uint lastEntry = kCloudRefNone - 1u;
+        uint lastInstance = 0;
+        [loop]
+        while (t < 1.f && transmittance > kMinTransmittance && steps < params.maxMarchSteps)
+        {
+            const float3 v = (ray.position + t * ray.direction) * cellWidth;
+            const float majorant = majorantAt(v);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+            const float dt = min(stepVoxels / voxelsPerUnit, 1.f - t);
+            CloudSample sample = {};
+            if (majorant > 0.f)
+            {
+                const float3 midpoint = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
+                const float footprint = rayFootprint(ray, t + 0.5f * dt);
+                const float alpha = 1.f - exp(-cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample) * dt * ray.worldLength);
+                result += mode == 7 ? 1.f : 0.f;
+                result += mode == 10 && stepVoxels <= minimumStep ? 1.f : 0.f;
+                result += mode == 11 && stepVoxels >= params.maxStepVoxels ? 1.f : 0.f;
+                result += mode == 12 && !sample.empty && alpha <= 1e-6f ? 1.f : 0.f;
+                result += mode == 13 && sample.empty ? 1.f : 0.f;
+                result += mode == 14 && alpha > 0.5f ? 1.f : 0.f;
+                result += mode == 15 ? dt * voxelsPerUnit / max(fineVoxels, 1e-3f) : 0.f;
+                result += mode == 20 && sample.brick && (sample.entry != lastEntry || sample.instance != lastInstance) ? 1.f : 0.f;
+                result += mode == 21 && sample.brick ? 1.f : 0.f;
+                if (sample.brick)
+                {
+                    lastEntry = sample.entry;
+                    lastInstance = sample.instance;
+                }
+                if (alpha > 1e-6f)
+                {
+                    const bool keyed = sample.brick && !sample.empty &&
+                                       cloudSunSlotOf(sample.entry, hstrCloudInstances[sample.instance].sunClass) != kCloudRefNone;
+                    result += mode == 1 ? 1.f : 0.f;
+                    result += mode == 2 && keyed && sample.level >= sample.desired ? 1.f : 0.f;
+                    result += mode == 3 && !sample.brick ? 1.f : 0.f;
+                    result += mode == 4 && sample.brick && !sample.empty && sample.level < sample.desired ? 1.f : 0.f;
+                    uint bakedEntry = sample.entry;
+                    const bool keyedUp = sample.brick && !sample.empty &&
+                                         cloudSunSlotUp(bakedEntry, hstrCloudInstances[sample.instance].sunClass) != kCloudRefNone;
+                    result += mode == 5 && sample.brick && !sample.empty && !keyedUp ? 1.f : 0.f;
+                    result += mode == 18 && keyedUp && !keyed && sample.level >= sample.desired ? 1.f : 0.f;
+                    result += mode == 6 && sample.brick && sample.empty ? 1.f : 0.f;
+                    if ((mode == 8 || mode == 9) && sample.brick && !sample.empty && !keyed)
+                    {
+                        bool anyClass = false;
+                        for (uint c = 0; c < 16; ++c)
+                            anyClass = anyClass || cloudSunSlotOf(sample.entry, c) != kCloudRefNone;
+                        result += mode == 8 && !anyClass ? 1.f : 0.f;
+                        result += mode == 9 && sample.level > sample.desired ? 1.f : 0.f;
+                    }
+                }
+                transmittance *= 1.f - alpha;
+            }
+            result += mode == 17 && majorant <= 0.f ? 1.f : 0.f;
+            if (majorant <= 0.f)
+                t = min(max(t + dt, majorantZeroExit(ray, t)), 1.f);
+            else
+                t = sample.empty && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, t + 0.5f * dt, sample)), 1.f) : t + dt;
+            ++steps;
+        }
+        if (mode == 16)
+            return transmittance <= kMinTransmittance ? 1.f : 0.f;
+        if (mode == 22 || mode == 23)
+            return steps > (mode == 22 ? 32u : 64u) ? 1.f : 0.f;
+        return result;
     }
 
     float transmittancePageAt(HSTRCutNode node, float3 leafPosition)
@@ -2389,6 +2763,9 @@ struct HSTRCloudRenderer
             return;
         float4 error = 0.f;
         uint count = 0;
+        if (params.compareExact != 0)
+            for (uint b = 0; b < kCompareBins; ++b)
+                hstrReferenceRowHistogram[row * kCompareBins + b] = 0.f;
         for (uint x = 0; x < params.frameDim.x; ++x)
         {
             const uint2 pixel = uint2(x, row);
@@ -2402,6 +2779,10 @@ struct HSTRCloudRenderer
                 const float logError = dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f);
                 error += float4(dot(abs(value - reference), 1.f / 3.f), logError, logError > 0.02f ? 1.f : 0.f, logError > 0.1f ? 1.f : 0.f);
                 ++count;
+                // Bin 0 up to kCompareBinFloor, then 4 bins per octave.
+                const uint bin = logError <= kCompareBinFloor ? 0u : min(uint(4.f * log2(logError / kCompareBinFloor)) + 1u, kCompareBins - 2u);
+                hstrReferenceRowHistogram[row * kCompareBins + bin] += 1.f;
+                hstrReferenceRowHistogram[row * kCompareBins + kCompareBins - 1u] = max(hstrReferenceRowHistogram[row * kCompareBins + kCompareBins - 1u], logError);
                 continue;
             }
             const ReferenceHalves target = referenceHalves(pixel, params.compareTarget);
@@ -3067,6 +3448,8 @@ struct HSTRCloudRenderer
             marchSegment(ray, float2(0.f, 1.f), withCache, withSingle, cached, single, cachedTransmittance, cachedSteps);
             const float3 background = (params.hstComponents & kComponentBackground) != 0 ? cachedTransmittance * sky : 0.f;
             color[pixel] = float4((cached + single) * volume.data.albedo + background, 1.f);
+            if (params.marchProbe != 0)
+                color[pixel] = float4(probeMarch(ray, params.marchProbe).xxx, 1.f);
             transportError[pixel] = 0.f;
             cutStats[pixel] = 0.f;
             return;
@@ -3443,24 +3826,69 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
         return;
     const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[dispatchThreadId.x];
     const uint3 origin = cloudSlotOrigin(info.slot, params.cloudAtlasShift);
-    uint words[2] = { 0u, 0u };
+    uint words[kCloudCellWords] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
     for (uint cz = 0; cz < 4; ++cz)
         for (uint cy = 0; cy < 4; ++cy)
             for (uint cx = 0; cx < 4; ++cx)
             {
-                bool occupied = info.valueMin > 0.f;
-                for (uint z = 2 * cz; z < 2 * cz + 4 && !occupied; ++z)
-                    for (uint y = 2 * cy; y < 2 * cy + 4 && !occupied; ++y)
-                        for (uint x = 2 * cx; x < 2 * cx + 4 && !occupied; ++x)
-                            occupied = gHSTRCloud.hstrCloudAtlas.Load(int4(origin + uint3(x, y, z), 0)) > 0.f;
-                if (occupied)
-                {
-                    const uint bit = cx + 4u * cy + 16u * cz;
-                    words[bit >> 5u] |= 1u << (bit & 31u);
-                }
+                float t = 0.f;
+                for (uint z = 2 * cz; z < 2 * cz + 4; ++z)
+                    for (uint y = 2 * cy; y < 2 * cy + 4; ++y)
+                        for (uint x = 2 * cx; x < 2 * cx + 4; ++x)
+                            t = max(t, gHSTRCloud.hstrCloudAtlas.Load(int4(origin + uint3(x, y, z), 0)));
+                const uint cell = cx + 4u * cy + 16u * cz;
+                words[cell >> 3u] |= cloudCellCode(t > 0.f ? info.valueMin + info.valueRange * t * t : info.valueMin) << ((cell & 7u) * 4u);
             }
-    gHSTRCloud.hstrCloudOccupancyOutput[info.brick * 2u] = words[0];
-    gHSTRCloud.hstrCloudOccupancyOutput[info.brick * 2u + 1u] = words[1];
+    for (uint w = 0; w < kCloudCellWords; ++w)
+        gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + w] = words[w];
+}
+
+/// Sun bakes of this frame (cloudCommitOffset, cloudCommitCount): for every atlas texel of a brick, the optical depth (in source
+/// voxel lengths, density scale applied) along the sun over job.reach source voxels, on the asset's own bricks at the brick's level
+/// (the density sunDepthAt's live march reads for a camera sample at that level), skipping exactly empty cells and octants.
+/// Thread (x, y, z) is texel (x, y, z % 10) of job z / 10.
+[numthreads(4, 4, 4)]
+void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const HSTRCloudParams params = gHSTRCloud.params;
+    const uint local = dispatchThreadId.z / kCloudBrickEdge;
+    if (local >= params.cloudCommitCount || any(dispatchThreadId.xy >= kCloudBrickEdge))
+        return;
+    const HSTRCloudSunBake job = gHSTRCloud.hstrCloudSunBakes[params.cloudCommitOffset + local];
+    const uint3 texel = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudBrickEdge);
+    const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[job.asset];
+    const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+    const float levelScale = float(1u << job.level);
+    const float3 start = (job.origin + float3(texel) - 1.f + 0.5f) * levelScale - 0.5f;
+    float depth = 0.f;
+    float u = 0.f;
+    float stepVoxels = 0.5f * levelScale;
+    [loop]
+    for (uint k = 0; k < 512 && u < job.reach && depth <= job.cap; ++k)
+    {
+        const float dt = min(stepVoxels, job.reach - u);
+        const float3 x = start + (u + 0.5f * dt) * job.direction;
+        CloudSample sample;
+        float next = u + dt;
+        if (gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample))
+        {
+            stepVoxels = 0.5f * float(1u << sample.level);
+            if (sample.empty)
+            {
+                float exit = 1e30f;
+                for (uint a = 0; a < 3; ++a)
+                    if (abs(job.direction[a]) > 1e-8f)
+                        exit = min(exit, ((job.direction[a] > 0.f ? sample.hi[a] : sample.lo[a]) - x[a]) / job.direction[a]);
+                next = max(next, u + 0.5f * dt + max(exit, 0.f));
+            }
+            else
+                depth += gHSTRCloud.cloudBrickDensity(sample.entry, x, int3(floor(x + 0.5f))) * scale * dt;
+        }
+        else
+            stepVoxels = 4.f * levelScale; // Outside the asset: no density until the march re-enters it.
+        u = min(next, job.reach);
+    }
+    gHSTRCloud.hstrCloudSunAtlasOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] = depth;
 }
 
 /// Byte k of the packed coefficients starting at payload word p.

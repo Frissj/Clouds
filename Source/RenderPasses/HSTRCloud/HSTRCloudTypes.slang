@@ -17,6 +17,8 @@ static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: uni
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
+static const uint kCompareBins = 64;       ///< Exact comparison histogram entries per row: log error bins, then the maximum.
+static const float kCompareBinFloor = 1e-4f; ///< Upper edge of the first log error bin; 4 bins per octave above.
 
 struct HSTRCutNode
 {
@@ -37,6 +39,8 @@ static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothin
 static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
 static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
 static const uint kCloudTransformHaar = 1;     ///< HSTRCloudStaging.transform: CloudFormat.h kTransformHaar.
+static const float kCloudSeaMinScale = 0.65f;  ///< Smallest instance scale of the sea (CloudSea::makeTile draws 0.65-1).
+static const float kCloudSunDepthOpaque = 12.f; ///< Sun optical depth past which nothing is lit (sunDepthAt stops).
 
 /// One tile of the cloud sea domain: a library asset placed with a quarter-turn rotation, mirror, scale and offset.
 struct HSTRCloudInstance
@@ -48,6 +52,10 @@ struct HSTRCloudInstance
     float sourceVoxelWorld; ///< World size of one source voxel of this instance.
     float proxyLevel;       ///< Pyramid level whose voxels are as coarse as the domain proxy: from here on the proxy is used.
     uint occupied;
+    uint sunClass; ///< Orientation class (the signed permutation of the rows): instances of one class share baked sun depth.
+    uint padInstance0;
+    uint padInstance1;
+    uint padInstance2;
 };
 
 struct HSTRCloudAsset
@@ -56,6 +64,10 @@ struct HSTRCloudAsset
     uint directoryOffset;
     uint3 chunkDims;
     uint topLevel;
+    float sourceVoxelWorld; ///< World size of one source voxel at instance scale 1.
+    uint padAsset0;
+    uint padAsset1;
+    uint padAsset2;
 };
 
 /// A resident brick: an atlas slot (or a constant), its quantisation and its place in the pyramid.
@@ -67,6 +79,25 @@ struct HSTRCloudBrick
     float fade;  ///< Blend weight against the parent while the brick streams in or out.
     float minValue;
     float range; ///< density = minValue + range * t^2 for the stored unorm t.
+    uint padBrick0;
+    uint padBrick1;
+};
+
+static const uint kCloudCellWords = 8;        ///< hstrCloudOccupancy words per brick: a 4-bit code per 2-voxel cell (cloudCellCode).
+static const uint kCloudSunAncestors = 2;    ///< Levels a sample of an unbaked brick climbs for a baked ancestor before the live march.
+static const uint kCloudSunBakesPerBrick = 8; ///< Orientation classes one brick keeps baked sun depth for (hstrCloudSunSlots).
+
+/// One brick's sun bake (bakeCloudSun): per atlas texel, the optical depth over reach source voxels towards the sun.
+struct HSTRCloudSunBake
+{
+    uint brick;
+    uint slot;        ///< Sun atlas slot.
+    uint asset;
+    uint level;
+    float3 origin;    ///< Level-voxel position of the brick's first core voxel.
+    float reach;      ///< Source voxels marched towards the sun.
+    float3 direction; ///< Unit sun direction in the asset's source voxels.
+    float cap;        ///< Source-length optical depth past which the march stops (opaque for every instance scale).
 };
 
 /// A brick staged for GPU reconstruction (see reconstructBrick in CloudFormat.h): parent prediction plus dequantised residual,
@@ -176,7 +207,12 @@ struct HSTRCloudParams
     float residualStrength = 1.4f;
 
     float stepOpticalDepth = 0.5f; ///< Target optical depth per majorant-bounded march step.
-    float minStepVoxels = 1.f;     ///< Midpoint quadrature of trilinear extinction is accurate at one-voxel steps at any density.
+    /// Midpoint quadrature of trilinear extinction is accurate at one-voxel steps at any density. MEASURED (4K, per-pixel c15, 2026-09-16):
+    /// 97% of the camera's density samples step at this minimum, so it, not stepOpticalDepth, sets the sample count - and the sample
+    /// count is what the march costs. 1 -> 2 voxels: 29.2 -> 16.8 samples per pixel, near 39.0 -> 24.2 ms and sea 29.9 -> 18.8 ms, at
+    /// 0.26% of pixels over 0.02 log error (p99.9 0.036, max 0.14). 1 -> 4 voxels: 10.8 samples, near 15.2 ms and sea 11.4 ms, but
+    /// 2.2% over 0.02 (p99.9 0.12, max 0.34): too coarse for midpoint quadrature.
+    float minStepVoxels = 1.f;
     float maxStepVoxels = 4.f;
     float compareMapScale = 0.f;   ///< >0: block comparisons overwrite the frame with their signed log error map, saturating here.
 
@@ -277,12 +313,30 @@ struct HSTRCloudParams
     uint cloudStagedCount = 0; ///< Staged bricks whose residuals decodeCloudResiduals decodes this frame.
 
     uint3 fineSunOffset = { 0, 0, 0 }; ///< First voxel of the sun page region computeFineSun updates.
-    uint padHSTRCloud2 = 0;
+    uint cloudSunGeneration = 0; ///< Changes with everything the baked sun depth depends on (sun, density scale, reach).
     uint3 fineSunSize = { 0, 0, 0 };   ///< Voxels of that region (0: the whole grid).
-    uint padHSTRCloud3 = 0;
+    uint cloudSunCache = 1; ///< 1: camera sun depth reads baked bricks where their key matches (else the live march).
 
     float3 cloudAtlasInvSize = float3(1.f); ///< Reciprocal texel dimensions of the brick atlas.
     float worldCacheKeep = 1.f;              ///< Share of the world cache deposits decayWorldCache keeps.
+
+    float3 cloudSunAtlasInvSize = float3(1.f); ///< Reciprocal texel dimensions of the sun atlas (its own slot pool, same brick layout).
+    uint marchProbe = 0; ///< kWorldCacheView: > 0 replaces the pixel with a per-pixel count of the camera march (probeMarch modes).
+
+    uint cloudSunOldestGeneration = 0; ///< Oldest sun generation whose bakes still answer (only the sun direction changed since).
+    float cloudThinDepth = 0.f; ///< Camera marches treat brick cells whose density bound gives at most this optical depth across as empty.
+    /// 1: camera steps with a zero majorant cross the whole zero 16-voxel block (hstrMajorantZero). MEASURED (4K c15): sea 32.0 ->
+    /// 29.1 ms, near 38.2 -> 40.7 ms - it pays where a view crosses a lot of empty sea and costs a little where it does not.
+    uint cloudZeroSkip = 1;
+    uint cloudTrapezoid = 0; ///< 1: camera steps integrate the trapezoid of their end extinctions instead of their midpoint's.
+    /// Domain voxels a camera march may move before it queries the sun depth again (0: every sample). MEASURED (4K c15, 0.1 voxels,
+    /// which reuses about every second query): near 42.8 -> 42.3 ms, sea 30.4 -> 33.0 ms - nothing. Halving the sun fetches does not
+    /// pay, the same way the brick context did not: what a sample costs is the sample, not the fetches inside it.
+    float cloudSunReuse = 0.f;
+    /// Camera transmittance at which a march stops (the rest of the ray is behind opaque cloud). MEASURED (4K c15, 0.001 -> 0.02):
+    /// near 42.6 -> 38.8 ms, sea 28.6 -> 30.4 ms, so the long-tailed rays are not what the frame waits for either.
+    float cloudMinTransmittance = 1e-3f;
+    uint padHSTRCloud9 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

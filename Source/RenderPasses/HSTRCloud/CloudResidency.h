@@ -20,6 +20,7 @@ struct CloudResidencyDesc
     uint32_t ioThreads = 2;
     uint32_t payloadPoolMB = 128;  ///< GPU memory of the packed coefficients of resident pages.
     bool directStorage = true;     ///< Load page payloads with DirectStorage (GPU decompression where supported).
+    uint32_t sunBakesPerFrame = 256; ///< Bricks whose sun depth bakeCloudSun bakes per frame.
 };
 
 /// What the residency cut is computed for.
@@ -31,6 +32,9 @@ struct CloudView
     float lodBias = 0.f;      ///< Levels added to every footprint.
     float3 sunDirection = float3(0.f, 1.f, 0.f);
     float sunReach = 0.f;     ///< World distance camera samples march towards the sun on fine density.
+    float sunNearVoxels = 0.f;    ///< HSTRCloudParams::sunNearVoxels (0: no baked sun depth).
+    uint32_t sunGeneration = 0;   ///< HSTRCloudParams::cloudSunGeneration.
+    float3 sunBakeDirection = float3(0.f, 1.f, 0.f); ///< Sun direction of that generation's bakes (the sun within cloudSunBakeAngle).
     float densityScale = 1.f; ///< Extinction per unit of stored density.
     float maxDistance = 1e9f; ///< Nothing beyond is rendered.
 };
@@ -58,6 +62,10 @@ public:
         double residentMB = 0.0;
         double payloadMB = 0.0; ///< Payload pool in use.
         double cutMilliseconds = 0.0;
+        uint32_t sunBaked = 0;      ///< Mapped bricks whose sun depth is baked for their instance's key.
+        uint32_t sunWaiting = 0;    ///< Mapped bricks still on the live march (not yet baked, or neighbourhood still streaming).
+        uint32_t sunBakesFrame = 0; ///< Bakes staged this frame.
+        uint32_t sunSlotsFree = 0;  ///< Free sun atlas slots.
     };
 
     /// Staged bricks of one level: one commit dispatch each, coarsest first, so parents are in the atlas before their children.
@@ -76,6 +84,9 @@ public:
     void bind(const ShaderVar& var) const;
     ref<Texture> getAtlas() const { return mpAtlas; }
     ref<Buffer> getOccupancy() const { return mpOccupancy; }
+    ref<Texture> getSunAtlas() const { return mpSunAtlas; }
+    /// Sun bakes staged this frame (bakeCloudSun runs over them after the commits).
+    uint32_t getSunBakeCount() const { return uint32_t(mSunBakes.size()); }
     /// Bricks staged this frame (decodeCloudResiduals runs over them before the commit groups).
     uint32_t getStagedCount() const { return uint32_t(mStaged.size()); }
     const std::vector<CommitGroup>& getCommitGroups() const { return mCommitGroups; }
@@ -108,6 +119,7 @@ private:
         float visibility = 1.f;
         float3 visibilityCamera = float3(std::numeric_limits<float>::max()); ///< Camera position the visibility was measured from.
         float fade = 0.f;
+        uint16_t sunClasses = 0;      ///< Orientation classes of the instances that desired the brick in the last cut (bit per class).
         uint16_t flags = 0;
         uint8_t childCount = 0;
         uint8_t loadedChildren = 0;
@@ -139,6 +151,9 @@ private:
         uint32_t directoryOffset = 0;
         std::vector<uint32_t> chunkStores; ///< Per chunk: store index, kNone or kPendingStore.
         std::vector<uint64_t> chunkBrick;  ///< Per chunk: handle of its level-4 brick.
+        uint3 changeDims = uint3(0);
+        std::vector<uint32_t> changeFrame; ///< Per 32^3-voxel cell: last frame a brick over it was mapped or unmapped.
+        uint32_t lastChange = 0;
     };
 
     struct Request
@@ -192,6 +207,10 @@ private:
     void touchNode(size_t node);
     void touchBrick(uint32_t gpu);
     void upload();
+    void scheduleSunBakes(const CloudSea& sea, const CloudView& view);
+    void markChanged(uint32_t asset, const BrickHeader& record);
+    bool sunBakeStale(uint32_t asset, const BrickHeader& record, float3 direction, float reach, uint32_t bakeFrame) const;
+    uint32_t sunClassOf(const HSTRCloudInstance& instance);
 
     ref<Device> mpDevice;
     CloudResidencyDesc mDesc;
@@ -225,7 +244,16 @@ private:
     ref<Buffer> mpNodes;
     ref<Buffer> mpBricks;
     ref<Texture> mpAtlas;
-    ref<Buffer> mpOccupancy; ///< Two words per GPU brick (occupancyCloudBricks).
+    ref<Buffer> mpOccupancy; ///< kCloudCellWords words per GPU brick: 4-bit cell density bounds (occupancyCloudBricks).
+    ref<Texture> mpSunAtlas; ///< Baked sun optical depth: its own pool of slots laid out like density atlas slots.
+    ref<Buffer> mpSunBakes;
+    ref<Buffer> mpSunSlotTable;
+    std::vector<HSTRCloudSunBake> mSunBakes;
+    std::vector<uint32_t> mSunSlotTable;  ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun slot); key kCloudRefNone: not valid.
+    std::vector<uint32_t> mSunBakeFrames; ///< Per pair: frame it was baked.
+    std::vector<uint32_t> mFreeSunSlots;
+    std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
+    std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
     ref<Buffer> mpStagingInfo;
     std::unique_ptr<CloudPayloadPool> mpPayload;

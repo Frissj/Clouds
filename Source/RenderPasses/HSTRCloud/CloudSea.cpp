@@ -109,7 +109,7 @@ CloudSea::Tile CloudSea::makeTile(int2 world) const
     const CloudAsset& asset = mAssets[assetID];
     const uint32_t turns = std::min(uint32_t(rng.next() * 4.f), 3u);
     const bool mirror = rng.next() < 0.5f;
-    const float scale = 0.65f + 0.35f * rng.next();
+    const float scale = kCloudSeaMinScale + (1.f - kCloudSeaMinScale) * rng.next();
     const float sourceVoxelWorld = asset.voxelWorld * mFitScale * scale;
     const float3 contentVoxels = float3(mContentMax[assetID] - mContentMin[assetID] + 1u);
     const float3 extent = contentVoxels * sourceVoxelWorld;

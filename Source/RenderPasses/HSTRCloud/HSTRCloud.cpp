@@ -108,6 +108,15 @@ const char kCloudFineMinVoxels[] = "cloudFineMinVoxels";
 const char kCloudEmptySkip[] = "cloudEmptySkip";
 const char kCloudStats[] = "cloudStats";
 const char kCloudSunTilesPerFrame[] = "cloudSunTilesPerFrame";
+const char kCloudSunBakesPerFrame[] = "cloudSunBakesPerFrame";
+const char kCloudSunBakeAngle[] = "cloudSunBakeAngle";
+const char kCloudSunCache[] = "cloudSunCache";
+const char kMarchProbe[] = "marchProbe";
+const char kCloudThinDepth[] = "cloudThinDepth";
+const char kCloudZeroSkip[] = "cloudZeroSkip";
+const char kCloudSunReuse[] = "cloudSunReuse";
+const char kCloudTrapezoid[] = "cloudTrapezoid";
+const char kCloudMinTransmittance[] = "cloudMinTransmittance";
 const char kSaveReference[] = "saveReference";
 const char kLoadReference[] = "loadReference";
 const char kBeamTolerance[] = "beamTolerance";
@@ -125,6 +134,8 @@ const char kReferenceError[] = "referenceError";
 const char kReferenceLogError[] = "referenceLogError";
 const char kReferenceNoiseError[] = "referenceNoiseError";
 const char kReferenceNoiseLogError[] = "referenceNoiseLogError";
+const char kReferenceLogP999[] = "referenceLogP999";
+const char kReferenceLogMax[] = "referenceLogMax";
 const char kReferenceSampleCount[] = "referenceSampleCount";
 constexpr uint32_t kReferenceView = 6;
 
@@ -193,6 +204,21 @@ auto timed(const char* label, F&& f)
 }
 
 void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Texture>& pTexture, const char* input);
+
+/// 1 for the 16-voxel blocks (4^3 majorant blocks) where any majorant block is non-zero.
+template<typename T>
+std::vector<uint8_t> majorantZeroBlocks(const std::vector<T>& majorant, uint3 blockDims)
+{
+    const uint3 dims = (blockDims + 3u) / 4u;
+    std::vector<uint8_t> blocks(size_t(dims.x) * dims.y * dims.z, 0);
+    for (size_t i = 0; i < majorant.size(); ++i)
+        if (float(majorant[i]) > 0.f)
+        {
+            const uint3 o = uint3(uint32_t(i % blockDims.x), uint32_t((i / blockDims.x) % blockDims.y), uint32_t(i / (size_t(blockDims.x) * blockDims.y))) / 4u;
+            blocks[size_t(o.x) + size_t(dims.x) * (size_t(o.y) + size_t(dims.y) * o.z)] = 1;
+        }
+    return blocks;
+}
 
 } // namespace
 
@@ -376,6 +402,24 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudFadeFrames = std::max(1u, uint32_t(value));
         else if (key == kCloudVirtual)
             mCloudVirtual = value;
+        else if (key == kCloudSunBakesPerFrame)
+            mCloudSunBakesPerFrame = uint32_t(value);
+        else if (key == kCloudSunBakeAngle)
+            mCloudSunBakeAngle = std::max(0.f, float(value));
+        else if (key == kCloudSunCache)
+            mParams.cloudSunCache = bool(value) ? 1u : 0u;
+        else if (key == kMarchProbe)
+            mParams.marchProbe = uint32_t(value);
+        else if (key == kCloudThinDepth)
+            mParams.cloudThinDepth = std::max(0.f, float(value));
+        else if (key == kCloudZeroSkip)
+            mParams.cloudZeroSkip = bool(value) ? 1u : 0u;
+        else if (key == kCloudSunReuse)
+            mParams.cloudSunReuse = std::max(0.f, float(value));
+        else if (key == kCloudTrapezoid)
+            mParams.cloudTrapezoid = bool(value) ? 1u : 0u;
+        else if (key == kCloudMinTransmittance)
+            mParams.cloudMinTransmittance = std::clamp(float(value), 1e-4f, 0.5f);
         else if (key == kCloudSunTilesPerFrame)
             mCloudSunTilesPerFrame = std::max(1u, uint32_t(value));
         else if (key == kCloudEmptySkip)
@@ -406,7 +450,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.compareSubstitute = value;
         else if (key == kCompareTarget)
             mParams.compareTarget = value;
-        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction || key == kCloudStats)
+        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceLogP999 || key == kReferenceLogMax || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction || key == kCloudStats)
             continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
@@ -571,6 +615,15 @@ Properties HSTRCloud::getProperties() const
     props[kCloudFineMinVoxels] = mParams.cloudFineMinVoxels;
     props[kCloudEmptySkip] = mParams.cloudEmptySkip != 0;
     props[kCloudSunTilesPerFrame] = mCloudSunTilesPerFrame;
+    props[kCloudSunBakesPerFrame] = mCloudSunBakesPerFrame;
+    props[kCloudSunBakeAngle] = mCloudSunBakeAngle;
+    props[kCloudSunCache] = mParams.cloudSunCache != 0;
+    props[kMarchProbe] = mParams.marchProbe;
+    props[kCloudThinDepth] = mParams.cloudThinDepth;
+    props[kCloudZeroSkip] = mParams.cloudZeroSkip != 0;
+    props[kCloudSunReuse] = mParams.cloudSunReuse;
+    props[kCloudTrapezoid] = mParams.cloudTrapezoid != 0;
+    props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
     if (mpCloudResidency)
     {
         const auto& stats = mpCloudResidency->getStats();
@@ -586,6 +639,10 @@ Properties HSTRCloud::getProperties() const
         cloud["residentMB"] = stats.residentMB;
         cloud["payloadMB"] = stats.payloadMB;
         cloud["cutMs"] = stats.cutMilliseconds;
+        cloud["sunBaked"] = stats.sunBaked;
+        cloud["sunWaiting"] = stats.sunWaiting;
+        cloud["sunSlotsFree"] = stats.sunSlotsFree;
+        cloud["sunBakesFrame"] = stats.sunBakesFrame;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         props[kCloudStats] = cloud;
     }
@@ -604,6 +661,8 @@ Properties HSTRCloud::getProperties() const
     props[kReferenceLogError] = mReferenceLogError;
     props[kReferenceNoiseError] = mReferenceNoiseError;
     props[kReferenceNoiseLogError] = mReferenceNoiseLogError;
+    props[kReferenceLogP999] = mReferenceLogP999;
+    props[kReferenceLogMax] = mReferenceLogMax;
     props[kReferenceSampleCount] = mParams.referenceSamples;
     return props;
 }
@@ -708,6 +767,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpOccupancyCloudPass = createPass("occupancyCloudBricks");
+    mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
@@ -1101,6 +1161,8 @@ void HSTRCloud::uploadExtinction()
         occupancy[size_t(o.x) + size_t(occupancyDims.x) * (size_t(o.y) + size_t(occupancyDims.y) * o.z)] = 1;
     }
     mpOccupancy = mpDevice->createTexture3D(occupancyDims.x, occupancyDims.y, occupancyDims.z, ResourceFormat::R8Uint, 1, occupancy.data());
+    const std::vector<uint8_t> majorantZero = majorantZeroBlocks(majorant, majorantDims);
+    mpMajorantZero = mpDevice->createTexture3D(occupancyDims.x, occupancyDims.y, occupancyDims.z, ResourceFormat::R8Uint, 1, majorantZero.data());
 
     // Sun residual pages live at voxel resolution.
     mParams.hstrFineDims = dims;
@@ -1166,7 +1228,14 @@ void HSTRCloud::buildCloudDomain()
         mCloudMeanBlocks.clear();
     }
     const std::string residencyKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}", mCloudBrickPoolMB, mCloudBrickLoadsPerFrame, mCloudLodPixels, mCloudFadeFrames, mCloudPayloadPoolMB, mCloudDirectStorage
+        "{}|{}|{}|{}|{}|{}|{}",
+        mCloudBrickPoolMB,
+        mCloudBrickLoadsPerFrame,
+        mCloudLodPixels,
+        mCloudFadeFrames,
+        mCloudPayloadPoolMB,
+        mCloudDirectStorage,
+        mCloudSunBakesPerFrame
     );
     if (!mCloudVirtual)
         mpCloudResidency.reset();
@@ -1181,6 +1250,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.fadeFrames = mCloudFadeFrames;
         residencyDesc.payloadPoolMB = mCloudPayloadPoolMB;
         residencyDesc.directStorage = mCloudDirectStorage;
+        residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mCloudResidencyKey = residencyKey;
         mCloudInstancesUploaded = false;
@@ -1201,6 +1271,8 @@ void HSTRCloud::buildCloudDomain()
     {
         const auto& atlas = mpCloudResidency->getAtlas();
         mParams.cloudAtlasInvSize = 1.f / float3(float(atlas->getWidth()), float(atlas->getHeight()), float(atlas->getDepth()));
+        const auto& sunAtlas = mpCloudResidency->getSunAtlas();
+        mParams.cloudSunAtlasInvSize = 1.f / float3(float(sunAtlas->getWidth()), float(sunAtlas->getHeight()), float(sunAtlas->getDepth()));
     }
     mVoxelSize = float3(voxel);
     constexpr uint32_t kCellWidth = 16;
@@ -1389,6 +1461,8 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     upload(mpMajorant, blockDims, ResourceFormat::R16Float, majorant.data());
     upload(mpTightMajorant, blockDims, ResourceFormat::R16Float, tight.data());
     upload(mpOccupancy, occupancyDims, ResourceFormat::R8Uint, occupancy.data());
+    const std::vector<uint8_t> majorantZero = majorantZeroBlocks(majorant, blockDims);
+    upload(mpMajorantZero, occupancyDims, ResourceFormat::R8Uint, majorantZero.data());
 }
 
 void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
@@ -1462,6 +1536,23 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.lodBias = mParams.cloudLodBias;
     view.sunDirection = normalize(mParams.sunDirection);
     view.sunReach = (mParams.sunNearVoxels + 1.f) * mpCloudSea->getVoxelWorld();
+    // Baked sun depth is valid for one sun direction, density scale and reach. Moving the sun more than cloudSunBakeAngle from the
+    // bake direction starts a new generation that rebakes in place, most important bricks first, while the older bakes keep
+    // answering; any other change starts one that nothing older answers for (the live march covers the bricks until they rebake).
+    const float3 sun = normalize(mParams.sunDirection);
+    const float densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
+    const bool sunReset = densityScale != mCloudSunBakeInputs.w || mParams.sunNearVoxels != mCloudSunBakeNear;
+    if (sunReset || dot(sun, mCloudSunBakeInputs.xyz()) < std::cos(math::radians(mCloudSunBakeAngle)))
+    {
+        mCloudSunBakeInputs = float4(sun, densityScale);
+        mCloudSunBakeNear = mParams.sunNearVoxels;
+        mParams.cloudSunGeneration = (mParams.cloudSunGeneration + 1) & 0x0FFFFFFF;
+        if (sunReset)
+            mParams.cloudSunOldestGeneration = mParams.cloudSunGeneration;
+    }
+    view.sunNearVoxels = mParams.sunNearVoxels;
+    view.sunGeneration = mParams.cloudSunGeneration;
+    view.sunBakeDirection = mCloudSunBakeInputs.xyz();
     view.densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
     view.maxDistance = mParams.seaViewDistance;
     bool densityChanged = false;
@@ -1495,6 +1586,18 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
         mpOccupancyCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
         mParams.cloudStagedCount = 0;
+    }
+    // Sun bakes last: they read the bricks and occupancy committed above.
+    if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
+    {
+        FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
+        mParams.cloudCommitOffset = 0;
+        mParams.cloudCommitCount = bakes;
+        bindRenderer(pRenderContext, mpBakeCloudSunPass);
+        bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", mpCloudResidency->getSunAtlas(), "hstrCloudSunAtlas");
+        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * bakes));
+        mParams.cloudCommitCount = 0;
+        mBeamReusable = false;
     }
     if (densityChanged)
         mBeamReusable = false;
@@ -2166,6 +2269,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrMajorant"] = mpMajorant;
     var["hstrTightMajorant"] = mpTightMajorant;
     var["hstrOccupancy"] = mpOccupancy;
+    var["hstrMajorantZero"] = mpMajorantZero;
     if (mpCloudResidency)
         mpCloudResidency->bind(var);
     if (mpCloudTileBatches)
@@ -2418,6 +2522,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpReferenceRowError = mpDevice->createStructuredBuffer(
             sizeof(float4),
             frameDim.y,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal,
+            nullptr,
+            false
+        );
+        mpReferenceRowHistogram = mpDevice->createStructuredBuffer(
+            sizeof(float),
+            frameDim.y * kCompareBins,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
             MemoryType::DeviceLocal,
             nullptr,
@@ -2909,6 +3021,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];
         var["hstrReferenceSum"] = mpReferenceSum;
         var["hstrReferenceRowError"] = mpReferenceRowError;
+        var["hstrReferenceRowHistogram"] = mpReferenceRowHistogram;
         var["color"] = color;
         // Block comparisons write one entry per row of blocks.
         const uint32_t rowCount = mParams.compareBlock > 1 ? frameDim.y / mParams.compareBlock : frameDim.y;
@@ -2921,6 +3034,35 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mReferenceLogError = total.y / float(rows.size());
         mReferenceNoiseError = total.z / float(rows.size());
         mReferenceNoiseLogError = total.w / float(rows.size());
+        mReferenceLogP999 = -1.f;
+        mReferenceLogMax = -1.f;
+        if (mParams.compareExact != 0 && mParams.compareBlock <= 1)
+        {
+            const std::vector<float> histogram = mpReferenceRowHistogram->getElements<float>(0, rowCount * kCompareBins);
+            std::vector<double> bins(kCompareBins - 1, 0.0);
+            mReferenceLogMax = 0.f;
+            for (uint32_t row = 0; row < rowCount; ++row)
+            {
+                for (uint32_t b = 0; b + 1 < kCompareBins; ++b)
+                    bins[b] += histogram[row * kCompareBins + b];
+                mReferenceLogMax = std::max(mReferenceLogMax, histogram[row * kCompareBins + kCompareBins - 1]);
+            }
+            double pixels = 0.0;
+            for (double v : bins)
+                pixels += v;
+            double above = 0.0;
+            for (uint32_t b = kCompareBins - 1; b-- > 0;)
+            {
+                above += bins[b];
+                if (above > 0.001 * pixels)
+                {
+                    mReferenceLogP999 = std::min(mReferenceLogMax, kCompareBinFloor * std::pow(2.f, float(b) / 4.f));
+                    break;
+                }
+            }
+            if (mReferenceLogP999 < 0.f)
+                mReferenceLogP999 = 0.f;
+        }
     }
     if (!mSaveReferencePath.empty())
     {

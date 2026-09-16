@@ -50,6 +50,8 @@ public:
     const CloudSeaDesc& getDesc() const { return mDesc; }
     uint3 getDims() const { return mDims; }
     float getVoxelWorld() const { return mVoxelWorld; }
+    /// World size of a VDB unit at instance scale 1 (an asset's source voxel is asset.voxelWorld times this, times the scale).
+    float getFitScale() const { return mFitScale; }
     const std::vector<float>& getMean() const { return mMean; }
     const std::vector<float>& getMax() const { return mMax; }
     const std::vector<Tile>& getTiles() const { return mTiles; }

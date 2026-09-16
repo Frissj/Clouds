@@ -98,7 +98,10 @@ private:
     ref<ComputePass> mpCompareReferencePass;
     ref<Texture> mpReferenceSum;     ///< Running sums of path-traced reference frames (rgb) and their count (a), per component and half.
     ref<Buffer> mpReferenceRowError; ///< Per-row mean error of the HST frame against the reference average.
+    ref<Buffer> mpReferenceRowHistogram; ///< Exact comparisons: per-row log error histogram and maximum.
     bool mCompareReference = false;
+    float mReferenceLogP999 = -1.f; ///< Exact comparisons: 99.9th percentile log error (upper edge of its bin).
+    float mReferenceLogMax = -1.f;  ///< Exact comparisons: largest pixel log error.
     float mReferenceError = -1.f;         ///< Mean |HST - reference| in linear radiance.
     float mReferenceLogError = -1.f;      ///< Mean |log(1 + HST) - log(1 + reference)|.
     float mReferenceNoiseError = -1.f;    ///< Expected linear error of the reference average itself, from its two halves.
@@ -171,6 +174,7 @@ private:
     ref<Texture> mpMajorant;
     ref<Texture> mpTightMajorant; ///< Undilated block maxima, for delta tracking.
     ref<Texture> mpOccupancy;     ///< Non-empty 16-voxel blocks, for delta tracking's empty-space skipping.
+    ref<Texture> mpMajorantZero;  ///< 16-voxel blocks with any non-zero (dilated) majorant, for the camera march's zero-block skipping.
     ref<Texture> mpCameraLighting;
     ref<Texture> mpCameraQueries;
     ref<Texture> mpTileCenters;
@@ -213,6 +217,11 @@ private:
     float mCloudCacheKeep = 1.f;         ///< Pending decay of the world cache after sun changes.
     std::vector<uint32_t> mSunPageQueue; ///< Sea tiles whose sun pages refresh over the next frames, nearest first.
     uint32_t mCloudSunTilesPerFrame = 8; ///< Sea tiles whose sun pages are recomputed per frame after a sun change.
+    uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
+    ref<ComputePass> mpBakeCloudSunPass;
+    float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
+    float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
+    float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     ref<ComputePass> mpDecayWorldCachePass;
     std::vector<float> mCloudMeanBlocks; ///< Domain majorant blocks of the mean density (transport), unscaled.
     std::vector<float> mCloudMaxBlocks;  ///< Domain majorant blocks of the maximum density (camera), unscaled.

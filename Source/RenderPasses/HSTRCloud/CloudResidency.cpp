@@ -63,6 +63,8 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mDirectory.resize(mDirectory.size() + chunkCount, kCloudRefNone);
         state.chunkStores.assign(chunkCount, kNone);
         state.chunkBrick.assign(chunkCount, kNoHandle);
+        state.changeDims = (asset.dims + 31u) / 32u;
+        state.changeFrame.assign(size_t(state.changeDims.x) * state.changeDims.y * state.changeDims.z, 0);
         mAssets.push_back(std::move(state));
         // The coarse pages are always resident; their payloads upload once.
         DecodedPage coarse;
@@ -88,6 +90,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         gpu.directoryOffset = mAssets[a].directoryOffset;
         gpu.chunkDims = asset.chunkDims;
         gpu.topLevel = asset.topLevel;
+        gpu.sourceVoxelWorld = asset.voxelWorld * sea.getFitScale();
         gpuAssets.push_back(gpu);
     }
     if (mDirectory.empty())
@@ -120,7 +123,34 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
     mpOccupancy = mpDevice->createStructuredBuffer(
-        sizeof(uint32_t), brickCapacity * 2, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+        sizeof(uint32_t), brickCapacity * kCloudCellWords, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+    );
+    mpSunAtlas = mpDevice->createTexture3D(
+        mpAtlas->getWidth(),
+        mpAtlas->getHeight(),
+        mpAtlas->getDepth(),
+        ResourceFormat::R16Float,
+        1,
+        nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    mpSunBakes = mpDevice->createStructuredBuffer(
+        sizeof(HSTRCloudSunBake), std::max(1u, mDesc.sunBakesPerFrame), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nullptr, false
+    );
+    // As many sun slots as density slots: bricks baked for several orientations are few, and a brick short of a slot keeps the live
+    // march for that orientation.
+    for (uint32_t s = slots; s-- > 0;)
+        mFreeSunSlots.push_back(s);
+    mSunSlotTable.resize(size_t(brickCapacity) * 2 * kCloudSunBakesPerBrick);
+    for (size_t k = 0; k < mSunSlotTable.size(); k += 2)
+    {
+        mSunSlotTable[k] = kCloudRefNone;
+        mSunSlotTable[k + 1] = kCloudRefNone;
+    }
+    mSunBakeFrames.assign(size_t(brickCapacity) * kCloudSunBakesPerBrick, 0);
+    mSunTableBlocksDirty.assign((brickCapacity + kBrickBlock - 1) / kBrickBlock, 0);
+    mpSunSlotTable = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), uint32_t(mSunSlotTable.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mSunSlotTable.data(), false
     );
     mStagingInfo.resize(mDesc.loadsPerFrame);
     mpResiduals = mpDevice->createStructuredBuffer(
@@ -454,7 +484,10 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mInstances[slot] = tiles[slot].instance;
         const HSTRCloudInstance& i = tiles[slot].instance;
         if (tiles[slot].occupied)
+        {
             mTileForward[slot] = inverse(float3x3{i.row0.x, i.row0.y, i.row0.z, i.row1.x, i.row1.y, i.row1.z, i.row2.x, i.row2.y, i.row2.z});
+            mInstances[slot].sunClass = sunClassOf(i);
+        }
         mInstancesDirty = true;
     }
 
@@ -568,15 +601,20 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     {
         Brick& b = brick(handle);
         storeOf(handle).lastUsedFrame = mFrame;
+        const uint16_t sunClass = uint16_t(1u << (mInstances[slot].sunClass & 15u));
         if (b.desiredFrame != mCutFrame)
         {
             b.desiredFrame = mCutFrame;
             b.priority = priority;
+            b.sunClasses = sunClass;
             desired.push_back(handle);
             ++bricksDesired;
         }
         else
+        {
             b.priority = std::max(b.priority, priority);
+            b.sunClasses |= sunClass;
+        }
         if (b.record.level < 3)
             b.visibility = visibility;
         if (priority > 0.f)
@@ -778,6 +816,10 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             }
 
     {
+        FALCOR_PROFILE(pRenderContext, "sunBakes");
+        scheduleSunBakes(sea, view);
+    }
+    {
         FALCOR_PROFILE(pRenderContext, "upload");
         upload();
     }
@@ -890,6 +932,16 @@ void CloudResidency::unload(uint64_t handle)
     mFreeSlots.push_back(b.slot);
     --mStats.slotsUsed;
     mBrickOwner[b.gpu] = kNoHandle;
+    // Its sun bakes go with it.
+    for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
+    {
+        const size_t pair = (size_t(b.gpu) * kCloudSunBakesPerBrick + k) * 2;
+        if (mSunSlotTable[pair + 1] != kCloudRefNone)
+            mFreeSunSlots.push_back(mSunSlotTable[pair + 1]);
+        mSunSlotTable[pair] = kCloudRefNone;
+        mSunSlotTable[pair + 1] = kCloudRefNone;
+    }
+    mSunTableBlocksDirty[b.gpu / kBrickBlock] = 1;
     mFreeBricks.push_back(b.gpu);
     b.slot = kNone;
     b.gpu = kNone;
@@ -914,6 +966,7 @@ bool CloudResidency::map(uint64_t handle)
     mBricks[b.gpu].fade = 0.f;
     touchBrick(b.gpu);
     paint(storeOf(handle).asset, b.record, b.gpu);
+    markChanged(storeOf(handle).asset, b.record);
     if (b.parent != kNoHandle)
         ++brick(b.parent).mappedChildren;
     mMappedList.push_back(handle);
@@ -925,6 +978,7 @@ void CloudResidency::unmap(uint64_t handle)
     Brick& b = brick(handle);
     const uint32_t replacement = b.parent != kNoHandle ? brick(b.parent).gpu : kCloudRefNone;
     replace(storeOf(handle).asset, b.record, b.gpu, replacement);
+    markChanged(storeOf(handle).asset, b.record);
     b.flags &= ~kMapped;
     b.fade = 0.f;
     if (b.parent != kNoHandle)
@@ -1142,6 +1196,244 @@ void CloudResidency::upload()
     }
     if (!mStaged.empty())
         mpStagingInfo->setBlob(mStagingInfo.data(), 0, mStaged.size() * sizeof(HSTRCloudStaging));
+    if (!mSunBakes.empty())
+        mpSunBakes->setBlob(mSunBakes.data(), 0, mSunBakes.size() * sizeof(HSTRCloudSunBake));
+    const size_t pairsPerBrick = 2 * kCloudSunBakesPerBrick;
+    for (size_t block = 0; block < mSunTableBlocksDirty.size(); ++block)
+    {
+        if (!mSunTableBlocksDirty[block])
+            continue;
+        const size_t first = block * kBrickBlock * pairsPerBrick;
+        const size_t count = std::min(mSunSlotTable.size() - first, size_t(kBrickBlock) * pairsPerBrick);
+        mpSunSlotTable->setBlob(mSunSlotTable.data() + first, first * sizeof(uint32_t), count * sizeof(uint32_t));
+        mSunTableBlocksDirty[block] = 0;
+    }
+}
+
+uint32_t CloudResidency::sunClassOf(const HSTRCloudInstance& instance)
+{
+    // The rows are a scaled signed permutation: normalised and rounded, one of eight matrices per class.
+    float3x3 m;
+    const float4 rows[3] = {instance.row0, instance.row1, instance.row2};
+    for (uint32_t r = 0; r < 3; ++r)
+    {
+        const float3 row = normalize(rows[r].xyz());
+        for (uint32_t c = 0; c < 3; ++c)
+            m[r][c] = std::round(row[c]);
+    }
+    for (uint32_t k = 0; k < mSunClasses.size(); ++k)
+        if (all(mSunClasses[k][0] == m[0]) && all(mSunClasses[k][1] == m[1]) && all(mSunClasses[k][2] == m[2]))
+            return k;
+    FALCOR_CHECK(mSunClasses.size() < 16, "HSTRCloud: more than 16 cloud orientation classes.");
+    mSunClasses.push_back(m);
+    return uint32_t(mSunClasses.size() - 1);
+}
+
+void CloudResidency::markChanged(uint32_t assetID, const BrickHeader& record)
+{
+    // Mapping or unmapping a brick changes what samples read inside its region only.
+    AssetState& state = mAssets[assetID];
+    const uint3 lo = record.brick() * (8u << record.level);
+    const uint3 hi = min(lo + (8u << record.level), mAssetRecords[assetID]->dims);
+    const uint3 cellLo = lo / 32u;
+    const uint3 cellHi = min((hi + 31u) / 32u, state.changeDims);
+    for (uint32_t z = cellLo.z; z < cellHi.z; ++z)
+        for (uint32_t y = cellLo.y; y < cellHi.y; ++y)
+            for (uint32_t x = cellLo.x; x < cellHi.x; ++x)
+                state.changeFrame[x + state.changeDims.x * (size_t(y) + state.changeDims.y * size_t(z))] = mFrame;
+    state.lastChange = mFrame;
+}
+
+bool CloudResidency::sunBakeStale(uint32_t assetID, const BrickHeader& record, float3 direction, float reach, uint32_t bakeFrame) const
+{
+    // A bake read the bricks mapped over its texels (with their trilinear support) swept towards the sun by the reach. If any of
+    // that region was mapped or unmapped since, the bake no longer equals the live march.
+    const AssetState& state = mAssets[assetID];
+    if (state.lastChange <= bakeFrame)
+        return false;
+    const float scale = float(1u << record.level);
+    const float3 origin = float3(record.brick() * (8u << record.level));
+    const float3 sweep = reach * direction;
+    const float3 lo = origin - 1.5f * scale - 0.5f + min(sweep, float3(0.f)) - scale;
+    const float3 hi = origin + 9.5f * scale - 0.5f + max(sweep, float3(0.f)) + scale;
+    const int3 maximum = int3(state.changeDims) - 1;
+    const int3 first = clamp(int3(floor(lo / 32.f)), int3(0), maximum);
+    const int3 last = clamp(int3(floor(hi / 32.f)), int3(0), maximum);
+    for (int32_t z = first.z; z <= last.z; ++z)
+        for (int32_t y = first.y; y <= last.y; ++y)
+            for (int32_t x = first.x; x <= last.x; ++x)
+                if (state.changeFrame[x + state.changeDims.x * (size_t(y) + state.changeDims.y * size_t(z))] > bakeFrame)
+                    return true;
+    return false;
+}
+
+void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view)
+{
+    mSunBakes.clear();
+    if (view.sunNearVoxels <= 0.f || mDesc.sunBakesPerFrame == 0 || mSunClasses.empty())
+        return;
+    // For every mapped brick and every orientation class that desired it: a bake pair with the current key whose read region has not
+    // been mapped or unmapped since, or a candidate bake. Candidates bake most important brick first; until then, and when a brick
+    // already holds kCloudSunBakesPerBrick wanted bakes or no sun slot is free, those samples take the live march.
+    //
+    // MEASURED (4K, single-asset sea of 64 instances, 2026-09-15): the sea's 8 orientation classes all want the coarse bricks every
+    // instance shares, so 4 bakes per brick left the most important candidates unplaceable and baking stalled at 0.2% of the queries
+    // answered; 8 pairs per brick plus the eviction below reach 96% (near) / 95% (farside) / 77% (sea, where the slot pool runs out
+    // at 271k bakes for 315k wanted). The bake pass itself costs 0.07 ms per frame at 256 bakes, so the budget has room: a camera
+    // flight leaves up to 190k bakes waiting and pays for it in the live march (41 -> 124 ms at 4 units per frame).
+    const float3 sun = normalize(view.sunBakeDirection);
+    auto reachOf = [&](uint32_t assetID)
+    { return view.sunNearVoxels * sea.getVoxelWorld() / (mAssetRecords[assetID]->voxelWorld * sea.getFitScale()); };
+    struct Candidate
+    {
+        float priority;
+        uint64_t handle;
+        uint32_t sunClass;
+    };
+    std::vector<Candidate> candidates;
+    mStats.sunBaked = 0;
+    mStats.sunWaiting = 0;
+    for (uint64_t handle : mMappedList)
+    {
+        const Brick& b = brick(handle);
+        if (b.desiredFrame != mCutFrame)
+            continue; // Cached but outside the cut: its bakes are the first evicted.
+        const uint32_t assetID = storeOf(handle).asset;
+        uint32_t needs = 0;
+        for (uint32_t sunClass = 0; sunClass < mSunClasses.size(); ++sunClass)
+        {
+            if (!(b.sunClasses & (1u << sunClass)))
+                continue;
+            const uint32_t key = (view.sunGeneration << 4) | sunClass;
+            const size_t base = size_t(b.gpu) * kCloudSunBakesPerBrick;
+            bool baked = false;
+            for (uint32_t k = 0; k < kCloudSunBakesPerBrick && !baked; ++k)
+            {
+                if (mSunSlotTable[(base + k) * 2] != key)
+                    continue;
+                if (!sunBakeStale(assetID, b.record, normalize(mul(mSunClasses[sunClass], sun)), reachOf(assetID), mSunBakeFrames[base + k]))
+                    baked = true;
+                else
+                {
+                    mSunSlotTable[(base + k) * 2] = kCloudRefNone; // Keeps its slot for the rebake.
+                    mSunTableBlocksDirty[b.gpu / kBrickBlock] = 1;
+                }
+            }
+            if (baked)
+            {
+                ++mStats.sunBaked;
+                continue;
+            }
+            ++mStats.sunWaiting;
+            needs |= 1u << sunClass;
+        }
+        // Only if a pair can take a bake: every pair holding a wanted bake leaves the brick's other classes on the live march.
+        uint32_t held = 0;
+        for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            const uint32_t key = mSunSlotTable[(size_t(b.gpu) * kCloudSunBakesPerBrick + k) * 2];
+            held += key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u))) ? 1 : 0;
+        }
+        for (uint32_t sunClass = 0; sunClass < mSunClasses.size() && held < kCloudSunBakesPerBrick; ++sunClass)
+            if (needs & (1u << sunClass))
+            {
+                candidates.push_back({b.priority, handle, sunClass});
+                ++held;
+            }
+    }
+    const size_t considered = std::min(candidates.size(), size_t(4 * mDesc.sunBakesPerFrame));
+    std::partial_sort(
+        candidates.begin(), candidates.begin() + considered, candidates.end(), [](const Candidate& a, const Candidate& c) { return a.priority > c.priority; }
+    );
+    // When the pool is short, slots held by the least important bakes (unwanted pairs and bricks outside the cut first) move to more
+    // important candidates.
+    struct Holder
+    {
+        float priority;
+        uint32_t pair;
+    };
+    std::vector<Holder> holders;
+    size_t nextHolder = 0;
+    if (mFreeSunSlots.size() < std::min(considered, size_t(mDesc.sunBakesPerFrame)))
+    {
+        for (uint64_t handle : mMappedList)
+        {
+            const Brick& b = brick(handle);
+            const bool inCut = b.desiredFrame == mCutFrame;
+            for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
+            {
+                const uint32_t pair = b.gpu * kCloudSunBakesPerBrick + k;
+                if (mSunSlotTable[pair * 2 + 1] == kCloudRefNone)
+                    continue;
+                const uint32_t key = mSunSlotTable[pair * 2];
+                const bool wanted = inCut && key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u)));
+                holders.push_back({wanted ? b.priority : (inCut ? -1.f : -2.f), pair});
+            }
+        }
+        const size_t needed = std::min(holders.size(), size_t(mDesc.sunBakesPerFrame));
+        std::partial_sort(
+            holders.begin(), holders.begin() + needed, holders.end(), [](const Holder& a, const Holder& c) { return a.priority < c.priority; }
+        );
+        holders.resize(needed);
+    }
+    for (size_t c = 0; c < considered && mSunBakes.size() < mDesc.sunBakesPerFrame; ++c)
+    {
+        const Brick& b = brick(candidates[c].handle);
+        const size_t base = size_t(b.gpu) * kCloudSunBakesPerBrick;
+        // A pair of this brick to (re)bake into: an invalid one holding a slot, one baked for a class nobody wants any more (or an old
+        // generation), else an empty one taking a free slot.
+        uint32_t chosen = kNone;
+        for (uint32_t k = 0; k < kCloudSunBakesPerBrick && chosen == kNone; ++k)
+        {
+            const uint32_t key = mSunSlotTable[(base + k) * 2];
+            const bool unwanted = key == kCloudRefNone || (key >> 4) != view.sunGeneration || !(b.sunClasses & (1u << (key & 15u)));
+            if (mSunSlotTable[(base + k) * 2 + 1] != kCloudRefNone && unwanted)
+                chosen = k;
+        }
+        for (uint32_t k = 0; k < kCloudSunBakesPerBrick && chosen == kNone && !mFreeSunSlots.empty(); ++k)
+            if (mSunSlotTable[(base + k) * 2 + 1] == kCloudRefNone)
+            {
+                chosen = k;
+                mSunSlotTable[(base + k) * 2 + 1] = mFreeSunSlots.back();
+                mFreeSunSlots.pop_back();
+            }
+        for (uint32_t k = 0; k < kCloudSunBakesPerBrick && chosen == kNone; ++k)
+        {
+            if (mSunSlotTable[(base + k) * 2 + 1] != kCloudRefNone)
+                continue;
+            // Skip holders already rebaked this frame (a candidate's own pair, or one handed over earlier).
+            while (nextHolder < holders.size() && mSunBakeFrames[holders[nextHolder].pair] == mFrame)
+                ++nextHolder;
+            if (nextHolder == holders.size() || holders[nextHolder].priority >= candidates[c].priority)
+                break;
+            const uint32_t pair = holders[nextHolder++].pair;
+            chosen = k;
+            mSunSlotTable[(base + k) * 2 + 1] = mSunSlotTable[pair * 2 + 1];
+            mSunSlotTable[pair * 2] = kCloudRefNone;
+            mSunSlotTable[pair * 2 + 1] = kCloudRefNone;
+            mSunTableBlocksDirty[(pair / kCloudSunBakesPerBrick) / kBrickBlock] = 1;
+        }
+        if (chosen == kNone)
+            continue;
+        const uint32_t assetID = storeOf(candidates[c].handle).asset;
+        const uint32_t sunClass = candidates[c].sunClass;
+        const float sourceVoxelWorld = mAssetRecords[assetID]->voxelWorld * sea.getFitScale();
+        HSTRCloudSunBake job;
+        job.brick = b.gpu;
+        job.slot = mSunSlotTable[(base + chosen) * 2 + 1];
+        job.asset = assetID;
+        job.level = b.record.level;
+        job.origin = float3(b.record.brick() * 8u);
+        job.reach = reachOf(assetID);
+        job.direction = normalize(mul(mSunClasses[sunClass], sun));
+        job.cap = kCloudSunDepthOpaque / (kCloudSeaMinScale * sourceVoxelWorld);
+        mSunBakes.push_back(job);
+        mSunSlotTable[(base + chosen) * 2] = (view.sunGeneration << 4) | sunClass;
+        mSunBakeFrames[base + chosen] = mFrame;
+        mSunTableBlocksDirty[b.gpu / kBrickBlock] = 1;
+    }
+    mStats.sunBakesFrame = uint32_t(mSunBakes.size());
+    mStats.sunSlotsFree = uint32_t(mFreeSunSlots.size());
 }
 
 void CloudResidency::bind(const ShaderVar& var) const
@@ -1153,6 +1445,9 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudBricks"] = mpBricks;
     var["hstrCloudAtlas"] = mpAtlas;
     var["hstrCloudOccupancy"] = mpOccupancy;
+    var["hstrCloudSunAtlas"] = mpSunAtlas;
+    var["hstrCloudSunBakes"] = mpSunBakes;
+    var["hstrCloudSunSlots"] = mpSunSlotTable;
     var["hstrCloudPayload"] = mpPayload->getBuffer();
     var["hstrCloudResiduals"] = mpResiduals;
     var["hstrCloudStagingInfo"] = mpStagingInfo;
