@@ -283,7 +283,11 @@ struct HSTRCloudParams
     /// read as closing that.
     uint beamTileSize = 16;
     uint beamLevels = 3;          ///< Beam tile levels; tiles that fail at the finest level are marched per pixel.
-    float beamTolerance = 0.02f;  ///< log(1 + radiance) surplus at a tile centre above which the tile is refined.
+    /// log(1 + radiance) surplus at a tile centre above which the tile is refined. NOT the knob that controls the refinement rate -
+    /// beamTileRefines ORs this with the silhouette test and the guide, and on the sea the silhouette test fires first almost
+    /// everywhere. Sweeping this 0.05 -> 0.5 leaves the marched share at 3.9% and the frame within 1%; setting it to 1e9 does not
+    /// stop refinement at all. Go to beamEdgeContrast instead.
+    float beamTolerance = 0.02f;
 
     uint worldCacheBands = 2; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
     uint worldCacheWindow = 1; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
@@ -293,7 +297,27 @@ struct HSTRCloudParams
     uint2 beamTileDims = { 0, 0 };    ///< Coarsest beam tiles.
     uint2 beamLatticeDims = { 0, 0 }; ///< Query lattice, one texel per beamLatticeStep pixels; every tile corner and centre is a texel.
 
-    float beamEdgeContrast = 0.05f; ///< Transmittance range of the queries around a tile above which it is refined (silhouettes); 0: off.
+    /// Transmittance range of the queries around a tile above which it is refined (silhouettes); 0: off. This, and NOT beamTolerance,
+    /// is what decides how much of the frame is marched per pixel. beamTileRefines takes three independent tests - the surplus
+    /// against beamTolerance, this silhouette test, and the guide - and on the sea the silhouette one fires first almost everywhere,
+    /// so beamTolerance is inert: sweeping it 0.05 -> 0.5 leaves the marched share at 3.9% and moves the frame 1%. Anything trying to
+    /// buy back quality or time through the refinement rate has to come here.
+    ///
+    /// MEASURED (sea, 4K, beam view, drift-anchored, first test repeated at the end), from 0.05:
+    ///     0.05   9.43 ms   3.9% marched   0.110% over 0.02   p99.9 2.15e-02
+    ///     0.1    8.99      3.4%           0.111%             2.15e-02
+    ///     0.2    8.42      2.7%           0.112%             2.15e-02
+    ///     0.5    7.46      1.7%           0.118%             2.56e-02
+    ///     1.0    5.97      0.4%           0.185%             3.04e-02   (saturates; 2.0 is the same image)
+    /// The sea is small distant clouds everywhere, so transmittance range is everywhere too, and 0.05 was marching ten times as many
+    /// pixels per pixel as the image needed. DEFAULTED TO 0.2: a tenth off the frame with p99.9 unchanged and the share over 0.02
+    /// moving 0.110 to 0.112, which is noise. 0.5 is there for 21% at 0.118%.
+    ///
+    /// It also reopens the tiling. beamTileSize 8 was measured twice as losing at equal quality, but both times against a silhouette
+    /// test at 0.05 that was forcing refinement everywhere, so coarsening the tiles only moved work into a pass that was already
+    /// over-firing. With the gate set sanely, 8 pixels at edge 1.0 gives 3.40 ms against 6.45 - the earlier conclusion was an
+    /// artefact of a badly tuned neighbour, not a property of the hierarchy.
+    float beamEdgeContrast = 0.2f;
     uint compareExact = 0;     ///< 1: the comparison measures against the stored exact frame instead of the reference.
     /// Threads that march consecutive segments of one query ray in parallel (divides 64). Every segment starts from unit
     /// transmittance, so splitting a ray defeats the march's early termination: segment 0 stops inside the first dense cloud it
