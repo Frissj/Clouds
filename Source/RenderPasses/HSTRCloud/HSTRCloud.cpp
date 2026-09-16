@@ -121,6 +121,7 @@ const char kCloudLocalStep[] = "cloudLocalStep";
 const char kCloudStepFootprint[] = "cloudStepFootprint";
 const char kCloudQuadrature[] = "cloudQuadrature";
 const char kCloudSourceLinear[] = "cloudSourceLinear";
+const char kCloudTransferClasses[] = "cloudTransferClasses";
 const char kCloudSunLiveMarch[] = "cloudSunLiveMarch";
 const char kCloudCameraKernel[] = "cloudCameraKernel";
 const char kCloudMinTransmittance[] = "cloudMinTransmittance";
@@ -435,6 +436,8 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudQuadrature = std::clamp(uint32_t(value), 1u, 3u);
         else if (key == kCloudSourceLinear)
             mParams.cloudSourceLinear = bool(value) ? 1u : 0u;
+        else if (key == kCloudTransferClasses)
+            mParams.cloudTransferClasses = std::min(uint32_t(value), 64u);
         else if (key == kCloudSunLiveMarch)
             mCloudSunLiveMarch = value;
         else if (key == kCloudCameraKernel)
@@ -649,6 +652,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudStepFootprint] = mParams.cloudStepFootprint;
     props[kCloudQuadrature] = mParams.cloudQuadrature;
     props[kCloudSourceLinear] = mParams.cloudSourceLinear != 0;
+    props[kCloudTransferClasses] = mParams.cloudTransferClasses;
     props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
@@ -672,6 +676,9 @@ Properties HSTRCloud::getProperties() const
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
+        // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
+        cloud["transferCrossings"] = mTransferCrossings;
+        cloud["transferEntries"] = mTransferEntries;
         // Beam tiles refined into each level, and so the query rays the level costs; the last entry is the per-pixel march list.
         for (uint32_t level = 1; level <= mParams.beamLevels; ++level)
             cloud[level < mParams.beamLevels ? ("beamLevel" + std::to_string(level)) : std::string("beamMarchTiles")] =
@@ -2303,6 +2310,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrTightMajorant"] = mpTightMajorant;
     var["hstrOccupancy"] = mpOccupancy;
     var["hstrMajorantZero"] = mpMajorantZero;
+    var["hstrTransferProbeOutput"] = mpTransferProbe;
     if (mpCloudResidency)
         mpCloudResidency->bind(var);
     if (mpCloudTileBatches)
@@ -2853,6 +2861,24 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mBasisDirty = false;
     }
 
+    // Transfer-reuse probe: two entry-cell mask words per (asset brick, direction class), then a distinct-entry counter and a
+    // crossing counter. Cleared every frame, so what it reports is one frame's worth of what a transfer cache would face.
+    if (mParams.cloudTransferClasses > 0 && mpCloudResidency && mpCloudResidency->getOccupancy())
+    {
+        const uint32_t bricks = uint32_t(mpCloudResidency->getOccupancy()->getElementCount()) / kCloudCellWords;
+        const uint32_t classes = mParams.cloudTransferClasses * mParams.cloudTransferClasses;
+        const uint32_t words = 2u * bricks * classes + 2u;
+        if (!mpTransferProbe || mpTransferProbe->getElementCount() != words)
+            mpTransferProbe = mpDevice->createStructuredBuffer(
+                sizeof(uint32_t), words, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                MemoryType::DeviceLocal, nullptr, false
+            );
+        mParams.cloudTransferWords = words;
+        pRenderContext->clearUAV(mpTransferProbe->getUAV().get(), uint4(0));
+    }
+    else
+        mParams.cloudTransferWords = 0;
+
     // Beam view: hierarchical tiles. Level 0 queries every coarsest tile corner and centre and tests every tile; each finer
     // level queries and tests only the children of the tiles refined above it, through compacted lists and indirect
     // dispatches. Tiles failing the finest level are marched per pixel.
@@ -3056,6 +3082,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             pRenderContext->clearUAV(cutStats->getUAV().get(), float4(0.f));
         }
         pPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+    }
+
+    if (mParams.cloudTransferWords > 0 && mpTransferProbe)
+    {
+        mTransferEntries = mpTransferProbe->getElement<uint32_t>(mParams.cloudTransferWords - 2u);
+        mTransferCrossings = mpTransferProbe->getElement<uint32_t>(mParams.cloudTransferWords - 1u);
     }
 
     if (mStoreExact)

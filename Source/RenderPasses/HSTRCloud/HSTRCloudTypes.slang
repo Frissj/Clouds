@@ -410,17 +410,25 @@ struct HSTRCloudParams
     /// the shorter step wins on both axes every time: sea q1 s2 8.98 ms at p99.9 0.022 against q2 s4 10.85 ms at 0.043, the latter
     /// slower despite equal taps because the node loop costs per-step overhead of its own.
     ///
-    /// The reason more nodes cannot help is that the optical-depth integral is not what a long step gets wrong. A step composites
-    /// radiance += T * (1 - exp(-tau)) * source(centre), and were the source constant across the step that would be exact once tau
-    /// is - the exponential already carries the transmittance's variation within the step. What a long step actually loses is the
-    /// source varying under the extinction weighting, C = integral of T(s) sigma(s) S(s) ds, which no amount of sampling of sigma
-    /// touches. The two views separate the two error terms cleanly: near, one tap and two over a 4-voxel step both give p99.9 0.122,
-    /// so the source term is the whole of it there; sea, two taps take 0.061 to 0.043, so some genuine tau quadrature error exists
-    /// as well, and it is the smaller half. So error goes as the step length and cost goes as the taps, a 2-tap step is strictly
-    /// beaten by two 1-tap steps of half the length, and every within-step estimator of sigma is dominated - an exact analytic
-    /// integral of the trilinear density would land on the same curve. Cheaper rays have to come from compositing events that each
-    /// still stand for a short interval: an extinction-weighted source basis over the step (cloudSourceLinear), pre-integrated
-    /// transfer along the ray, which this asset does not carry, or fewer rays.
+    /// Two error terms live in a step, and separating them needs care with where the downstream sample sits. The centre node, which
+    /// carries the source evaluation, the sun lookup and the empty-cell skip, is node cloudQuadrature / 2 - the exact midpoint at
+    /// three nodes, but 0.789 of the way through the step at two. So one tap against two does not hold the source position fixed,
+    /// and the two-node measurements above conflate a better tau with a displaced source. One tap against three does hold it.
+    ///
+    /// MEASURED that way, and tau is a real and roughly equal-proportion part of both views: at 4-voxel steps p99.9 goes 0.122 ->
+    /// 0.086 near and 0.072 -> 0.051 sea, at 6-voxel steps 0.205 -> 0.145 and 0.205 -> 0.172. That is about 30% of the error, and it
+    /// is why two nodes looked useless near - their tau gain was cancelled by the source moving off the midpoint, landing back on
+    /// 0.122 exactly. The rest is the source varying under the extinction weighting, C = integral of T(s) sigma(s) S(s) ds, which
+    /// sampling sigma cannot touch: even with tau nearly exact at three nodes, a 4-voxel step still carries 2.4 times the error of a
+    /// 2-voxel one.
+    ///
+    /// Neither term is worth paying taps for, which is the part that decides the design. At equal cost the shorter step with fewer
+    /// taps wins every time: q3 over 4 voxels is 10.96 ms at p99.9 0.086 against one tap over 2 voxels at 11.00 ms and 0.036, and
+    /// q3 over 6 voxels is 7.94 ms at 0.145 against one tap over 4 voxels at 6.71 ms and 0.122 - beaten on both axes. So error goes
+    /// as the step length, cost goes as the taps, and every within-step estimator of sigma is dominated; an exact analytic integral
+    /// of the trilinear density would land on the same curve, because it would only address the 30%. Cheaper rays have to come from
+    /// compositing events that each still stand for a short interval: an extinction-weighted source basis over the step
+    /// (cloudSourceLinear), pre-integrated transfer along the ray, which this asset does not carry, or fewer rays.
     uint cloudQuadrature = 1;
     /// 1: a step composites its source as an extinction-weighted blend of the values at its two ends instead of one value standing
     /// for the whole interval. That is the error term cloudQuadrature isolated, and it costs nothing: the sample already sits at the
@@ -442,6 +450,30 @@ struct HSTRCloudParams
     /// step is not low-order - a linear basis with reasonable weights recovers none of it - and any transfer representation has to
     /// carry the fine structure, not a smooth fit to it.
     uint cloudSourceLinear = 0;
+    /// Octahedral grid edge of the transfer-reuse probe's direction classes, 0 to leave it off. A stored transfer operator has to be
+    /// keyed by direction as well as entry point, so this counts how many rays would share one: the probe marks, per (asset brick,
+    /// source-space direction class), which of the brick's 64 cells a ray entered through, and counts brick crossings. Crossings
+    /// divided by distinct marks is the reuse, and it has to beat Z/(Z-1) - about 1.45 at the measured 3.2 events per crossing -
+    /// before precomposing anything can pay.
+    ///
+    /// MEASURED (4K, beam view, minStepVoxels 2, one thread per ray, temporal off), and it clears break-even without clearing it by
+    /// enough. Near, 8.86M crossings over 1.95M entries, 4.55 each; sea, 6.27M over 2.55M, 2.46 each. Almost none of that is lost to
+    /// direction binning - 16, 64 and 256 classes give 5.37, 4.63, 4.55 near and 2.60, 2.47, 2.46 sea - because the camera is a point
+    /// and the rays crossing one brick already arrive within a narrow cone. Nor is the sharing local: an entry cell is two source
+    /// voxels, about two pixels, while the beam traces roughly one ray per eight, so what is being reused is the same asset brick
+    /// entered at the same cell and angle from different sea tiles. That is CloudSea's instancing paying off, and it is the only
+    /// reuse there is.
+    ///
+    /// It is not enough. Serving a crossing costs 1 + Z/R events against Z, so the brick work falls by Z/(1 + Z/R): 2.05x near but
+    /// 1.40x on the sea, and brick samples are only 73% of the sea's density samples, so the frame gains 1.26x - 8.83 ms to about
+    /// 7.0 - before a single cache lookup, eviction, bake dispatch or fade invalidation is paid for. Nor does a deeper unit rescue
+    /// it, which was the obvious escape: four times deeper multiplies Z by four but a ray then crosses four times fewer units while
+    /// the entries stay put, since distinct units fall with surface area about as fast as entry cells per unit rise. With Z = z d
+    /// and R = r/d the gain z d / (1 + z d^2 / r) peaks at d = sqrt(r/z) = 0.87, so the brick is already the best unit and a node
+    /// would give 1.03x. Precomposition needs reuse, reuse needs many rays through one entry, and a beam path with a two-pixel entry
+    /// resolution does not have them.
+    uint cloudTransferClasses = 0;
+    uint cloudTransferWords = 0; ///< Size of that buffer; its last word is the crossing counter.
     /// Domain voxels a camera march may move before it queries the sun depth again (0: every sample). MEASURED (4K c15, 0.1 voxels,
     /// which reuses about every second query): near 42.8 -> 42.3 ms, sea 30.4 -> 33.0 ms - nothing. Halving the sun fetches does not
     /// pay, the same way the brick context did not: what a sample costs is the sample, not the fetches inside it.

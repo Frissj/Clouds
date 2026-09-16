@@ -192,6 +192,11 @@ struct HSTRCloudRenderer
     // density (occupancyCloudBricks).
     StructuredBuffer<uint> hstrCloudOccupancy;
     RWStructuredBuffer<uint> hstrCloudOccupancyOutput;
+    /// Transfer-reuse probe (cloudTransferClasses): two mask words per (asset brick, source-space direction class) marking which of
+    /// the brick's 64 cells a ray first entered it through, plus one global crossing counter at the end. A stored transfer operator
+    /// would need one entry per bit set here and would replace one crossing each time, so crossings divided by bits set is the reuse
+    /// the whole idea lives on.
+    RWStructuredBuffer<uint> hstrTransferProbeOutput;
     // Baked sun optical depth per atlas texel (same slots as the density atlas) and this frame's bakes (bakeCloudSun).
     Texture3D<float> hstrCloudSunAtlas;
     RWTexture3D<float> hstrCloudSunAtlasOutput;
@@ -494,6 +499,41 @@ struct HSTRCloudRenderer
             allowed = min(allowed, max(0.f, (nextFootprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength - sample.t));
         }
         return allowed;
+    }
+
+    /// Octahedral direction class of a unit vector on an edge x edge grid: equal-area enough for counting, and continuous across the
+    /// hemisphere boundary so neighbouring directions land in neighbouring classes.
+    uint octahedralClass(float3 d, uint edge)
+    {
+        const float3 a = d / max(dot(abs(d), float3(1.f)), 1e-12f);
+        float2 p = a.xy;
+        if (a.z < 0.f)
+            p = (1.f - abs(float2(a.y, a.x))) * float2(a.x >= 0.f ? 1.f : -1.f, a.y >= 0.f ? 1.f : -1.f);
+        const float2 uv = saturate(p * 0.5f + 0.5f);
+        const uint2 c = min(uint2(uv * float(edge)), edge - 1u);
+        return c.x + edge * c.y;
+    }
+
+    /// Records one ray's entry into a brick for the transfer-reuse probe. The direction is taken in the asset's own frame, so the
+    /// instance's quarter-turn and mirror fold into the key instead of multiplying it: two tiles of the sea that present the same
+    /// brick at the same angle share one entry however they are oriented in the world.
+    void recordTransferCrossing(CutRay ray, CloudSample sample)
+    {
+        const uint edge = params.cloudTransferClasses;
+        const HSTRCloudInstance instance = hstrCloudInstances[sample.instance];
+        const float3 dv = ray.direction * float(params.hstrCellWidth);
+        const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
+        const uint direction = octahedralClass(normalize(dx), edge);
+        // The 4 x 4 x 4 cell the sample sits in is already decoded in sample.bounds, and stands for where the ray came in.
+        const uint cell = ((sample.bounds >> 12u) & 3u) + 4u * ((sample.bounds >> 14u) & 3u) + 16u * ((sample.bounds >> 16u) & 3u);
+        const uint key = 2u * (sample.entry * edge * edge + direction);
+        const uint bit = 1u << (cell & 31u);
+        uint previous;
+        InterlockedOr(hstrTransferProbeOutput[key + (cell >> 5u)], bit, previous);
+        // A bit that was not set is an entry a transfer cache would have had to produce; every crossing is one it could serve.
+        if ((previous & bit) == 0u)
+            InterlockedAdd(hstrTransferProbeOutput[params.cloudTransferWords - 2u], 1u);
+        InterlockedAdd(hstrTransferProbeOutput[params.cloudTransferWords - 1u], 1u);
     }
 
     float cloudEmptyExit(CutRay ray, float t, CloudSample box)
@@ -1439,6 +1479,7 @@ struct HSTRCloudRenderer
         float3 heldSource = 0.f;   ///< Source at the previous step's end, which is this step's start (cloudSourceLinear).
         float3 heldResidual = 0.f; ///< The same for the single-scattered residual.
         bool heldEnds = false;     ///< Whether those two hold a value from a step that ended where this one starts.
+        uint lastEntry = kCloudRefNone; ///< Brick the previous density sample read, so a change of it is one brick crossing.
         float heldSigma = -1.f; ///< The previous step's end extinction, or negative where the march jumped (cloudTrapezoid).
         float heldStep = -1.f;  ///< Step the previous sample's density bounds allow (cloudLocalStep), or negative for the majorant rule.
         uint sinceLighting = ~0u;
@@ -1510,6 +1551,11 @@ struct HSTRCloudRenderer
                 const float depth = (trapezoid ? 0.5f * (heldSigma + sigma) : sigma) * dt * ray.worldLength;
                 heldSigma = ends ? sigma : -1.f;
                 sample.t = tSample;
+                if (params.cloudTransferClasses > 0 && sample.brick && !sample.empty && sample.entry != lastEntry)
+                {
+                    recordTransferCrossing(ray, sample);
+                    lastEntry = sample.entry;
+                }
                 heldStep = params.cloudLocalStep != 0 && sample.brick && !sample.empty
                                ? cloudLocalStep(ray, sample, params.stepOpticalDepth, gScene.getGridVolume(0).data.densityScale * params.densityScale)
                                : -1.f;

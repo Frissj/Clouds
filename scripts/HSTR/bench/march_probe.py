@@ -67,4 +67,17 @@ for name, position, target in views:
         f"alpha > 0.5 {100 * k[14] / d:5.1f}%; mean step {k[15] / d:5.2f} sampled voxels; pixels terminated {100 * k[16]:5.1f}%")
     log(f"{name}: brick samples {k[21]:6.2f}/px in {k[20]:5.2f} brick visits/px ({k[21] / max(k[20], 1e-9):5.2f} samples per visit); "
         f"pixels still marching after 32 steps {100 * k[22]:5.1f}%, after 64 steps {100 * k[23]:5.1f}%")
+    # What a transfer cache would face on the path that ships: brick crossings it could serve against the distinct (asset brick,
+    # source-space direction class, entry cell) entries it would have to produce. Break-even is Z / (Z - 1) with Z the events per
+    # crossing above, so about 1.45. The beam view traces far fewer rays than there are pixels, which is the whole question.
+    hstr.set_properties(dict(PROPS, debugView=9, hstComponents=15))
+    for edge in (4, 8, 16):
+        hstr.set_properties({"cloudTransferClasses": edge})
+        m.renderFrame()
+        m.renderFrame()
+        t = hstr.properties.get("cloudStats", {})
+        crossings, entries = int(t.get("transferCrossings", 0)), int(t.get("transferEntries", 0))
+        log(f"{name}: transfer reuse at {edge * edge:4d} direction classes: {crossings} crossings over {entries} entries "
+            f"= {crossings / max(entries, 1):5.2f} per entry")
+    hstr.set_properties({"cloudTransferClasses": 0})
 exit()

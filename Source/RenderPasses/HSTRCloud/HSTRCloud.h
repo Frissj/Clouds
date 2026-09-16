@@ -145,6 +145,9 @@ private:
     ref<Texture> mpExactFrame;         ///< Stored frame that compareExact measures against.
     bool mStoreExact = false;          ///< Copy the next frame into mpExactFrame.
     float mBeamMarchedFraction = -1.f; ///< Share of pixels the beam view marched per pixel, read with the comparison.
+    ref<Buffer> mpTransferProbe;       ///< Entry-cell masks per (asset brick, direction class) and two counters (cloudTransferClasses).
+    uint32_t mTransferCrossings = 0;   ///< Brick crossings the last probed frame marched.
+    uint32_t mTransferEntries = 0;     ///< Distinct entries a transfer cache would have had to produce for them.
     uint32_t mBeamLevelCounts[kBeamMaxLevels + 1] = {}; ///< Tiles entering each level, read with the comparison; the last is the
                                                         ///< per-pixel march list. Eight queries per entry, so these are what the
                                                         ///< query pass costs.
