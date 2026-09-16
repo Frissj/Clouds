@@ -485,24 +485,27 @@ struct HSTRCloudParams
     ///     sea   full ~10.0   no atlas ~10.0   proxy only ~4.0     so atlas ~0 ms, hierarchy ~6.0 ms
     ///     near  full ~12.2   no atlas  ~9.1   proxy only ~3.2     so atlas ~3.0 ms, hierarchy ~6.0 ms
     ///
-    /// Mode 3 then splits that 6 ms, and the two halves are nothing alike between the views:
+    /// Mode 3 then splits that 6 ms, and cloudInstanceAt turns out to be almost none of it:
     ///
-    ///                    proxy + fixed   cloudInstanceAt   sparse walk   atlas      full
-    ///     sea                 3.94            2.77            3.70        ~0.1      10.5
-    ///     near                3.18            0.51            4.79        3.95      12.4
+    ///                    proxy + fixed   cloudInstanceAt   walk + atlas    full
+    ///     sea                 2.78            0.13             6.80        9.71
+    ///     near                3.18            0.23             9.0        12.4
     ///
-    /// Both columns sum to the measured frame. The instance figure is the soundest number here: modes 1 and 3 produce bit-identical
-    /// images and identical marched fractions (5.5% sea, 7.7% near), so their difference is free of the schedule perturbation that
-    /// taints the rest - unlike full against no-atlas, where refinement moves 3.9% to 4.5%.
+    /// AN EARLIER READING HERE SAID 2.77 ms FOR THE SEA, a quarter of its frame, and it was an artefact. The sea's instance cost
+    /// measured 2.43, then 0.41, then 0.13 across runs; the large readings came only from runs where the sea followed the near view,
+    /// and its settle is not a settle - "sun slots free 0, 88498 waiting" means the bake pool is exhausted and those bakes can never
+    /// land, so which bricks hold one keeps churning as frames render. settle() waits on sunBakesFrame and not on sunWaiting, so it
+    /// returns while the view is still moving. Interleaving an anchor between tests added about sixty frames before each later arm
+    /// and shifted them along that churn, which is what exposed it. The near view settles properly (waiting 0) and had been saying
+    /// 0.23 ms the whole time; a tenfold disagreement between the views was read as content asymmetry when it was a broken settle.
     ///
-    /// cloudInstanceAt costs the sea 2.77 ms, a quarter of its frame, and the near view 0.51: the asymmetry is the instance grid, not
-    /// the tree. It is the sea tile modulo, the instance load and the domain-to-asset transform, recomputed per density sample, and
-    /// all of it is invariant along a ray's stay inside one 64-voxel sea tile. Hoisting it by walking sea tiles with a 2D DDA and
-    /// transforming the ray once per tile interval is not the brick-context experiment that failed: that carried a speculative cache
-    /// in every lane's registers and lost on occupancy, where this segments the loop structurally and carries nothing. Time the live
-    /// sun path as well as the cached one when trying it - restructuring this march has hit a codegen cliff before.
+    /// Prefer the near view for per-sample cost work. Sea arms reproduce to a few percent within one run and not at all across
+    /// settles, so read only differences between adjacent tests there, and never a difference spanning a run.
     ///
-    /// The sparse walk, 3.70 sea and 4.79 near, is what a flat resolved page table would attack, and the chain is deeper than the
+    /// So hoisting the instance is not worth doing - a 2D DDA over sea tiles would be chasing 0.13 ms - and the tile mask and the
+    /// removal of the duplicate instance fetch beside it are kept because they are provably less work for a bit-identical image,
+    /// not because either was measurable. What is left is the walk: about 6.8 ms of a 9.7 ms sea frame, with the atlas at roughly
+    /// nothing. That is the one thing worth building for, and the chain is deeper than the
     /// node descent suggests: cloudAssetBrickAt goes directory, node, node, brick info, then a parent walk of up to fifteen dependent
     /// .parent and .info loads when the mapped brick is finer than the footprint asked for. A table keyed on (position, desired level)
     /// that stores the brick the residency cut says should answer removes the descent AND that loop. Weigh it against the note above
@@ -713,7 +716,17 @@ struct HSTRCloudParams
     /// Camera transmittance at which a march stops (the rest of the ray is behind opaque cloud). MEASURED (4K c15, 0.001 -> 0.02):
     /// near 42.6 -> 38.8 ms, sea 28.6 -> 30.4 ms, so the long-tailed rays are not what the frame waits for either.
     float cloudMinTransmittance = 1e-3f;
-    uint padHSTRCloud9 = 0;
+    /// cloudTiles - 1 where the tile count is a power of two, else ~0u (the counts are square, so one scalar covers both axes).
+    /// The sea wraps a possibly negative tile coordinate into the instance grid, which costs two integer modulos per density sample,
+    /// and integer division is emulated on this hardware - tens of instructions each, paid 12.81 times a pixel on the sea, inside the
+    /// cloudInstanceAt that cloudCostProbe mode 3 measures at a quarter of the sea's frame. For a power-of-two count the Euclidean
+    /// wrap is exactly an AND, for negative coordinates too in two's complement, so the pair collapses to one instruction.
+    ///
+    /// This took the LAST slot rather than a place beside cloudTiles on purpose. HSTRCloudParams is hand-packed in 16-byte rows and
+    /// cloudTiles, cloudTileVoxels and cloudAtlasShift fill one exactly; inserting there shifted every field after it and the shader
+    /// silently read the wrong ones - every probe mode stopped working and every beam image came out identical and wrong. Add
+    /// parameters by taking a pad slot or appending, never by inserting into a full row.
+    uint cloudTileMask = ~0u;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

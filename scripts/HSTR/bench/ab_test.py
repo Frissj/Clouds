@@ -42,6 +42,11 @@ def settle():
     for i in range(1500):
         m.renderFrame()
         s = stats()
+        # sunWaiting is NOT in this condition and cannot be: the sea exhausts the bake slot pool (sun slots free 0) and leaves tens of
+        # thousands of bakes permanently queued, so waiting on it would never return. The consequence is that the sea is never fully
+        # settled - which bricks hold a bake keeps churning - and its timings drift with frame count as well as temperature. That is
+        # what made cloudInstanceAt read 2.43, 0.41 and 0.13 ms in three different runs. Trust the near view (waiting 0) for
+        # per-sample costs, and on the sea compare only adjacent tests within one run.
         busy = int(s.get("pendingTiles", 0)) + int(s.get("pending", 0)) + int(s.get("sunBakesFrame", 0))
         quiet = quiet + 1 if busy == 0 else 0
         if i > 32 and quiet > 20:
@@ -91,9 +96,26 @@ for name, position, target in views:
         m.renderFrame()
         capture(f"{TAG}_{name}_{label.replace(' ', '_')}_A")
         # Every test is measured against the same A and the same stored frame, so their times and errors are comparable.
-        for test, properties in TESTS:
+        # Thermal drift is the limit on this machine, not noise: the sea's first test reads about 9.8 ms and the same test repeated at
+        # the end about 11.0, a monotonic 12% across a run, which buries any change worth less than a millisecond. It is monotonic, so
+        # it subtracts out. HSTR_INTERLEAVE re-measures the FIRST test after every later one, giving each test an anchor taken either
+        # side of it, and reports the ratio against the mean of those two. Compare tests by their ratio, never by raw ms; the raw
+        # figure is kept so the drift itself stays visible. Costs one extra timing pass per test.
+        interleave = os.environ.get("HSTR_INTERLEAVE", "0") != "0" and len(TESTS) > 1
+        anchor_props = TESTS[0][1]
+        anchor = None
+        for index, (test, properties) in enumerate(TESTS):
             hstr.set_properties(properties)
             b = gpu_times()
+            before = anchor
+            if interleave and index > 0:
+                hstr.set_properties(anchor_props)
+                anchor = gpu_times().get("HSTRCloud", 0.0)
+                hstr.set_properties(properties)
+            elif index == 0:
+                anchor = b.get("HSTRCloud", 0.0)
+            # The anchor either side of this test; the first test is its own anchor.
+            local = anchor if before is None else 0.5 * (before + anchor)
             hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
             p = hstr.properties
@@ -101,7 +123,9 @@ for name, position, target in views:
             capture(f"{TAG}_{name}_{label.replace(' ', '_')}_{test.replace(' ', '_')}")
             parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
             marched = float(p["beamMarchedFraction"])
-            log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms ({parts}); "
+            ratio = b.get("HSTRCloud", 0.0) / max(local, 1e-9)
+            log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms "
+                f"[x{ratio:5.3f} of anchor {local:6.2f}] ({parts}); "
                 f"marched {100 * marched:4.1f}%; B vs A: log {float(p['referenceLogError']):.2e}, "
                 f">0.02 {100 * float(p['referenceNoiseError']):.3f}%, >0.1 {100 * float(p['referenceNoiseLogError']):.3f}%, "
                 f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}")

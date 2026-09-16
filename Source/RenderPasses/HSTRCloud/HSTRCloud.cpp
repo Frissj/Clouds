@@ -1324,6 +1324,10 @@ void HSTRCloud::buildCloudDomain()
     mParams.seaOrigin = desc.origin;
     mParams.seaVoxelSize = float3(voxel);
     mParams.cloudTiles = uint2(desc.tiles);
+    // The shader wraps a possibly negative tile coordinate into the instance grid. Where an axis' count is a power of two that wrap
+    // is exactly an AND, which replaces two emulated integer modulos on the hottest path there is; ~0u keeps the general path.
+    const uint32_t n = mParams.cloudTiles.x;
+    mParams.cloudTileMask = n == mParams.cloudTiles.y && n != 0 && (n & (n - 1)) == 0 ? n - 1 : ~0u;
     mParams.cloudTileVoxels = desc.tileVoxels;
     mParams.cloudAtlasShift = mpCloudResidency ? mpCloudResidency->getAtlasShift() : 6u;
     if (mpCloudResidency)

@@ -600,17 +600,31 @@ struct HSTRCloudRenderer
     /// footprintLevel. false in the proxy regime: no virtual density, an empty tile, or a footprint as coarse as the proxy.
     bool cloudInstanceAt(float3 v, float footprint, out uint instanceIndex, out float3 x, out float footprintLevel)
     {
+        HSTRCloudInstance unused;
+        return cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel, unused);
+    }
+
+    /// cloudInstanceAt that also hands back the instance it loaded. Callers that go on to read the instance - which is every camera
+    /// density sample that finds a brick - would otherwise fetch the same 64 bytes a second time on the next line.
+    bool cloudInstanceAt(float3 v, float footprint, out uint instanceIndex, out float3 x, out float footprintLevel,
+                         out HSTRCloudInstance instanceOut)
+    {
         instanceIndex = 0;
         x = 0.f;
         footprintLevel = 0.f;
+        instanceOut = {};
         if (params.cloudVirtual == 0)
             return false;
         const float tileVoxels = float(params.cloudTileVoxels);
         const float2 worldTile = floor((v.xz + 0.5f) / tileVoxels);
         const int2 tiles = int2(params.cloudTiles);
-        const int2 slot = (int2(worldTile) % tiles + tiles) % tiles;
+        // Euclidean wrap into the instance grid. For a power-of-two count the mask is exact for negative coordinates too, which is
+        // what the general form below costs two emulated integer divisions to reproduce (cloudTileMask).
+        const int2 slot = params.cloudTileMask != ~0u ? (int2(worldTile) & int2(int(params.cloudTileMask)))
+                                                     : (int2(worldTile) % tiles + tiles) % tiles;
         instanceIndex = slot.x + tiles.x * slot.y;
         const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
+        instanceOut = instance;
         if (instance.occupied == 0)
             return false;
         footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
@@ -734,13 +748,13 @@ struct HSTRCloudRenderer
         uint instanceIndex;
         float3 x;
         float footprintLevel;
-        if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel))
+        HSTRCloudInstance instance;
+        if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel, instance))
             return proxy;
         // 3 stops with the instance resolved and its transform applied, so mode 3 minus mode 1 is what cloudInstanceAt costs - the
         // sea tile modulo, the instance load and the domain-to-asset transform - and full minus 3 is the sparse walk proper.
         if (params.cloudCostProbe == 3)
             return proxy;
-        const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
         const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
         // Thin cells: the optical depth along a level-0 cell's diagonal (2 sqrt(3) source voxels) at the bound is cloudThinDepth.
         const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
@@ -900,9 +914,10 @@ struct HSTRCloudRenderer
         uint instanceIndex;
         float3 x;
         float footprintLevel;
-        if (footprint >= 0.f && cloudInstanceAt(seaVoxel(v), footprint, instanceIndex, x, footprintLevel))
+        HSTRCloudInstance instance;
+        if (footprint >= 0.f && cloudInstanceAt(seaVoxel(v), footprint, instanceIndex, x, footprintLevel, instance))
         {
-            cloudAssetBrickAt(hstrCloudAssets[hstrCloudInstances[instanceIndex].asset], x, uint(max(footprintLevel, 0.f)), true, sample);
+            cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, sample);
             sample.instance = instanceIndex;
         }
         return sunDepthAt(v, footprint, sample);
