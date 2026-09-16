@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 
 namespace hstrcloud
 {
@@ -66,6 +67,10 @@ public:
         uint32_t sunWaiting = 0;    ///< Mapped bricks still on the live march (not yet baked, or neighbourhood still streaming).
         uint32_t sunBakesFrame = 0; ///< Bakes staged this frame.
         uint32_t sunSlotsFree = 0;  ///< Free sun atlas slots.
+        // The last cut.
+        uint32_t cutPops = 0;      ///< Bricks refined.
+        bool cutOrdered = false;   ///< Whether the atlas budget bound, forcing the priority-ordered cut.
+        double cutTotalMs = 0.0;
     };
 
     /// Staged bricks of one level: one commit dispatch each, coarsest first, so parents are in the atlas before their children.
@@ -114,10 +119,8 @@ private:
         uint32_t children = kNone; ///< Offset into the store's child list (childCount entries; page indices for level-3 bricks).
         uint32_t gpu = kNone;      ///< Brick index on the GPU while loaded.
         uint32_t slot = kNone;     ///< Atlas slot while loaded.
-        uint32_t desiredFrame = 0;
+        uint32_t desiredFrame = 0; ///< Id of the last cut that desired the brick (CloudResidency::mCutId).
         float priority = 0.f;
-        float visibility = 1.f;
-        float3 visibilityCamera = float3(std::numeric_limits<float>::max()); ///< Camera position the visibility was measured from.
         float fade = 0.f;
         uint16_t sunClasses = 0;      ///< Orientation classes of the instances that desired the brick in the last cut (bit per class).
         uint16_t flags = 0;
@@ -136,6 +139,7 @@ private:
         uint32_t parentPage = kNone;  ///< Page stores: their entry in the chunk store's directory.
         std::vector<Brick> bricks;
         std::vector<uint32_t> children; ///< Store-local brick indices, or page indices for level-3 bricks.
+        std::vector<uint32_t> heads;    ///< Page stores: the level-2 bricks, which hang from the chunk store.
         uint32_t payloadWord = kNone;   ///< The page payload's range in the payload pool.
         uint32_t payloadBytes = 0;
         std::vector<PageEntry> pages;     ///< Chunk stores: level-2 page directory.
@@ -189,7 +193,7 @@ private:
     void enqueue(std::vector<Request> requests);
     void resetPending(const Request& request);
 
-    float brickPriority(const CloudSea& sea, uint32_t slot, Brick& b, const CloudView& view, float& visibility) const;
+    float brickPriority(const CloudSea& sea, uint32_t slot, uint64_t handle, const CloudView& view, float& visibility);
     float transmittance(const CloudSea& sea, const CloudView& view, float3 target) const;
     bool inFrustum(const CloudView& view, float3 lo, float3 hi) const;
 
@@ -254,6 +258,23 @@ private:
     std::vector<uint32_t> mFreeSunSlots;
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
+    /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.
+    struct SunScheduleInputs
+    {
+        uint32_t cutFrame = 0;
+        uint32_t generation = 0;
+        uint32_t lastChange = 0;
+        size_t freeSlots = 0;
+        size_t mapped = 0;
+        float3 direction = float3(0.f);
+        bool operator==(const SunScheduleInputs& o) const
+        {
+            return cutFrame == o.cutFrame && generation == o.generation && lastChange == o.lastChange && freeSlots == o.freeSlots &&
+                   mapped == o.mapped && all(direction == o.direction);
+        }
+    };
+    SunScheduleInputs mSunScheduleIdle;
+    bool mSunScheduleIdleValid = false;
     ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
     ref<Buffer> mpStagingInfo;
     std::unique_ptr<CloudPayloadPool> mpPayload;
@@ -271,7 +292,41 @@ private:
     std::vector<const CloudAsset*> mAssetRecords;
 
     uint32_t mFrame = 1;
-    uint32_t mCutFrame = 0;         ///< Frame of the last cut; desiredFrame == mCutFrame marks its bricks.
+    uint32_t mCutFrame = 0;         ///< Frame of the last cut.
+    uint32_t mCutId = 0;            ///< Increases with every cut (and restart); desiredFrame == mCutId marks its bricks.
+    std::vector<uint64_t> mToLoad;  ///< Unloaded bricks of the last cut, coarsest level first, then by priority.
+
+    /// Camera transmittance to one instance of a brick of level >= 3, per sea slot and brick: every instance of an asset shares its
+    /// bricks, and a per-brick value was one instance's visibility handed to all the others. Per slot, so the cut's per-instance
+    /// walks never share one.
+    struct VisibilityEntry
+    {
+        float visibility = 1.f;
+        float3 camera = float3(0.f); ///< Camera position it was measured from.
+        uint32_t generation = 0;     ///< The store's generation: a reused store index is another brick.
+    };
+    std::vector<std::unordered_map<uint64_t, VisibilityEntry>> mVisibility;
+
+    struct CutEntry
+    {
+        float priority;
+        uint64_t handle;
+        uint32_t slot;
+        float visibility; ///< The brick's visibility in this instance, which its children inherit.
+        bool operator<(const CutEntry& other) const { return priority < other.priority; }
+    };
+    struct CutVisit
+    {
+        uint64_t handle;
+        float priority;
+        uint32_t slot;
+    };
+    /// The top brick of a slot's instance, if the instance needs fine bricks at all.
+    bool cutSeed(const CloudSea& sea, const CloudView& view, uint32_t slot, CutEntry& entry);
+    /// The bricks a queued brick refines into that are in memory; page requests for those that are not.
+    void cutChildren(const CutEntry& entry, std::vector<uint64_t>& children, std::vector<Request>& requests) const;
+    /// Whether a brick has children to refine into (expanding a leaf does nothing, and most bricks are leaves).
+    bool cutRefinable(uint64_t handle) const;
     std::vector<uint64_t> mDesired; ///< Bricks of the last cut, parents before children.
     float3 mCutPosition = float3(std::numeric_limits<float>::max());
     float4x4 mCutViewProjection;

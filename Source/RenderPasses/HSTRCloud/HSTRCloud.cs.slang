@@ -14,6 +14,17 @@ import HSTRCloudTypes;
 #define HSTR_SUN_LIVE 1
 #endif
 
+/// 1 compiles the march's experimental switches to their shipping values (HSTRCloud::beamShipping says when that is exact): a
+/// cbuffer value cannot be folded, so every one of them otherwise stays a live branch in the beam programs.
+#ifndef HSTR_SHIP
+#define HSTR_SHIP 0
+#endif
+#if HSTR_SHIP
+#define SHIP(name, value) (value)
+#else
+#define SHIP(name, value) (params.name)
+#endif
+
 static const uint kMaxTraceDofs = 24;
 static const uint kMaxTileNodes = 128;
 static const uint kSortGroupSize = 64;
@@ -68,6 +79,8 @@ struct BeamSample
     float3 cache;
     float3 single;
     float depth;
+    float distance; ///< Opacity-weighted distance from the camera (0: no opacity).
+    float steps;    ///< March steps taken: the cost the next build predicts for a ray here (beamQueue).
 };
 
 /// Camera-ray sample of the adaptive cache march (integrateCachedSegment).
@@ -247,9 +260,16 @@ struct HSTRCloudRenderer
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
+    Texture2DArray<float4> hstrBeamLatticePrev; ///< beamRefresh: the previous build's lattice.
+    Texture2D<uint> hstrBeamLevelPrev;          ///< beamRefresh: the previous build's level map.
+    Texture2D<float4> hstrBeamPixelPrev;        ///< beamRefresh: the previous build's marched pixels (rgb radiance, a distance).
+    RWTexture2D<float4> hstrBeamPixelOutput;    ///< beamRefresh: this build's marched pixels.
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
     RWStructuredBuffer<uint> hstrBeamArgs;
+    RWStructuredBuffer<uint> hstrBeamQueue;       ///< beamQueue: kBeamQueueBuckets lists of beamQueueCapacity packed positions.
+    RWStructuredBuffer<uint> hstrBeamQueueCounts; ///< beamQueue: entries per list.
+    RWStructuredBuffer<uint> hstrBeamQueueArgs;   ///< beamQueue: dispatch arguments per list (bound by its own pass only).
     // Temporal beam tiles: last frame's lists and counts, and per finest cell the levels at which the tile starting there was
     // refined (bit per level), last frame's and this frame's.
     StructuredBuffer<uint> hstrBeamPreviousLists;
@@ -536,7 +556,7 @@ struct HSTRCloudRenderer
     /// brick at the same angle share one entry however they are oriented in the world.
     void recordTransferCrossing(CutRay ray, CloudSample sample)
     {
-        const uint edge = params.cloudTransferClasses;
+        const uint edge = SHIP(cloudTransferClasses, 0u);
         const HSTRCloudInstance instance = hstrCloudInstances[sample.instance];
         const float3 dv = ray.direction * float(params.hstrCellWidth);
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
@@ -684,7 +704,7 @@ struct HSTRCloudRenderer
         // 5 stops with the directory/node descent done and nothing after it, so mode 5 minus mode 3 is the descent alone - the part a
         // flat page table would replace - and mode 2 minus mode 5 is the parent climb, the octant test and the occupancy read, which
         // it would not. Returning false sends the caller to the proxy, which is what the other cost modes do.
-        if (params.cloudCostProbe == 5)
+        if (SHIP(cloudCostProbe, 0u) == 5)
             return false;
         sample.brick = true;
         uint level = hstrCloudBricks[entry].info & 15u;
@@ -713,9 +733,9 @@ struct HSTRCloudRenderer
         sample.entry = entry;
         sample.level = level;
         // 6 adds the octant test and the parent climb to mode 5 but stops before the occupancy read, splitting the rest in two.
-        if (params.cloudCostProbe == 6)
+        if (SHIP(cloudCostProbe, 0u) == 6)
             return false;
-        if (params.cloudEmptySkip != 0 && (!settledOnly || hstrCloudBricks[entry].fade >= 1.f))
+        if (SHIP(cloudEmptySkip, 1u) != 0 && (!settledOnly || hstrCloudBricks[entry].fade >= 1.f))
         {
             // An empty 2-voxel cell of the brick: every trilinear texel it can read is zero. Voxels of the cell whose finest mapped
             // brick is a descendant walk back up to this brick, so the whole cell reads it.
@@ -758,7 +778,7 @@ struct HSTRCloudRenderer
         // Timing oracle (cloudCostProbe), not an image: 1 stops here, so every sample costs what a proxy-resolved one costs, and
         // 2 walks the instance and the sparse hierarchy but never reads the atlas. The frame is wrong in both; the differences
         // decompose a sample into proxy fetch, virtual lookup and atlas filtering, which the all-sample cost fit cannot.
-        if (params.cloudCostProbe == 1)
+        if (SHIP(cloudCostProbe, 0u) == 1)
             return proxy;
         uint instanceIndex;
         float3 x;
@@ -768,7 +788,7 @@ struct HSTRCloudRenderer
             return proxy;
         // 3 stops with the instance resolved and its transform applied, so mode 3 minus mode 1 is what cloudInstanceAt costs - the
         // sea tile modulo, the instance load and the domain-to-asset transform - and full minus 3 is the sparse walk proper.
-        if (params.cloudCostProbe == 3)
+        if (SHIP(cloudCostProbe, 0u) == 3)
             return proxy;
         const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
         // Thin cells: the optical depth along a level-0 cell's diagonal (2 sqrt(3) source voxels) at the bound is cloudThinDepth.
@@ -782,7 +802,7 @@ struct HSTRCloudRenderer
             return 0.f;
         // The hierarchy has been walked and sample is written, so the caller's skipping and stepping still depend on it and none of
         // that work folds away; only the atlas fetch and its filtering are missing.
-        if (params.cloudCostProbe == 2)
+        if (SHIP(cloudCostProbe, 0u) == 2)
             return proxy;
         const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
         const int3 i = int3(floor(x + 0.5f));
@@ -949,7 +969,7 @@ struct HSTRCloudRenderer
     /// whose bake is missing or stale, not a steady-state path.
     float sunDepthAt(float3 v, float footprint, CloudSample sample)
     {
-        if (footprint >= 0.f && !sample.brick && params.cloudVirtual != 0 && params.cloudSunCache != 0)
+        if (footprint >= 0.f && !sample.brick && params.cloudVirtual != 0 && SHIP(cloudSunCache, 1u) != 0)
             return sunDepthProxy(v);
         v = seaVoxel(v);
         static const float kSunDepthOpaque = kCloudSunDepthOpaque;
@@ -962,7 +982,7 @@ struct HSTRCloudRenderer
             // A brick coarser than the footprint asks for (not streamed finer here) answers with its own level's bake: the density the
             // sample itself read. The live march would read finer bricks further towards the sun where those are mapped.
             uint bakedEntry = sample.entry;
-            const uint sunSlot = params.cloudSunCache != 0 && !sample.empty && sample.level >= sample.desired
+            const uint sunSlot = SHIP(cloudSunCache, 1u) != 0 && !sample.empty && sample.level >= sample.desired
                                      ? cloudSunSlotUp(bakedEntry, instance.sunClass)
                                      : kCloudRefNone;
             if (sunSlot != kCloudRefNone)
@@ -1530,13 +1550,31 @@ struct HSTRCloudRenderer
         inout uint steps
     )
     {
+        float opacityDistance = 0.f;
+        marchSegmentMoment(ray, segment, withSource, residual, radiance, residualRadiance, transmittance, steps, opacityDistance);
+    }
+
+    /// marchSegment that also accumulates the world distance from the camera weighted by each step's share of the opacity
+    /// (divided by the opacity, the distance the ray's light comes from).
+    void marchSegmentMoment(
+        CutRay ray,
+        float2 segment,
+        bool withSource,
+        bool residual,
+        inout float3 radiance,
+        inout float3 residualRadiance,
+        inout float transmittance,
+        inout uint steps,
+        inout float opacityDistance
+    )
+    {
         const float cellWidth = float(params.hstrCellWidth);
         const float voxelsPerUnit = length(ray.direction) * cellWidth;
         if (voxelsPerUnit <= 1e-6f)
             return;
         const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
         const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
-        if (cached && params.adaptiveMarch != 0)
+        if (cached && SHIP(adaptiveMarch, 0u) != 0)
         {
             integrateCachedSegment(ray, segment, withSource, residual, radiance, residualRadiance, transmittance, steps);
             return;
@@ -1575,13 +1613,13 @@ struct HSTRCloudRenderer
                 // linear and lets the steps grow (the sample count is what the march costs).
                 // Local stepping samples the step's end so the bounds it reads are the ones the next step runs through.
                 // cloudSourceLinear needs the sample, and so the source, at the step's end, which is the next step's start.
-                const bool ends = params.cloudTrapezoid != 0 || params.cloudLocalStep != 0 || params.cloudSourceLinear != 0;
+                const bool ends = SHIP(cloudTrapezoid, 0u) != 0 || SHIP(cloudLocalStep, 0u) != 0 || SHIP(cloudSourceLinear, 0u) != 0;
                 const bool trapezoid = ends && heldSigma >= 0.f;
                 tSample = ends ? t + dt : t + 0.5f * dt;
                 float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
                 // The sample stands for the whole step, so its footprint is the wider of the pixel's and the step's (cloudStepFootprint).
-                const float footprint = params.cloudStepFootprint > 0.f
-                                            ? max(rayFootprint(ray, tSample), params.cloudStepFootprint * dt * ray.worldLength)
+                const float footprint = SHIP(cloudStepFootprint, 0.f) > 0.f
+                                            ? max(rayFootprint(ray, tSample), SHIP(cloudStepFootprint, 0.f) * dt * ray.worldLength)
                                             : rayFootprint(ray, tSample);
                 // Higher-order quadrature of the step (cloudQuadrature): the density is minValue + range * t^2 on a trilinear t, so
                 // inside one interpolation cell it is a polynomial of degree at most six in the ray parameter, which Gauss-Legendre
@@ -1596,12 +1634,12 @@ struct HSTRCloudRenderer
                 // extra fetch every sample pays against the brick walks the rejections save. Packing hstrTightMajorant into
                 // hstrMajorant as a second channel would buy exactly the difference.
                 bool tightZero = false;
-                if (params.cloudTightReject != 0 && params.cloudQuadrature <= 1 && params.cloudLongitudinalOracle <= 1)
+                if (SHIP(cloudTightReject, 0u) != 0 && SHIP(cloudQuadrature, 1u) <= 1 && SHIP(cloudLongitudinalOracle, 0u) <= 1)
                 {
                     const float3 block = seaVoxel(midpoint) * 0.25f;
                     const float3 frac = block - floor(block);
                     tightZero = all(frac > 0.125f) && all(frac < 0.875f) && tightMajorantAt(midpoint) <= 0.f &&
-                                params.cloudTightReject == 1;
+                                SHIP(cloudTightReject, 0u) == 1;
                 }
                 float sigma;
                 if (tightZero)
@@ -1612,16 +1650,16 @@ struct HSTRCloudRenderer
                     sigma = 0.f;
                     fineVoxels = 1.f;
                 }
-                else if (params.cloudQuadrature > 1)
+                else if (SHIP(cloudQuadrature, 1u) > 1)
                 {
                     // Gauss-Legendre nodes and weights on [0, 1] for two and three points.
-                    const float3 nodes = params.cloudQuadrature == 2 ? float3(0.21132487f, 0.78867513f, 0.f)
+                    const float3 nodes = SHIP(cloudQuadrature, 1u) == 2 ? float3(0.21132487f, 0.78867513f, 0.f)
                                                                     : float3(0.11270167f, 0.5f, 0.88729833f);
-                    const float3 weights = params.cloudQuadrature == 2 ? float3(0.5f, 0.5f, 0.f)
+                    const float3 weights = SHIP(cloudQuadrature, 1u) == 2 ? float3(0.5f, 0.5f, 0.f)
                                                                        : float3(0.27777778f, 0.44444444f, 0.27777778f);
-                    const uint centre = params.cloudQuadrature / 2u;
+                    const uint centre = SHIP(cloudQuadrature, 1u) / 2u;
                     sigma = 0.f;
-                    for (uint q = 0; q < params.cloudQuadrature; ++q)
+                    for (uint q = 0; q < SHIP(cloudQuadrature, 1u); ++q)
                     {
                         const float tq = t + nodes[q] * dt;
                         const float3 vq = (ray.position + tq * ray.direction) * cellWidth;
@@ -1644,9 +1682,9 @@ struct HSTRCloudRenderer
                 // their running transmittance and M1 the same weighted by distance along the step, so M1 / M0 is the opacity
                 // centroid. The centre observation keeps the sample the lighting and the skip logic read, as the quadrature does.
                 float oracleCentroid = 0.5f;
-                if (params.cloudLongitudinalOracle > 1)
+                if (SHIP(cloudLongitudinalOracle, 0u) > 1)
                 {
-                    const uint taps = params.cloudLongitudinalOracle;
+                    const uint taps = SHIP(cloudLongitudinalOracle, 0u);
                     const float sub = dt / float(taps);
                     const uint centre = taps / 2u;
                     float oracleDepth = 0.f;
@@ -1688,7 +1726,7 @@ struct HSTRCloudRenderer
                 // to spend - it measures what the quantity would be worth if it were free, not a way to make it free.
                 float3 sourcePoint = midpoint;
                 CloudSample sourceSample = sample;
-                if (params.cloudLongitudinalOracle > 1 && params.cloudOracleCentroid != 0)
+                if (SHIP(cloudLongitudinalOracle, 0u) > 1 && SHIP(cloudOracleCentroid, 0u) != 0)
                 {
                     const float tSource = t + oracleCentroid * dt;
                     sourcePoint = (ray.position + tSource * ray.direction) * cellWidth;
@@ -1698,12 +1736,12 @@ struct HSTRCloudRenderer
                 }
                 heldSigma = ends ? sigma : -1.f;
                 sample.t = tSample;
-                if (params.cloudTransferClasses > 0 && sample.brick && !sample.empty && sample.entry != lastEntry)
+                if (SHIP(cloudTransferClasses, 0u) > 0 && sample.brick && !sample.empty && sample.entry != lastEntry)
                 {
                     recordTransferCrossing(ray, sample);
                     lastEntry = sample.entry;
                 }
-                heldStep = params.cloudLocalStep != 0 && sample.brick && !sample.empty
+                heldStep = SHIP(cloudLocalStep, 0u) != 0 && sample.brick && !sample.empty
                                ? cloudLocalStep(ray, sample, params.stepOpticalDepth, gScene.getGridVolume(0).data.densityScale * params.densityScale)
                                : -1.f;
                 const float alpha = 1.f - exp(-depth);
@@ -1715,7 +1753,7 @@ struct HSTRCloudRenderer
                 // step's S0 and there is still one source evaluation per step. weightEnd is that second term's coefficient, rising to
                 // alpha/2 for a thin step, where the two ends weigh equally, and falling towards zero for a thick one, where the
                 // front of the step is all that is seen.
-                const float weightEnd = params.cloudSourceLinear != 0
+                const float weightEnd = SHIP(cloudSourceLinear, 0u) != 0
                                             ? (depth > 1e-4f ? (alpha - depth * (1.f - alpha)) / depth : 0.5f * depth)
                                             : 0.f;
                 const float weightStart = alpha - weightEnd;
@@ -1734,7 +1772,7 @@ struct HSTRCloudRenderer
                             sinceLighting = 0;
                         }
                         ++sinceLighting;
-                        if (params.cloudSourceLinear != 0)
+                        if (SHIP(cloudSourceLinear, 0u) != 0)
                         {
                             radiance += transmittance * ((heldEnds ? heldSource : held) * weightStart + held * weightEnd);
                             heldSource = held;
@@ -1748,7 +1786,7 @@ struct HSTRCloudRenderer
                         // whose end sample is empty still carries the light of its start (trapezoid), and an empty sample has no bake
                         // to read - it would take the live march - so it keeps the last depth instead.
                         const float3 moved = sourcePoint - sunAt;
-                        const bool stale = params.cloudSunReuse <= 0.f || dot(moved, moved) > params.cloudSunReuse * params.cloudSunReuse;
+                        const bool stale = SHIP(cloudSunReuse, 0.f) <= 0.f || dot(moved, moved) > SHIP(cloudSunReuse, 0.f) * SHIP(cloudSunReuse, 0.f);
                         if (stale && !(sourceSample.empty && sunAt.x < 1e29f))
                         {
                             heldSun = sunDepthAt(sourcePoint, footprint, sourceSample);
@@ -1756,7 +1794,7 @@ struct HSTRCloudRenderer
                         }
                         const float sunDepth = heldSun;
                         const float3 residualEnd = residualAtDepth(sourcePoint, sunDepth, ray.sunOctaves);
-                        if (params.cloudSourceLinear != 0)
+                        if (SHIP(cloudSourceLinear, 0u) != 0)
                         {
                             residualRadiance +=
                                 transmittance * ((heldEnds ? heldResidual : residualEnd) * weightStart + residualEnd * weightEnd);
@@ -1765,14 +1803,15 @@ struct HSTRCloudRenderer
                         else
                             residualRadiance += transmittance * alpha * residualEnd;
                     }
-                    heldEnds = params.cloudSourceLinear != 0;
+                    heldEnds = SHIP(cloudSourceLinear, 0u) != 0;
                 }
+                opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
                 transmittance *= 1.f - alpha;
             }
             // Past an exactly empty cell or octant, or a zero 16-voxel block, in one step: the next step starts where density can return.
             const float next = majorant <= 0.f
                                    ? min(max(t + dt, majorantZeroExit(ray, t)), segment.y)
-                                   : (sample.empty && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y)
+                                   : (sample.empty && SHIP(cloudEmptySkip, 1u) != 0 ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y)
                                                                                  : t + dt);
             // A step that took no sample at its end, or that jumped, leaves no start value for the next trapezoid, local step or
             // source basis: the next step begins somewhere else, so its start source is its own.
@@ -1900,7 +1939,7 @@ struct HSTRCloudRenderer
             if (majorant <= 0.f)
                 t = min(max(t + dt, majorantZeroExit(ray, t)), 1.f);
             else
-                t = sample.empty && params.cloudEmptySkip != 0 ? min(max(t + dt, cloudEmptyExit(ray, t + 0.5f * dt, sample)), 1.f) : t + dt;
+                t = sample.empty && SHIP(cloudEmptySkip, 1u) != 0 ? min(max(t + dt, cloudEmptyExit(ray, t + 0.5f * dt, sample)), 1.f) : t + dt;
             ++steps;
         }
         if (mode == 16)
@@ -3201,8 +3240,11 @@ struct HSTRCloudRenderer
         ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
         float transmittance = 1.f;
         uint steps = 0;
-        marchSegment(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps);
+        float opacityDistance = 0.f;
+        marchSegmentMoment(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
         result.depth = -log(max(transmittance, 1e-12f));
+        result.steps = float(steps);
+        result.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
         return result;
     }
 
@@ -3277,6 +3319,8 @@ struct HSTRCloudRenderer
             // tile's own eight queries are the edge midpoints and the child centres, nothing else - so a skipped corner would
             // leave those children interpolating a stale lattice. Corners are always marched; a tile predicted to fail its own
             // level (beamRootDifficult) saves its centre ray and its test.
+            if (centre && params.beamCentreless != 0)
+                return false;
             if (params.beamAdaptiveRoot != 0 && params.beamLevels >= 2 && centre)
                 return !beamRootDifficult(point);
             return true;
@@ -3320,11 +3364,79 @@ struct HSTRCloudRenderer
         return true;
     }
 
-    void writeBeamQuery(uint2 position, float4 depthCache, float4 single)
+    /// Writes a lattice query: slice 0 the cache and optical depth, 1 the single scatter and opacity-weighted distance, 2 the march
+    /// steps it cost (beamQueue's prediction for the next build).
+    void writeBeamQuery(uint2 position, float4 depthCache, float4 single, float steps = 0.f)
     {
         const uint2 texel = position / params.beamLatticeStep;
         hstrBeamLatticeOutput[uint3(texel, 0)] = depthCache;
         hstrBeamLatticeOutput[uint3(texel, 1)] = single;
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 0.f, 0.f, 0.f);
+    }
+
+    /// Queues a root query for the march pass of its predicted cost (beamQueue).
+    void beamEnqueue(uint2 position)
+    {
+        const float steps = params.beamHistoryValid != 0 ? beamLatticePrevAt(position, 2).x : 0.f;
+        const uint bucket = min(uint(steps / max(params.beamQueueSteps, 1e-3f)), kBeamQueueBuckets - 1u);
+        uint slot;
+        InterlockedAdd(hstrBeamQueueCounts[bucket], 1u, slot);
+        if (slot < params.beamQueueCapacity)
+            hstrBeamQueue[bucket * params.beamQueueCapacity + slot] = packBeamTile(position);
+    }
+
+    /// One queued root query of list beamQueueBucket.
+    void marchBeamQueued(uint thread)
+    {
+        const uint bucket = params.beamQueueBucket;
+        if (thread >= min(hstrBeamQueueCounts[bucket], params.beamQueueCapacity))
+            return;
+        const uint2 position = unpackBeamTile(hstrBeamQueue[bucket * params.beamQueueCapacity + thread]);
+        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+    }
+
+    /// Queues a finest tile of the per-pixel march list by the steps its corners cost (beamQueue, one level).
+    void queueBeamTile(uint thread)
+    {
+        if (thread >= hstrBeamCounts[params.beamLevels])
+            return;
+        const uint2 tile = unpackBeamTile(hstrBeamLists[beamListOffset(params.beamLevels) + thread]);
+        const uint s = beamTileEdge(params.beamLevels - 1);
+        const uint2 origin = tile * s;
+        const float steps = max(max(beamLatticeAt(origin, 2).x, beamLatticeAt(origin + uint2(s, 0), 2).x),
+                                max(beamLatticeAt(origin + uint2(0, s), 2).x, beamLatticeAt(origin + uint2(s, s), 2).x));
+        const uint bucket = min(uint(steps / max(params.beamQueueSteps, 1e-3f)), kBeamQueueBuckets - 1u);
+        uint slot;
+        InterlockedAdd(hstrBeamQueueCounts[bucket], 1u, slot);
+        if (slot < params.beamQueueCapacity)
+            hstrBeamQueue[bucket * params.beamQueueCapacity + slot] = packBeamTile(tile);
+    }
+
+    /// One pixel of a queued finest tile of list beamQueueBucket.
+    void marchBeamQueuedPixel(uint thread)
+    {
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint entry = thread / (finest * finest);
+        const uint bucket = params.beamQueueBucket;
+        if (entry >= min(hstrBeamQueueCounts[bucket], params.beamQueueCapacity))
+            return;
+        const uint local = thread % (finest * finest);
+        const uint2 pixel = unpackBeamTile(hstrBeamQueue[bucket * params.beamQueueCapacity + entry]) * finest + uint2(local % finest, local / finest);
+        if (any(pixel >= params.frameDim))
+            return;
+        marchBeamAt(pixel);
+    }
+
+    /// Dispatch arguments of the queued march passes, one triple per list.
+    void writeBeamQueueArgs()
+    {
+        for (uint bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
+        {
+            hstrBeamQueueArgs[3 * bucket] = (min(hstrBeamQueueCounts[bucket], params.beamQueueCapacity) * params.beamQueueThreads + 63u) / 64u;
+            hstrBeamQueueArgs[3 * bucket + 1] = 1;
+            hstrBeamQueueArgs[3 * bucket + 2] = 1;
+        }
     }
 
     float4 bilinear(float4 q00, float4 q10, float4 q01, float4 q11, float2 f) { return lerp(lerp(q00, q10, f.x), lerp(q01, q11, f.x), f.y); }
@@ -3356,7 +3468,7 @@ struct HSTRCloudRenderer
                     lo = min(lo, t);
                     hi = max(hi, t);
                 }
-            for (int y = first.y; y <= min(int(tile.y) + 1, corners.y - 1); ++y)
+            for (int y = first.y; y <= min(int(tile.y) + 1, corners.y - 1) && params.beamCentreless == 0; ++y)
                 for (int x = first.x; x <= min(int(tile.x) + 1, corners.x - 1); ++x)
                 {
                     const float t = exp(-beamLatticeAt(uint2(x, y) * s + s / 2, 0).a);
@@ -3459,12 +3571,85 @@ struct HSTRCloudRenderer
         return false;
     }
 
+    /// Pixel of a tile reconstructed from its basis: bilinear corners plus the centre's bubble (none for a centreless root tile).
+    float3 beamReconstruct(uint level, uint2 pixel)
+    {
+        const uint s = beamTileEdge(level);
+        const uint2 origin = pixel / s * s;
+        const float4 a00 = beamLatticeAt(origin, 0);
+        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
+        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
+        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
+        const float4 b00 = beamLatticeAt(origin, 1);
+        const float4 b10 = beamLatticeAt(origin + uint2(s, 0), 1);
+        const float4 b01 = beamLatticeAt(origin + uint2(0, s), 1);
+        const float4 b11 = beamLatticeAt(origin + uint2(s, s), 1);
+        const float2 f = (float2(pixel - origin) + 0.5f) / float(s);
+        float4 a = bilinear(a00, a10, a01, a11, f);
+        float4 b = bilinear(b00, b10, b01, b11, f);
+        if (!(level == 0 && params.beamCentreless != 0))
+        {
+            const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
+            a += (beamLatticeAt(origin + s / 2, 0) - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
+            b += (beamLatticeAt(origin + s / 2, 1) - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
+        }
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
+    }
+
+    /// Oracle tile test (beamOracle): the tile's own reconstruction against the stored exact frame, in the compare metric.
+    bool beamTileOracleFails(uint level, uint2 tile)
+    {
+        const uint s = beamTileEdge(level);
+        const uint2 origin = tile * s;
+        const uint2 last = min(origin + s, params.frameDim);
+        uint failing = 0;
+        for (uint y = origin.y; y < last.y; ++y)
+            for (uint x = origin.x; x < last.x; ++x)
+            {
+                const float3 value = beamReconstruct(level, uint2(x, y));
+                const float3 reference = max(hstrExactFrame[uint2(x, y)].rgb, 0.f);
+                if (dot(abs(log(1.f + value) - log(1.f + reference)), 1.f / 3.f) > params.beamOracleBar)
+                    ++failing;
+            }
+        return failing >= params.beamOracle;
+    }
+
+    /// log(1 + radiance) of a coarsest corner, in corner units, clamped to the lattice.
+    float3 beamCornerLog(int2 corner)
+    {
+        const uint2 position = uint2(clamp(corner, 0, int2(params.beamTileDims))) * params.beamTileSize;
+        const float4 a = beamLatticeAt(position, 0);
+        const float4 b = beamLatticeAt(position, 1);
+        const float3 w = cameraRayDirection(float2(position));
+        return log(1.f + beamRadiance(a.rgb, b.rgb, a.a, w, gScene.getGridVolume(0).data.albedo));
+    }
+
+    /// Centreless root test: the largest second difference of log radiance along either axis at the tile's corners, which is what a
+    /// bilinear basis cannot reproduce.
+    float beamCornerCurvature(uint2 tile)
+    {
+        float curvature = 0.f;
+        for (uint k = 0; k < 4; ++k)
+        {
+            const int2 c = int2(tile) + int2(k & 1u, k >> 1);
+            const float3 centre = beamCornerLog(c);
+            const float3 dxx = beamCornerLog(c - int2(1, 0)) - 2.f * centre + beamCornerLog(c + int2(1, 0));
+            const float3 dyy = beamCornerLog(c - int2(0, 1)) - 2.f * centre + beamCornerLog(c + int2(0, 1));
+            curvature = max(curvature, max(maxComponent(abs(dxx)), maxComponent(abs(dyy))));
+        }
+        return curvature;
+    }
+
     /// Surplus test of one tile: the centre as the bilinear corner basis predicts it, against the exact centre query, in
     /// log(1 + radiance); and the silhouette test of beamTransmittanceRange against beamEdgeContrast.
     bool beamTileRefines(uint level, uint2 tile)
     {
+        if (params.beamOracle != 0)
+            return beamTileOracleFails(level, tile);
         const uint s = beamTileEdge(level);
         const uint2 origin = tile * s;
+        const bool centreless = level == 0 && params.beamCentreless != 0;
         const float4 a00 = beamLatticeAt(origin, 0);
         const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
         const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
@@ -3478,6 +3663,13 @@ struct HSTRCloudRenderer
         const float3 wc = cameraRayDirection(float2(origin + s / 2));
         const float3 exactCentre = beamRadiance(ac.rgb, bc.rgb, ac.a, wc, albedo);
         const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
+        if (centreless)
+        {
+            bool refine = beamCornerCurvature(tile) > params.beamTolerance;
+            if (!refine && params.beamEdgeContrast > 0.f)
+                refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
+            return refine;
+        }
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
         if (!refine && params.beamEdgeContrast > 0.f)
             refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
@@ -3656,24 +3848,7 @@ struct HSTRCloudRenderer
         const uint level = hstrBeamLevel[pixel / finest];
         if (level >= params.beamLevels)
             return;
-        const uint s = beamTileEdge(level);
-        const uint2 origin = pixel / s * s;
-        const float4 a00 = beamLatticeAt(origin, 0);
-        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
-        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
-        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
-        const float4 ac = beamLatticeAt(origin + s / 2, 0);
-        const float4 b00 = beamLatticeAt(origin, 1);
-        const float4 b10 = beamLatticeAt(origin + uint2(s, 0), 1);
-        const float4 b01 = beamLatticeAt(origin + uint2(0, s), 1);
-        const float4 b11 = beamLatticeAt(origin + uint2(s, s), 1);
-        const float4 bc = beamLatticeAt(origin + s / 2, 1);
-        const float2 f = (float2(pixel - origin) + 0.5f) / float(s);
-        const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
-        const float4 a = bilinear(a00, a10, a01, a11, f) + (ac - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
-        const float4 b = bilinear(b00, b10, b01, b11, f) + (bc - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
-        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
-        color[pixel] = float4(beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo), 1.f);
+        color[pixel] = float4(beamReconstruct(level, pixel), 1.f);
     }
 
     /// One pixel of a finest tile that failed its surplus test, marched exactly.
@@ -3687,9 +3862,291 @@ struct HSTRCloudRenderer
         const uint2 pixel = unpackBeamTile(hstrBeamLists[beamListOffset(params.beamLevels) + entry]) * finest + uint2(local % finest, local / finest);
         if (any(pixel >= params.frameDim))
             return;
+        marchBeamAt(pixel);
+    }
+
+    /// marchBeamPixel as a full-frame dispatch (beamGridDispatch): every pixel whose finest tile was not accepted.
+    void marchBeamGridPixel(uint2 pixel)
+    {
+        if (any(pixel >= params.frameDim) || hstrBeamLevel[pixel / beamTileEdge(params.beamLevels - 1)] < params.beamLevels)
+            return;
+        marchBeamAt(pixel);
+    }
+
+    /// Root lattice query at grid point p as a 2D dispatch (beamGridDispatch): a tile corner, or a tile centre with beamGridCentres.
+    void buildBeamGridQuery(uint2 point)
+    {
+        const bool centre = params.beamGridCentres != 0;
+        if (any(point >= (centre ? params.beamTileDims : params.beamTileDims + 1u)))
+            return;
+        if (centre && params.beamAdaptiveRoot != 0 && params.beamLevels >= 2 && beamRootDifficult(point))
+            return;
+        const uint s = params.beamTileSize;
+        const uint2 position = point * s + (centre ? s / 2 : 0u);
+        float4 depthCache;
+        float4 single;
+        if (!beamRefreshes(point) && beamReprojectQuery(position, depthCache, single))
+        {
+            // The carried value keeps the cost last measured here, so the prediction survives until the point is marched again.
+            writeBeamQuery(position, depthCache, single, params.beamHistoryValid != 0 ? beamLatticePrevAt(position, 2).x : 0.f);
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, unused);
+            return;
+        }
+        if (params.beamQueue != 0)
+        {
+            beamEnqueue(position);
+            return;
+        }
+        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+    }
+
+    void marchBeamAt(uint2 pixel)
+    {
         const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        float4 value;
+        if (params.beamRefresh != 0 && !beamRefreshes(pixel / beamTileEdge(params.beamLevels - 1)) && beamReprojectPixel(pixel, w, value))
+        {
+            color[pixel] = float4(value.rgb, 1.f);
+            hstrBeamPixelOutput[pixel] = value;
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamMaxLevels], 1u, unused);
+            return;
+        }
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
-        color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
+        const float3 radiance = beamRadiance(exact.cache, exact.single, exact.depth, w, albedo);
+        color[pixel] = float4(radiance, 1.f);
+        if (params.beamRefresh != 0)
+            hstrBeamPixelOutput[pixel] = float4(radiance, exact.distance);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Beam refresh (beamRefresh): the lattice and the marched pixels are carried from the previous build where they reproject.
+
+    /// Whether grid cell p (a root lattice point, or a finest tile) is marched this build: one cell of an n x n pattern per build.
+    bool beamRefreshes(uint2 p)
+    {
+        if (params.beamRefresh == 0 || params.beamHistoryValid == 0)
+            return true;
+        const uint n = params.beamRefresh;
+        // For 2 x 2, cells 0, 3, 1, 2 (packed as nibbles), so that consecutive builds alternate across the diagonal.
+        const uint cell = n == 2 ? (0x2130u >> (4u * (params.beamFrame % 4u))) & 0xFu : params.beamFrame % (n * n);
+        return (p.x % n) + n * (p.y % n) == cell;
+    }
+
+    /// Pixel-corner position of a world point in the previous build's image.
+    bool beamPreviousPosition(float3 world, out float2 position)
+    {
+        position = 0.f;
+        const float4 clip = mul(params.beamRefreshDebug == 3 ? gScene.camera.data.viewProjMatNoJitter : params.beamPrevViewProj, float4(world, 1.f));
+        if (clip.w <= 1e-6f)
+            return false;
+        position = (float2(0.5f, -0.5f) * clip.xy / clip.w + 0.5f) * float2(params.frameDim);
+        return all(position >= 0.f) && all(position <= float2(params.frameDim));
+    }
+
+    /// Distance from the current camera along w of a point the previous build saw at distance d along a ray close to w.
+    float beamCurrentDistance(float d, float3 w) { return d + dot(params.beamPrevCamera - gScene.camera.data.posW, w); }
+
+    float4 beamLatticePrevAt(uint2 position, uint slice) { return hstrBeamLatticePrev[uint3(position / params.beamLatticeStep, slice)]; }
+
+    /// Whether the previous camera's ray through the point at distance d along w is within beamParallax pixels of w.
+    bool beamParallaxAllows(float d, float3 w)
+    {
+        if (params.beamParallax <= 0.f || d <= 0.f)
+            return true;
+        const float3 camera = gScene.camera.data.posW;
+        const float3 previous = normalize(camera + w * d - params.beamPrevCamera);
+        return length(cross(previous, w)) <= params.beamParallax * params.cloudPixelAngle;
+    }
+
+    /// Distance the previous build would have stored, along a ray close to w, for a point at distance d from the current camera.
+    float beamPreviousDistance(float d, float3 w) { return d - dot(params.beamPrevCamera - gScene.camera.data.posW, w); }
+
+    /// Whether a previous sample with stored distance sample may stand for a point at previous distance d (0: no opacity) with
+    /// interpolation weight weight: it carries no weight, or it saw the same surface - both empty, or distances within
+    /// beamDepthTolerance.
+    bool beamSampleAgrees(float sample, float d, float weight)
+    {
+        if (weight <= 1e-3f || params.beamRefreshDebug == 4)
+            return true;
+        if ((sample > 0.f) != (d > 0.f))
+            return false;
+        return d <= 0.f || abs(sample - d) <= params.beamDepthTolerance * max(sample, d);
+    }
+
+    /// The previous build's root lattice reconstructed at pixel-corner position q, as its resolve would. With check set, valid
+    /// where every sample the reconstruction weighs agrees with previous distance d.
+    bool beamPreviousLattice(float2 q, float d, bool check, out float4 a, out float4 b)
+    {
+        const uint s = params.beamTileSize;
+        const uint2 tile = min(uint2(q) / s, params.beamTileDims - 1u);
+        const uint2 origin = tile * s;
+        const float2 f = saturate((q - float2(origin)) / float(s));
+        const float4 a00 = beamLatticePrevAt(origin, 0);
+        const float4 a10 = beamLatticePrevAt(origin + uint2(s, 0), 0);
+        const float4 a01 = beamLatticePrevAt(origin + uint2(0, s), 0);
+        const float4 a11 = beamLatticePrevAt(origin + uint2(s, s), 0);
+        const float4 b00 = beamLatticePrevAt(origin, 1);
+        const float4 b10 = beamLatticePrevAt(origin + uint2(s, 0), 1);
+        const float4 b01 = beamLatticePrevAt(origin + uint2(0, s), 1);
+        const float4 b11 = beamLatticePrevAt(origin + uint2(s, s), 1);
+        a = bilinear(a00, a10, a01, a11, f);
+        b = bilinear(b00, b10, b01, b11, f);
+        const float4 weights = float4((1.f - f.x) * (1.f - f.y), f.x * (1.f - f.y), (1.f - f.x) * f.y, f.x * f.y);
+        // The stored distance is interpolated over the samples that saw opacity only: an empty neighbour has no distance.
+        const float4 distances = float4(b00.a, b10.a, b01.a, b11.a);
+        const float4 seen = weights * float4(distances > 0.f);
+        b.a = dot(seen, distances) / max(dot(seen, 1.f), 1e-6f);
+        bool valid = !check || (beamSampleAgrees(b00.a, d, weights.x) && beamSampleAgrees(b10.a, d, weights.y) &&
+                                beamSampleAgrees(b01.a, d, weights.z) && beamSampleAgrees(b11.a, d, weights.w));
+        // A value that blends samples is only as good as the tile's basis: the previous build must have accepted the tile. Without
+        // this a turning camera, which reprojects exactly, still tripled the error - resampled through failing tiles, every frame.
+        const bool blends = max(max(weights.x, weights.y), max(weights.z, weights.w)) < 1.f - 1e-3f;
+        if (check && blends && params.beamRefreshDebug != 5 && hstrBeamLevelPrev[origin / beamTileEdge(params.beamLevels - 1)] >= params.beamLevels)
+            valid = false;
+        if (check && blends && params.beamCarryTolerance > 0.f && params.beamRefreshDebug != 6)
+        {
+            // The corners' spread (and the centre's, which the bubble weighs) in log radiance proxy and in transmittance.
+            float3 lo = log(1.f + max(a00.rgb + b00.rgb, 0.f));
+            float3 hi = lo;
+            float tLo = exp(-a00.a);
+            float tHi = tLo;
+            const float4 ac = beamLatticePrevAt(origin + s / 2, 0);
+            const float4 bcSample = beamLatticePrevAt(origin + s / 2, 1);
+            const float4 as[4] = { a10, a01, a11, ac };
+            const float4 bs[4] = { b10, b01, b11, bcSample };
+            for (uint k = 0; k < (params.beamCentreless == 0 ? 4u : 3u); ++k)
+            {
+                const float3 l = log(1.f + max(as[k].rgb + bs[k].rgb, 0.f));
+                lo = min(lo, l);
+                hi = max(hi, l);
+                tLo = min(tLo, exp(-as[k].a));
+                tHi = max(tHi, exp(-as[k].a));
+            }
+            if (maxComponent(hi - lo) > params.beamCarryTolerance || tHi - tLo > params.beamCarryTolerance)
+                valid = false;
+        }
+        if (params.beamCentreless == 0)
+        {
+            const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
+            const float4 bc = beamLatticePrevAt(origin + s / 2, 1);
+            a += (beamLatticePrevAt(origin + s / 2, 0) - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
+            b.rgb += (bc.rgb - 0.25f * (b00.rgb + b10.rgb + b01.rgb + b11.rgb)) * bubble;
+            valid = valid && (!check || beamSampleAgrees(bc.a, d, bubble));
+        }
+        return valid;
+    }
+
+    /// A lattice query carried from the previous build: found at a first distance (its own previous one, or the middle of the
+    /// medium), then at the distance the previous build has there, where every sample it interpolates must agree.
+    bool beamReprojectQuery(uint2 position, out float4 depthCache, out float4 single)
+    {
+        depthCache = 0.f;
+        single = 0.f;
+        const float3 w = cameraRayDirection(float2(position));
+        const float3 camera = gScene.camera.data.posW;
+        float d = beamLatticePrevAt(position, 1).a;
+        if (d > 0.f)
+            d = beamCurrentDistance(d, w);
+        else
+        {
+            CutRay ray;
+            if (!makeCutRay(camera, w, gScene.getGridVolume(0), ray))
+                return true; // Outside the medium: nothing to carry, nothing to march.
+            d = ray.entryDistance + 0.5f * ray.worldLength;
+        }
+        float2 q;
+        if (!beamPreviousPosition(camera + w * d, q))
+            return false;
+        if (params.beamRefreshDebug != 0 && beamLatticePrevAt(position, 1).a > 0.f && length(q - float2(position)) < 0.5f)
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[2], 1u, unused);
+        }
+        beamPreviousLattice(q, 0.f, false, depthCache, single);
+        if (params.beamRefreshDebug == 2 || params.beamRefreshDebug == 3)
+            return true;
+        // Empty there: the point is expected empty at the same place.
+        float previous = 0.f;
+        if (single.a > 0.f)
+        {
+            d = beamCurrentDistance(single.a, w);
+            if (!beamPreviousPosition(camera + w * d, q))
+                return false;
+            previous = beamPreviousDistance(d, w);
+        }
+        if (!beamPreviousLattice(q, previous, true, depthCache, single) || !beamParallaxAllows(d, w))
+            return false;
+        single.a = single.a > 0.f ? beamCurrentDistance(single.a, w) : 0.f;
+        return true;
+    }
+
+    /// A marched pixel carried from the previous build: every previous pixel its reprojection weighs must have been marched and
+    /// agree with the distance.
+    bool beamReprojectPixel(uint2 pixel, float3 w, out float4 value)
+    {
+        value = 0.f;
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const float3 camera = gScene.camera.data.posW;
+        // First guess: this pixel's own previous distance where it was marched, else the lattice's here.
+        float d;
+        if (hstrBeamLevelPrev[pixel / finest] >= params.beamLevels)
+            d = hstrBeamPixelPrev[pixel].a;
+        else
+        {
+            const uint s = params.beamTileSize;
+            const uint2 origin = pixel / s * s;
+            d = max(max(beamLatticeAt(origin, 1).a, beamLatticeAt(origin + uint2(s, 0), 1).a),
+                    max(beamLatticeAt(origin + uint2(0, s), 1).a, beamLatticeAt(origin + uint2(s, s), 1).a));
+        }
+        if (d > 0.f)
+            d = beamCurrentDistance(d, w);
+        for (uint i = 0; i < 2; ++i)
+        {
+            float2 q;
+            if (d <= 0.f || !beamPreviousPosition(camera + w * d, q))
+                return false;
+            const float2 texel = q - 0.5f;
+            const int2 base = int2(floor(texel));
+            const float2 g = texel - float2(base);
+            if (any(base < 0) || any(base + 1 >= int2(params.frameDim)) || !beamParallaxAllows(d, w))
+                return false;
+            const float4 weights = float4((1.f - g.x) * (1.f - g.y), g.x * (1.f - g.y), (1.f - g.x) * g.y, g.x * g.y);
+            const float previous = beamPreviousDistance(d, w);
+            float4 sum = 0.f;
+            float seen = 0.f;
+            float3 logLo = 1e30f;
+            float3 logHi = -1e30f;
+            for (uint k = 0; k < 4; ++k)
+            {
+                if (weights[k] <= 1e-3f)
+                    continue;
+                const uint2 p = uint2(base + int2(k & 1u, k >> 1));
+                if (hstrBeamLevelPrev[p / finest] < params.beamLevels)
+                    return false;
+                const float4 v = hstrBeamPixelPrev[p];
+                // The first pass only finds the surface; the second requires agreement with it.
+                if (i == 1 && !beamSampleAgrees(v.a, previous, weights[k]))
+                    return false;
+                // Marched pixels are the edges by construction: blending across one is exactly what they were marched to avoid.
+                logLo = min(logLo, log(1.f + max(v.rgb, 0.f)));
+                logHi = max(logHi, log(1.f + max(v.rgb, 0.f)));
+                if (i == 1 && maxComponent(logHi - logLo) > (params.beamCarryTolerance > 0.f ? params.beamCarryTolerance : params.beamTolerance))
+                    return false;
+                sum.rgb += weights[k] * v.rgb;
+                sum.a += v.a > 0.f ? weights[k] * v.a : 0.f;
+                seen += v.a > 0.f ? weights[k] : 0.f;
+            }
+            value = float4(sum.rgb / max(dot(weights, float4(weights > 1e-3f)), 1e-6f), 0.f);
+            if (seen <= 0.f)
+                return false; // A marched pixel that saw nothing is cheap to march again.
+            d = beamCurrentDistance(sum.a / seen, w);
+            value.a = d;
+        }
+        return true;
     }
 
     /// Full-resolution guide of one beam pixel from an extinction-only march (the stepping of marchSegment, no lighting): x the
@@ -4051,6 +4508,42 @@ void beamGuide(uint3 dispatchThreadId: SV_DispatchThreadID)
 void marchBeamPixels(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.marchBeamPixel(dispatchThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void marchBeamGrid(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.marchBeamGridPixel(dispatchThreadId.xy);
+}
+
+[numthreads(8, 8, 1)]
+void buildBeamGridQueries(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.buildBeamGridQuery(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void marchBeamQueue(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.marchBeamQueued(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void queueBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.queueBeamTile(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void marchBeamQueuePixels(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.marchBeamQueuedPixel(dispatchThreadId.x);
+}
+
+[numthreads(1, 1, 1)]
+void writeBeamQueueArgs(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.writeBeamQueueArgs();
 }
 
 [numthreads(1, 1, 1)]

@@ -137,6 +137,19 @@ const char kBeamGuide[] = "beamGuide";
 const char kBeamGuideDepth[] = "beamGuideDepth";
 const char kBeamGuideSun[] = "beamGuideSun";
 const char kBeamEdgeContrast[] = "beamEdgeContrast";
+const char kBeamOracle[] = "beamOracle";
+const char kBeamOracleBar[] = "beamOracleBar";
+const char kBeamCentreless[] = "beamCentreless";
+const char kBeamGridDispatch[] = "beamGridDispatch";
+const char kBeamRefresh[] = "beamRefresh";
+const char kBeamShip[] = "beamShip";
+const char kBeamQueue[] = "beamQueue";
+const char kBeamQueueSteps[] = "beamQueueSteps";
+const char kCloudResidencyFrozen[] = "cloudResidencyFrozen";
+const char kBeamRefreshDebug[] = "beamRefreshDebug";
+const char kBeamParallax[] = "beamParallax";
+const char kBeamCarryTolerance[] = "beamCarryTolerance";
+const char kBeamDepthTolerance[] = "beamDepthTolerance";
 const char kStoreExact[] = "storeExact";
 const char kCompareExact[] = "compareExact";
 const char kBeamMarchedFraction[] = "beamMarchedFraction";
@@ -249,6 +262,72 @@ void HSTRCloud::parseProperties(const Properties& props)
 {
     for (const auto& [key, value] : props)
     {
+        // Split from the chain below, which is at MSVC's nesting limit.
+        if (key == kBeamOracle)
+        {
+            mParams.beamOracle = uint32_t(value);
+            continue;
+        }
+        if (key == kBeamOracleBar)
+        {
+            mParams.beamOracleBar = value;
+            continue;
+        }
+        if (key == kBeamCentreless)
+        {
+            mParams.beamCentreless = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == kBeamGridDispatch)
+        {
+            mBeamGridDispatch = value;
+            continue;
+        }
+        if (key == kBeamRefresh)
+        {
+            mBeamRefresh = uint32_t(value);
+            continue;
+        }
+        if (key == kBeamDepthTolerance)
+        {
+            mParams.beamDepthTolerance = value;
+            continue;
+        }
+        if (key == kBeamQueue)
+        {
+            mBeamQueue = value;
+            continue;
+        }
+        if (key == kBeamQueueSteps)
+        {
+            mParams.beamQueueSteps = value;
+            continue;
+        }
+        if (key == kBeamShip)
+        {
+            mBeamShip = value;
+            continue;
+        }
+        if (key == kBeamParallax)
+        {
+            mParams.beamParallax = value;
+            continue;
+        }
+        if (key == kBeamCarryTolerance)
+        {
+            mParams.beamCarryTolerance = value;
+            continue;
+        }
+        if (key == kBeamRefreshDebug)
+        {
+            mParams.beamRefreshDebug = uint32_t(value);
+            continue;
+        }
+        if (key == kCloudResidencyFrozen)
+        {
+            mCloudResidencyFrozen = value;
+            continue;
+        }
         if (key == kBaseSteps)
             mParams.baseSteps = value;
         else if (key == kRefinementLevel)
@@ -505,6 +584,23 @@ void HSTRCloud::parseProperties(const Properties& props)
     }
 }
 
+void HSTRCloud::writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry)
+{
+    mParams.beamQueueThreads = threadsPerEntry;
+    bindRenderer(pRenderContext, mpBeamQueueArgsPass);
+    mpBeamQueueArgsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamQueueArgs"] = mpBeamQueueArgs;
+    mpBeamQueueArgsPass->execute(pRenderContext, uint3(1));
+    mParams.beamQueueThreads = 1;
+}
+
+bool HSTRCloud::beamShipping() const
+{
+    const HSTRCloudParams& p = mParams;
+    return mBeamShip && p.cloudQuadrature <= 1 && p.cloudSourceLinear == 0 && p.cloudCostProbe == 0 && p.cloudLongitudinalOracle <= 1 &&
+           p.cloudSunReuse <= 0.f && p.cloudTransferClasses == 0 && p.cloudTightReject == 0 && p.cloudStepFootprint <= 0.f &&
+           p.cloudLocalStep == 0 && p.cloudTrapezoid == 0 && p.adaptiveMarch == 0 && p.cloudEmptySkip == 1 && p.cloudSunCache == 1;
+}
+
 void HSTRCloud::setProperties(const Properties& props)
 {
     const HSTRCloudParams previous = mParams;
@@ -539,6 +635,10 @@ void HSTRCloud::setProperties(const Properties& props)
     }
     const auto& p = mParams;
     const auto& q = previous;
+    // A beamRefresh history without centres cannot be carried. Other views leave it alone (they do not build), and it still holds the
+    // last beam build and its camera, which is what the benchmarks rely on when they interleave exact frames.
+    if (p.beamCentreless != q.beamCentreless)
+        mBeamRefreshValid = false;
     const bool operatorChanged = p.densityScale != q.densityScale || p.anisotropy != q.anisotropy ||
                                  p.traceSpatialOrder != q.traceSpatialOrder || p.ballisticBudget != q.ballisticBudget ||
                                  p.nearScatterBudget != q.nearScatterBudget || p.diffuseRankBudget != q.diffuseRankBudget ||
@@ -704,6 +804,9 @@ Properties HSTRCloud::getProperties() const
         cloud["sunWaiting"] = stats.sunWaiting;
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
+        cloud["cutPops"] = stats.cutPops;
+        cloud["cutOrdered"] = stats.cutOrdered;
+        cloud["cutTotalMs"] = stats.cutTotalMs;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
@@ -712,6 +815,13 @@ Properties HSTRCloud::getProperties() const
         for (uint32_t level = 1; level <= mParams.beamLevels; ++level)
             cloud[level < mParams.beamLevels ? ("beamLevel" + std::to_string(level)) : std::string("beamMarchTiles")] =
                 mBeamLevelCounts[level];
+        // beamRefresh (one level): root lattice points and marched pixels carried from the previous build.
+        if (mBeamRefresh != 0)
+        {
+            cloud["beamCarriedPoints"] = mBeamLevelCounts[kBeamMaxLevels - 1];
+            cloud["beamCarriedPixels"] = mBeamLevelCounts[kBeamMaxLevels];
+            cloud["beamRefreshDebugCount"] = mBeamLevelCounts[2];
+        }
         props[kCloudStats] = cloud;
     }
     props[kBeamTolerance] = mParams.beamTolerance;
@@ -719,6 +829,19 @@ Properties HSTRCloud::getProperties() const
     props[kBeamGuideDepth] = mParams.beamGuideDepth;
     props[kBeamGuideSun] = mParams.beamGuideSun;
     props[kBeamEdgeContrast] = mParams.beamEdgeContrast;
+    props[kBeamOracle] = mParams.beamOracle;
+    props[kBeamOracleBar] = mParams.beamOracleBar;
+    props[kBeamCentreless] = mParams.beamCentreless != 0;
+    props[kBeamGridDispatch] = mBeamGridDispatch;
+    props[kBeamRefresh] = mBeamRefresh;
+    props[kBeamDepthTolerance] = mParams.beamDepthTolerance;
+    props[kBeamShip] = mBeamShip;
+    props[kBeamQueue] = mBeamQueue;
+    props[kBeamQueueSteps] = mParams.beamQueueSteps;
+    props[kCloudResidencyFrozen] = mCloudResidencyFrozen;
+    props[kBeamRefreshDebug] = mParams.beamRefreshDebug;
+    props[kBeamParallax] = mParams.beamParallax;
+    props[kBeamCarryTolerance] = mParams.beamCarryTolerance;
     props[kStoreExact] = mStoreExact;
     props[kCompareExact] = mParams.compareExact != 0;
     props[kBeamMarchedFraction] = mBeamMarchedFraction;
@@ -783,6 +906,12 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamArgsPass = nullptr;
     mpBeamResolvePass = nullptr;
     mpBeamMarchPass = nullptr;
+    mpBeamGridQueryPass = nullptr;
+    mpBeamGridMarchPass = nullptr;
+    mpBeamQueueMarchPass = nullptr;
+    mpBeamQueueArgsPass = nullptr;
+    mpBeamQueueTilePass = nullptr;
+    mpBeamQueuePixelPass = nullptr;
     mFirstFrame = true;
     mCameraLightingDirty = true;
     mCutDirty = true;
@@ -832,6 +961,12 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamMarchPass = createPass("marchBeamPixels");
+    mpBeamGridQueryPass = createPass("buildBeamGridQueries");
+    mpBeamGridMarchPass = createPass("marchBeamGrid");
+    mpBeamQueueMarchPass = createPass("marchBeamQueue");
+    mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
+    mpBeamQueueTilePass = createPass("queueBeamTiles");
+    mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
     mpBeamGuidePass = createPass("beamGuide");
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
@@ -1658,6 +1793,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
     view.maxDistance = mParams.seaViewDistance;
     bool densityChanged = false;
+    // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
+    // 100 ms a frame on the sea - and while the GPU waits it drops to a lower power state, so its moving-camera timings measured
+    // the laptop's power management at five times the settled cost rather than the frame.
+    if (!mCloudResidencyFrozen)
     {
         FALCOR_PROFILE(pRenderContext, "residency");
         densityChanged = mpCloudResidency->update(*mpCloudSea, view, changed);
@@ -2355,6 +2494,20 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
 {
     mpScene->bindShaderDataForRaytracing(pRenderContext, pPass->getRootVar()["gScene"]);
     ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    static bool layoutChecked = false;
+    if (!layoutChecked)
+    {
+        layoutChecked = true;
+        // The params upload is a raw copy, so the host and shader layouts must agree to the byte.
+        const size_t shaderSize = var["params"].getType()->getByteSize();
+        const size_t shaderMatrix = var["params"]["beamPrevViewProj"].getByteOffset() - var["params"].getByteOffset();
+        const size_t hostMatrix = offsetof(HSTRCloudParams, beamPrevViewProj);
+        if (shaderSize != sizeof(mParams) || shaderMatrix != hostMatrix)
+            logError(
+                "HSTRCloud: params layout differs: {} bytes in the shader and {} on the host, beamPrevViewProj at {} and {}.", shaderSize,
+                sizeof(mParams), shaderMatrix, hostMatrix
+            );
+    }
     var["params"].setBlob(mParams);
     var["hstrRadiance"] = mpLeafRadiance;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
@@ -2403,6 +2556,11 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamLevel"] = mpBeamLevel;
+    var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
+    var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
+    var["hstrBeamPixelPrev"] = mpBeamPixels[mBeamParity ^ 1u];
+    var["hstrBeamQueue"] = mpBeamQueue;
+    var["hstrBeamQueueCounts"] = mpBeamQueueCounts;
     var["hstrBeamLists"] = mpBeamLists[mBeamParity];
     var["hstrBeamCounts"] = mpBeamCounts[mBeamParity];
     var["hstrBeamPreviousLists"] = mpBeamLists[mBeamParity ^ 1u];
@@ -2960,7 +3118,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const uint2 levelDims = mParams.beamLevelDims;
         const uint32_t tileCount = mParams.beamTileDims.x * mParams.beamTileDims.y;
         if (!mpBeamLattice || mpBeamLattice->getWidth() != latticeDims.x || mpBeamLattice->getHeight() != latticeDims.y)
-            mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 2, 1, nullptr, flags);
+            mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
         // Full-resolution guide for the tile tests. Near view at 4K (one segment per query, moving camera), 4x1 tiles, mean 8-bit
@@ -3002,6 +3160,61 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mBeamLayout = layout;
             mBeamHistoryValid = false;
             mBeamReusable = false;
+            mBeamRefreshValid = false;
+        }
+        // beamRefresh and beamQueue need one level, the per-level build and single-segment queries; otherwise the view marches
+        // everything in place. Both keep the previous build's lattice and levels: the refresh carries from them, the queue predicts
+        // each point's cost from them.
+        const bool rootOnly = mParams.beamLevels == 1 && mParams.beamTemporal == 0 && mParams.beamSegments == 1;
+        const bool refresh = mBeamRefresh != 0 && rootOnly;
+        const bool queue = mBeamQueue && rootOnly;
+        const bool history = refresh || queue;
+        mParams.beamRefresh = refresh ? mBeamRefresh : 0u;
+        mParams.beamQueue = queue ? 1u : 0u;
+        if (history)
+        {
+            if (!mpBeamLatticePrev || mpBeamLatticePrev->getWidth() != latticeDims.x || mpBeamLatticePrev->getHeight() != latticeDims.y)
+            {
+                mpBeamLatticePrev = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
+                mBeamRefreshValid = false;
+            }
+            if (!mpBeamLevelPrev || mpBeamLevelPrev->getWidth() != levelDims.x || mpBeamLevelPrev->getHeight() != levelDims.y)
+            {
+                mpBeamLevelPrev = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                mBeamRefreshValid = false;
+            }
+        }
+        else
+        {
+            mpBeamLatticePrev = nullptr;
+            mpBeamLevelPrev = nullptr;
+            mBeamRefreshValid = false;
+        }
+        if (refresh)
+        {
+            for (ref<Texture>& pPixels : mpBeamPixels)
+                if (!pPixels || pPixels->getWidth() != frameDim.x || pPixels->getHeight() != frameDim.y)
+                {
+                    pPixels = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
+                    mBeamRefreshValid = false;
+                }
+        }
+        else
+            mpBeamPixels = {};
+        if (queue)
+        {
+            // Each list can hold every root point: corners and centres.
+            const uint32_t capacity = (mParams.beamTileDims.x + 1) * (mParams.beamTileDims.y + 1) + tileCount;
+            mParams.beamQueueCapacity = capacity;
+            if (!mpBeamQueue || mpBeamQueue->getElementCount() != capacity * kBeamQueueBuckets)
+                mpBeamQueue = mpDevice->createStructuredBuffer(sizeof(uint32_t), capacity * kBeamQueueBuckets, flags, MemoryType::DeviceLocal, nullptr, false);
+            if (!mpBeamQueueCounts)
+                mpBeamQueueCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamQueueBuckets, flags, MemoryType::DeviceLocal, nullptr, false);
+            if (!mpBeamQueueArgs)
+                mpBeamQueueArgs = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 3 * kBeamQueueBuckets, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg,
+                    MemoryType::DeviceLocal, nullptr, false
+                );
         }
         if (!mpBeamArgs)
         {
@@ -3033,6 +3246,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // dispatched: setting it with the march pass below left a frame's queries compiled against the previous value of
         // cloudSunLiveMarch whenever it changed.
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -3075,6 +3289,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     pRenderContext->clearUAV(mpBeamHistory[mBeamParity ^ 1u]->getUAV().get(), uint4(0));
                 pRenderContext->clearUAV(mpBeamHistory[mBeamParity]->getUAV().get(), uint4(0));
                 pRenderContext->clearUAV(mpBeamCounts[mBeamParity]->getUAV().get(), uint4(0));
+                if (history)
+                {
+                    // Last build's lattice and levels become the history; this build writes every root point and tile again.
+                    std::swap(mpBeamLattice, mpBeamLatticePrev);
+                    std::swap(mpBeamLevel, mpBeamLevelPrev);
+                    mParams.beamHistoryValid = mBeamRefreshValid ? 1u : 0u;
+                    mParams.beamPrevViewProj = mBeamPrevViewProj;
+                    mParams.beamPrevCamera = mBeamPrevCamera;
+                    ++mParams.beamFrame;
+                }
+                else
+                    mParams.beamHistoryValid = 0;
+                const bool gridDispatch = (mBeamGridDispatch || history) && mParams.beamSegments == 1;
                 for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                 {
                     FALCOR_PROFILE(pRenderContext, "beamLevel" + std::to_string(level));
@@ -3083,17 +3310,55 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mParams.beamPassLevel = level;
                     {
                         FALCOR_PROFILE(pRenderContext, "queries" + std::to_string(level));
-                        bindRenderer(pRenderContext, mpBeamQueryPass);
-                        bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
-                        if (level == 0)
+                        if (level == 0 && gridDispatch)
                         {
+                            // The corner grid, then the centre grid, each as a 2D dispatch at the lattice spacing. With the queue these
+                            // only carry and queue; the queued points are marched below, one list of similar cost per dispatch.
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+                            if (queue)
+                                pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
+                            for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
+                            {
+                                mParams.beamGridCentres = centres;
+                                bindRenderer(pRenderContext, mpBeamGridQueryPass);
+                                bindOutput(mpBeamGridQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                mpBeamGridQueryPass->execute(pRenderContext, uint3(mParams.beamTileDims + (centres ? 0u : 1u), 1));
+                            }
+                            mParams.beamGridCentres = 0;
+                            if (queue)
+                            {
+                                writeBeamQueueArgs(pRenderContext, 1);
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+                                for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
+                                {
+                                    FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
+                                    mParams.beamQueueBucket = bucket;
+                                    bindRenderer(pRenderContext, mpBeamQueueMarchPass);
+                                    bindOutput(mpBeamQueueMarchPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                    // The offset is in bytes: three uint32 per list.
+                                    mpBeamQueueMarchPass->executeIndirect(pRenderContext, mpBeamQueueArgs.get(), 12 * bucket);
+                                }
+                            }
+                        }
+                        else if (level == 0)
+                        {
+                            bindRenderer(pRenderContext, mpBeamQueryPass);
+                            bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                             // Corners and centres in blocks of 8 x 4 lattice points (see beamQueryPosition).
                             auto blockQueries = [](uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; };
-                            const uint32_t queries = blockQueries(mParams.beamTileDims + 1u) + blockQueries(mParams.beamTileDims);
+                            // A centreless root queries the corners only; the centre threads would all return at once.
+                            const uint32_t queries = blockQueries(mParams.beamTileDims + 1u) +
+                                                     (mParams.beamCentreless != 0 ? 0u : blockQueries(mParams.beamTileDims));
                             mpBeamQueryPass->execute(pRenderContext, uint3(queries * mParams.beamSegments, 1, 1));
                         }
                         else
+                        {
+                            bindRenderer(pRenderContext, mpBeamQueryPass);
+                            bindOutput(mpBeamQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                             mpBeamQueryPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level);
+                        }
                     }
                     bindRenderer(pRenderContext, mpBeamTilePass);
                     bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
@@ -3104,6 +3369,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
                 }
                 mBeamHistoryValid = true;
+                if (history)
+                {
+                    mBeamPrevViewProj = mpScene->getCamera()->getViewProjMatrixNoJitter();
+                    mBeamPrevCamera = cameraPosition;
+                    mBeamRefreshValid = true;
+                }
             }
             writeArgs(mParams.beamLevels);
             mBeamReusable = true;
@@ -3121,11 +3392,41 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpBeamResolvePass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
         mpBeamResolvePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
         FALCOR_PROFILE(pRenderContext, "march");
-        bindRenderer(pRenderContext, mpBeamMarchPass);
         // The beam's per-pixel refinement runs the same camera march, so it drops the live sun march with it.
-        mpBeamMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        mpBeamMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
-        mpBeamMarchPass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * mParams.beamLevels);
+        const bool queued = mParams.beamQueue != 0 && !mBeamGridDispatch;
+        const ref<ComputePass>& pMarch = queued ? mpBeamQueuePixelPass : (mBeamGridDispatch ? mpBeamGridMarchPass : mpBeamMarchPass);
+        pMarch->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+        pMarch->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+        auto bindMarch = [&]()
+        {
+            bindRenderer(pRenderContext, pMarch);
+            pMarch->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+            pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] =
+                mParams.beamRefresh != 0 ? mpBeamPixels[mBeamParity] : ref<Texture>();
+        };
+        if (queued)
+        {
+            // The refined tiles by predicted cost, then one march dispatch per list (see beamQueue).
+            const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
+            pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
+            bindRenderer(pRenderContext, mpBeamQueueTilePass);
+            mpBeamQueueTilePass->execute(pRenderContext, uint3(mParams.beamTileDims.x * mParams.beamTileDims.y, 1, 1));
+            writeBeamQueueArgs(pRenderContext, finest * finest);
+            for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
+            {
+                mParams.beamQueueBucket = bucket;
+                bindMarch();
+                pMarch->executeIndirect(pRenderContext, mpBeamQueueArgs.get(), 12 * bucket); // Bytes: three uint32 per list.
+            }
+        }
+        else
+        {
+            bindMarch();
+            if (mBeamGridDispatch)
+                pMarch->execute(pRenderContext, uint3(mParams.frameDim, 1));
+            else
+                pMarch->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * mParams.beamLevels);
+        }
     }
     else
     {
@@ -3174,7 +3475,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
             const uint32_t marchedTiles = mpBeamCounts[mBeamParity]->getElement<uint32_t>(mParams.beamLevels);
             mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
-            for (uint32_t level = 0; level <= mParams.beamLevels; ++level)
+            for (uint32_t level = 0; level <= kBeamMaxLevels; ++level)
                 mBeamLevelCounts[level] = mpBeamCounts[mBeamParity]->getElement<uint32_t>(level);
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);

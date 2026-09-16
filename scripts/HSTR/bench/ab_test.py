@@ -124,6 +124,11 @@ for name, position, target in views:
             parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
             marched = float(p["beamMarchedFraction"])
             ratio = b.get("HSTRCloud", 0.0) / max(local, 1e-9)
+            with open(f"{OUT}/{TAG}_test.jsonl", "a") as f:
+                f.write(json.dumps({"view": name, "config": label, "test": test, "a": a, "b": b, "anchor": local, "ratio": ratio,
+                                    "marched": marched, "log": float(p["referenceLogError"]), "over02": float(p["referenceNoiseError"]),
+                                    "over10": float(p["referenceNoiseLogError"]), "p999": float(p["referenceLogP999"]),
+                                    "max": float(p["referenceLogMax"])}) + "\n")
             log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms "
                 f"[x{ratio:5.3f} of anchor {local:6.2f}] ({parts}); "
                 f"marched {100 * marched:4.1f}%; B vs A: log {float(p['referenceLogError']):.2e}, "

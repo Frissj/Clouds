@@ -17,6 +17,7 @@ static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: uni
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
+static const uint kBeamQueueBuckets = 4;   ///< Lists of queued root queries by predicted cost (beamQueue).
 static const uint kCompareBins = 64;       ///< Exact comparison histogram entries per row: log error bins, then the maximum.
 static const float kCompareBinFloor = 1e-4f; ///< Upper edge of the first log error bin; 4 bins per octave above.
 
@@ -788,6 +789,55 @@ struct HSTRCloudParams
     /// same bug would have bitten a camera flying above the grid with no clamp at all, which is the intended use of this renderer.
     uint cloudSlabClamp = 1;
     uint padHSTRCloud10 = 0;
+
+    /// Measurement only, needs a stored exact frame: >0 replaces every beam tile test with the truth - a tile refines when at least
+    /// this many of its pixels, reconstructed from its basis, are off the stored frame by more than beamOracleBar in the compare
+    /// metric. The floor any real test could reach for a tiling.
+    uint beamOracle = 0;
+    float beamOracleBar = 0.02f;
+    /// 1: coarsest tiles have no centre query - the root lattice is corners only, and accepted root tiles reconstruct bilinearly.
+    uint beamCentreless = 0;
+    uint beamGridCentres = 0; ///< Set per dispatch: the grid query pass marches tile centres (1) or corners (0).
+
+    /// Temporal refresh of the beam view (0: off; one level, per-level build). Each build marches the root lattice points and the
+    /// refined tiles of one cell of a beamRefresh x beamRefresh pattern, and reprojects the rest from the previous build at the
+    /// opacity-weighted distance of their rays; points and pixels that do not reproject consistently are marched as well.
+    uint beamRefresh = 0;
+    uint beamFrame = 0;               ///< Set per build: the build counter that picks the refreshed cell.
+    uint beamHistoryValid = 0;        ///< Set per build: whether the previous build's lattice, levels and pixels exist.
+    float beamDepthTolerance = 0.05f; ///< Relative spread of distances across a reprojection footprint above which it is marched.
+    // The fields above end half-way through a 16-byte row, and the shader starts a matrix on a fresh row while the host does not:
+    // without these the matrix and everything after it were read 8 bytes off (HSTRCloud checks the two sizes at startup).
+    uint padHSTRCloud13 = 0;
+    uint padHSTRCloud14 = 0;
+    float4x4 beamPrevViewProj;        ///< Set per build: view-projection of the previous build.
+    float3 beamPrevCamera = { 0, 0, 0 }; ///< Set per build: camera position of the previous build.
+    /// beamRefresh diagnostics: 1 counts cloud points whose first reprojection lands within half a pixel of themselves (in the list
+    /// counts' slot 2), 2 also accepts every reprojection that lands in the frame, unchecked; 4, 5 and 6 skip the distance agreement,
+    /// the accepted-tile requirement and the carry tolerance respectively.
+    uint beamRefreshDebug = 0;
+    /// beamRefresh: the largest angle, in pixels, between a carried value's previous ray and its current ray through the point it
+    /// was found at (0: no limit). A volume ray is not a surface point: under parallax the new ray crosses the cloud along another path.
+    float beamParallax = 0.f;
+    /// beamRefresh: a carried lattice value that blends samples needs them to agree to this, in log(1 + cache + single) and in
+    /// transmittance (0: no limit). The tile tests accept bases at beamTolerance; a carried value is resampled again every build.
+    float beamCarryTolerance = 0.f;
+    /// Queued root queries (one level, per-level build, single segments): a first pass carries what beamRefresh can and queues the
+    /// rest into kBeamQueueBuckets lists by the step count the previous build marched there, and each list is marched in a dispatch
+    /// of its own. A dispatch's threads run in batches that wait for their slowest ray, so a quarter of the rays marched in every 2 x 2
+    /// block costs nearly what all of them do, and rays of very different lengths side by side cost what the longest does.
+    ///
+    /// MEASURED and OFF (sea, 4K, frozen residency, 2026-09-17): the hypothesis behind it is half right - with beamRefresh carrying 87%
+    /// of the points the grid pass still costs 2.49 of 3.14 ms - but queuing loses anyway. Parked 5.72 -> 8.75 ms (buckets of 12
+    /// steps), 10.17 (6), 8.95 (24); flying 2 units a frame 9.19 -> 9.47; the queued pixel march 1.76 -> 2.73. The lists fill in the
+    /// order threads finish, so neighbouring rays stop being neighbours, and the march is memory-bound: losing that coherence costs
+    /// more than similar batches save. A queue would have to keep spatial order within each list to be worth another try.
+    uint beamQueue = 0;
+    uint beamQueueBucket = 0;    ///< Set per dispatch: the list the queued march pass reads.
+    uint beamQueueCapacity = 0;  ///< Set per build: entries per list.
+    float beamQueueSteps = 12.f; ///< Steps per bucket of the predicted cost.
+    uint beamQueueThreads = 1;   ///< Set per use: threads per queued entry (1 for root queries, the finest tile's pixels for tiles).
+    uint padHSTRCloud19 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

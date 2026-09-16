@@ -125,6 +125,32 @@ private:
     ref<ComputePass> mpBeamArgsPass;
     ref<ComputePass> mpBeamResolvePass;
     ref<ComputePass> mpBeamMarchPass;
+    ref<ComputePass> mpBeamGridQueryPass;  ///< Root lattice queries as a 2D dispatch over the corner (or centre) grid.
+    ref<ComputePass> mpBeamGridMarchPass;  ///< Per-pixel refinement as a full-frame 2D dispatch that skips accepted tiles.
+    bool mBeamGridDispatch = false;        ///< Whether the beam view uses the two passes above (beamSegments 1, per-level build).
+    // beamRefresh: the previous build's lattice and level map (swapped with the current ones every build), its marched pixels
+    // (the two alternate), and its camera.
+    ref<Texture> mpBeamLatticePrev;
+    ref<Texture> mpBeamLevelPrev;
+    std::array<ref<Texture>, 2> mpBeamPixels;
+    uint32_t mBeamRefresh = 0; ///< Requested beamRefresh; the shader's copy is 0 where the build cannot refresh.
+    bool mBeamQueue = false;   ///< Requested beamQueue; the shader's copy is 0 where the build cannot queue.
+    ref<Buffer> mpBeamQueue;
+    ref<Buffer> mpBeamQueueCounts;
+    ref<Buffer> mpBeamQueueArgs;
+    ref<ComputePass> mpBeamQueueMarchPass;
+    ref<ComputePass> mpBeamQueueArgsPass;
+    ref<ComputePass> mpBeamQueueTilePass;
+    ref<ComputePass> mpBeamQueuePixelPass;
+    /// Fills the queue's dispatch arguments for entries of threadsPerEntry threads.
+    void writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry);
+    bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
+    bool mBeamShip = false;    ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
+    /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
+    bool beamShipping() const;
+    bool mBeamRefreshValid = false;
+    float4x4 mBeamPrevViewProj;
+    float3 mBeamPrevCamera = float3(0.f);
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
     ref<ComputePass> mpBeamGuidePass;

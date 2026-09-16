@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <numeric>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 
 namespace hstrcloud
@@ -229,6 +232,8 @@ uint32_t CloudResidency::createStore(
         Brick& b = store.bricks[i];
         if (kind != StoreKind::Coarse && b.record.level == firstLevel)
             b.parent = parentHandle;
+        if (kind == StoreKind::Page && b.record.level == kPageLevel)
+            store.heads.push_back(i);
         b.children = uint32_t(store.children.size());
         if (kind == StoreKind::Chunk)
         {
@@ -417,8 +422,9 @@ float CloudResidency::transmittance(const CloudSea& sea, const CloudView& view, 
     return std::exp(-depth);
 }
 
-float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, Brick& b, const CloudView& view, float& visibility) const
+float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t handle, const CloudView& view, float& visibility)
 {
+    const Brick& b = brick(handle);
     const CloudSea::Tile& tile = sea.getTiles()[slot];
     const CloudSeaDesc& desc = sea.getDesc();
     const HSTRCloudInstance& instance = tile.instance;
@@ -455,8 +461,11 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, Brick& b
     const bool inside = inFrustum(view, min(lo, lo + sweep), max(hi, hi + sweep));
     if (inside && level >= 3)
     {
-        const float3 moved = view.position - b.visibilityCamera;
-        if (dot(moved, moved) > 0.01f * distance * distance + 1.f)
+        const uint32_t generation = storeOf(handle).generation;
+        auto [it, inserted] = mVisibility[slot].try_emplace(handle);
+        VisibilityEntry& entry = it->second;
+        const float3 moved = view.position - entry.camera;
+        if (inserted || entry.generation != generation || dot(moved, moved) > 0.01f * distance * distance + 1.f)
         {
             float best = transmittance(sea, view, nearest);
             for (uint32_t corner = 0; corner < 8 && best < 0.99f; ++corner)
@@ -464,13 +473,96 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, Brick& b
                 const float3 p((corner & 1) ? hi.x : lo.x, (corner & 2) ? hi.y : lo.y, (corner & 4) ? hi.z : lo.z);
                 best = std::max(best, transmittance(sea, view, p));
             }
-            b.visibility = best;
-            b.visibilityCamera = view.position;
+            entry.visibility = best;
+            entry.camera = view.position;
+            entry.generation = generation;
         }
-        visibility = b.visibility;
+        visibility = entry.visibility;
     }
     const float importance = (inside ? 1.f : 0.125f) * std::max(visibility, 0.01f);
     return std::log2(std::max(pixels * importance / mDesc.lodPixels, 1e-6f)) - view.lodBias + hysteresis;
+}
+
+bool CloudResidency::cutSeed(const CloudSea& sea, const CloudView& view, uint32_t slot, CutEntry& entry)
+{
+    const CloudSea::Tile& tile = sea.getTiles()[slot];
+    if (!tile.occupied || mAssets[tile.instance.asset].top == kNoHandle)
+        return false;
+    // Instances whose proxy already projects below the pixel threshold need no fine bricks.
+    const float distance = math::length(clamp(view.position, tile.worldMin, tile.worldMax) - view.position);
+    const float proxyPixels = sea.getVoxelWorld() / (std::max(distance, 1e-3f) * view.pixelAngle);
+    if (std::log2(proxyPixels / mDesc.lodPixels) - view.lodBias <= 0.f || distance > view.maxDistance)
+        return false;
+    const uint64_t top = mAssets[tile.instance.asset].top;
+    float visibility = 1.f;
+    const float priority = std::max(brickPriority(sea, slot, top, view, visibility), 1e-3f);
+    entry = {priority, top, slot, visibility};
+    return true;
+}
+
+void CloudResidency::cutChildren(const CutEntry& entry, std::vector<uint64_t>& children, std::vector<Request>& requests) const
+{
+    children.clear();
+    const uint32_t storeIndex = uint32_t(entry.handle >> 32);
+    const Store& store = *mStores[storeIndex];
+    const Brick& b = store.bricks[uint32_t(entry.handle)];
+    const CloudAsset& asset = *mAssetRecords[store.asset];
+    if (store.kind == StoreKind::Coarse && b.record.level == kChunkLevel)
+    {
+        // Children: the level-3 bricks of the chunk page.
+        if (b.record.childMask == 0 || !all(b.record.brick() < asset.chunkDims))
+            return;
+        const uint32_t chunk = asset.chunkIndex(b.record.brick());
+        const uint32_t chunkStore = mAssets[store.asset].chunkStores[chunk];
+        if (asset.chunks[chunk].meta.raw == 0)
+            return;
+        if (chunkStore == kNone || chunkStore == kPendingStore)
+        {
+            Request request;
+            request.priority = entry.priority + 1.f; // Pages precede the bricks they unlock.
+            request.asset = store.asset;
+            request.chunk = chunk;
+            request.blobs = asset.chunks[chunk];
+            requests.push_back(request);
+            return;
+        }
+        for (uint32_t i = 0; i < mStores[chunkStore]->bricks.size(); ++i)
+            children.push_back(makeHandle(chunkStore, i));
+    }
+    else if (store.kind == StoreKind::Chunk)
+    {
+        // Children: the level-2 bricks heading the level-2 pages below this level-3 brick.
+        for (uint32_t c = 0; c < b.childCount; ++c)
+        {
+            const uint32_t page = store.children[b.children + c];
+            const uint32_t pageStore = store.pageStores[page];
+            if (pageStore == kNone || pageStore == kPendingStore)
+            {
+                Request request;
+                request.priority = entry.priority + 1.f;
+                request.asset = store.asset;
+                request.chunk = store.chunk;
+                request.store = storeIndex;
+                request.generation = store.generation;
+                request.page = page;
+                request.blobs = store.pages[page].blobs;
+                requests.push_back(request);
+                continue;
+            }
+            for (uint32_t head : mStores[pageStore]->heads)
+                children.push_back(makeHandle(pageStore, head));
+        }
+    }
+    else
+        for (uint32_t c = 0; c < b.childCount; ++c)
+            children.push_back(makeHandle(storeIndex, store.children[b.children + c]));
+}
+
+bool CloudResidency::cutRefinable(uint64_t handle) const
+{
+    const Store& store = *mStores[handle >> 32];
+    const Brick& b = store.bricks[uint32_t(handle)];
+    return b.childCount > 0 || (store.kind == StoreKind::Coarse && b.record.level == kChunkLevel && b.record.childMask != 0);
 }
 
 bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const std::vector<uint32_t>& changedSlots)
@@ -481,6 +573,8 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     const auto& tiles = sea.getTiles();
     for (uint32_t slot : changedSlots)
     {
+        if (slot < mVisibility.size())
+            mVisibility[slot].clear(); // Another instance now: its bricks sit elsewhere.
         mInstances[slot] = tiles[slot].instance;
         const HSTRCloudInstance& i = tiles[slot].instance;
         if (tiles[slot].occupied)
@@ -574,37 +668,35 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
 
     // The cut: greedy refinement by priority from each nearby instance's top brick, within the atlas budget. It is redone when the
     // camera or the sea changed, or newly arrived pages or bricks can refine further; a static, converged view costs nothing.
-    const bool viewChanged = any(view.position != mCutPosition) || any(view.viewProjection.getRow(0) != mCutViewProjection.getRow(0)) ||
-                             any(view.viewProjection.getRow(1) != mCutViewProjection.getRow(1)) ||
-                             any(view.viewProjection.getRow(2) != mCutViewProjection.getRow(2));
-    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || mCutCommits > 0 || mFrame >= mCutFrame + 30;
-    struct Entry
+    // A move under a quarter voxel or a turn under a quarter degree changes no brick's level or frustum membership that the guard band
+    // and the 30-frame refresh below do not cover; re-cutting for it cost the whole cut (~100 ms on the sea) on every frame of a slow
+    // camera.
+    auto rowAngleChanged = [&](uint32_t row)
     {
-        float priority;
-        uint64_t handle;
-        uint32_t slot;
-        bool operator<(const Entry& other) const { return priority < other.priority; }
+        const float3 a = view.viewProjection.getRow(row).xyz();
+        const float3 c = mCutViewProjection.getRow(row).xyz();
+        const float la = length(a);
+        const float lc = length(c);
+        return la <= 0.f || lc <= 0.f || dot(a, c) < std::cos(math::radians(0.25f)) * la * lc || std::abs(la - lc) > 1e-3f * lc;
     };
-    std::vector<Entry> heap;
+    const float3 moved = view.position - mCutPosition;
+    const float moveLimit = 0.25f * sea.getVoxelWorld();
+    const bool viewChanged = dot(moved, moved) > moveLimit * moveLimit || rowAngleChanged(0) || rowAngleChanged(1) || rowAngleChanged(3);
+    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || mCutCommits > 0 || mFrame >= mCutFrame + 30;
     std::vector<uint64_t> desired;
     std::vector<Request> requests;
-    if (runCut)
-    {
-        mCutFrame = mFrame;
-        mCutCommits = 0;
-        mCutPosition = view.position;
-        mCutViewProjection = view.viewProjection;
-    }
     const uint32_t budget = uint32_t(0.9f * float(mBricks.size()));
     uint32_t bricksDesired = 0;
-    auto desire = [&](uint64_t handle, float priority, float visibility, uint32_t slot)
+    uint32_t pops = 0;
+    // Marks a visit: the brick joins this cut at the highest priority any instance gives it.
+    auto desire = [&](uint64_t handle, float priority, uint32_t slot)
     {
         Brick& b = brick(handle);
         storeOf(handle).lastUsedFrame = mFrame;
         const uint16_t sunClass = uint16_t(1u << (mInstances[slot].sunClass & 15u));
-        if (b.desiredFrame != mCutFrame)
+        if (b.desiredFrame != mCutId)
         {
-            b.desiredFrame = mCutFrame;
+            b.desiredFrame = mCutId;
             b.priority = priority;
             b.sunClasses = sunClass;
             desired.push_back(handle);
@@ -615,121 +707,197 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             b.priority = std::max(b.priority, priority);
             b.sunClasses |= sunClass;
         }
-        if (b.record.level < 3)
-            b.visibility = visibility;
-        if (priority > 0.f)
-        {
-            heap.push_back({priority, handle, slot});
-            std::push_heap(heap.begin(), heap.end());
-        }
     };
-    for (uint32_t slot = 0; runCut && slot < tiles.size(); ++slot)
-    {
-        const CloudSea::Tile& tile = tiles[slot];
-        if (!tile.occupied || mAssets[tile.instance.asset].top == kNoHandle)
-            continue;
-        // Instances whose proxy already projects below the pixel threshold need no fine bricks.
-        const float distance = math::length(clamp(view.position, tile.worldMin, tile.worldMax) - view.position);
-        const float proxyPixels = sea.getVoxelWorld() / (std::max(distance, 1e-3f) * view.pixelAngle);
-        if (std::log2(proxyPixels / mDesc.lodPixels) - view.lodBias <= 0.f || distance > view.maxDistance)
-            continue;
-        const uint64_t top = mAssets[tile.instance.asset].top;
-        float visibility = 1.f;
-        desire(top, std::max(brickPriority(sea, slot, brick(top), view, visibility), 1e-3f), visibility, slot);
-    }
+    // The cut is a greedy refinement in priority order, but the order only matters once the atlas budget stops it: until then every
+    // brick with a positive priority is refined whatever the order. So it first runs as a depth-first walk of every instance, one
+    // thread per group of sea slots (the walks only read shared state; each slot owns its visibility cache), merged in slot order -
+    // which keeps parents before children. Only if that desires more than the budget does it run again as the ordered greedy cut.
+    // MEASURED (sea, settled, 90k refinements, 127k bricks): the single-threaded heap cut took ~100 ms, the heap alone a quarter of it.
+    bool ordered = false;
     std::optional<ScopedProfilerEvent> cutScope;
+    const auto cutStart = std::chrono::steady_clock::now();
     if (runCut)
-        cutScope.emplace(pRenderContext, "cut");
-    std::vector<uint64_t> children;
-    uint32_t pops = 0;
-    while (!heap.empty() && pops < 200000)
     {
-        std::pop_heap(heap.begin(), heap.end());
-        const Entry entry = heap.back();
-        heap.pop_back();
-        ++pops;
-        const uint32_t storeIndex = uint32_t(entry.handle >> 32);
-        Store& store = *mStores[storeIndex];
-        Brick& b = store.bricks[uint32_t(entry.handle)];
-        const CloudAsset& asset = *mAssetRecords[store.asset];
-        children.clear();
-        if (store.kind == StoreKind::Coarse && b.record.level == kChunkLevel)
+        cutScope.emplace(pRenderContext, "cut");
+        mCutCommits = 0;
+        mCutPosition = view.position;
+        mCutViewProjection = view.viewProjection;
+        mCutFrame = mFrame;
+        mVisibility.resize(tiles.size());
+        const uint32_t tasks = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+        // Two phases, because the work is not spread over the instances: the one or two nearest hold most of the fine bricks. The
+        // first walks each instance's coarse bricks (one thread per group of slots) and stops at the level-3 bricks; the second
+        // walks those subtrees, in parallel over all instances together. Below level 3 no brick measures visibility, so the second
+        // phase never touches a slot's visibility cache.
+        struct Task
         {
-            // Children: the level-3 bricks of the chunk page.
-            if (b.record.childMask == 0 || !all(b.record.brick() < asset.chunkDims))
-                continue;
-            const uint32_t chunk = asset.chunkIndex(b.record.brick());
-            const uint32_t chunkStore = mAssets[store.asset].chunkStores[chunk];
-            if (asset.chunks[chunk].meta.raw == 0)
-                continue;
-            if (chunkStore == kNone || chunkStore == kPendingStore)
-            {
-                Request request;
-                request.priority = entry.priority + 1.f; // Pages precede the bricks they unlock.
-                request.asset = store.asset;
-                request.chunk = chunk;
-                request.blobs = asset.chunks[chunk];
-                requests.push_back(request);
-                continue;
-            }
-            for (uint32_t i = 0; i < mStores[chunkStore]->bricks.size(); ++i)
-                children.push_back(makeHandle(chunkStore, i));
-        }
-        else if (store.kind == StoreKind::Chunk)
+            std::vector<CutVisit> visits;
+            std::vector<Request> requests;
+            std::vector<CutEntry> frontier;
+            uint32_t pops = 0;
+        };
+        std::vector<Task> coarse(tasks);
+        std::vector<Task> fine(tasks);
+        auto expand = [&](Task& task, std::vector<CutEntry>& stack, bool stopAtChunks)
         {
-            // Children: the level-2 bricks heading the level-2 pages below this level-3 brick.
-            for (uint32_t c = 0; c < b.childCount; ++c)
+            std::vector<uint64_t> children;
+            while (!stack.empty())
             {
-                const uint32_t page = store.children[b.children + c];
-                const uint32_t pageStore = store.pageStores[page];
-                if (pageStore == kNone || pageStore == kPendingStore)
+                const CutEntry entry = stack.back();
+                stack.pop_back();
+                if (stopAtChunks && brick(entry.handle).record.level <= 3)
                 {
-                    Request request;
-                    request.priority = entry.priority + 1.f;
-                    request.asset = store.asset;
-                    request.chunk = store.chunk;
-                    request.store = storeIndex;
-                    request.generation = store.generation;
-                    request.page = page;
-                    request.blobs = store.pages[page].blobs;
-                    requests.push_back(request);
+                    task.frontier.push_back(entry);
                     continue;
                 }
-                for (uint32_t i = 0; i < mStores[pageStore]->bricks.size(); ++i)
-                    if (mStores[pageStore]->bricks[i].record.level == kPageLevel)
-                        children.push_back(makeHandle(pageStore, i));
+                ++task.pops;
+                cutChildren(entry, children, task.requests);
+                for (uint64_t child : children)
+                {
+                    float visibility = entry.visibility;
+                    const float priority = brickPriority(sea, entry.slot, child, view, visibility);
+                    task.visits.push_back({child, priority, entry.slot});
+                    if (priority > 0.f && cutRefinable(child))
+                        stack.push_back({priority, child, entry.slot, visibility});
+                }
+            }
+        };
+        auto walkCoarse = [&](uint32_t index)
+        {
+            std::vector<CutEntry> stack;
+            for (uint32_t slot = index; slot < tiles.size(); slot += tasks)
+            {
+                CutEntry top;
+                if (!cutSeed(sea, view, slot, top))
+                    continue;
+                coarse[index].visits.push_back({top.handle, top.priority, slot});
+                if (cutRefinable(top.handle))
+                    stack.push_back(top);
+                expand(coarse[index], stack, true);
+            }
+        };
+        std::vector<CutEntry> frontier;
+        auto walkFine = [&](uint32_t index)
+        {
+            // Round robin, so the subtrees of one near instance spread over every thread.
+            std::vector<CutEntry> stack;
+            for (size_t i = index; i < frontier.size(); i += tasks)
+                stack.push_back(frontier[i]);
+            expand(fine[index], stack, false);
+        };
+        auto parallel = [&](const std::function<void(uint32_t)>& body)
+        {
+            std::vector<std::future<void>> workers;
+            for (uint32_t index = 1; index < tasks; ++index)
+                workers.push_back(std::async(std::launch::async, body, index));
+            body(0);
+            for (auto& worker : workers)
+                worker.get();
+        };
+        parallel(walkCoarse);
+        for (const Task& task : coarse)
+            frontier.insert(frontier.end(), task.frontier.begin(), task.frontier.end());
+        parallel(walkFine);
+        ++mCutId;
+        for (const std::vector<Task>* phase : {&coarse, &fine})
+            for (const Task& task : *phase)
+            {
+                for (const CutVisit& visit : task.visits)
+                    desire(visit.handle, visit.priority, visit.slot);
+                requests.insert(requests.end(), task.requests.begin(), task.requests.end());
+                pops += task.pops;
+            }
+        ordered = bricksDesired > budget;
+    }
+    if (ordered)
+    {
+        // The budget binds: which bricks win now depends on the order, so the cut runs again as the greedy one.
+        ++mCutId;
+        desired.clear();
+        requests.clear();
+        bricksDesired = 0;
+        pops = 0;
+        std::vector<CutEntry> heap;
+        auto queue = [&](const CutEntry& entry)
+        {
+            desire(entry.handle, entry.priority, entry.slot);
+            if (entry.priority > 0.f && cutRefinable(entry.handle))
+            {
+                heap.push_back(entry);
+                std::push_heap(heap.begin(), heap.end());
+            }
+        };
+        for (uint32_t slot = 0; slot < tiles.size(); ++slot)
+        {
+            CutEntry top;
+            if (cutSeed(sea, view, slot, top))
+                queue(top);
+        }
+        std::vector<uint64_t> children;
+        while (!heap.empty() && pops < 200000)
+        {
+            std::pop_heap(heap.begin(), heap.end());
+            const CutEntry entry = heap.back();
+            heap.pop_back();
+            ++pops;
+            cutChildren(entry, children, requests);
+            uint32_t newBricks = 0;
+            for (uint64_t child : children)
+                newBricks += brick(child).desiredFrame != mCutId ? 1 : 0;
+            if (bricksDesired + newBricks > budget)
+                continue;
+            for (uint64_t child : children)
+            {
+                float visibility = entry.visibility;
+                const float priority = brickPriority(sea, entry.slot, child, view, visibility);
+                queue({priority, child, entry.slot, visibility});
             }
         }
-        else
-            for (uint32_t c = 0; c < b.childCount; ++c)
-                children.push_back(makeHandle(storeIndex, store.children[b.children + c]));
-        uint32_t newBricks = 0;
-        for (uint64_t child : children)
-            newBricks += brick(child).desiredFrame != mCutFrame ? 1 : 0;
-        if (bricksDesired + newBricks > budget)
-            continue;
-        for (uint64_t child : children)
-        {
-            float visibility = b.visibility;
-            const float priority = brickPriority(sea, entry.slot, brick(child), view, visibility);
-            desire(child, priority, visibility, entry.slot);
-        }
+    }
+    if (runCut)
+    {
+        mStats.cutPops = pops;
+        mStats.cutOrdered = ordered;
+        mStats.cutTotalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cutStart).count();
     }
     cutScope.reset();
     if (runCut)
+    {
         mDesired.swap(desired);
+        // Loads go most important first within each level, coarsest level first (a parent before its children). The walk above
+        // leaves parents first but not in priority order, and the loads per frame are capped.
+        mToLoad.clear();
+        for (uint64_t handle : mDesired)
+            if (!(brick(handle).flags & kLoaded))
+                mToLoad.push_back(handle);
+        std::sort(
+            mToLoad.begin(), mToLoad.end(),
+            [&](uint64_t a, uint64_t c)
+            {
+                const Brick& ba = brick(a);
+                const Brick& bc = brick(c);
+                return ba.record.level != bc.record.level ? ba.record.level > bc.record.level : ba.priority > bc.priority;
+            }
+        );
+    }
     FALCOR_PROFILE(pRenderContext, "apply");
     mStats.desired = uint32_t(mDesired.size());
 
-    // Reconstruct desired bricks whose parents are in the atlas (parents come first in the cut, and a parent staged this frame
-    // commits in an earlier dispatch than its children); map those whose parents are mapped.
+    // Reconstruct desired bricks whose parents are in the atlas (mToLoad has parents first, and a parent staged this frame commits in
+    // an earlier dispatch than its children); then map those whose parents are mapped (mDesired has parents first too).
     mStaged.clear();
+    for (uint64_t handle : mToLoad)
+    {
+        if (mStaged.size() >= mDesc.loadsPerFrame)
+            break;
+        const Brick& b = brick(handle);
+        const bool parentLoaded = b.parent == kNoHandle || (brick(b.parent).flags & kLoaded);
+        if (!(b.flags & kLoaded) && parentLoaded)
+            commit(handle);
+    }
     for (uint64_t handle : mDesired)
     {
         Brick& b = brick(handle);
-        const bool parentLoaded = b.parent == kNoHandle || (brick(b.parent).flags & kLoaded);
-        if (!(b.flags & kLoaded) && parentLoaded && mStaged.size() < mDesc.loadsPerFrame)
-            commit(handle);
         const bool parentMapped = b.parent == kNoHandle || (brick(b.parent).flags & kMapped);
         if ((b.flags & kLoaded) && !(b.flags & kMapped) && parentMapped)
             changed |= map(handle);
@@ -764,7 +932,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     {
         const uint64_t handle = mMappedList[i];
         Brick& b = brick(handle);
-        if (b.desiredFrame == mCutFrame)
+        if (b.desiredFrame == mCutId)
         {
             if (b.fade < 1.f)
             {
@@ -808,7 +976,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                     continue;
                 bool busy = false;
                 for (const Brick& b : store.bricks)
-                    busy |= b.desiredFrame == mCutFrame;
+                    busy |= b.desiredFrame == mCutId;
                 for (uint32_t pageStore : store.pageStores)
                     busy |= pageStore != kNone;
                 if (!busy)
@@ -904,7 +1072,7 @@ bool CloudResidency::evict(uint32_t slotsNeeded, uint32_t metasNeeded)
         if (!(b.flags & kLoaded))
             continue;
         mLoadedList[kept++] = handle;
-        if (!(b.flags & kMapped) && b.desiredFrame != mCutFrame && b.loadedChildren == 0)
+        if (!(b.flags & kMapped) && b.desiredFrame != mCutId && b.loadedChildren == 0)
             candidates.push_back(handle);
     }
     mLoadedList.resize(kept);
@@ -1282,6 +1450,22 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     // at 271k bakes for 315k wanted). The bake pass itself costs 0.07 ms per frame at 256 bakes, so the budget has room: a camera
     // flight leaves up to 190k bakes waiting and pays for it in the live march (41 -> 124 ms at 4 units per frame).
     const float3 sun = normalize(view.sunBakeDirection);
+    // MEASURED (4K sea, settled, slot pool full): 18 ms of CPU every frame to conclude, every frame, that nothing can be baked - the
+    // walk below visits every mapped brick and, with no free slot, sorts every held pair as well. A repeat with the same inputs
+    // reaches the same conclusion, and the stats it set still stand.
+    SunScheduleInputs inputs;
+    inputs.cutFrame = mCutId;
+    inputs.generation = view.sunGeneration;
+    for (const AssetState& state : mAssets)
+        inputs.lastChange = std::max(inputs.lastChange, state.lastChange);
+    inputs.freeSlots = mFreeSunSlots.size();
+    inputs.mapped = mMappedList.size();
+    inputs.direction = sun;
+    if (mSunScheduleIdleValid && inputs == mSunScheduleIdle)
+    {
+        mStats.sunBakesFrame = 0;
+        return;
+    }
     auto reachOf = [&](uint32_t assetID)
     { return view.sunNearVoxels * sea.getVoxelWorld() / (mAssetRecords[assetID]->voxelWorld * sea.getFitScale()); };
     struct Candidate
@@ -1291,55 +1475,95 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         uint32_t sunClass;
     };
     std::vector<Candidate> candidates;
+    std::vector<float3> classDirections(mSunClasses.size());
+    for (size_t c = 0; c < mSunClasses.size(); ++c)
+        classDirections[c] = normalize(mul(mSunClasses[c], sun));
+    // Each brick reads and writes only its own pairs of the slot table, so the walk runs in parallel chunks of the mapped list; the
+    // counters, dirty blocks and candidates of each chunk merge afterwards, in chunk order (the candidate order the serial walk had).
+    // MEASURED (sea flight, 127k mapped bricks, 8 classes): ~50 ms a frame serially whenever the cut moved.
+    struct Chunk
+    {
+        std::vector<Candidate> candidates;
+        std::vector<uint32_t> dirtyBlocks;
+        uint32_t baked = 0;
+        uint32_t waiting = 0;
+    };
+    const size_t chunkCount = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+    const size_t chunkSize = (mMappedList.size() + chunkCount - 1) / std::max<size_t>(chunkCount, 1);
+    std::vector<Chunk> chunks(chunkCount);
+    auto scan = [&](size_t index)
+    {
+        Chunk& chunk = chunks[index];
+        const size_t first = index * chunkSize;
+        const size_t last = std::min(mMappedList.size(), first + chunkSize);
+        for (size_t i = first; i < last; ++i)
+        {
+            const uint64_t handle = mMappedList[i];
+            const Brick& b = brick(handle);
+            if (b.desiredFrame != mCutId)
+                continue; // Cached but outside the cut: its bakes are the first evicted.
+            const uint32_t assetID = mStores[handle >> 32]->asset;
+            const float reach = reachOf(assetID);
+            uint32_t needs = 0;
+            for (uint32_t sunClass = 0; sunClass < mSunClasses.size(); ++sunClass)
+            {
+                if (!(b.sunClasses & (1u << sunClass)))
+                    continue;
+                const uint32_t key = (view.sunGeneration << 4) | sunClass;
+                const size_t base = size_t(b.gpu) * kCloudSunBakesPerBrick;
+                bool baked = false;
+                for (uint32_t k = 0; k < kCloudSunBakesPerBrick && !baked; ++k)
+                {
+                    if (mSunSlotTable[(base + k) * 2] != key)
+                        continue;
+                    if (!sunBakeStale(assetID, b.record, classDirections[sunClass], reach, mSunBakeFrames[base + k]))
+                        baked = true;
+                    else
+                    {
+                        mSunSlotTable[(base + k) * 2] = kCloudRefNone; // Keeps its slot for the rebake.
+                        chunk.dirtyBlocks.push_back(b.gpu / kBrickBlock);
+                    }
+                }
+                if (baked)
+                {
+                    ++chunk.baked;
+                    continue;
+                }
+                ++chunk.waiting;
+                needs |= 1u << sunClass;
+            }
+            // Only if a pair can take a bake: every pair holding a wanted bake leaves the brick's other classes on the live march.
+            uint32_t held = 0;
+            for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
+            {
+                const uint32_t key = mSunSlotTable[(size_t(b.gpu) * kCloudSunBakesPerBrick + k) * 2];
+                held += key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u))) ? 1 : 0;
+            }
+            for (uint32_t sunClass = 0; sunClass < mSunClasses.size() && held < kCloudSunBakesPerBrick; ++sunClass)
+                if (needs & (1u << sunClass))
+                {
+                    chunk.candidates.push_back({b.priority, handle, sunClass});
+                    ++held;
+                }
+        }
+    };
+    {
+        std::vector<std::future<void>> workers;
+        for (size_t index = 1; index < chunkCount; ++index)
+            workers.push_back(std::async(std::launch::async, scan, index));
+        scan(0);
+        for (auto& worker : workers)
+            worker.get();
+    }
     mStats.sunBaked = 0;
     mStats.sunWaiting = 0;
-    for (uint64_t handle : mMappedList)
+    for (const Chunk& chunk : chunks)
     {
-        const Brick& b = brick(handle);
-        if (b.desiredFrame != mCutFrame)
-            continue; // Cached but outside the cut: its bakes are the first evicted.
-        const uint32_t assetID = storeOf(handle).asset;
-        uint32_t needs = 0;
-        for (uint32_t sunClass = 0; sunClass < mSunClasses.size(); ++sunClass)
-        {
-            if (!(b.sunClasses & (1u << sunClass)))
-                continue;
-            const uint32_t key = (view.sunGeneration << 4) | sunClass;
-            const size_t base = size_t(b.gpu) * kCloudSunBakesPerBrick;
-            bool baked = false;
-            for (uint32_t k = 0; k < kCloudSunBakesPerBrick && !baked; ++k)
-            {
-                if (mSunSlotTable[(base + k) * 2] != key)
-                    continue;
-                if (!sunBakeStale(assetID, b.record, normalize(mul(mSunClasses[sunClass], sun)), reachOf(assetID), mSunBakeFrames[base + k]))
-                    baked = true;
-                else
-                {
-                    mSunSlotTable[(base + k) * 2] = kCloudRefNone; // Keeps its slot for the rebake.
-                    mSunTableBlocksDirty[b.gpu / kBrickBlock] = 1;
-                }
-            }
-            if (baked)
-            {
-                ++mStats.sunBaked;
-                continue;
-            }
-            ++mStats.sunWaiting;
-            needs |= 1u << sunClass;
-        }
-        // Only if a pair can take a bake: every pair holding a wanted bake leaves the brick's other classes on the live march.
-        uint32_t held = 0;
-        for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
-        {
-            const uint32_t key = mSunSlotTable[(size_t(b.gpu) * kCloudSunBakesPerBrick + k) * 2];
-            held += key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u))) ? 1 : 0;
-        }
-        for (uint32_t sunClass = 0; sunClass < mSunClasses.size() && held < kCloudSunBakesPerBrick; ++sunClass)
-            if (needs & (1u << sunClass))
-            {
-                candidates.push_back({b.priority, handle, sunClass});
-                ++held;
-            }
+        mStats.sunBaked += chunk.baked;
+        mStats.sunWaiting += chunk.waiting;
+        for (uint32_t block : chunk.dirtyBlocks)
+            mSunTableBlocksDirty[block] = 1;
+        candidates.insert(candidates.end(), chunk.candidates.begin(), chunk.candidates.end());
     }
     const size_t considered = std::min(candidates.size(), size_t(4 * mDesc.sunBakesPerFrame));
     std::partial_sort(
@@ -1354,12 +1578,18 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     };
     std::vector<Holder> holders;
     size_t nextHolder = 0;
-    if (mFreeSunSlots.size() < std::min(considered, size_t(mDesc.sunBakesPerFrame)))
+    if (considered > 0 && mFreeSunSlots.size() < std::min(considered, size_t(mDesc.sunBakesPerFrame)))
     {
+        // Only the least important sunBakesPerFrame holders can be handed over, and only to a candidate more important than they
+        // are: a bounded max-heap keeps those, where this used to collect every held pair (~800k on a moving sea) and sort them.
+        const size_t needed = mDesc.sunBakesPerFrame;
+        const float best = candidates.front().priority;
+        auto lower = [](const Holder& a, const Holder& c) { return a.priority < c.priority; };
+        holders.reserve(needed);
         for (uint64_t handle : mMappedList)
         {
             const Brick& b = brick(handle);
-            const bool inCut = b.desiredFrame == mCutFrame;
+            const bool inCut = b.desiredFrame == mCutId;
             for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
             {
                 const uint32_t pair = b.gpu * kCloudSunBakesPerBrick + k;
@@ -1367,14 +1597,19 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
                     continue;
                 const uint32_t key = mSunSlotTable[pair * 2];
                 const bool wanted = inCut && key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u)));
-                holders.push_back({wanted ? b.priority : (inCut ? -1.f : -2.f), pair});
+                const float priority = wanted ? b.priority : (inCut ? -1.f : -2.f);
+                if (priority >= best || (holders.size() == needed && priority >= holders.front().priority))
+                    continue;
+                if (holders.size() == needed)
+                {
+                    std::pop_heap(holders.begin(), holders.end(), lower);
+                    holders.pop_back();
+                }
+                holders.push_back({priority, pair});
+                std::push_heap(holders.begin(), holders.end(), lower);
             }
         }
-        const size_t needed = std::min(holders.size(), size_t(mDesc.sunBakesPerFrame));
-        std::partial_sort(
-            holders.begin(), holders.begin() + needed, holders.end(), [](const Holder& a, const Holder& c) { return a.priority < c.priority; }
-        );
-        holders.resize(needed);
+        std::sort(holders.begin(), holders.end(), lower);
     }
     for (size_t c = 0; c < considered && mSunBakes.size() < mDesc.sunBakesPerFrame; ++c)
     {
@@ -1434,6 +1669,9 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     }
     mStats.sunBakesFrame = uint32_t(mSunBakes.size());
     mStats.sunSlotsFree = uint32_t(mFreeSunSlots.size());
+    // Idle only if this pass staged nothing and left the slots as it found them (an eviction without a bake still moved them).
+    mSunScheduleIdleValid = mSunBakes.empty() && mFreeSunSlots.size() == inputs.freeSlots;
+    mSunScheduleIdle = inputs;
 }
 
 void CloudResidency::bind(const ShaderVar& var) const
