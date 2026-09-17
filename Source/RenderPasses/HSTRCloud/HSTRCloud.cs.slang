@@ -3256,11 +3256,95 @@ struct HSTRCloudRenderer
         float transmittance = 1.f;
         uint steps = 0;
         float opacityDistance = 0.f;
+#if (HSTR_SHIP & 512) != 0
+        marchBeamShipping(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
+#else
         marchSegmentMoment(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
+#endif
         result.depth = -log(max(transmittance, 1e-12f));
         result.steps = float(steps);
         result.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
         return result;
+    }
+
+    /// marchSegmentMoment in the beam view with every HSTR_SHIP switch at its shipping value (HSTR_SHIP bit 512): a midpoint march
+    /// with the empty-cell skip, the held cache and the sun depth per contributing sample, and none of the experiments' state. The
+    /// same frame, from a loop DXC sees without the dead branches.
+    /// MEASURED and OFF (4K, 2026-09-17, same frame everywhere): 4-6% slower than the folded generic loop (mask 509) - near 12.34 ->
+    /// 13.04 ms, farside 7.15 -> 7.58, sea 5.83 -> 5.98, flying 2 units 5.96 -> 6.12. DXC already drops what the folds leave dead.
+    void marchBeamShipping(
+        CutRay ray,
+        float2 segment,
+        bool withSource,
+        bool residual,
+        inout float3 radiance,
+        inout float3 residualRadiance,
+        inout float transmittance,
+        inout uint steps,
+        inout float opacityDistance
+    )
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        const float cellVoxels = float(params.worldCacheCellVoxels);
+        float3 held = 0.f;
+        float3 heldAt = 0.f;
+        float heldSun = 0.f;
+        float3 sunAt = float3(1e30f);
+        uint sinceLighting = ~0u;
+        float fineVoxels = 1.f;
+        float t = segment.x;
+        [loop]
+        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
+        {
+            const float3 v = (ray.position + t * ray.direction) * cellWidth;
+            const float majorant = majorantAt(v);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+            const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
+            ++steps;
+            if (majorant <= 0.f)
+            {
+                t = min(max(t + dt, majorantZeroExit(ray, t)), segment.y);
+                continue;
+            }
+            const float tSample = t + 0.5f * dt;
+            const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+            const float footprint = rayFootprint(ray, tSample);
+            CloudSample sample = {};
+            const float sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
+            const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+            if ((withSource || residual) && alpha > 1e-6f)
+            {
+                if (withSource)
+                {
+                    const float3 moved = midpoint - heldAt;
+                    if (sinceLighting >= params.lightingStride || dot(moved, moved) > cellVoxels * cellVoxels)
+                    {
+                        held = worldCacheRadiance(midpoint, ray.viewDirection);
+                        heldAt = midpoint;
+                        sinceLighting = 0;
+                    }
+                    ++sinceLighting;
+                    radiance += transmittance * alpha * held;
+                }
+                if (residual)
+                {
+                    if (!(sample.empty && sunAt.x < 1e29f))
+                    {
+                        heldSun = sunDepthAt(midpoint, footprint, sample);
+                        sunAt = midpoint;
+                    }
+                    residualRadiance += transmittance * alpha * residualAtDepth(midpoint, heldSun, ray.sunOctaves);
+                }
+            }
+            opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
+            transmittance *= 1.f - alpha;
+            t = sample.empty ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y) : t + dt;
+        }
     }
 
     bool beamWithCache() { return (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0; }
