@@ -101,7 +101,7 @@ def timed(frames, first, forward, yaw):
     # Page table edits during the timed frames (per frame), and what waited at the end.
     for k in ("maps", "unmaps", "fadeStarts", "fadeEnds", "fadeVoid"):
         t["residency"][k] = round((s.get(k, 0) - before.get(k, 0)) / frames, 3)
-    for k in ("mapBacklog", "unmapBacklog", "undesiredFadingOut", "undesiredHeld", "undesiredIdle", "staleFades"):
+    for k in ("mapBacklog", "undesiredFadingOut", "undesiredHeld", "undesiredIdle", "staleFades"):
         t["residency"][k] = s.get(k, 0)
     if TRACE_SUN:
         t["residency"]["flight"] = trace

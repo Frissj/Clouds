@@ -858,7 +858,6 @@ Properties HSTRCloud::getProperties() const
         cloud["maps"] = stats.maps;
         cloud["unmaps"] = stats.unmaps;
         cloud["mapBacklog"] = stats.mapBacklog;
-        cloud["unmapBacklog"] = stats.unmapBacklog;
         cloud["activeFades"] = stats.activeFades;
         cloud["fadeStarts"] = stats.fadeStarts;
         cloud["fadeEnds"] = stats.fadeEnds;

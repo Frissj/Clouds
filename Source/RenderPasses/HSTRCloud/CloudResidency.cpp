@@ -999,7 +999,6 @@ void CloudResidency::finishFrame(const CloudSea& sea, const CloudView& view, std
     }
     mStats.mapped = uint32_t(mMappedList.size());
     mStats.mapBacklog = uint32_t(mToMap.size());
-    mStats.unmapBacklog = uint32_t(mUnmapQueue.size());
     mStats.activeFades = mActiveFades;
     mStats.loaded = uint32_t(mLoadedList.size());
     mStats.committed = uint32_t(mStaged.size());
@@ -1430,18 +1429,12 @@ bool CloudResidency::map(uint64_t handle)
 
 void CloudResidency::mapReady(bool& changed)
 {
-    // Bricks still in the atlas all map on the frame a cut wants them back: a bounded number a frame (parents first, as listed).
+    // Everything the cut wants whose parent holds it, this frame: what a frame does is what its cut changed, which is the work the
+    // motion asks for. Rationing it to a fixed number a frame only moved the cost to later frames and, whenever the flight's churn
+    // passed the number, left the fades and the mapped set behind the cut for good.
     size_t kept = 0;
-    uint32_t maps = 0;
-    for (size_t i = 0; i < mToMap.size(); ++i)
+    for (uint64_t handle : mToMap)
     {
-        if (maps >= kMapsPerFrame)
-        {
-            // The rest waits untouched.
-            kept = std::copy(mToMap.begin() + i, mToMap.end(), mToMap.begin() + kept) - mToMap.begin();
-            break;
-        }
-        const uint64_t handle = mToMap[i];
         const Brick& b = brick(handle);
         if (b.mapped)
             continue;
@@ -1449,10 +1442,7 @@ void CloudResidency::mapReady(bool& changed)
         if (!(b.flags & kLoaded) || !parentMapped || !map(handle))
             mToMap[kept++] = handle;
         else
-        {
-            ++maps;
             changed = true;
-        }
     }
     mToMap.resize(kept);
 }
@@ -1559,11 +1549,13 @@ void CloudResidency::processFadeEnds(bool& changed)
         const Brick& b = brick(end.handle);
         return b.fadeSerial == end.serial && b.mapped;
     };
-    // Ended fades in settle; ended fades out queue for their unmap.
+    // Ended fades in settle; ended fades out unmap (they read as their parent already).
     auto sweep = [&](std::vector<FadeEnd>& bucket)
     {
-        for (const FadeEnd& end : bucket)
+        // A brick unmapped here may end its parent's fade, in this same bucket: it is read by index as it grows.
+        for (size_t i = 0; i < bucket.size(); ++i)
         {
+            const FadeEnd end = bucket[i];
             if (!valid(end))
             {
                 ++mStats.fadeVoid;
@@ -1580,35 +1572,17 @@ void CloudResidency::processFadeEnds(bool& changed)
                 noteMapped(end.handle);
             }
             else
-                mUnmapQueue.push_back(end);
+            {
+                setFade(end.handle, 0);
+                unmap(end.handle);
+                unlistMapped(end.handle);
+            }
         }
         bucket.clear();
     };
     for (uint32_t k = 0; k < count; ++k)
         sweep(mFadeEnds[(mFrame - count + 1 + k) % ring]);
     mFadeProcessed = mFrame;
-    // Bricks that faded out read as their parent already, so their unmaps spread over frames (a cut's fade-outs all end together),
-    // oldest first. A parent whose last mapped child unmaps here may end at once, in this frame's bucket.
-    auto& current = mFadeEnds[mFrame % ring];
-    for (uint32_t unmaps = 0; unmaps < kUnmapsPerFrame;)
-    {
-        if (mUnmapQueue.empty())
-        {
-            if (current.empty())
-                break;
-            sweep(current);
-            continue;
-        }
-        const FadeEnd end = mUnmapQueue.front();
-        mUnmapQueue.pop_front();
-        if (!valid(end) || fadeDirection(mBricks[brick(end.handle).gpu]) >= 0)
-            continue;
-        ++unmaps;
-        setFade(end.handle, 0);
-        unmap(end.handle);
-        unlistMapped(end.handle);
-    }
-    sweep(current); // What the last unmaps started waits in the queue, not for this bucket's next turn.
 }
 
 void CloudResidency::unlistMapped(uint64_t handle)

@@ -89,11 +89,10 @@ public:
         // Page table edits so far (maps and unmaps), and what waits.
         uint32_t maps = 0;
         uint32_t unmaps = 0;
-        uint32_t mapBacklog = 0;   ///< Loaded desired bricks not yet mapped.
-        uint32_t unmapBacklog = 0; ///< Faded out, not yet unmapped.
+        uint32_t mapBacklog = 0;   ///< Desired bricks not mapped yet (waiting on a parent or a load).
         uint32_t activeFades = 0;  ///< Bricks whose fade runs.
         uint32_t fadeStarts = 0;   ///< Fades started or turned so far.
-        uint32_t fadeEnds = 0;     ///< Fade ends handled so far (settled or queued for the unmap).
+        uint32_t fadeEnds = 0;     ///< Fade ends handled so far.
         uint32_t fadeVoid = 0;     ///< End entries whose fade had already been replaced.
     };
     /// Mapped bricks the cut does not want, by why they are still mapped (auditMapped walks every mapped brick: diagnostics only).
@@ -319,10 +318,7 @@ private:
         uint32_t serial;     ///< Brick::fadeSerial of the fade it ends.
         uint32_t generation; ///< Of the brick's store (a released store's handles are void).
     };
-    static constexpr uint32_t kUnmapsPerFrame = 512;
-    static constexpr uint32_t kMapsPerFrame = 1024;
-    std::vector<std::vector<FadeEnd>> mFadeEnds;
-    std::deque<FadeEnd> mUnmapQueue; ///< Faded out, waiting for their unmap. ///< Ring of fadeFrames + 1 buckets, by the frame a fade ends.
+    std::vector<std::vector<FadeEnd>> mFadeEnds; ///< Ring of fadeFrames + 1 buckets, by the frame a fade ends.
     uint32_t mFadeProcessed = 0;                 ///< The last frame whose fade ends were handled.
     uint32_t mActiveFades = 0;                   ///< Bricks whose fade runs.
     float mFadeStep = 1.f;
@@ -351,7 +347,7 @@ private:
     std::vector<uint64_t> mWalkTouched;         ///< Bricks changed while the walk ran.
     /// Refreshes a brick's mMappedState entry (and records it while a walk runs).
     void noteMapped(uint64_t handle);
-    /// Maps what the cut wants and its parents hold, up to kMapsPerFrame.
+    /// Maps what the cut wants and its parents hold.
     void mapReady(bool& changed);
     void unlistMapped(uint64_t handle);
     std::vector<float3x3> mTileForward; ///< Per slot: asset source voxel to tile-local domain voxel (linear part).
