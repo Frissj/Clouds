@@ -149,6 +149,8 @@ const char kBeamQueueSteps[] = "beamQueueSteps";
 const char kCloudResidencyFrozen[] = "cloudResidencyFrozen";
 const char kCloudCutMargin[] = "cloudCutMargin";
 const char kCloudCutTurn[] = "cloudCutTurn";
+const char kCloudCutAsync[] = "cloudCutAsync";
+const char kCloudGpuSun[] = "cloudGpuSun";
 const char kBeamRefreshDebug[] = "beamRefreshDebug";
 const char kBeamParallax[] = "beamParallax";
 const char kBeamCarryTolerance[] = "beamCarryTolerance";
@@ -159,6 +161,7 @@ const char kStoreExact[] = "storeExact";
 const char kCompareExact[] = "compareExact";
 const char kBeamMarchedFraction[] = "beamMarchedFraction";
 const char kReferenceShow[] = "referenceShow";
+const char kReferenceBandRows[] = "referenceBandRows";
 const char kCompareSubstitute[] = "compareSubstitute";
 const char kCompareTarget[] = "compareTarget";
 const char kReferenceError[] = "referenceError";
@@ -328,6 +331,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamCarryTolerance = value;
             continue;
         }
+        if (key == kReferenceBandRows)
+        {
+            mReferenceBandRows = uint32_t(value);
+            continue;
+        }
         if (key == kBeamRefreshBlock)
         {
             mParams.beamRefreshBlock = std::max(uint32_t(value), 1u);
@@ -351,6 +359,16 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == kCloudCutTurn)
         {
             mCloudCutTurn = value;
+            continue;
+        }
+        if (key == kCloudGpuSun)
+        {
+            mCloudGpuSun = value; // Read when the residency is created.
+            continue;
+        }
+        if (key == kCloudCutAsync)
+        {
+            mCloudCutAsync = value;
             continue;
         }
         if (key == kCloudResidencyFrozen)
@@ -815,8 +833,10 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
+    props[kCloudGpuSun] = mCloudGpuSun;
     if (mpCloudResidency)
     {
+        mpCloudResidency->readGpuSunStats();
         const auto& stats = mpCloudResidency->getStats();
         Properties cloud;
         cloud["loaded"] = stats.loaded;
@@ -879,6 +899,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudResidencyFrozen] = mCloudResidencyFrozen;
     props[kCloudCutMargin] = mCloudCutMargin;
     props[kCloudCutTurn] = mCloudCutTurn;
+    props[kCloudCutAsync] = mCloudCutAsync;
     props[kBeamRefreshDebug] = mParams.beamRefreshDebug;
     props[kBeamParallax] = mParams.beamParallax;
     props[kBeamCarryTolerance] = mParams.beamCarryTolerance;
@@ -888,6 +909,7 @@ Properties HSTRCloud::getProperties() const
     props[kCompareExact] = mParams.compareExact != 0;
     props[kBeamMarchedFraction] = mBeamMarchedFraction;
     props[kReferenceShow] = mParams.referenceShow;
+    props[kReferenceBandRows] = mReferenceBandRows;
     props[kCompareSubstitute] = mParams.compareSubstitute;
     props[kCompareTarget] = mParams.compareTarget;
     props[kReferenceError] = mReferenceError;
@@ -1014,6 +1036,13 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpOccupancyCloudPass = createPass("occupancyCloudBricks");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
+    mpReleaseSunPass = createPass("releaseSunBakes");
+    mpScanSunPass = createPass("scanSunBakes");
+    mpStaleSunPass = createPass("staleSunBakes");
+    mpSelectSunPass = createPass("selectSunBakes");
+    mpEmitSunPass = createPass("emitSunBakes");
+    mpEvictSunPass = createPass("evictSunBakes");
+    mpAssignSunPass = createPass("assignSunBakes");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
@@ -1497,6 +1526,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.payloadPoolMB = mCloudPayloadPoolMB;
         residencyDesc.directStorage = mCloudDirectStorage;
         residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
+        residencyDesc.gpuSun = mCloudGpuSun;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mCloudResidencyKey = residencyKey;
         mCloudInstancesUploaded = false;
@@ -1751,7 +1781,8 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     std::vector<uint32_t> changed;
     {
         FALCOR_PROFILE(pRenderContext, "seaTiles");
-        changed = mpCloudSea->update(camera->getPosition());
+        // A residency cut running on its worker reads the tiles: finished tiles wait until it is back.
+        changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && mpCloudResidency->cutInFlight()));
     }
     if (!mCloudInstancesUploaded)
     {
@@ -1836,6 +1867,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.maxDistance = mParams.seaViewDistance;
     view.cutMargin = mCloudCutMargin;
     view.cutTurn = mCloudCutTurn;
+    view.cutAsync = mCloudCutAsync;
     bool densityChanged = false;
     // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
     // 100 ms a frame on the sea - and while the GPU waits it drops to a lower power state, so its moving-camera timings measured
@@ -1873,7 +1905,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mParams.cloudStagedCount = 0;
     }
     // Sun bakes last: they read the bricks and occupancy committed above.
-    if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
+    if (mCloudGpuSun)
+    {
+        dispatchSunScheduling(pRenderContext);
+    }
+    else if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
     {
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
@@ -1900,6 +1936,68 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             stats.residentMB,
             stats.cutMilliseconds
         );
+    }
+}
+
+void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
+{
+    auto& residency = *mpCloudResidency;
+    // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle.
+    if (mSunReadbackPending != 0 && mpSunFence->getCurrentValue() >= mSunReadbackPending)
+    {
+        const uint32_t bakes = *static_cast<const uint32_t*>(mpSunReadback->map());
+        mpSunReadback->unmap();
+        residency.gpuSunRead(bakes);
+        mSunReadbackPending = 0;
+    }
+    const auto& sun = residency.getGpuSunFrame();
+    pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
+    if (!sun.run)
+        return;
+    FALCOR_PROFILE(pRenderContext, "scheduleSun");
+    pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
+    mParams.cloudResidencyFrame = sun.frame;
+    mParams.cloudSunReleaseCount = sun.releaseCount;
+    mParams.cloudSunClassCount = sun.classCount;
+    mParams.cloudSunBakeMax = sun.bakeMax;
+    mParams.cloudBrickCapacity = sun.capacity;
+    auto run = [&](const char* name, const ref<ComputePass>& pPass, uint32_t threads)
+    {
+        FALCOR_PROFILE(pRenderContext, name);
+        bindRenderer(pRenderContext, pPass);
+        residency.bindGpuSun(pPass->getRootVar()["CB"]["gHSTRCloud"]);
+        pPass->execute(pRenderContext, uint3(threads, 1, 1));
+    };
+    if (sun.releaseCount > 0)
+        run("release", mpReleaseSunPass, sun.releaseCount);
+    run("stale", mpStaleSunPass, (sun.capacity + 3) / 4);
+    run("scan", mpScanSunPass, sun.capacity);
+    run("select", mpSelectSunPass, 1);
+    run("emit", mpEmitSunPass, sun.capacity);
+    run("evict", mpEvictSunPass, sun.bakeMax);
+    run("assign", mpAssignSunPass, sun.bakeMax);
+    // The jobs assign wrote; entries without a slot return at once.
+    {
+        FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
+        mParams.cloudCommitOffset = 0;
+        mParams.cloudCommitCount = sun.bakeMax;
+        bindRenderer(pRenderContext, mpBakeCloudSunPass);
+        bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
+        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * sun.bakeMax));
+        mParams.cloudCommitCount = 0;
+    }
+    mBeamReusable = false;
+    if (mSunReadbackPending == 0)
+    {
+        if (!mpSunReadback)
+        {
+            mpSunReadback = mpDevice->createBuffer(sizeof(uint32_t), ResourceBindFlags::None, MemoryType::ReadBack);
+            mpSunFence = mpDevice->createFence();
+        }
+        pRenderContext->copyBufferRegion(mpSunReadback.get(), 0, residency.getGpuSunCounters().get(), 2 * sizeof(uint32_t), sizeof(uint32_t));
+        residency.gpuSunQueued();
+        pRenderContext->submit(false);
+        mSunReadbackPending = pRenderContext->signal(mpSunFence.get());
     }
 }
 
@@ -2857,13 +2955,23 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mReferencePosition = position;
         mReferenceDirection = direction;
         FALCOR_PROFILE(pRenderContext, "reference");
-        bindRenderer(pRenderContext, mpReferencePass);
-        ShaderVar var = mpReferencePass->getRootVar()["CB"]["gHSTRCloud"];
-        var["hstrReferenceSum"] = mpReferenceSum;
-        var["color"] = color;
-        var["transportError"] = error;
-        var["cutStats"] = cutStats;
-        mpReferencePass->execute(pRenderContext, uint3(mParams.frameDim, 1));
+        // In bands of mReferenceBandRows, each submitted on its own: one 4K sample of the sea runs longer than the driver's
+        // timeout (DXGI_ERROR_DEVICE_REMOVED).
+        const uint32_t bandRows = mReferenceBandRows > 0 ? mReferenceBandRows : mParams.frameDim.y;
+        for (uint32_t row = 0; row < mParams.frameDim.y; row += bandRows)
+        {
+            mParams.referenceRowOffset = row;
+            bindRenderer(pRenderContext, mpReferencePass);
+            ShaderVar var = mpReferencePass->getRootVar()["CB"]["gHSTRCloud"];
+            var["hstrReferenceSum"] = mpReferenceSum;
+            var["color"] = color;
+            var["transportError"] = error;
+            var["cutStats"] = cutStats;
+            mpReferencePass->execute(pRenderContext, uint3(mParams.frameDim.x, std::min(bandRows, mParams.frameDim.y - row), 1));
+            if (bandRows < mParams.frameDim.y)
+                pRenderContext->submit(true);
+        }
+        mParams.referenceRowOffset = 0;
         ++mParams.referenceSamples;
         ++mParams.frameIndex;
         if (!mSaveReferencePath.empty())

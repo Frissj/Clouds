@@ -16,7 +16,7 @@ REFERENCE = {
 
 BEAM = {
     "debugView": 9, "hstComponents": 15, "beamTemporal": False, "cloudSunCache": True, "cloudZeroSkip": 8,
-    "minStepVoxels": 2, "maxStepVoxels": 2, "cloudLongitudinalOracle": 0, "cloudOracleCentroid": False,
+    "minStepVoxels": 2, "maxStepVoxels": 1, "cloudLongitudinalOracle": 0, "cloudOracleCentroid": False,
     "beamTileSize": 4, "beamLevels": 1, "beamTolerance": 0.05, "cloudThinDepth": 0.05, "cloudEmptySkip": True,
     "cloudTightReject": 0, "cloudCostProbe": 0, "cloudSunReuse": 0.0, "cloudMinTransmittance": 0.02,
     "cloudLocalStep": False, "cloudTrapezoid": False, "cloudSlabClamp": True, "beamSegments": 1,
@@ -24,7 +24,7 @@ BEAM = {
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 0,
     "beamDepthTolerance": 0.05, "beamShip": True, "beamRefreshDebug": 0, "beamParallax": 0.0,
     "beamCarryTolerance": 0.0, "beamRefreshBlock": 1, "beamRefreshCentres": 0,
-    "cloudCutMargin": 8.0, "beamShipMask": 509,
+    "cloudCutMargin": 8.0, "beamShipMask": 509, "cloudCutAsync": False,
 }
 
 

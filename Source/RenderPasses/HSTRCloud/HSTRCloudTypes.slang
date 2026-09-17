@@ -105,6 +105,22 @@ struct HSTRCloudSunBake
     float cap;        ///< Source-length optical depth past which the march stops (opaque for every instance scale).
 };
 
+/// GPU sun bake scheduling (CloudResidencyDesc::gpuSun): what the scheduler needs of a GPU brick, written by the CPU when the brick
+/// is mapped or unmapped and when a cut changes its priority.
+static const uint kCloudSunInCut = 0x10000;  ///< HSTRCloudSunSched.flags: the last cut desired the brick.
+static const uint kCloudSunMapped = 0x20000; ///< HSTRCloudSunSched.flags: the brick is mapped.
+static const uint kCloudSunBins = 256;       ///< Priority histogram bins of the scheduler (candidates, then holders).
+/// hstrCloudSunCounters entries (cleared every frame): candidates emitted, holders emitted, bakes staged, bricks baked, bricks
+/// waiting, stale bakes invalidated, then the partial-bin reservations of candidates and holders.
+static const uint kCloudSunCounters = 8;
+struct HSTRCloudSunSched
+{
+    float priority; ///< The last cut's priority of the brick.
+    uint flags;     ///< Orientation classes that desired it (bits 0-15), kCloudSunInCut, kCloudSunMapped.
+    uint coord;     ///< BrickHeader::coord: level-local brick coordinates, 10 bits per axis.
+    uint asset;
+};
+
 /// A brick staged for GPU reconstruction (see reconstructBrick in CloudFormat.h): parent prediction plus dequantised residual,
 /// requantised into its atlas slot.
 struct HSTRCloudStaging
@@ -222,6 +238,10 @@ struct HSTRCloudParams
     /// gives sea 5.39 ms at p99.9 0.061 and near 6.55 ms at p99.9 0.122. The near view degrades about twice as hard, which is what
     /// the aliasing reading predicts: close up the pixel footprint is fine, so a 4-voxel step is furthest above the rate the density
     /// needs, while in the distance the footprint already exceeds the step and nothing changes.
+    /// MEASURED against the 4K path tracer (sea farside, 65 spp, 8x8 block log error, 2026-09-17): min 2 / max 2 0.1265, min 2 / max 1
+    /// 0.0998, 1 / 1 0.0996 (the exact march 0.0984). A step is sized before its sample reads the brick, so with max 2 the first step
+    /// from coarse density into a fine brick crossed ~5 of its voxels; the per-pixel 1-voxel comparison showed it as 51% of farside's
+    /// pixels over 0.02. Capping at one voxel costs 3-8% (the 1-voxel march 60-78%). CloudSea.py ships min 2, max 1.
     float minStepVoxels = 1.f;
     float maxStepVoxels = 4.f;
     float compareMapScale = 0.f;   ///< >0: block comparisons overwrite the frame with their signed log error map, saturating here.
@@ -848,7 +868,14 @@ struct HSTRCloudParams
     /// beamRefresh: the pattern size for tile centres (0: beamRefresh). The centres only feed the bubble term and the tile tests.
     /// MEASURED (before the carry fast path): r4 with centres at 8 carries 2% more points, 4.03 -> 3.93 ms parked and nothing flying.
     uint beamRefreshCentres = 0;
-    uint padHSTRCloud20 = 0;
+    /// Set per dispatch: the first row of the band of the path-traced reference being traced (HSTRCloud::mReferenceBandRows).
+    uint referenceRowOffset = 0;
+    // GPU sun bake scheduling (CloudResidencyDesc::gpuSun), set per frame.
+    uint cloudResidencyFrame = 0;   ///< CloudResidency's frame counter (bake and change frames are in it).
+    uint cloudSunReleaseCount = 0;  ///< Bricks in hstrCloudSunRelease whose bakes are freed this frame.
+    uint cloudSunClassCount = 0;    ///< Orientation classes in hstrCloudSunDirections.
+    uint cloudSunBakeMax = 0;       ///< Bakes staged per frame at most (the candidate list's capacity).
+    uint cloudBrickCapacity = 0;    ///< GPU bricks (the scheduler's scan range).
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

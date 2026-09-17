@@ -231,6 +231,23 @@ struct HSTRCloudRenderer
     RWTexture3D<float> hstrCloudSunAtlasOutput;
     StructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakes;
     StructuredBuffer<uint> hstrCloudSunSlots; ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun atlas slot).
+    // GPU sun bake scheduling (CloudResidencyDesc::gpuSun): the scheduler owns the slot table, the bake frames and the free slots.
+    RWStructuredBuffer<uint> hstrCloudSunSlotsOutput;
+    RWStructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakesOutput;
+    StructuredBuffer<HSTRCloudSunSched> hstrCloudSunSched;  ///< Per GPU brick.
+    RWStructuredBuffer<uint> hstrCloudSunFrames;            ///< Per pair: the residency frame it was baked in.
+    RWStructuredBuffer<uint> hstrCloudSunFree;              ///< Free sun atlas slots, a stack.
+    RWStructuredBuffer<uint> hstrCloudSunFreeTop;           ///< Its size.
+    RWStructuredBuffer<uint> hstrCloudSunCounters;          ///< kCloudSunCounters entries.
+    RWStructuredBuffer<uint> hstrCloudSunHistogram;         ///< kCloudSunBins candidate bins, then kCloudSunBins holder bins.
+    RWStructuredBuffer<uint> hstrCloudSunSelect;            ///< Candidate bin and count taken from it, holder bin and count, holders.
+    RWStructuredBuffer<uint> hstrCloudSunNeeds;             ///< Per GPU brick: classes needing a bake (bits 0-15).
+    RWStructuredBuffer<float4> hstrCloudSunCandidates;      ///< (brick, class, priority, -), cloudSunBakeMax of them.
+    RWStructuredBuffer<uint> hstrCloudSunHolders;           ///< Pairs whose slots move to candidates, cloudSunBakeMax of them.
+    StructuredBuffer<uint> hstrCloudSunRelease;             ///< Bricks whose bakes are freed this frame (unloaded).
+    StructuredBuffer<float4> hstrCloudSunDirections;        ///< Per orientation class: sun direction in its source voxels.
+    StructuredBuffer<uint> hstrCloudChangeFrames;           ///< Per asset, per 32^3-voxel cell: last frame a brick over it changed.
+    StructuredBuffer<uint> hstrCloudAssetChanges;           ///< Per asset: last change frame, offset of its cells.
     StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
     StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
     Texture3D<float4> hstrCameraLighting;
@@ -3155,6 +3172,7 @@ struct HSTRCloudRenderer
 
     void referencePixel(uint2 pixel)
     {
+        pixel.y += params.referenceRowOffset;
         if (any(pixel >= params.frameDim))
             return;
         // Seeded by the sample index, not frameIndex: property changes reset frameIndex and would repeat earlier samples.
@@ -3238,6 +3256,334 @@ struct HSTRCloudRenderer
             ++count;
         }
         hstrReferenceRowError[row] = error / float(max(count, 1u));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // GPU sun bake scheduling (CloudResidencyDesc::gpuSun). The CPU pass it replaces walked every mapped brick (and every held bake
+    // when the slot pool was short) every frame: 9-19 ms of a moving sea's frame. Here the GPU owns the slot table and the free
+    // slots, and each frame runs release, scan, select, emit, evict and assign; the bake pass then runs over the jobs assign wrote.
+    // Nothing is read back. What it decides is what CloudResidency::scheduleSunBakes decided, except that a brick takes at most one
+    // bake per frame and the most important candidates are chosen by histogram bin rather than exact order.
+
+    uint sunCandidateBin(float priority) { return uint(clamp(int(priority * 16.f), 0, int(kCloudSunBins) - 1)); }
+
+    /// Holders: unwanted bakes of bricks outside the cut first, then of bricks in it, then wanted bakes by priority.
+    uint sunHolderBin(bool wanted, bool inCut, float priority)
+    {
+        return wanted ? 2u + uint(clamp(int(priority * 16.f), 0, int(kCloudSunBins) - 3)) : (inCut ? 1u : 0u);
+    }
+
+    bool sunKeyWanted(uint key, uint flags)
+    {
+        return key != kCloudRefNone && (key >> 4) == params.cloudSunGeneration && (flags & (1u << (key & 15u))) != 0;
+    }
+
+    void pushSunSlot(uint slot)
+    {
+        uint top;
+        InterlockedAdd(hstrCloudSunFreeTop[0], 1u, top);
+        hstrCloudSunFree[top] = slot;
+    }
+
+    /// A free sun slot, or kCloudRefNone when there is none (pushes only happen in earlier dispatches).
+    uint popSunSlot()
+    {
+        uint previous;
+        InterlockedAdd(hstrCloudSunFreeTop[0], 0xFFFFFFFFu, previous);
+        if (previous == 0u || previous > params.cloudBrickCapacity)
+        {
+            uint unused;
+            InterlockedAdd(hstrCloudSunFreeTop[0], 1u, unused);
+            return kCloudRefNone;
+        }
+        return hstrCloudSunFree[previous - 1u];
+    }
+
+    /// CloudResidency::sunBakeStale: whether any of the region a bake read (its texels with their trilinear support, swept towards
+    /// the sun by the reach) was mapped or unmapped since it was baked.
+    bool sunBakeStale(uint assetID, uint level, uint coord, float3 direction, float reach, uint bakeFrame)
+    {
+        if (hstrCloudAssetChanges[2u * assetID] <= bakeFrame)
+            return false;
+        const uint offset = hstrCloudAssetChanges[2u * assetID + 1u];
+        const uint3 dims = (hstrCloudAssets[assetID].dims + 31u) / 32u;
+        const float scale = float(1u << level);
+        const uint3 brick = uint3(coord & 1023u, (coord >> 10) & 1023u, coord >> 20);
+        const float3 origin = float3(brick * (8u << level));
+        const float3 sweep = reach * direction;
+        const float3 lo = origin - 1.5f * scale - 0.5f + min(sweep, 0.f) - scale;
+        const float3 hi = origin + 9.5f * scale - 0.5f + max(sweep, 0.f) + scale;
+        const int3 maximum = int3(dims) - 1;
+        const int3 first = clamp(int3(floor(lo / 32.f)), 0, maximum);
+        const int3 last = clamp(int3(floor(hi / 32.f)), 0, maximum);
+        for (int z = first.z; z <= last.z; ++z)
+            for (int y = first.y; y <= last.y; ++y)
+                for (int x = first.x; x <= last.x; ++x)
+                    if (hstrCloudChangeFrames[offset + uint(x) + dims.x * (uint(y) + dims.y * uint(z))] > bakeFrame)
+                        return true;
+        return false;
+    }
+
+    float sunReach(uint assetID) { return params.sunNearVoxels * params.seaVoxelSize.x / hstrCloudAssets[assetID].sourceVoxelWorld; }
+
+    /// Release: the bakes of unloaded bricks give their slots back.
+    void releaseSunBakes(uint entry)
+    {
+        if (entry >= params.cloudSunReleaseCount)
+            return;
+        const uint base = hstrCloudSunRelease[entry] * kCloudSunBakesPerBrick;
+        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            const uint slot = hstrCloudSunSlotsOutput[2u * (base + k) + 1u];
+            if (slot != kCloudRefNone)
+                pushSunSlot(slot);
+            hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
+            hstrCloudSunSlotsOutput[2u * (base + k) + 1u] = kCloudRefNone;
+        }
+    }
+
+    /// Scan: a mapped brick in the cut drops its stale bakes and counts the classes still needing one; every held bake is a holder.
+    void scanSunBakes(uint b)
+    {
+        if (b >= params.cloudBrickCapacity)
+            return;
+        const HSTRCloudSunSched s = hstrCloudSunSched[b];
+        const uint base = b * kCloudSunBakesPerBrick;
+        const bool inCut = (s.flags & kCloudSunInCut) != 0;
+        const bool active = inCut && (s.flags & kCloudSunMapped) != 0;
+        uint needs = 0;
+        uint baked = 0;
+        uint waiting = 0;
+        if (active)
+        {
+            for (uint c = 0; c < params.cloudSunClassCount; ++c)
+            {
+                if ((s.flags & (1u << c)) == 0)
+                    continue;
+                const uint key = (params.cloudSunGeneration << 4) | c;
+                bool have = false;
+                for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+                    have = have || hstrCloudSunSlotsOutput[2u * (base + k)] == key;
+                if (have)
+                    ++baked;
+                else
+                {
+                    ++waiting;
+                    needs |= 1u << c;
+                }
+            }
+        }
+        uint held = 0;
+        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            const uint key = hstrCloudSunSlotsOutput[2u * (base + k)];
+            const bool wanted = active && sunKeyWanted(key, s.flags);
+            held += wanted ? 1u : 0u;
+            if (hstrCloudSunSlotsOutput[2u * (base + k) + 1u] != kCloudRefNone)
+                InterlockedAdd(hstrCloudSunHistogram[kCloudSunBins + sunHolderBin(wanted, inCut, s.priority)], 1u);
+        }
+        if (needs != 0 && held < kCloudSunBakesPerBrick)
+            InterlockedAdd(hstrCloudSunHistogram[sunCandidateBin(s.priority)], 1u);
+        else
+            needs = 0;
+        hstrCloudSunNeeds[b] = needs;
+        if (baked > 0)
+            InterlockedAdd(hstrCloudSunCounters[3], baked);
+        if (waiting > 0)
+            InterlockedAdd(hstrCloudSunCounters[4], waiting);
+    }
+
+    /// Stale: a quarter of the bricks each frame (thread i is brick 4 i + the frame's phase) drop the wanted bakes whose neighbourhood
+    /// changed since they were baked, keeping their slots for the rebake; the scan that follows finds those classes waiting. In its
+    /// own pass because inside the scan's loops it made the whole scan several times slower.
+    void staleSunBakes(uint thread)
+    {
+        const uint b = 4u * thread + ((4u - (params.cloudResidencyFrame & 3u)) & 3u);
+        if (b >= params.cloudBrickCapacity)
+            return;
+        const HSTRCloudSunSched s = hstrCloudSunSched[b];
+        if ((s.flags & (kCloudSunInCut | kCloudSunMapped)) != (kCloudSunInCut | kCloudSunMapped))
+            return;
+        if (hstrCloudAssetChanges[2u * s.asset] == 0u)
+            return;
+        const uint base = b * kCloudSunBakesPerBrick;
+        const uint level = hstrCloudBricks[b].info & 15u;
+        const float reach = sunReach(s.asset);
+        uint stale = 0;
+        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            const uint key = hstrCloudSunSlotsOutput[2u * (base + k)];
+            if (!sunKeyWanted(key, s.flags))
+                continue;
+            if (sunBakeStale(s.asset, level, s.coord, hstrCloudSunDirections[key & 15u].xyz, reach, hstrCloudSunFrames[base + k]))
+            {
+                hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
+                ++stale;
+            }
+        }
+        if (stale > 0)
+            InterlockedAdd(hstrCloudSunCounters[5], stale);
+    }
+
+    /// Select: the candidate bins that fill this frame's bakes, and the holder bins that free the slots they lack (only holders
+    /// less important than the best candidate).
+    void selectSunBakes()
+    {
+        const uint capacity = params.cloudSunBakeMax;
+        uint total = 0;
+        uint candidateBin = 0;
+        uint candidateTake = 0;
+        int top = -1;
+        for (int bin = int(kCloudSunBins) - 1; bin >= 0 && total < capacity; --bin)
+        {
+            const uint count = hstrCloudSunHistogram[bin];
+            if (count == 0)
+                continue;
+            top = max(top, bin);
+            candidateBin = uint(bin);
+            candidateTake = min(count, capacity - total);
+            total += candidateTake;
+        }
+        const uint freeSlots = hstrCloudSunFreeTop[0];
+        const uint needed = total > freeSlots ? total - freeSlots : 0u;
+        const uint limit = top >= 0 ? min(uint(top) + 2u, kCloudSunBins) : 0u;
+        uint holders = 0;
+        uint holderBin = 0;
+        uint holderTake = 0;
+        for (uint bin = 0; bin < limit && holders < needed; ++bin)
+        {
+            const uint count = hstrCloudSunHistogram[kCloudSunBins + bin];
+            if (count == 0)
+                continue;
+            holderBin = bin;
+            holderTake = min(count, needed - holders);
+            holders += holderTake;
+        }
+        hstrCloudSunSelect[0] = candidateBin;
+        hstrCloudSunSelect[1] = candidateTake;
+        hstrCloudSunSelect[2] = holderBin;
+        hstrCloudSunSelect[3] = holderTake;
+        hstrCloudSunSelect[4] = holders;
+    }
+
+    /// Emit: the selected candidates (one bake per brick per frame) and holders into their lists.
+    void emitSunBakes(uint b)
+    {
+        if (b >= params.cloudBrickCapacity)
+            return;
+        const HSTRCloudSunSched s = hstrCloudSunSched[b];
+        const uint needs = hstrCloudSunNeeds[b];
+        if (needs != 0)
+        {
+            const uint bin = sunCandidateBin(s.priority);
+            bool take = bin > hstrCloudSunSelect[0];
+            if (!take && bin == hstrCloudSunSelect[0])
+            {
+                uint reserved;
+                InterlockedAdd(hstrCloudSunCounters[6], 1u, reserved);
+                take = reserved < hstrCloudSunSelect[1];
+            }
+            if (take)
+            {
+                uint index;
+                InterlockedAdd(hstrCloudSunCounters[0], 1u, index);
+                if (index < params.cloudSunBakeMax)
+                    hstrCloudSunCandidates[index] = float4(float(b), float(firstbitlow(needs)), s.priority, 0.f);
+            }
+        }
+        const uint holders = hstrCloudSunSelect[4];
+        if (holders == 0)
+            return;
+        const uint base = b * kCloudSunBakesPerBrick;
+        const bool inCut = (s.flags & kCloudSunInCut) != 0;
+        const bool active = inCut && (s.flags & kCloudSunMapped) != 0;
+        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+        {
+            if (hstrCloudSunSlotsOutput[2u * (base + k) + 1u] == kCloudRefNone)
+                continue;
+            const bool wanted = active && sunKeyWanted(hstrCloudSunSlotsOutput[2u * (base + k)], s.flags);
+            const uint bin = sunHolderBin(wanted, inCut, s.priority);
+            bool take = bin < hstrCloudSunSelect[2];
+            if (!take && bin == hstrCloudSunSelect[2])
+            {
+                uint reserved;
+                InterlockedAdd(hstrCloudSunCounters[7], 1u, reserved);
+                take = reserved < hstrCloudSunSelect[3];
+            }
+            if (!take)
+                continue;
+            uint index;
+            InterlockedAdd(hstrCloudSunCounters[1], 1u, index);
+            if (index < holders)
+                hstrCloudSunHolders[index] = base + k;
+        }
+    }
+
+    /// Evict: the holders' slots go back to the free list.
+    void evictSunBakes(uint entry)
+    {
+        if (entry >= min(hstrCloudSunCounters[1], hstrCloudSunSelect[4]))
+            return;
+        const uint pair = hstrCloudSunHolders[entry];
+        const uint slot = hstrCloudSunSlotsOutput[2u * pair + 1u];
+        if (slot != kCloudRefNone)
+            pushSunSlot(slot);
+        hstrCloudSunSlotsOutput[2u * pair] = kCloudRefNone;
+        hstrCloudSunSlotsOutput[2u * pair + 1u] = kCloudRefNone;
+    }
+
+    /// Assign: a candidate takes a pair holding a slot it may reuse, else an empty pair and a free slot, and writes its bake job.
+    void assignSunBake(uint entry)
+    {
+        if (entry >= params.cloudSunBakeMax)
+            return;
+        HSTRCloudSunBake job = {};
+        job.slot = kCloudRefNone;
+        if (entry < min(hstrCloudSunCounters[0], params.cloudSunBakeMax))
+        {
+            const float4 candidate = hstrCloudSunCandidates[entry];
+            const uint b = uint(candidate.x);
+            const uint sunClass = uint(candidate.y);
+            const HSTRCloudSunSched s = hstrCloudSunSched[b];
+            const uint base = b * kCloudSunBakesPerBrick;
+            uint chosen = kCloudRefNone;
+            uint slot = kCloudRefNone;
+            for (uint k = 0; k < kCloudSunBakesPerBrick && chosen == kCloudRefNone; ++k)
+            {
+                const uint held = hstrCloudSunSlotsOutput[2u * (base + k) + 1u];
+                if (held != kCloudRefNone && !sunKeyWanted(hstrCloudSunSlotsOutput[2u * (base + k)], s.flags))
+                {
+                    chosen = k;
+                    slot = held;
+                }
+            }
+            for (uint k = 0; k < kCloudSunBakesPerBrick && chosen == kCloudRefNone; ++k)
+            {
+                if (hstrCloudSunSlotsOutput[2u * (base + k) + 1u] != kCloudRefNone)
+                    continue;
+                slot = popSunSlot();
+                if (slot != kCloudRefNone)
+                    chosen = k;
+                break;
+            }
+            if (chosen != kCloudRefNone)
+            {
+                hstrCloudSunSlotsOutput[2u * (base + chosen)] = (params.cloudSunGeneration << 4) | sunClass;
+                hstrCloudSunSlotsOutput[2u * (base + chosen) + 1u] = slot;
+                hstrCloudSunFrames[base + chosen] = params.cloudResidencyFrame;
+                const HSTRCloudAsset asset = hstrCloudAssets[s.asset];
+                job.brick = b;
+                job.slot = slot;
+                job.asset = s.asset;
+                job.level = hstrCloudBricks[b].info & 15u;
+                job.origin = float3(uint3(s.coord & 1023u, (s.coord >> 10) & 1023u, s.coord >> 20) * 8u);
+                job.reach = sunReach(s.asset);
+                job.direction = hstrCloudSunDirections[sunClass].xyz;
+                job.cap = kCloudSunDepthOpaque / (kCloudSeaMinScale * asset.sourceVoxelWorld);
+                InterlockedAdd(hstrCloudSunCounters[2], 1u);
+            }
+        }
+        hstrCloudSunBakesOutput[entry] = job;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -4923,6 +5269,8 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
     if (local >= params.cloudCommitCount || any(dispatchThreadId.xy >= kCloudBrickEdge))
         return;
     const HSTRCloudSunBake job = gHSTRCloud.hstrCloudSunBakes[params.cloudCommitOffset + local];
+    if (job.slot == kCloudRefNone)
+        return; // A GPU-scheduled entry that found no slot (or no candidate).
     const uint3 texel = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudBrickEdge);
     const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[job.asset];
     const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
@@ -5139,4 +5487,47 @@ void solveLeaves(uint3 dispatchThreadId: SV_DispatchThreadID)
     const float omittedCorrectionError = max(0.f, gHSTRCloud.hstrLeafResidualBounds[leaf] - admittedError);
     for (uint outputDof = 0; outputDof < params.hstrTraceDofs; ++outputDof)
         gHSTRCloud.hstrRadiance[params.hstrTraceDofs * leaf + outputDof] = float4(outgoing[outputDof], omittedCorrectionError + omittedError);
+}
+
+// GPU sun bake scheduling (CloudResidencyDesc::gpuSun), in this order every frame; see HSTRCloudRenderer::scanSunBakes.
+[numthreads(64, 1, 1)]
+void releaseSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.releaseSunBakes(dispatchThreadId.x);
+}
+
+[numthreads(256, 1, 1)]
+void staleSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.staleSunBakes(dispatchThreadId.x);
+}
+
+[numthreads(256, 1, 1)]
+void scanSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.scanSunBakes(dispatchThreadId.x);
+}
+
+[numthreads(1, 1, 1)]
+void selectSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.selectSunBakes();
+}
+
+[numthreads(256, 1, 1)]
+void emitSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.emitSunBakes(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void evictSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.evictSunBakes(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void assignSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.assignSunBake(dispatchThreadId.x);
 }

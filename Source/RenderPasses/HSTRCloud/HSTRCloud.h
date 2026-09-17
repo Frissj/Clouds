@@ -147,6 +147,7 @@ private:
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
     float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).
     float mCloudCutTurn = 3.f;          ///< CloudView::cutTurn (degrees).
+    bool mCloudCutAsync = false;        ///< CloudView::cutAsync.
     bool mBeamShip = true;     ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
     /// The HSTR_SHIP groups folded when they do. MEASURED (4K, 2026-09-17, same frame everywhere): all of them (511) sped up the sea
     /// 7.25 -> 5.40 ms but slowed near 14.3 -> 19.5 and farside 11.4 -> 14.7 - a DXC codegen cliff no single group causes; every
@@ -187,6 +188,7 @@ private:
     std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.
     std::string mLoadReferencePath;    ///< When set, the reference sums are read from <path>_s<slice>.exr at the start of the frame.
     float3 mReferencePosition = float3(0.f);
+    uint32_t mReferenceBandRows = 0; ///< Rows per separately submitted band of a path-traced sample (0: the whole frame).
     float3 mReferenceDirection = float3(0.f);
     ref<Buffer> mpLeafRadiance;
     ref<Buffer> mpLeafBasisLeft;
@@ -258,6 +260,19 @@ private:
     uint32_t mCloudSunTilesPerFrame = 8; ///< Sea tiles whose sun pages are recomputed per frame after a sun change.
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
     ref<ComputePass> mpBakeCloudSunPass;
+    // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).
+    bool mCloudGpuSun = true;
+    ref<ComputePass> mpReleaseSunPass;
+    ref<ComputePass> mpScanSunPass;
+    ref<ComputePass> mpStaleSunPass;
+    ref<ComputePass> mpSelectSunPass;
+    ref<ComputePass> mpEmitSunPass;
+    ref<ComputePass> mpEvictSunPass;
+    ref<ComputePass> mpAssignSunPass;
+    ref<Buffer> mpSunReadback; ///< The bake count of a run, read back without waiting.
+    ref<Fence> mpSunFence;
+    uint64_t mSunReadbackPending = 0;
+    void dispatchSunScheduling(RenderContext* pRenderContext);
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.

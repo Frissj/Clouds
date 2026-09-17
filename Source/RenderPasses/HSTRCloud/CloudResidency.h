@@ -6,6 +6,8 @@
 #include "CloudPayloadPool.h"
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <unordered_map>
 
@@ -22,6 +24,7 @@ struct CloudResidencyDesc
     uint32_t payloadPoolMB = 128;  ///< GPU memory of the packed coefficients of resident pages.
     bool directStorage = true;     ///< Load page payloads with DirectStorage (GPU decompression where supported).
     uint32_t sunBakesPerFrame = 256; ///< Bricks whose sun depth bakeCloudSun bakes per frame.
+    bool gpuSun = false;             ///< Sun bakes are scheduled on the GPU (the scheduler passes of HSTRCloud.cs.slang).
 };
 
 /// What the residency cut is computed for.
@@ -45,6 +48,8 @@ struct CloudView
     /// payload fills. 20 units a frame: 43 -> 37 ms. HSTRCloud defaults to 8.
     float cutMargin = 0.f;
     float cutTurn = 3.f;
+    /// The cut's walk runs on a worker while frames keep the last cut, and is applied in the first frame after it returns.
+    bool cutAsync = false;
 };
 
 /// Virtual memory for cloud density. The cut through every nearby instance's brick pyramid is chosen by importance each frame:
@@ -106,6 +111,40 @@ public:
     const std::vector<CommitGroup>& getCommitGroups() const { return mCommitGroups; }
     uint32_t getAtlasShift() const { return 6; }
     const Stats& getStats() const { return mStats; }
+    /// Whether a cut is running on the worker (CloudView::cutAsync). The sea must not apply tile changes meanwhile: the walk reads them.
+    bool cutInFlight() const { return mCutJob.valid(); }
+    void waitForCut() const
+    {
+        if (mCutJob.valid())
+            mCutJob.wait();
+    }
+
+    /// What this frame's GPU sun scheduling (CloudResidencyDesc::gpuSun) runs with.
+    struct GpuSunFrame
+    {
+        bool run = false;
+        uint32_t frame = 0;
+        uint32_t releaseCount = 0;
+        uint32_t classCount = 0;
+        uint32_t bakeMax = 0;
+        uint32_t capacity = 0;
+    };
+    const GpuSunFrame& getGpuSunFrame() const { return mGpuSunFrame; }
+    /// Binds the scheduler's buffers for writing (and unbinds the camera's views of the same buffers).
+    void bindGpuSun(const ShaderVar& var) const;
+    /// The scheduler's buffers to clear before its scan.
+    ref<Buffer> getGpuSunCounters() const { return mpSunCounters; }
+    ref<Buffer> getGpuSunHistogram() const { return mpSunHistogram; }
+    /// Reads the scheduler's counts of the last frame into the stats (a GPU readback: for scripts, not the frame).
+    void readGpuSunStats();
+    /// The scheduler goes idle while its inputs stay as they were in a run that staged nothing. HSTRCloud reads that count back
+    /// asynchronously: it calls gpuSunQueued when it queues the read for this frame's run, and gpuSunRead when the count arrives.
+    void gpuSunQueued() { mGpuSunQueuedInputs = mGpuSunInputs; }
+    void gpuSunRead(uint32_t bakes)
+    {
+        mGpuSunIdleValid = bakes == 0;
+        mGpuSunIdle = mGpuSunQueuedInputs;
+    }
 
 private:
     static constexpr uint32_t kNone = 0xFFFFFFFF;
@@ -284,6 +323,34 @@ private:
     };
     SunScheduleInputs mSunScheduleIdle;
     bool mSunScheduleIdleValid = false;
+    // GPU sun bake scheduling (mDesc.gpuSun). The GPU owns mpSunSlotTable, the bake frames and the free slots; the CPU writes what
+    // the scheduler needs of each GPU brick, the change grids and the bricks whose bakes are freed.
+    void writeSunSched(uint64_t handle);
+    GpuSunFrame mGpuSunFrame;
+    SunScheduleInputs mGpuSunInputs;       ///< This frame's.
+    SunScheduleInputs mGpuSunQueuedInputs; ///< Those of the run whose bake count is being read back.
+    SunScheduleInputs mGpuSunIdle;
+    bool mGpuSunIdleValid = false;
+    std::vector<HSTRCloudSunSched> mSunSched; ///< Per GPU brick.
+    std::vector<uint8_t> mSunSchedBlocksDirty; ///< Per 4096 bricks.
+    std::vector<uint32_t> mSunRelease;         ///< GPU bricks unloaded since the last scheduling.
+    std::vector<uint32_t> mAssetChangeOffsets; ///< Per asset: its first cell in mpChangeFrames.
+    std::vector<uint8_t> mAssetChangeDirty;
+    std::vector<float4> mSunDirections;
+    ref<Buffer> mpSunSched;
+    ref<Buffer> mpSunFrames;
+    ref<Buffer> mpSunFree;
+    ref<Buffer> mpSunFreeTop;
+    ref<Buffer> mpSunCounters;
+    ref<Buffer> mpSunHistogram;
+    ref<Buffer> mpSunSelect;
+    ref<Buffer> mpSunNeeds;
+    ref<Buffer> mpSunCandidates;
+    ref<Buffer> mpSunHolders;
+    ref<Buffer> mpSunRelease;
+    ref<Buffer> mpSunDirections;
+    ref<Buffer> mpChangeFrames;
+    ref<Buffer> mpAssetChanges;
     ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
     ref<Buffer> mpStagingInfo;
     std::unique_ptr<CloudPayloadPool> mpPayload;
@@ -336,6 +403,21 @@ private:
     void cutChildren(const CutEntry& entry, std::vector<uint64_t>& children, std::vector<Request>& requests) const;
     /// Whether a brick has children to refine into (expanding a leaf does nothing, and most bricks are leaves).
     bool cutRefinable(uint64_t handle) const;
+    /// What a cut's walk found: every brick it visited with its priority and slot (parents first) and the page requests.
+    struct CutWalk
+    {
+        std::vector<CutVisit> visits;
+        std::vector<Request> requests;
+        uint32_t pops = 0;
+        double milliseconds = 0.0;
+    };
+    /// Records the view a cut is chosen for (the next cuts are measured against it).
+    void beginCut(const CloudSea& sea, const CloudView& view);
+    /// The cut's walk. It only reads the stores and bricks, and writes the per-slot visibility caches.
+    CutWalk walkCut(const CloudSea& sea, const CloudView& view);
+    /// The end of every update: sun bake scheduling, uploads and stats.
+    void finishFrame(const CloudSea& sea, const CloudView& view, std::chrono::steady_clock::time_point startTime);
+    std::future<CutWalk> mCutJob;
     std::vector<uint64_t> mDesired; ///< Bricks of the last cut, parents before children.
     float3 mCutPosition = float3(std::numeric_limits<float>::max());
     float4x4 mCutViewProjection;

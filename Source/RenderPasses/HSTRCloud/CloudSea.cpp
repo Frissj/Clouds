@@ -265,7 +265,7 @@ void CloudSea::worker()
     }
 }
 
-std::vector<uint32_t> CloudSea::update(float3 cameraPosition)
+std::vector<uint32_t> CloudSea::update(float3 cameraPosition, bool applyResults)
 {
     const int32_t n = int32_t(mDesc.tiles);
     const int2 cameraTile(
@@ -307,7 +307,8 @@ std::vector<uint32_t> CloudSea::update(float3 cameraPosition)
             );
             mJobs.insert(mJobs.end(), jobs.begin(), jobs.end());
         }
-        results.swap(mResults);
+        if (applyResults)
+            results.swap(mResults);
     }
     mWake.notify_all();
     for (Result& result : results)

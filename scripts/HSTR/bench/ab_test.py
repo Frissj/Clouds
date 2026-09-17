@@ -89,7 +89,7 @@ for name, position, target in views:
     s = stats()
     log(f"{name}: settled in {frames} frames; {s.get('sunBaked', 0)} sun bakes, {s.get('sunWaiting', 0)} waiting, {s.get('mapped', 0)} bricks mapped")
     for label, props in configs:
-        hstr.set_properties(dict(props, **BASE))
+        hstr.set_properties(dict(BASE, **props))  # The configuration decides what it sets (e.g. hstComponents) over the base.
         m.renderFrame()
         a = gpu_times()
         hstr.set_properties({"storeExact": True})

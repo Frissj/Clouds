@@ -27,6 +27,13 @@ g.addPass(createPass("HSTRCloud", {
     "worldCacheUpdates": 1,
     "worldCacheBakeInterval": 8,
     "sunNearVoxels": 2.0,
+    # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross
+    # ~5 of its voxels with one sample: against the 4K path tracer (farside, 8x8 blocks) 0.1265 log error, 0.0998 capped, 0.0996 at
+    # 1-voxel steps, which cost 60-78% more; the cap costs 3-8%.
+    "minStepVoxels": 2.0,
+    "maxStepVoxels": 1.0,
+    # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
+    "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
     # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
     # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:
