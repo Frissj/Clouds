@@ -24,6 +24,7 @@ parser.add_argument("sweep")
 parser.add_argument("--motions", nargs="*", help='"label forward yaw" per motion (motion harness)')
 parser.add_argument("--steps", type=int, default=6, help="compared steps per flight (motion harness)")
 parser.add_argument("--live", action="store_true", help="leave residency running (motion harness)")
+parser.add_argument("--views", default="sea", help="comma-separated views of ab_test.py: near, farside, sea (ab harness)")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
@@ -34,7 +35,7 @@ env = dict(os.environ, HSTR_TAG=args.tag, HSTR_BASE=json.dumps(REFERENCE), HSTR_
 for suffix in ("_test.txt", "_test.jsonl"):
     (RESULTS / f"{args.tag}{suffix}").unlink(missing_ok=True)
 if args.harness == "ab":
-    env.update(HSTR_VIEWS="sea", HSTR_CAPTURE="0", HSTR_INTERLEAVE="1", HSTR_CONFIGS='[["beam", {"hstComponents": 15}]]')
+    env.update(HSTR_VIEWS=args.views, HSTR_CAPTURE="0", HSTR_INTERLEAVE="1", HSTR_CONFIGS='[["beam", {"hstComponents": 15}]]')
     script = "scripts/HSTR/bench/ab_test.py"
 else:
     motions = [[m.split()[0].replace("_", " "), float(m.split()[1]), float(m.split()[2])] for m in args.motions] if args.motions else None

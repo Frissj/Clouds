@@ -14,15 +14,30 @@ import HSTRCloudTypes;
 #define HSTR_SUN_LIVE 1
 #endif
 
-/// 1 compiles the march's experimental switches to their shipping values (HSTRCloud::beamShipping says when that is exact): a
-/// cbuffer value cannot be folded, so every one of them otherwise stays a live branch in the beam programs.
+/// A mask of groups of the march's experimental switches compiled to their shipping values (HSTRCloud::beamShipping says when that
+/// is exact): a cbuffer value cannot be folded, so every one of them otherwise stays a live branch in the beam programs. The groups
+/// exist because folding them all slowed one view while speeding up another.
 #ifndef HSTR_SHIP
 #define HSTR_SHIP 0
 #endif
-#if HSTR_SHIP
-#define SHIP(name, value) (value)
-#else
+#define SHIP_BIT_cloudTransferClasses 1
+#define SHIP_BIT_cloudCostProbe 2
+#define SHIP_BIT_cloudEmptySkip 4
+#define SHIP_BIT_cloudSunCache 8
+#define SHIP_BIT_adaptiveMarch 16
+#define SHIP_BIT_cloudTrapezoid 32
+#define SHIP_BIT_cloudLocalStep 32
+#define SHIP_BIT_cloudSourceLinear 32
+#define SHIP_BIT_cloudStepFootprint 64
+#define SHIP_BIT_cloudTightReject 128
+#define SHIP_BIT_cloudQuadrature 128
+#define SHIP_BIT_cloudLongitudinalOracle 128
+#define SHIP_BIT_cloudOracleCentroid 128
+#define SHIP_BIT_cloudSunReuse 256
+#if HSTR_SHIP == 0
 #define SHIP(name, value) (params.name)
+#else
+#define SHIP(name, value) ((((HSTR_SHIP) & SHIP_BIT_##name) != 0) ? (value) : (params.name))
 #endif
 
 static const uint kMaxTraceDofs = 24;

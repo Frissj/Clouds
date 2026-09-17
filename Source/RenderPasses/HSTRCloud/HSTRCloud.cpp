@@ -143,6 +143,7 @@ const char kBeamCentreless[] = "beamCentreless";
 const char kBeamGridDispatch[] = "beamGridDispatch";
 const char kBeamRefresh[] = "beamRefresh";
 const char kBeamShip[] = "beamShip";
+const char kBeamShipMask[] = "beamShipMask";
 const char kBeamQueue[] = "beamQueue";
 const char kBeamQueueSteps[] = "beamQueueSteps";
 const char kCloudResidencyFrozen[] = "cloudResidencyFrozen";
@@ -310,6 +311,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == kBeamShip)
         {
             mBeamShip = value;
+            continue;
+        }
+        if (key == kBeamShipMask)
+        {
+            mBeamShipMask = uint32_t(value);
             continue;
         }
         if (key == kBeamParallax)
@@ -867,6 +873,7 @@ Properties HSTRCloud::getProperties() const
     props[kBeamRefresh] = mBeamRefresh;
     props[kBeamDepthTolerance] = mParams.beamDepthTolerance;
     props[kBeamShip] = mBeamShip;
+    props[kBeamShipMask] = mBeamShipMask;
     props[kBeamQueue] = mBeamQueue;
     props[kBeamQueueSteps] = mParams.beamQueueSteps;
     props[kCloudResidencyFrozen] = mCloudResidencyFrozen;
@@ -3283,7 +3290,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // dispatched: setting it with the march pass below left a frame's queries compiled against the previous value of
         // cloudSunLiveMarch whenever it changed.
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -3352,7 +3359,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // The corner grid, then the centre grid, each as a 2D dispatch at the lattice spacing. With the queue these
                             // only carry and queue; the queued points are marched below, one list of similar cost per dispatch.
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                             for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
@@ -3367,7 +3374,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             {
                                 writeBeamQueueArgs(pRenderContext, 1);
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
@@ -3433,7 +3440,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const bool queued = mParams.beamQueue != 0 && !mBeamGridDispatch;
         const ref<ComputePass>& pMarch = queued ? mpBeamQueuePixelPass : (mBeamGridDispatch ? mpBeamGridMarchPass : mpBeamMarchPass);
         pMarch->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        pMarch->getProgram()->addDefine("HSTR_SHIP", beamShipping() ? "1" : "0");
+        pMarch->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
         auto bindMarch = [&]()
         {
             bindRenderer(pRenderContext, pMarch);

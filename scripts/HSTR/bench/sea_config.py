@@ -22,9 +22,9 @@ BEAM = {
     "cloudLocalStep": False, "cloudTrapezoid": False, "cloudSlabClamp": True, "beamSegments": 1,
     "beamEdgeContrast": 0.5, "beamGuide": 0, "beamOracle": 0, "beamOracleBar": 0.02, "beamCentreless": False,
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 0,
-    "beamDepthTolerance": 0.05, "beamShip": False, "beamRefreshDebug": 0, "beamParallax": 0.0,
+    "beamDepthTolerance": 0.05, "beamShip": True, "beamRefreshDebug": 0, "beamParallax": 0.0,
     "beamCarryTolerance": 0.0, "beamRefreshBlock": 1, "beamRefreshCentres": 0,
-    "cloudCutMargin": 8.0,
+    "cloudCutMargin": 8.0, "beamShipMask": 509,
 }
 
 

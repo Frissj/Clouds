@@ -147,7 +147,12 @@ private:
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
     float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).
     float mCloudCutTurn = 3.f;          ///< CloudView::cutTurn (degrees).
-    bool mBeamShip = false;    ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
+    bool mBeamShip = true;     ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
+    /// The HSTR_SHIP groups folded when they do. MEASURED (4K, 2026-09-17, same frame everywhere): all of them (511) sped up the sea
+    /// 7.25 -> 5.40 ms but slowed near 14.3 -> 19.5 and farside 11.4 -> 14.7 - a DXC codegen cliff no single group causes; every
+    /// group but the cost probe (509) is faster everywhere: near 12.5, farside 9.9, sea 5.5, flying 2 units 7.9 -> 5.8, 20 units
+    /// 10.0 -> 8.0.
+    uint32_t mBeamShipMask = 509;
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
     bool mBeamRefreshValid = false;
