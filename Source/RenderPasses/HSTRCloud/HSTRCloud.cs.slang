@@ -3885,12 +3885,15 @@ struct HSTRCloudRenderer
         const uint2 position = point * s + (centre ? s / 2 : 0u);
         float4 depthCache;
         float4 single;
-        if (!beamRefreshes(point) && beamReprojectQuery(position, depthCache, single))
+        if (!beamRefreshes(point, centre) && beamReprojectQuery(position, depthCache, single))
         {
             // The carried value keeps the cost last measured here, so the prediction survives until the point is marched again.
-            writeBeamQuery(position, depthCache, single, params.beamHistoryValid != 0 ? beamLatticePrevAt(position, 2).x : 0.f);
+            const float carriedSteps = params.beamHistoryValid != 0 ? beamLatticePrevAt(position, 2).x : 0.f;
+            writeBeamQuery(position, depthCache, single, carriedSteps);
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, unused);
+            if (params.beamRefreshDebug == 7)
+                InterlockedAdd(hstrBeamCounts[kBeamMaxLevels + 2], uint(carriedSteps), unused);
             return;
         }
         if (params.beamQueue != 0)
@@ -3900,6 +3903,11 @@ struct HSTRCloudRenderer
         }
         const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+        if (params.beamRefreshDebug == 7)
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamMaxLevels + 1], uint(q.steps), unused);
+        }
     }
 
     void marchBeamAt(uint2 pixel)
@@ -3926,11 +3934,12 @@ struct HSTRCloudRenderer
     // Beam refresh (beamRefresh): the lattice and the marched pixels are carried from the previous build where they reproject.
 
     /// Whether grid cell p (a root lattice point, or a finest tile) is marched this build: one cell of an n x n pattern per build.
-    bool beamRefreshes(uint2 p)
+    bool beamRefreshes(uint2 p, bool centre = false)
     {
         if (params.beamRefresh == 0 || params.beamHistoryValid == 0)
             return true;
-        const uint n = params.beamRefresh;
+        const uint n = centre && params.beamRefreshCentres != 0 ? params.beamRefreshCentres : params.beamRefresh;
+        p /= max(params.beamRefreshBlock, 1u);
         // For 2 x 2, cells 0, 3, 1, 2 (packed as nibbles), so that consecutive builds alternate across the diagonal.
         const uint cell = n == 2 ? (0x2130u >> (4u * (params.beamFrame % 4u))) & 0xFu : params.beamFrame % (n * n);
         return (p.x % n) + n * (p.y % n) == cell;
@@ -4048,9 +4057,10 @@ struct HSTRCloudRenderer
         single = 0.f;
         const float3 w = cameraRayDirection(float2(position));
         const float3 camera = gScene.camera.data.posW;
-        float d = beamLatticePrevAt(position, 1).a;
-        if (d > 0.f)
-            d = beamCurrentDistance(d, w);
+        const float stored = beamLatticePrevAt(position, 1).a;
+        float d;
+        if (stored > 0.f)
+            d = beamCurrentDistance(stored, w);
         else
         {
             CutRay ray;
@@ -4061,23 +4071,28 @@ struct HSTRCloudRenderer
         float2 q;
         if (!beamPreviousPosition(camera + w * d, q))
             return false;
-        if (params.beamRefreshDebug != 0 && beamLatticePrevAt(position, 1).a > 0.f && length(q - float2(position)) < 0.5f)
+        if (params.beamRefreshDebug == 1 && stored > 0.f && length(q - float2(position)) < 0.5f)
         {
             uint unused;
             InterlockedAdd(hstrBeamCounts[2], 1u, unused);
         }
-        beamPreviousLattice(q, 0.f, false, depthCache, single);
         if (params.beamRefreshDebug == 2 || params.beamRefreshDebug == 3)
-            return true;
-        // Empty there: the point is expected empty at the same place.
-        float previous = 0.f;
-        if (single.a > 0.f)
         {
-            d = beamCurrentDistance(single.a, w);
-            if (!beamPreviousPosition(camera + w * d, q))
-                return false;
-            previous = beamPreviousDistance(d, w);
+            beamPreviousLattice(q, 0.f, false, depthCache, single);
+            return true;
         }
+        // Onto itself (a camera that did not move): the previous value is this point's own, with nothing resampled to check.
+        if (all(abs(q - float2(position)) < 0.01f))
+        {
+            depthCache = beamLatticePrevAt(position, 0);
+            single = beamLatticePrevAt(position, 1);
+            single.a = stored > 0.f ? d : 0.f;
+            return true;
+        }
+        // One checked reconstruction where the point's own distance lands (an empty point: where the middle of the medium does, and
+        // everything it weighs must be empty too). Every sample it weighs must agree with that distance, so re-centring on the
+        // interpolated distance, as a second reconstruction, moved it by less than the depth tolerance - at twice the fetches.
+        const float previous = stored > 0.f ? stored : 0.f;
         if (!beamPreviousLattice(q, previous, true, depthCache, single) || !beamParallaxAllows(d, w))
             return false;
         single.a = single.a > 0.f ? beamCurrentDistance(single.a, w) : 0.f;
@@ -4109,6 +4124,14 @@ struct HSTRCloudRenderer
             float2 q;
             if (d <= 0.f || !beamPreviousPosition(camera + w * d, q))
                 return false;
+            // Onto itself: this pixel's own previous march, if it had one that saw something.
+            if (i == 0 && all(abs(q - float2(pixel) - 0.5f) < 0.01f))
+            {
+                if (hstrBeamLevelPrev[pixel / finest] < params.beamLevels || hstrBeamPixelPrev[pixel].a <= 0.f)
+                    return false;
+                value = float4(hstrBeamPixelPrev[pixel].rgb, d);
+                return true;
+            }
             const float2 texel = q - 0.5f;
             const int2 base = int2(floor(texel));
             const float2 g = texel - float2(base);

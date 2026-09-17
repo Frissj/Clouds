@@ -146,10 +146,14 @@ const char kBeamShip[] = "beamShip";
 const char kBeamQueue[] = "beamQueue";
 const char kBeamQueueSteps[] = "beamQueueSteps";
 const char kCloudResidencyFrozen[] = "cloudResidencyFrozen";
+const char kCloudCutMargin[] = "cloudCutMargin";
+const char kCloudCutTurn[] = "cloudCutTurn";
 const char kBeamRefreshDebug[] = "beamRefreshDebug";
 const char kBeamParallax[] = "beamParallax";
 const char kBeamCarryTolerance[] = "beamCarryTolerance";
 const char kBeamDepthTolerance[] = "beamDepthTolerance";
+const char kBeamRefreshBlock[] = "beamRefreshBlock";
+const char kBeamRefreshCentres[] = "beamRefreshCentres";
 const char kStoreExact[] = "storeExact";
 const char kCompareExact[] = "compareExact";
 const char kBeamMarchedFraction[] = "beamMarchedFraction";
@@ -318,9 +322,29 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamCarryTolerance = value;
             continue;
         }
+        if (key == kBeamRefreshBlock)
+        {
+            mParams.beamRefreshBlock = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == kBeamRefreshCentres)
+        {
+            mParams.beamRefreshCentres = uint32_t(value);
+            continue;
+        }
         if (key == kBeamRefreshDebug)
         {
             mParams.beamRefreshDebug = uint32_t(value);
+            continue;
+        }
+        if (key == kCloudCutMargin)
+        {
+            mCloudCutMargin = value;
+            continue;
+        }
+        if (key == kCloudCutTurn)
+        {
+            mCloudCutTurn = value;
             continue;
         }
         if (key == kCloudResidencyFrozen)
@@ -807,6 +831,8 @@ Properties HSTRCloud::getProperties() const
         cloud["cutPops"] = stats.cutPops;
         cloud["cutOrdered"] = stats.cutOrdered;
         cloud["cutTotalMs"] = stats.cutTotalMs;
+        cloud["cutMargin"] = stats.cutMargin;
+        cloud["cuts"] = stats.cuts;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
@@ -821,6 +847,11 @@ Properties HSTRCloud::getProperties() const
             cloud["beamCarriedPoints"] = mBeamLevelCounts[kBeamMaxLevels - 1];
             cloud["beamCarriedPixels"] = mBeamLevelCounts[kBeamMaxLevels];
             cloud["beamRefreshDebugCount"] = mBeamLevelCounts[2];
+            if (mParams.beamRefreshDebug == 7)
+            {
+                cloud["beamMarchedSteps"] = mBeamLevelCounts[kBeamMaxLevels + 1];
+                cloud["beamCarriedSteps"] = mBeamLevelCounts[kBeamMaxLevels + 2];
+            }
         }
         props[kCloudStats] = cloud;
     }
@@ -839,9 +870,13 @@ Properties HSTRCloud::getProperties() const
     props[kBeamQueue] = mBeamQueue;
     props[kBeamQueueSteps] = mParams.beamQueueSteps;
     props[kCloudResidencyFrozen] = mCloudResidencyFrozen;
+    props[kCloudCutMargin] = mCloudCutMargin;
+    props[kCloudCutTurn] = mCloudCutTurn;
     props[kBeamRefreshDebug] = mParams.beamRefreshDebug;
     props[kBeamParallax] = mParams.beamParallax;
     props[kBeamCarryTolerance] = mParams.beamCarryTolerance;
+    props[kBeamRefreshBlock] = mParams.beamRefreshBlock;
+    props[kBeamRefreshCentres] = mParams.beamRefreshCentres;
     props[kStoreExact] = mStoreExact;
     props[kCompareExact] = mParams.compareExact != 0;
     props[kBeamMarchedFraction] = mBeamMarchedFraction;
@@ -1792,6 +1827,8 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.sunBakeDirection = mCloudSunBakeInputs.xyz();
     view.densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
     view.maxDistance = mParams.seaViewDistance;
+    view.cutMargin = mCloudCutMargin;
+    view.cutTurn = mCloudCutTurn;
     bool densityChanged = false;
     // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
     // 100 ms a frame on the sea - and while the GPU waits it drops to a lower power state, so its moving-camera timings measured
@@ -3147,7 +3184,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
             if (!mpBeamCounts[i])
                 mpBeamCounts[i] =
-                    mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamMaxLevels + 1, flags, MemoryType::DeviceLocal, nullptr, false);
+                    mpDevice->createStructuredBuffer(sizeof(uint32_t), kBeamCountSlots, flags, MemoryType::DeviceLocal, nullptr, false);
             if (!mpBeamHistory[i] || mpBeamHistory[i]->getWidth() != levelDims.x || mpBeamHistory[i]->getHeight() != levelDims.y)
             {
                 mpBeamHistory[i] = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
@@ -3475,7 +3512,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const uint32_t finest = mParams.beamTileSize >> (mParams.beamLevels - 1);
             const uint32_t marchedTiles = mpBeamCounts[mBeamParity]->getElement<uint32_t>(mParams.beamLevels);
             mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
-            for (uint32_t level = 0; level <= kBeamMaxLevels; ++level)
+            for (uint32_t level = 0; level < kBeamCountSlots; ++level)
                 mBeamLevelCounts[level] = mpBeamCounts[mBeamParity]->getElement<uint32_t>(level);
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);

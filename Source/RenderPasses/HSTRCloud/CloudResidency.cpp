@@ -442,8 +442,9 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
     const float3 lo = tileCorner + (min(p0, p1) + 0.5f) * voxel;
     const float3 hi = tileCorner + (max(p0, p1) + 0.5f) * voxel;
 
+    // Within the motion envelope the camera may come closer by its margin, and see the brick from anywhere in it.
     const float3 nearest = clamp(view.position, lo, hi);
-    const float distance = math::length(nearest - view.position);
+    const float distance = std::max(math::length(nearest - view.position) - mCutMarginWorld, 0.f);
     if (distance > view.maxDistance)
         return -1.f;
     const float voxelWorld = scale * instance.sourceVoxelWorld;
@@ -458,7 +459,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
     // The most visible of the brick's nearest point and corners counts: a silhouette brick's nearest point is often behind the
     // cloud's surface while its outer part is seen against the sky, and left coarse it rendered as spikes of clipped coarse density.
     const float3 sweep = view.sunDirection * view.sunReach;
-    const bool inside = inFrustum(view, min(lo, lo + sweep), max(hi, hi + sweep));
+    const bool inside = inFrustum(view, min(lo, lo + sweep) - mCutMarginWorld, max(hi, hi + sweep) + mCutMarginWorld);
     if (inside && level >= 3)
     {
         const uint32_t generation = storeOf(handle).generation;
@@ -489,7 +490,7 @@ bool CloudResidency::cutSeed(const CloudSea& sea, const CloudView& view, uint32_
     if (!tile.occupied || mAssets[tile.instance.asset].top == kNoHandle)
         return false;
     // Instances whose proxy already projects below the pixel threshold need no fine bricks.
-    const float distance = math::length(clamp(view.position, tile.worldMin, tile.worldMax) - view.position);
+    const float distance = std::max(math::length(clamp(view.position, tile.worldMin, tile.worldMax) - view.position) - mCutMarginWorld, 0.f);
     const float proxyPixels = sea.getVoxelWorld() / (std::max(distance, 1e-3f) * view.pixelAngle);
     if (std::log2(proxyPixels / mDesc.lodPixels) - view.lodBias <= 0.f || distance > view.maxDistance)
         return false;
@@ -671,18 +672,23 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     // A move under a quarter voxel or a turn under a quarter degree changes no brick's level or frustum membership that the guard band
     // and the 30-frame refresh below do not cover; re-cutting for it cost the whole cut (~100 ms on the sea) on every frame of a slow
     // camera.
+    // With a motion envelope (view.cutMargin) the last cut holds until the camera leaves it or turns by cutTurn, which the frustum's
+    // guard band covers, and arrivals re-cut every fourth frame at most.
+    const bool envelope = view.cutMargin > 0.f;
+    const float turnLimit = envelope ? view.cutTurn : 0.25f;
     auto rowAngleChanged = [&](uint32_t row)
     {
         const float3 a = view.viewProjection.getRow(row).xyz();
         const float3 c = mCutViewProjection.getRow(row).xyz();
         const float la = length(a);
         const float lc = length(c);
-        return la <= 0.f || lc <= 0.f || dot(a, c) < std::cos(math::radians(0.25f)) * la * lc || std::abs(la - lc) > 1e-3f * lc;
+        return la <= 0.f || lc <= 0.f || dot(a, c) < std::cos(math::radians(turnLimit)) * la * lc || std::abs(la - lc) > 1e-3f * lc;
     };
     const float3 moved = view.position - mCutPosition;
-    const float moveLimit = 0.25f * sea.getVoxelWorld();
+    const float moveLimit = std::max(0.25f * sea.getVoxelWorld(), envelope ? mCutMarginWorld : 0.f);
     const bool viewChanged = dot(moved, moved) > moveLimit * moveLimit || rowAngleChanged(0) || rowAngleChanged(1) || rowAngleChanged(3);
-    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || mCutCommits > 0 || mFrame >= mCutFrame + 30;
+    const bool arrivals = mCutCommits > 0 && (!envelope || mFrame >= mCutFrame + 4);
+    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || arrivals || mFrame >= mCutFrame + 30;
     std::vector<uint64_t> desired;
     std::vector<Request> requests;
     const uint32_t budget = uint32_t(0.9f * float(mBricks.size()));
@@ -723,6 +729,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mCutPosition = view.position;
         mCutViewProjection = view.viewProjection;
         mCutFrame = mFrame;
+        mCutMarginWorld = view.cutMargin * mCutMarginScale * sea.getVoxelWorld();
         mVisibility.resize(tiles.size());
         const uint32_t tasks = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
         // Two phases, because the work is not spread over the instances: the one or two nearest hold most of the fine bricks. The
@@ -808,6 +815,15 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                 pops += task.pops;
             }
         ordered = bricksDesired > budget;
+        // An envelope that does not fit is dropped rather than rationed - the budget goes to the current view - and the next ones are
+        // halved until they fit; one that leaves a third of the budget free grows back.
+        if (ordered && mCutMarginWorld > 0.f)
+        {
+            mCutMarginWorld = 0.f;
+            mCutMarginScale = mCutMarginScale > 0.125f ? 0.5f * mCutMarginScale : 0.f;
+        }
+        else if (envelope && bricksDesired < 2 * budget / 3)
+            mCutMarginScale = std::min(1.f, std::max(2.f * mCutMarginScale, 0.125f));
     }
     if (ordered)
     {
@@ -858,6 +874,8 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     {
         mStats.cutPops = pops;
         mStats.cutOrdered = ordered;
+        mStats.cutMargin = mCutMarginWorld / sea.getVoxelWorld();
+        ++mStats.cuts;
         mStats.cutTotalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cutStart).count();
     }
     cutScope.reset();
@@ -1491,6 +1509,15 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     const size_t chunkCount = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
     const size_t chunkSize = (mMappedList.size() + chunkCount - 1) / std::max<size_t>(chunkCount, 1);
     std::vector<Chunk> chunks(chunkCount);
+    auto parallel = [&](const std::function<void(size_t)>& body)
+    {
+        std::vector<std::future<void>> workers;
+        for (size_t index = 1; index < chunkCount; ++index)
+            workers.push_back(std::async(std::launch::async, body, index));
+        body(0);
+        for (auto& worker : workers)
+            worker.get();
+    };
     auto scan = [&](size_t index)
     {
         Chunk& chunk = chunks[index];
@@ -1547,14 +1574,12 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
                 }
         }
     };
+    auto* pRenderContext = mpDevice->getRenderContext();
     {
-        std::vector<std::future<void>> workers;
-        for (size_t index = 1; index < chunkCount; ++index)
-            workers.push_back(std::async(std::launch::async, scan, index));
-        scan(0);
-        for (auto& worker : workers)
-            worker.get();
+        FALCOR_PROFILE(pRenderContext, "scan");
+        parallel(scan);
     }
+    FALCOR_PROFILE(pRenderContext, "assign");
     mStats.sunBaked = 0;
     mStats.sunWaiting = 0;
     for (const Chunk& chunk : chunks)
@@ -1581,35 +1606,52 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     if (considered > 0 && mFreeSunSlots.size() < std::min(considered, size_t(mDesc.sunBakesPerFrame)))
     {
         // Only the least important sunBakesPerFrame holders can be handed over, and only to a candidate more important than they
-        // are: a bounded max-heap keeps those, where this used to collect every held pair (~800k on a moving sea) and sort them.
+        // are: a bounded max-heap keeps those, where this used to collect every held pair (~800k on a moving sea) and sort them. One
+        // heap per chunk of the mapped list, in parallel (the pool is full on a moving sea, so this ran every frame), then merged.
         const size_t needed = mDesc.sunBakesPerFrame;
         const float best = candidates.front().priority;
         auto lower = [](const Holder& a, const Holder& c) { return a.priority < c.priority; };
-        holders.reserve(needed);
-        for (uint64_t handle : mMappedList)
+        std::vector<std::vector<Holder>> heaps(chunkCount);
+        auto collect = [&](size_t index)
         {
-            const Brick& b = brick(handle);
-            const bool inCut = b.desiredFrame == mCutId;
-            for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
+            std::vector<Holder>& heap = heaps[index];
+            heap.reserve(needed);
+            const size_t first = index * chunkSize;
+            const size_t last = std::min(mMappedList.size(), first + chunkSize);
+            for (size_t i = first; i < last; ++i)
             {
-                const uint32_t pair = b.gpu * kCloudSunBakesPerBrick + k;
-                if (mSunSlotTable[pair * 2 + 1] == kCloudRefNone)
-                    continue;
-                const uint32_t key = mSunSlotTable[pair * 2];
-                const bool wanted = inCut && key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u)));
-                const float priority = wanted ? b.priority : (inCut ? -1.f : -2.f);
-                if (priority >= best || (holders.size() == needed && priority >= holders.front().priority))
-                    continue;
-                if (holders.size() == needed)
+                const Brick& b = brick(mMappedList[i]);
+                const bool inCut = b.desiredFrame == mCutId;
+                for (uint32_t k = 0; k < kCloudSunBakesPerBrick; ++k)
                 {
-                    std::pop_heap(holders.begin(), holders.end(), lower);
-                    holders.pop_back();
+                    const uint32_t pair = b.gpu * kCloudSunBakesPerBrick + k;
+                    if (mSunSlotTable[pair * 2 + 1] == kCloudRefNone)
+                        continue;
+                    const uint32_t key = mSunSlotTable[pair * 2];
+                    const bool wanted =
+                        inCut && key != kCloudRefNone && (key >> 4) == view.sunGeneration && (b.sunClasses & (1u << (key & 15u)));
+                    const float priority = wanted ? b.priority : (inCut ? -1.f : -2.f);
+                    if (priority >= best || (heap.size() == needed && priority >= heap.front().priority))
+                        continue;
+                    if (heap.size() == needed)
+                    {
+                        std::pop_heap(heap.begin(), heap.end(), lower);
+                        heap.pop_back();
+                    }
+                    heap.push_back({priority, pair});
+                    std::push_heap(heap.begin(), heap.end(), lower);
                 }
-                holders.push_back({priority, pair});
-                std::push_heap(holders.begin(), holders.end(), lower);
             }
+        };
+        {
+            FALCOR_PROFILE(pRenderContext, "holders");
+            parallel(collect);
         }
-        std::sort(holders.begin(), holders.end(), lower);
+        for (const std::vector<Holder>& heap : heaps)
+            holders.insert(holders.end(), heap.begin(), heap.end());
+        const size_t kept = std::min(holders.size(), needed);
+        std::partial_sort(holders.begin(), holders.begin() + kept, holders.end(), lower);
+        holders.resize(kept);
     }
     for (size_t c = 0; c < considered && mSunBakes.size() < mDesc.sunBakesPerFrame; ++c)
     {

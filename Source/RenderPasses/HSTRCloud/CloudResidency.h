@@ -38,6 +38,13 @@ struct CloudView
     float3 sunBakeDirection = float3(0.f, 1.f, 0.f); ///< Sun direction of that generation's bakes (the sun within cloudSunBakeAngle).
     float densityScale = 1.f; ///< Extinction per unit of stored density.
     float maxDistance = 1e9f; ///< Nothing beyond is rendered.
+    /// Motion envelope (0: off): the cut is chosen for any camera within this many voxels of the position it was cut at, and is not
+    /// redone until the camera leaves that envelope or turns by more than cutTurn degrees. It trades atlas slots for cut time.
+    /// MEASURED (sea, live residency, 2026-09-17): flying 2 units a frame, 48 cuts in 48 frames -> 7 at 4 or 8 voxels (residency
+    /// 29.9 -> 18.6 / 19.7 ms, 2-4% more bricks); at 16 the extra bricks' sun bakes cost more than the cuts saved, at 64+ the atlas
+    /// payload fills. 20 units a frame: 43 -> 37 ms. HSTRCloud defaults to 8.
+    float cutMargin = 0.f;
+    float cutTurn = 3.f;
 };
 
 /// Virtual memory for cloud density. The cut through every nearby instance's brick pyramid is chosen by importance each frame:
@@ -71,6 +78,8 @@ public:
         uint32_t cutPops = 0;      ///< Bricks refined.
         bool cutOrdered = false;   ///< Whether the atlas budget bound, forcing the priority-ordered cut.
         double cutTotalMs = 0.0;
+        float cutMargin = 0.f; ///< The motion envelope of the last cut, in voxels.
+        uint32_t cuts = 0;     ///< Cuts run so far.
     };
 
     /// Staged bricks of one level: one commit dispatch each, coarsest first, so parents are in the atlas before their children.
@@ -331,6 +340,8 @@ private:
     float3 mCutPosition = float3(std::numeric_limits<float>::max());
     float4x4 mCutViewProjection;
     uint32_t mCutCommits = 0; ///< Bricks committed or pages arrived since the last cut.
+    float mCutMarginWorld = 0.f; ///< The motion envelope the running (or last) cut is chosen for, in world units.
+    float mCutMarginScale = 1.f; ///< Share of CloudView::cutMargin that fitted the atlas budget lately.
     Stats mStats;
     bool mWarnedNodes = false;
 };

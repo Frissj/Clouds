@@ -145,6 +145,8 @@ private:
     /// Fills the queue's dispatch arguments for entries of threadsPerEntry threads.
     void writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry);
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
+    float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).
+    float mCloudCutTurn = 3.f;          ///< CloudView::cutTurn (degrees).
     bool mBeamShip = false;    ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
@@ -174,7 +176,7 @@ private:
     ref<Buffer> mpTransferProbe;       ///< Entry-cell masks per (asset brick, direction class) and two counters (cloudTransferClasses).
     uint32_t mTransferCrossings = 0;   ///< Brick crossings the last probed frame marched.
     uint32_t mTransferEntries = 0;     ///< Distinct entries a transfer cache would have had to produce for them.
-    uint32_t mBeamLevelCounts[kBeamMaxLevels + 1] = {}; ///< Tiles entering each level, read with the comparison; the last is the
+    uint32_t mBeamLevelCounts[kBeamCountSlots] = {};    ///< Tiles entering each level, read with the comparison; the last is the
                                                         ///< per-pixel march list. Eight queries per entry, so these are what the
                                                         ///< query pass costs.
     std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.

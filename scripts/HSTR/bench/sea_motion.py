@@ -60,6 +60,7 @@ def timed(frames, first, forward, yaw):
     import time
     m.profiler.enabled = True
     m.profiler.start_capture()
+    cuts = stats().get("cuts", 0)
     wall = time.perf_counter()
     for i in range(frames):
         pose(first + i, forward, yaw)
@@ -74,7 +75,8 @@ def timed(frames, first, forward, yaw):
                 for name, lane in capture["events"].items() if name.endswith("cpu_time") and "cloudSea" in name}
     s = stats()
     t["residency"] = {k: s.get(k, 0) for k in ("loaded", "mapped", "desired", "pending", "cutMs", "sunWaiting", "sunBakesFrame", "cutPops",
-                                               "cutOrdered", "cutTotalMs")}
+                                               "cutOrdered", "cutTotalMs", "cutMargin")}
+    t["residency"]["cuts"] = s.get("cuts", 0) - cuts  # Cuts run during the timed frames.
     return t
 
 
@@ -109,7 +111,8 @@ for motion, forward, yaw in MOTIONS:
             errors.append({"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]),
                            "max": float(p["referenceLogMax"]), "marched": float(p["beamMarchedFraction"]),
                            "carriedPoints": int(s.get("beamCarriedPoints", 0)), "carriedPixels": int(s.get("beamCarriedPixels", 0)),
-                           "marchTiles": int(s.get("beamMarchTiles", 0)), "debug": int(s.get("beamRefreshDebugCount", 0))})
+                           "marchTiles": int(s.get("beamMarchTiles", 0)), "debug": int(s.get("beamRefreshDebugCount", 0)),
+                           "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0))})
         mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0]}
         worst = max(e["over02"] for e in errors)
         with open(f"{OUT}/{TAG}_test.jsonl", "a") as f:
@@ -117,6 +120,6 @@ for motion, forward, yaw in MOTIONS:
         parts = " ".join(f"{k} {v:.2f}" for k, v in t.items() if k not in ("HSTRCloud", "residency", "cpu") and v >= 0.3)
         parts += " " + json.dumps(t["residency"]) + " cpu " + json.dumps({k: v for k, v in t["cpu"].items() if v >= 0.2})
         log(f"{motion:7s} {test:16s} {t.get('HSTRCloud', 0):6.2f} ms ({parts}); marched {100 * mean['marched']:4.1f}%; "
-            f"carried {mean['carriedPoints']:.0f} points {mean['carriedPixels']:.0f} pixels (debug {mean['debug']:.0f}); "
+            f"carried {mean['carriedPoints']:.0f} points {mean['carriedPixels']:.0f} pixels (debug {mean['debug']:.0f}, steps marched {mean['marchedSteps']:.0f} carried {mean['carriedSteps']:.0f}); "
             f">0.02 mean {100 * mean['over02']:.3f}% worst {100 * worst:.3f}%, p99.9 {mean['p999']:.2e}, max {max(e['max'] for e in errors):.2e}")
 exit()

@@ -17,6 +17,8 @@ static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: uni
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
+/// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
+static const uint kBeamCountSlots = kBeamMaxLevels + 3;
 static const uint kBeamQueueBuckets = 4;   ///< Lists of queued root queries by predicted cost (beamQueue).
 static const uint kCompareBins = 64;       ///< Exact comparison histogram entries per row: log error bins, then the maximum.
 static const float kCompareBinFloor = 1e-4f; ///< Upper edge of the first log error bin; 4 bins per octave above.
@@ -837,7 +839,16 @@ struct HSTRCloudParams
     uint beamQueueCapacity = 0;  ///< Set per build: entries per list.
     float beamQueueSteps = 12.f; ///< Steps per bucket of the predicted cost.
     uint beamQueueThreads = 1;   ///< Set per use: threads per queued entry (1 for root queries, the finest tile's pixels for tiles).
-    uint padHSTRCloud19 = 0;
+    /// beamRefresh: cells of the refresh pattern are blocks of this many lattice points (or finest tiles) a side, so a carried block
+    /// runs no march at all instead of sharing its batches with the marched quarter.
+    /// MEASURED (sea, 4K, r4, 2026-09-17): batching was not the loss - the carried points hold 77% of the steps (debug 7) but the
+    /// carry itself cost ~2.6 ns a point against ~4 ns a march. Blocks of 4: parked 3.24 -> 2.95 ms at the same error, but flying
+    /// 2 units a frame the error rises 0.152 -> 0.185%, and 8 is no better.
+    uint beamRefreshBlock = 1;
+    /// beamRefresh: the pattern size for tile centres (0: beamRefresh). The centres only feed the bubble term and the tile tests.
+    /// MEASURED (before the carry fast path): r4 with centres at 8 carries 2% more points, 4.03 -> 3.93 ms parked and nothing flying.
+    uint beamRefreshCentres = 0;
+    uint padHSTRCloud20 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
