@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "Utils/HostDeviceShared.slangh"
 
 BEGIN_NAMESPACE_FALCOR
@@ -82,8 +82,22 @@ struct HSTRCloudBrick
     float fade;  ///< Blend weight against the parent while the brick streams in or out.
     float minValue;
     float range; ///< density = minValue + range * t^2 for the stored unorm t.
-    uint padBrick0;
-    uint padBrick1;
+    /// A running fade (kCloudFadeIn or kCloudFadeOut set, the frame it started below them) is advanced on the GPU
+    /// (advanceCloudFades): fade = saturate(fadeBase +- (frame - start) / fadeFrames). The CPU writes a brick only when its fade
+    /// starts, turns or ends.
+    uint fadeStart;
+    float fadeBase;
+};
+static const uint kCloudFadeIn = 0x80000000;
+static const uint kCloudFadeOut = 0x40000000;
+static const uint kCloudFadeFrameMask = 0x3fffffff;
+/// What advanceCloudFades evaluates fades with.
+struct HSTRCloudFadeFrame
+{
+    uint frame;      ///< CloudResidency's frame counter (kCloudFadeFrameMask bits).
+    uint brickCount;
+    float step;      ///< 1 / fadeFrames.
+    uint padFade;
 };
 
 /// hstrCloudOccupancy words per brick: a 4-bit density bound per 2-voxel cell (cloudCellCode) in words 0-7, then the bound of each of
@@ -105,20 +119,90 @@ struct HSTRCloudSunBake
     float cap;        ///< Source-length optical depth past which the march stops (opaque for every instance scale).
 };
 
-/// GPU sun bake scheduling (CloudResidencyDesc::gpuSun): what the scheduler needs of a GPU brick, written by the CPU when the brick
-/// is mapped or unmapped and when a cut changes its priority.
-static const uint kCloudSunInCut = 0x10000;  ///< HSTRCloudSunSched.flags: the last cut desired the brick.
-static const uint kCloudSunMapped = 0x20000; ///< HSTRCloudSunSched.flags: the brick is mapped.
+/// GPU sun bake scheduling (CloudResidencyDesc::gpuSun): what the scheduler needs of a GPU brick, written by the CPU. Where the brick
+/// is (HSTRCloudSunSched) changes only when it maps; its state (hstrCloudSunState: the flags below, the priority bin above
+/// kCloudSunBinShift) changes with every cut, so it is its own 4-byte table.
+static const uint kCloudSunInCut = 0x10000;  ///< State flag: the last cut desired the brick.
+static const uint kCloudSunMapped = 0x20000; ///< State flag: the brick is mapped.
 static const uint kCloudSunBins = 256;       ///< Priority histogram bins of the scheduler (candidates, then holders).
+static const uint kCloudSunBinShift = 24;    ///< State: the last cut's priority bin (floor(priority * 16), clamped to the bins).
 /// hstrCloudSunCounters entries (cleared every frame): candidates emitted, holders emitted, bakes staged, bricks baked, bricks
 /// waiting, stale bakes invalidated, then the partial-bin reservations of candidates and holders.
 static const uint kCloudSunCounters = 8;
 struct HSTRCloudSunSched
 {
-    float priority; ///< The last cut's priority of the brick.
-    uint flags;     ///< Orientation classes that desired it (bits 0-15), kCloudSunInCut, kCloudSunMapped.
     uint coord;     ///< BrickHeader::coord: level-local brick coordinates, 10 bits per axis.
     uint asset;
+};
+
+/// Sun bake invalidation (CloudResidencyDesc::gpuSun). A bake of a level-L brick read the change cells (32^3 source voxels) over its
+/// texels, their trilinear support and the sun sweep. The invalidation field holds, per brick position and orientation class, the
+/// last frame a change landed in the region a bake there read: a map or unmap is a change over the cells of the brick's region, and
+/// stampSunChanges writes the frame into every entry whose bakes that region reaches, so a bake is stale when its one entry is newer.
+/// Every entry is one brick position, so the test is exact (it equals the per-cell test over the bake's region).
+/// - Levels >= 2: a dense block per (asset, class) pair in use, one entry per brick position of each level.
+/// - Levels 0 and 1: per directory node, kCloudSunFineEntries entries (8 level-1 and 64 level-0 positions per class). A node holds
+///   the 8-voxel cells of one 32-voxel cell and exists exactly while fine bricks are mapped there, so fine entries cost memory only
+///   where fine bricks are resident; a node is reset when it is created.
+/// Entries are 16-bit frame epochs in an R16 texture (kCloudSunFieldWidth texels a row): a bake is stale when its entry's age is
+/// below its own. Bakes kCloudSunAgeCap frames old are rebaked, and ageSunField clamps older entries to that age before they wrap.
+static const uint kCloudSunClasses = 8;         ///< Orientation classes at most (the sea's quarter turns and mirror).
+static const uint kCloudSunFieldLevels = 16;    ///< Levels per asset in hstrCloudSunFieldLevels.
+static const uint kCloudSunFineEntries = 72 * kCloudSunClasses;
+static const uint kCloudSunFieldWidth = 16384;
+static const uint kCloudSunAgeCap = 32768;
+
+/// What one frame's sun scheduling runs with (hstrCloudSunFrameInfo, one element). Kept out of HSTRCloudParams: a params change
+/// rebuilds every binding of a pass, and the scheduler's many small dispatches then cost more CPU than GPU.
+struct HSTRCloudSunFrame
+{
+    uint frame;        ///< CloudResidency's frame counter (bake and change frames are in it).
+    uint releaseCount; ///< Bricks in hstrCloudSunRelease whose bakes are freed.
+    uint classCount;   ///< Orientation classes in hstrCloudSunDirections.
+    uint bakeMax;      ///< Bakes staged at most (the candidate list's capacity).
+    uint capacity;     ///< GPU bricks (the scan range).
+    uint changeCount;  ///< Residency changes in hstrCloudSunChanges to stamp.
+    uint fineBase;     ///< First field entry of the per-node part.
+    uint generation;   ///< HSTRCloudParams::cloudSunGeneration.
+    uint ageRow;       ///< ageSunField's first field row.
+    uint ageRows;
+    uint blockResets;  ///< hstrCloudSunResets: pair blocks (blockLength entries each), then nodes (kCloudSunFineEntries each).
+    uint nodeResets;
+    uint blockLength;
+    float reachScale;  ///< World length of the sun reach (sunNearVoxels sea voxels); over a source voxel's world size, its voxels.
+    uint padSunFrame0;
+    uint padSunFrame1;
+};
+
+/// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed
+/// slot (hstrDomainRegions), its packed volume scattered from hstrDomainStaged with its extinction, the 4^3-voxel block maxima
+/// around it, the dilated majorant and the 16-voxel occupancy. The world cache clear of changed tiles reads it too.
+struct HSTRCloudDomainFrame
+{
+    uint regionCount;  ///< Changed slots in hstrDomainRegions.
+    float scale;       ///< Density scale (the volumes are unscaled).
+    uint tileVoxels;   ///< Domain voxels per tile edge.
+    uint tiles;        ///< Tiles per window axis.
+    uint3 dims;        ///< Domain voxels.
+    uint cacheCellVoxels; ///< Domain voxels per world cache cell edge.
+    uint3 blockDims;   ///< Majorant blocks (dims / 4).
+    uint padDomain1;
+    uint3 cacheDims;   ///< World cache cells.
+    uint padDomain2;
+};
+static const uint kDomainBlock = 4;       ///< Voxels per majorant block edge.
+static const uint kDomainOccupancy = 4;   ///< Majorant blocks per occupancy cell edge.
+static const uint kDomainBatch = 8;       ///< Slots per scatter (hstrDomainStaged holds this many volumes).
+static const uint kDomainRegionZero = 0x80000000; ///< Region flag: the slot is empty (its volume clears).
+static const uint kDomainRegionKeep = 0x40000000; ///< Region flag: the GPU holds the slot's volume (only what derives from it rebuilds).
+static const uint kDomainRegionSlot = 0x3fffffff;
+
+/// One residency change: an asset's change cells [first, last] (10 bits per axis).
+struct HSTRCloudSunChange
+{
+    uint asset;
+    uint first;
+    uint last;
 };
 
 /// A brick staged for GPU reconstruction (see reconstructBrick in CloudFormat.h): parent prediction plus dequantised residual,
@@ -870,12 +954,6 @@ struct HSTRCloudParams
     uint beamRefreshCentres = 0;
     /// Set per dispatch: the first row of the band of the path-traced reference being traced (HSTRCloud::mReferenceBandRows).
     uint referenceRowOffset = 0;
-    // GPU sun bake scheduling (CloudResidencyDesc::gpuSun), set per frame.
-    uint cloudResidencyFrame = 0;   ///< CloudResidency's frame counter (bake and change frames are in it).
-    uint cloudSunReleaseCount = 0;  ///< Bricks in hstrCloudSunRelease whose bakes are freed this frame.
-    uint cloudSunClassCount = 0;    ///< Orientation classes in hstrCloudSunDirections.
-    uint cloudSunBakeMax = 0;       ///< Bakes staged per frame at most (the candidate list's capacity).
-    uint cloudBrickCapacity = 0;    ///< GPU bricks (the scheduler's scan range).
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

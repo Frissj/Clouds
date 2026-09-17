@@ -141,6 +141,11 @@ public:
      */
     uint3 getThreadGroupSize() const { return mpState->getProgram()->getReflector()->getThreadGroupSize(); }
 
+    /**
+     * Compile the kernels and create the pipeline state now rather than on the first execute.
+     */
+    void warm() { mpState->getCSO(mpVars.get()); }
+
     const ref<Device>& getDevice() const { return mpDevice; }
 
 protected:

@@ -5,6 +5,7 @@
 #include "CloudSea.h"
 #include "CloudPayloadPool.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -79,13 +80,31 @@ public:
         uint32_t sunWaiting = 0;    ///< Mapped bricks still on the live march (not yet baked, or neighbourhood still streaming).
         uint32_t sunBakesFrame = 0; ///< Bakes staged this frame.
         uint32_t sunSlotsFree = 0;  ///< Free sun atlas slots.
-        // The last cut.
+        uint32_t sunStale = 0;      ///< Bakes dropped this frame because their neighbourhood was mapped or unmapped since.        // The last cut.
         uint32_t cutPops = 0;      ///< Bricks refined.
         bool cutOrdered = false;   ///< Whether the atlas budget bound, forcing the priority-ordered cut.
         double cutTotalMs = 0.0;
         float cutMargin = 0.f; ///< The motion envelope of the last cut, in voxels.
         uint32_t cuts = 0;     ///< Cuts run so far.
+        // Page table edits so far (maps and unmaps), and what waits.
+        uint32_t maps = 0;
+        uint32_t unmaps = 0;
+        uint32_t mapBacklog = 0;   ///< Loaded desired bricks not yet mapped.
+        uint32_t unmapBacklog = 0; ///< Faded out, not yet unmapped.
+        uint32_t activeFades = 0;  ///< Bricks whose fade runs.
+        uint32_t fadeStarts = 0;   ///< Fades started or turned so far.
+        uint32_t fadeEnds = 0;     ///< Fade ends handled so far (settled or queued for the unmap).
+        uint32_t fadeVoid = 0;     ///< End entries whose fade had already been replaced.
     };
+    /// Mapped bricks the cut does not want, by why they are still mapped (auditMapped walks every mapped brick: diagnostics only).
+    struct MappedAudit
+    {
+        uint32_t fadingOut = 0;
+        uint32_t held = 0; ///< Mapped children keep them.
+        uint32_t idle = 0; ///< Neither: nothing will unmap them.
+        uint32_t stale = 0; ///< Fades still running fadeFrames after they started: their end was missed.
+    };
+    MappedAudit auditMapped() const;
 
     /// Staged bricks of one level: one commit dispatch each, coarsest first, so parents are in the atlas before their children.
     struct CommitGroup
@@ -113,6 +132,11 @@ public:
     const Stats& getStats() const { return mStats; }
     /// Whether a cut is running on the worker (CloudView::cutAsync). The sea must not apply tile changes meanwhile: the walk reads them.
     bool cutInFlight() const { return mCutJob.valid(); }
+    /// Whether advanceCloudFades has fades to run this frame, and what it binds.
+    bool fadesRunning() const { return mActiveFades > 0; }
+    uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
+    const ref<Buffer>& getBricks() const { return mpBricks; }
+    const ref<Buffer>& getFadeFrame() const { return mpFadeFrame; }
     void waitForCut() const
     {
         if (mCutJob.valid())
@@ -122,14 +146,12 @@ public:
     /// What this frame's GPU sun scheduling (CloudResidencyDesc::gpuSun) runs with.
     struct GpuSunFrame
     {
-        bool run = false;
-        uint32_t frame = 0;
-        uint32_t releaseCount = 0;
-        uint32_t classCount = 0;
-        uint32_t bakeMax = 0;
-        uint32_t capacity = 0;
+        bool run = false;        ///< The scheduling passes run (ageSunField runs whenever info.ageRows > 0).
+        HSTRCloudSunFrame info = {}; ///< Uploaded to hstrCloudSunFrameInfo.
     };
     const GpuSunFrame& getGpuSunFrame() const { return mGpuSunFrame; }
+    /// HSTRCloud dispatched the frame: a frame without a residency update (frozen) must not replay its releases, resets and changes.
+    void gpuSunDispatched() { mGpuSunFrame = {}; }
     /// Binds the scheduler's buffers for writing (and unbinds the camera's views of the same buffers).
     void bindGpuSun(const ShaderVar& var) const;
     /// The scheduler's buffers to clear before its scan.
@@ -151,13 +173,21 @@ private:
     static constexpr uint32_t kPendingStore = 0xFFFFFFFE;
     static constexpr uint64_t kNoHandle = ~0ull;
     static constexpr uint16_t kLoaded = 1;
-    static constexpr uint16_t kMapped = 4;
+    static constexpr uint16_t kToMap = 16;  ///< In mToMap.
 
     enum class StoreKind : uint8_t
     {
         Coarse, ///< An asset's bricks of levels >= 4.
         Chunk,  ///< The level-3 bricks of one chunk and its page directory.
         Page,   ///< One level-2 brick and its level-1 and level-0 descendants.
+    };
+
+    /// What one cut decided for a brick.
+    struct CutState
+    {
+        uint32_t id = 0;      ///< The cut (mCutId) that desired the brick last in this slot.
+        float priority = 0.f;
+        uint16_t sunClasses = 0; ///< Orientation classes of the instances that desired it (bit per class).
     };
 
     struct Brick
@@ -167,11 +197,14 @@ private:
         uint32_t children = kNone; ///< Offset into the store's child list (childCount entries; page indices for level-3 bricks).
         uint32_t gpu = kNone;      ///< Brick index on the GPU while loaded.
         uint32_t slot = kNone;     ///< Atlas slot while loaded.
-        uint32_t desiredFrame = 0; ///< Id of the last cut that desired the brick (CloudResidency::mCutId).
-        float priority = 0.f;
-        float fade = 0.f;
-        uint16_t sunClasses = 0;      ///< Orientation classes of the instances that desired the brick in the last cut (bit per class).
+        uint32_t mappedIndex = kNone; ///< Position in mMappedList while mapped.
+        /// The current cut's state is cut[mCutSlot]; the walk of the next one writes the other slot, so taking it on is a flip.
+        CutState cut[2];
+        uint32_t fadeSerial = 0; ///< Bumped by every fade change (a FadeEnd of an older one is void).
         uint16_t flags = 0;
+        /// In the page table. Its own field: maps and unmaps run beside a cut's walk, which reads flags (and the mapped state only
+        /// from mMappedSnapshot).
+        bool mapped = false;
         uint8_t childCount = 0;
         uint8_t loadedChildren = 0;
         uint8_t mappedChildren = 0;
@@ -204,7 +237,7 @@ private:
         std::vector<uint32_t> chunkStores; ///< Per chunk: store index, kNone or kPendingStore.
         std::vector<uint64_t> chunkBrick;  ///< Per chunk: handle of its level-4 brick.
         uint3 changeDims = uint3(0);
-        std::vector<uint32_t> changeFrame; ///< Per 32^3-voxel cell: last frame a brick over it was mapped or unmapped.
+        std::vector<uint32_t> changeFrame; ///< CPU scheduler: per 32^3-voxel cell, last frame a brick over it was mapped or unmapped.
         uint32_t lastChange = 0;
     };
 
@@ -271,6 +304,56 @@ private:
     std::vector<uint32_t> mFreeStores;
     std::vector<uint64_t> mMappedList;
     std::vector<uint64_t> mLoadedList;
+    // The apply step touches only what can change (the cut merge rebuilds these; the rest is events):
+    size_t mToLoadNext = 0;          ///< mToLoad before it is loaded.
+    std::vector<uint64_t> mToMap;    ///< Desired bricks not yet mapped, parents first (kToMap).
+    uint32_t mMergeFrame = 0;        ///< Frame of the last cut merge (every desired brick's store was used then).
+    uint32_t mPageStores = 0;        ///< Non-empty chunk and page stores.
+    // Fades: mapped bricks fade in while desired, and out once undesired with no mapped children (then unmap). A fade runs on the
+    // GPU from its start (HSTRCloudBrick::fadeStart); the frame handles only where one starts, turns, stops or ends.
+    // MEASURED before (4K sea flight at 20 units a frame): stepping every fading brick every frame cost 0.13 ms a frame and up to
+    // 0.95 ms after a cut, plus the upload of every brick block it touched.
+    struct FadeEnd
+    {
+        uint64_t handle;
+        uint32_t serial;     ///< Brick::fadeSerial of the fade it ends.
+        uint32_t generation; ///< Of the brick's store (a released store's handles are void).
+    };
+    static constexpr uint32_t kUnmapsPerFrame = 512;
+    static constexpr uint32_t kMapsPerFrame = 1024;
+    std::vector<std::vector<FadeEnd>> mFadeEnds;
+    std::deque<FadeEnd> mUnmapQueue; ///< Faded out, waiting for their unmap. ///< Ring of fadeFrames + 1 buckets, by the frame a fade ends.
+    uint32_t mFadeProcessed = 0;                 ///< The last frame whose fade ends were handled.
+    uint32_t mActiveFades = 0;                   ///< Bricks whose fade runs.
+    float mFadeStep = 1.f;
+    ref<Buffer> mpFadeFrame;                     ///< HSTRCloudFadeFrame.
+    /// A GPU brick's fade at a frame (advanceCloudFades computes the same).
+    float fadeOf(const HSTRCloudBrick& gpu, uint32_t frame) const;
+    /// Starts, turns or stops a mapped brick's fade for what it is now (desired, mapped children).
+    void updateFade(uint64_t handle);
+    /// Its fade from now: 1 in, -1 out, 0 held at its current value.
+    void setFade(uint64_t handle, int direction);
+    int fadeDirection(const HSTRCloudBrick& gpu) const
+    {
+        return (gpu.fadeStart & kCloudFadeIn) ? 1 : (gpu.fadeStart & kCloudFadeOut) ? -1 : 0;
+    }
+    void processFadeEnds(bool& changed);
+    // Maps, unmaps and fades run beside a cut's walk (it takes about three frames on the sea; they waited for it, so each frame
+    // between walks did three frames of them). The walk reads what they change from a snapshot taken when it starts, per GPU
+    // brick; the merge revisits the bricks they touched meanwhile.
+    static constexpr uint8_t kSnapMapped = 1;
+    static constexpr uint8_t kSnapChildren = 2; ///< Mapped children.
+    static constexpr uint8_t kSnapFadeIn = 4;
+    static constexpr uint8_t kSnapFadeOut = 8;
+    static constexpr uint8_t kSnapFull = 16;    ///< Held at a fade of 1.
+    std::vector<uint8_t> mMappedState;          ///< Current, per GPU brick.
+    std::vector<uint8_t> mMappedSnapshot;       ///< The running walk's copy.
+    std::vector<uint64_t> mWalkTouched;         ///< Bricks changed while the walk ran.
+    /// Refreshes a brick's mMappedState entry (and records it while a walk runs).
+    void noteMapped(uint64_t handle);
+    /// Maps what the cut wants and its parents hold, up to kMapsPerFrame.
+    void mapReady(bool& changed);
+    void unlistMapped(uint64_t handle);
     std::vector<float3x3> mTileForward; ///< Per slot: asset source voxel to tile-local domain voxel (linear part).
 
     // GPU mirrors.
@@ -324,20 +407,51 @@ private:
     SunScheduleInputs mSunScheduleIdle;
     bool mSunScheduleIdleValid = false;
     // GPU sun bake scheduling (mDesc.gpuSun). The GPU owns mpSunSlotTable, the bake frames and the free slots; the CPU writes what
-    // the scheduler needs of each GPU brick, the change grids and the bricks whose bakes are freed.
+    // the scheduler needs of each GPU brick, the residency changes and the bricks whose bakes are freed.
     void writeSunSched(uint64_t handle);
+    /// A sea slot's instance takes (or gives up) its (asset, class) pair's block of the invalidation field.
+    void acquireSunField(uint32_t slot);
+    void releaseSunField(uint32_t slot);
+    /// Uploads the field's block table, the ranges to reset and the changes to stamp into mGpuSunFrame.
+    void uploadSunChanges();
     GpuSunFrame mGpuSunFrame;
+    bool mGpuSunRan = false; ///< Whether the last residency update ran the scheduler (the stats' bake count is its).
     SunScheduleInputs mGpuSunInputs;       ///< This frame's.
     SunScheduleInputs mGpuSunQueuedInputs; ///< Those of the run whose bake count is being read back.
     SunScheduleInputs mGpuSunIdle;
     bool mGpuSunIdleValid = false;
-    std::vector<HSTRCloudSunSched> mSunSched; ///< Per GPU brick.
+    std::vector<HSTRCloudSunSched> mSunSched; ///< Per GPU brick: where it is (written when it maps).
     std::vector<uint8_t> mSunSchedBlocksDirty; ///< Per 4096 bricks.
+    /// Per GPU brick, the scheduler state (hstrCloudSunState), twice: mSunState[mSunStateLive] is uploaded, and a cut's walk writes
+    /// its changes into the other, so taking the cut on swaps them. The walk first copies the entries the previous cut changed
+    /// (mSunStateSync) from the live one; the frame writes both, and only while no walk runs.
+    /// MEASURED before (4K sea flight at 20 units a frame): writing the ~150k changed 16-byte entries on the frame cost 0.57 ms per
+    /// cut, and uploading them 0.56 ms.
+    std::array<std::vector<uint32_t>, 2> mSunState;
+    uint32_t mSunStateLive = 0;
+    std::vector<uint32_t> mSunStateSync;
+    std::vector<uint8_t> mSunStateBlocksDirty; ///< Per 4096 bricks.
     std::vector<uint32_t> mSunRelease;         ///< GPU bricks unloaded since the last scheduling.
-    std::vector<uint32_t> mAssetChangeOffsets; ///< Per asset: its first cell in mpChangeFrames.
-    std::vector<uint8_t> mAssetChangeDirty;
+    // The invalidation field (HSTRCloudTypes.slang, kCloudSunClasses): level >= 2 blocks per (asset, class) pair, then a row per
+    // directory node for levels 0-1.
+    std::vector<HSTRCloudSunChange> mSunChanges; ///< Since the last scheduling run.
+    std::vector<uint32_t> mSunFieldBlocks;       ///< Per asset, kCloudSunClasses entries: block index or kNone.
+    std::vector<uint32_t> mSunFieldUsers;        ///< Per (asset, class): sea slots using it.
+    std::vector<uint32_t> mSunFieldLevels;       ///< Per asset, kCloudSunFieldLevels entries: a level's offset in a block.
+    std::vector<uint32_t> mSlotSunPair;          ///< Per sea slot: its (asset, class) pair, or kNone.
+    std::vector<uint32_t> mFreeSunFieldBlocks;
+    std::vector<uint32_t> mSunBlockResets;       ///< Blocks newly taken: every bake of their pair is stale.
+    std::vector<uint32_t> mSunNodeResets;        ///< Directory nodes created since the last run.
+    bool mSunResetAll = false;                   ///< Changes went unstamped: every block and node restarts.
+    bool mSunFieldBlocksDirty = true;
+    uint32_t mSunFieldBlockSize = 0;
+    uint32_t mSunFineBase = 0;
+    uint32_t mSunFieldRows = 0;
+    uint32_t mSunAgeRow = 0;
+    uint32_t mSunChangeCapacity = 0;
     std::vector<float4> mSunDirections;
     ref<Buffer> mpSunSched;
+    ref<Buffer> mpSunState;
     ref<Buffer> mpSunFrames;
     ref<Buffer> mpSunFree;
     ref<Buffer> mpSunFreeTop;
@@ -349,9 +463,12 @@ private:
     ref<Buffer> mpSunHolders;
     ref<Buffer> mpSunRelease;
     ref<Buffer> mpSunDirections;
-    ref<Buffer> mpChangeFrames;
-    ref<Buffer> mpAssetChanges;
-    ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
+    ref<Texture> mpSunField;
+    ref<Buffer> mpSunResets;
+    ref<Buffer> mpSunFrameInfo;
+    ref<Buffer> mpSunFieldBlocks;
+    ref<Buffer> mpSunFieldLevels;
+    ref<Buffer> mpSunChanges;    ref<Buffer> mpResiduals; ///< decodeCloudResiduals output, 512 floats per staged brick.
     ref<Buffer> mpStagingInfo;
     std::unique_ptr<CloudPayloadPool> mpPayload;
 
@@ -369,7 +486,12 @@ private:
 
     uint32_t mFrame = 1;
     uint32_t mCutFrame = 0;         ///< Frame of the last cut.
-    uint32_t mCutId = 0;            ///< Increases with every cut (and restart); desiredFrame == mCutId marks its bricks.
+    uint32_t mCutId = 0;            ///< Increases with every cut; cut[mCutSlot].id == mCutId marks its bricks.
+    uint32_t mCutSlot = 0;
+    const CutState& cutOf(const Brick& b) const { return b.cut[mCutSlot]; }
+    bool desired(const Brick& b) const { return b.cut[mCutSlot].id == mCutId; }
+    /// The last cut that desired a brick (the eviction order).
+    static uint32_t lastDesired(const Brick& b) { return std::max(b.cut[0].id, b.cut[1].id); }
     std::vector<uint64_t> mToLoad;  ///< Unloaded bricks of the last cut, coarsest level first, then by priority.
 
     /// Camera transmittance to one instance of a brick of level >= 3, per sea slot and brick: every instance of an asset shares its
@@ -403,21 +525,39 @@ private:
     void cutChildren(const CutEntry& entry, std::vector<uint64_t>& children, std::vector<Request>& requests) const;
     /// Whether a brick has children to refine into (expanding a leaf does nothing, and most bricks are leaves).
     bool cutRefinable(uint64_t handle) const;
-    /// What a cut's walk found: every brick it visited with its priority and slot (parents first) and the page requests.
+    /// A cut ready to take on: its bricks carry it in their spare CutState slot, and the lists the frame applies are built.
     struct CutWalk
     {
-        std::vector<CutVisit> visits;
         std::vector<Request> requests;
         uint32_t pops = 0;
+        uint32_t id = 0;      ///< The cut's mCutId.
+        bool ordered = false; ///< The atlas budget bound, forcing the priority-ordered cut.
         double milliseconds = 0.0;
+        std::vector<uint64_t> desired; ///< Parents before children.
+        std::vector<uint64_t> toLoad;  ///< Coarsest level first, then by priority.
+        std::vector<uint64_t> toMap;
+        std::vector<uint64_t> fading;  ///< Mapped bricks that start or keep fading.
+        std::vector<uint32_t> stateChanged;      ///< GPU bricks whose scheduler state the walk changed (in the spare mSunState).
+        std::vector<uint8_t> stateBlocksDirty;   ///< The same, per 4096 bricks.
     };
     /// Records the view a cut is chosen for (the next cuts are measured against it).
     void beginCut(const CloudSea& sea, const CloudView& view);
-    /// The cut's walk. It only reads the stores and bricks, and writes the per-slot visibility caches.
+    /// The cut, up to what the frame applies (on the worker with CloudView::cutAsync). It writes only the spare CutState slot of
+    /// bricks, store use frames and the per-slot visibility caches; the frame changes none of what it reads until it is taken on.
     CutWalk walkCut(const CloudSea& sea, const CloudView& view);
+    /// The scheduler entry of a GPU brick under a cut's state (priorities at the scheduler's bin resolution).
+    uint32_t sunStateOf(const CutState& state, uint32_t cutId, bool mapped) const;
     /// The end of every update: sun bake scheduling, uploads and stats.
     void finishFrame(const CloudSea& sea, const CloudView& view, std::chrono::steady_clock::time_point startTime);
     std::future<CutWalk> mCutJob;
+    /// The async cut's own thread, started with the first cut: launching one per cut cost the frame the thread's creation.
+    void cutWorker();
+    std::thread mCutThread;
+    std::mutex mCutMutex;
+    std::condition_variable mCutWake;
+    std::packaged_task<CutWalk()> mCutTask; ///< Guarded by mCutMutex.
+    bool mCutQueued = false;
+    bool mCutStop = false;
     std::vector<uint64_t> mDesired; ///< Bricks of the last cut, parents before children.
     float3 mCutPosition = float3(std::numeric_limits<float>::max());
     float4x4 mCutViewProjection;

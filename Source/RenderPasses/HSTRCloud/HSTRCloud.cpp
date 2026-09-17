@@ -853,7 +853,21 @@ Properties HSTRCloud::getProperties() const
         cloud["sunBaked"] = stats.sunBaked;
         cloud["sunWaiting"] = stats.sunWaiting;
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
+        cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
+        cloud["maps"] = stats.maps;
+        cloud["unmaps"] = stats.unmaps;
+        cloud["mapBacklog"] = stats.mapBacklog;
+        cloud["unmapBacklog"] = stats.unmapBacklog;
+        cloud["activeFades"] = stats.activeFades;
+        cloud["fadeStarts"] = stats.fadeStarts;
+        cloud["fadeEnds"] = stats.fadeEnds;
+        cloud["fadeVoid"] = stats.fadeVoid;
+        const auto audit = mpCloudResidency->auditMapped();
+        cloud["undesiredFadingOut"] = audit.fadingOut;
+        cloud["undesiredHeld"] = audit.held;
+        cloud["undesiredIdle"] = audit.idle;
+        cloud["staleFades"] = audit.stale;
         cloud["cutPops"] = stats.cutPops;
         cloud["cutOrdered"] = stats.cutOrdered;
         cloud["cutTotalMs"] = stats.cutTotalMs;
@@ -1038,12 +1052,21 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
     mpScanSunPass = createPass("scanSunBakes");
-    mpStaleSunPass = createPass("staleSunBakes");
+    mResidencyPassesBound.clear();
+    mpDomainExtinctionPass = createPass("domainExtinction");
+    mpDomainBlocksPass = createPass("domainBlocks");
+    mpDomainMajorantPass = createPass("domainMajorant");
+    mpDomainOccupancyPass = createPass("domainOccupancy");
+    mpStampSunPass = createPass("stampSunChanges");
+    mpResetSunBlocksPass = createPass("resetSunBlocks");
+    mpResetSunNodesPass = createPass("resetSunNodes");
+    mpAgeSunPass = createPass("ageSunField");
     mpSelectSunPass = createPass("selectSunBakes");
     mpEmitSunPass = createPass("emitSunBakes");
     mpEvictSunPass = createPass("evictSunBakes");
     mpAssignSunPass = createPass("assignSunBakes");
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
+    mpAdvanceFadesPass = createPass("advanceCloudFades");
     mpDecayWorldCachePass = createPass("decayWorldCache");
     buildHierarchy();
 }
@@ -1466,6 +1489,58 @@ void HSTRCloud::createSamplers()
     mpLinearClampSampler = mpDevice->createSampler(samplerDesc);
 }
 
+DomainStaging::DomainStaging(ref<Device> pDevice, uint32_t tileValues, uint32_t count) : mpFence(pDevice->createFence())
+{
+    mBuffers.resize(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        // Mapped once for its lifetime: the workers write through the pointer, never through the device.
+        mBuffers[i].pBuffer = pDevice->createBuffer(size_t(tileValues) * sizeof(uint32_t), ResourceBindFlags::None, MemoryType::Upload);
+        mBuffers[i].pData = static_cast<uint32_t*>(mBuffers[i].pBuffer->map());
+        mFree.push_back(int32_t(i));
+    }
+}
+
+int32_t DomainStaging::acquire(uint32_t*& data)
+{
+    std::lock_guard lock(mMutex);
+    if (mFree.empty())
+        return -1;
+    const int32_t handle = mFree.back();
+    mFree.pop_back();
+    data = mBuffers[handle].pData;
+    return handle;
+}
+
+void DomainStaging::discard(int32_t handle)
+{
+    std::lock_guard lock(mMutex);
+    mFree.push_back(handle);
+}
+
+void DomainStaging::beginFrame(RenderContext* pRenderContext)
+{
+    // Last frame's command list is submitted, so a fence signalled now passes once the GPU ran its copies.
+    if (!mRecorded.empty())
+    {
+        const uint64_t value = pRenderContext->signal(mpFence.get());
+        for (int32_t handle : mRecorded)
+            mInFlight.emplace_back(value, handle);
+        mRecorded.clear();
+    }
+    if (mInFlight.empty())
+        return;
+    const uint64_t reached = mpFence->getCurrentValue();
+    std::lock_guard lock(mMutex);
+    auto keep = mInFlight.begin();
+    for (auto it = mInFlight.begin(); it != mInFlight.end(); ++it)
+        if (it->first <= reached)
+            mFree.push_back(it->second);
+        else
+            *keep++ = *it;
+    mInFlight.erase(keep, mInFlight.end());
+}
+
 void HSTRCloud::buildCloudDomain()
 {
     const auto& volume = mpScene->getGridVolume(0);
@@ -1497,10 +1572,14 @@ void HSTRCloud::buildCloudDomain()
         seaDesc.seed = mCloudSeaSeed;
         seaDesc.coverage = mCloudSeaCoverage;
         mpCloudSea = std::make_unique<hstrcloud::CloudSea>(std::move(library.assets), seaDesc);
+        // Staging for three rows of tiles: a flight takes on at most a row and a column at a time. The load's full window
+        // overflows it into host memory, which uploads from the main thread.
+        const uint3 seaDims = mpCloudSea->getDims();
+        mpDomainStaging = std::make_unique<DomainStaging>(mpDevice, seaDesc.tileVoxels * seaDims.y * seaDesc.tileVoxels, 3 * seaDesc.tiles);
+        mpCloudSea->setStaging(mpDomainStaging.get());
         timed("cloud sea window", [&] { mpCloudSea->fill(cameraPosition); });
         mCloudSeaKey = seaKey;
         mCloudInstancesUploaded = false;
-        mCloudMeanBlocks.clear();
     }
     const std::string residencyKey = fmt::format(
         "{}|{}|{}|{}|{}|{}|{}",
@@ -1528,6 +1607,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
         residencyDesc.gpuSun = mCloudGpuSun;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
+        mResidencyPassesBound.clear();
         mCloudResidencyKey = residencyKey;
         mCloudInstancesUploaded = false;
     }
@@ -1584,10 +1664,13 @@ void HSTRCloud::buildCloudDomain()
     mpCloudTileReset = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileReset.data(), false
     );
+    mDomainPassesBound = false; // The world cache clear reads the tile resets.
     std::vector<uint32_t> slots(tileCount);
     std::iota(slots.begin(), slots.end(), 0u);
-    mCloudMeanBlocks.clear();
     uploadDomainExtinction(slots);
+    // Tile changes dispatch this pass mid-flight: its kernels compile now, not in the first frame that takes on a tile (150 ms).
+    mpClearWorldCacheTilesPass->warm();
+    mpAdvanceFadesPass->warm();
     updateSunVoxelDirection();
     createSamplers();
     mpLeafRadiance = nullptr;
@@ -1602,181 +1685,176 @@ void HSTRCloud::buildCloudDomain()
 
 void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
 {
-    const auto& sea = *mpCloudSea;
+    // The domain proxy of the changed slots: their float16 volumes (converted on the sea's workers, straight into staging buffers)
+    // copy to the GPU, which scatters them and derives the extinction, block maxima, majorants and occupancy around them
+    // (domainExtinction ... domainOccupancy), a batch of slots at a time.
+    // MEASURED before (4K sea flight at 20 units a frame): building all of it on the CPU cost 2.1 ms a frame on average and up to
+    // 51 ms in a frame that took on a row of tiles - float16 conversion 17, block maxima 10, the whole majorant 15.5. Uploading
+    // the volumes from the main thread still cost 5.4 ms for a row, and binding the rarely run passes 0.7 ms each.
+    auto& sea = *mpCloudSea;
     const uint3 dims = sea.getDims();
     const uint32_t r = sea.getDesc().tileVoxels;
     const uint32_t tiles = sea.getDesc().tiles;
-    const float scale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
-    const auto& mean = sea.getMean();
-    const auto& maximum = sea.getMax();
-    auto voxelIndex = [&](uint32_t x, uint32_t y, uint32_t z) { return size_t(x) + size_t(dims.x) * (size_t(y) + size_t(dims.y) * size_t(z)); };
-
-    // Proxy extinction, per changed tile.
-    const bool fullTexture =
-        !mpExtinction || mpExtinction->getWidth() != dims.x || mpExtinction->getHeight() != dims.y || mpExtinction->getDepth() != dims.z;
-    if (fullTexture)
+    const uint3 blockDims = dims / kDomainBlock;
+    const uint3 occupancyDims = (blockDims + kDomainOccupancy - 1u) / kDomainOccupancy;
+    const size_t tileBytes = size_t(r) * dims.y * r * sizeof(uint32_t);
+    auto* pRenderContext = mpDevice->getRenderContext();
+    const auto readWrite = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    auto ensure = [&](ref<Texture>& texture, uint3 size, ResourceFormat format)
     {
-        std::vector<float16_t> extinction(mean.size());
-        for (size_t i = 0; i < mean.size(); ++i)
-            extinction[i] = float16_t(mean[i] * scale);
-        mpExtinction = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R16Float, 1, extinction.data());
-    }
-    else
-    {
-        std::vector<float16_t> tile(size_t(r) * dims.y * r);
-        for (uint32_t slot : slots)
+        if (!texture || texture->getWidth() != size.x || texture->getHeight() != size.y || texture->getDepth() != size.z ||
+            !is_set(texture->getBindFlags(), ResourceBindFlags::UnorderedAccess))
         {
-            const uint3 corner(slot % tiles * r, 0, slot / tiles * r);
-            for (uint32_t z = 0; z < r; ++z)
-                for (uint32_t y = 0; y < dims.y; ++y)
-                    for (uint32_t x = 0; x < r; ++x)
-                        tile[x + size_t(r) * (y + size_t(dims.y) * z)] = float16_t(mean[voxelIndex(corner.x + x, y, corner.z + z)] * scale);
-            mpDevice->getRenderContext()->updateSubresourceData(mpExtinction.get(), 0, tile.data(), corner, uint3(r, dims.y, r));
+            texture = mpDevice->createTexture3D(size.x, size.y, size.z, format, 1, nullptr, readWrite);
+            mDomainPassesBound = false;
         }
-    }
-
-    // Block maxima over 4^3 voxels plus the voxels one past the upper faces (trilinear support), wrapping in X/Z. A tile's change
-    // also reaches the blocks just before it.
-    constexpr uint32_t kBlock = 4;
-    const uint3 blockDims = dims / kBlock;
-    const size_t blockCount = size_t(blockDims.x) * blockDims.y * blockDims.z;
-    auto blockIndex = [&](uint3 b) { return size_t(b.x) + size_t(blockDims.x) * (size_t(b.y) + size_t(blockDims.y) * size_t(b.z)); };
-    std::vector<uint8_t> dirtyColumns(size_t(blockDims.x) * blockDims.z, 0);
-    if (mCloudMeanBlocks.size() != blockCount)
+    };
+    ensure(mpDomainVolume, dims, ResourceFormat::RG16Float);
+    ensure(mpExtinction, dims, ResourceFormat::R16Float);
+    ensure(mpDomainBlocks, blockDims, ResourceFormat::RG16Float);
+    ensure(mpMajorant, blockDims, ResourceFormat::R16Float);
+    ensure(mpTightMajorant, blockDims, ResourceFormat::R16Float);
+    ensure(mpOccupancy, occupancyDims, ResourceFormat::R8Uint);
+    ensure(mpMajorantZero, occupancyDims, ResourceFormat::R8Uint);
+    mParams.hstrMajorantDims = blockDims;
+    if (!mpDomainRegions)
     {
-        mCloudMeanBlocks.assign(blockCount, 0.f);
-        mCloudMaxBlocks.assign(blockCount, 0.f);
-        std::fill(dirtyColumns.begin(), dirtyColumns.end(), uint8_t(1));
+        mpDomainRegions = mpDevice->createStructuredBuffer(sizeof(uint32_t), kDomainBatch, ResourceBindFlags::ShaderResource);
+        mpDomainFrame = mpDevice->createStructuredBuffer(sizeof(HSTRCloudDomainFrame), 1, ResourceBindFlags::ShaderResource);
+        mDomainPassesBound = false;
     }
-    else
-        for (uint32_t slot : slots)
+    if (!mpDomainStaged || mpDomainStaged->getSize() != kDomainBatch * tileBytes)
+    {
+        mpDomainStaged = mpDevice->createBuffer(kDomainBatch * tileBytes, ResourceBindFlags::ShaderResource);
+        mDomainPassesBound = false;
+    }
+    if (!mDomainPassesBound)
+    {
+        // Each stage binds only what it reads and writes (an output must not also be bound as the stage's input), once: the
+        // resources persist and only their contents change.
+        auto bind = [&](const ref<ComputePass>& pPass, std::initializer_list<std::pair<const char*, ref<Resource>>> resources)
         {
-            const int32_t bx = int32_t(slot % tiles * r / kBlock);
-            const int32_t bz = int32_t(slot / tiles * r / kBlock);
-            for (int32_t z = bz - 1; z < bz + int32_t(r / kBlock); ++z)
-                for (int32_t x = bx - 1; x < bx + int32_t(r / kBlock); ++x)
-                {
-                    const uint32_t wx = uint32_t((x + int32_t(blockDims.x)) % int32_t(blockDims.x));
-                    const uint32_t wz = uint32_t((z + int32_t(blockDims.z)) % int32_t(blockDims.z));
-                    dirtyColumns[wx + size_t(blockDims.x) * wz] = 1;
-                }
-        }
-    parallelFor(
-        dirtyColumns.size(),
-        [&](size_t column)
+            ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+            var["hstrDomainRegions"] = mpDomainRegions;
+            var["hstrDomainFrame"] = mpDomainFrame;
+            for (const auto& [name, pResource] : resources)
+                if (auto pTexture = pResource->asTexture())
+                    var[name] = pTexture;
+                else
+                    var[name] = pResource->asBuffer();
+        };
+        bind(mpDomainExtinctionPass, {{"hstrDomainStaged", mpDomainStaged}, {"hstrDomainVolumeOutput", mpDomainVolume}, {"hstrExtinctionOutput", mpExtinction}});
+        bind(mpDomainBlocksPass, {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}});
+        bind(mpDomainMajorantPass, {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorantOutput", mpMajorant}, {"hstrTightMajorantOutput", mpTightMajorant}});
+        bind(mpDomainOccupancyPass,
+             {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorant", mpMajorant}, {"hstrOccupancyOutput", mpOccupancy}, {"hstrMajorantZeroOutput", mpMajorantZero}});
+        bind(mpClearWorldCacheTilesPass, {{"hstrCloudTileReset", mpCloudTileReset}});
+        mpClearBoundDeposit = nullptr;
+        mDomainPassesBound = true;
+    }
+    HSTRCloudDomainFrame frame = {};
+    frame.scale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
+    frame.tileVoxels = r;
+    frame.tiles = tiles;
+    frame.dims = dims;
+    frame.blockDims = blockDims;
+    frame.cacheDims = mParams.worldCacheDims;
+    frame.cacheCellVoxels = mParams.worldCacheCellVoxels;
+    if (slots.empty())
+    {
+        mpDomainFrame->setBlob(&frame, 0, sizeof(frame));
+        return;
+    }
+    const uint32_t blocksWide = r / kDomainBlock + 1;
+    const uint32_t majorantWide = r / kDomainBlock + 3;
+    const uint32_t cellsWide = r / (kDomainBlock * kDomainOccupancy) + 2;
+    for (size_t first = 0; first < slots.size(); first += kDomainBatch)
+    {
+        const uint32_t count = uint32_t(std::min<size_t>(slots.size() - first, kDomainBatch));
+        std::array<uint32_t, kDomainBatch> regions;
         {
-            if (!dirtyColumns[column])
-                return;
-            const uint32_t bx = uint32_t(column % blockDims.x);
-            const uint32_t bz = uint32_t(column / blockDims.x);
-            for (uint32_t by = 0; by < blockDims.y; ++by)
+            // Region i's volume is at i tile volumes into the batch buffer. A staged tile costs a recorded copy; a tile in host
+            // memory (the staging was full) uploads here.
+            FALCOR_PROFILE(pRenderContext, "volumes");
+            for (uint32_t i = 0; i < count; ++i)
             {
-                float meanValue = 0.f;
-                float maxValue = 0.f;
-                for (uint32_t z = 0; z <= kBlock; ++z)
-                    for (uint32_t y = by * kBlock; y <= std::min(by * kBlock + kBlock, dims.y - 1); ++y)
-                        for (uint32_t x = 0; x <= kBlock; ++x)
-                        {
-                            const size_t i = voxelIndex((bx * kBlock + x) % dims.x, y, (bz * kBlock + z) % dims.z);
-                            meanValue = std::max(meanValue, mean[i]);
-                            maxValue = std::max(maxValue, std::max(mean[i], maximum[i]));
-                        }
-                mCloudMeanBlocks[blockIndex(uint3(bx, by, bz))] = meanValue;
-                mCloudMaxBlocks[blockIndex(uint3(bx, by, bz))] = maxValue;
+                const uint32_t slot = slots[first + i];
+                auto& volume = sea.getUploadVolume(slot);
+                using Upload = hstrcloud::CloudSea::TileVolume::Upload;
+                regions[i] = slot;
+                if (volume.upload == Upload::Staged)
+                {
+                    pRenderContext->copyBufferRegion(mpDomainStaged.get(), i * tileBytes, mpDomainStaging->getBuffer(volume.staged).get(), 0, tileBytes);
+                    mpDomainStaging->recorded(volume.staged);
+                    volume.staged = -1;
+                }
+                else if (volume.upload == Upload::Packed)
+                {
+                    mpDomainStaged->setBlob(volume.packed.data(), i * tileBytes, tileBytes);
+                    volume.packed = {};
+                }
+                else
+                    regions[i] |= volume.upload == Upload::Zero ? kDomainRegionZero : kDomainRegionKeep;
+                volume.upload = Upload::Done;
             }
         }
-    );
-
-    auto roundedUp = [](float value)
-    {
-        float16_t rounded(value);
-        if (float(rounded) < value)
-            rounded = float16_t(value * (1.f + 1.f / 1024.f));
-        return rounded;
-    };
-    // Camera majorant: maximum density dilated by one block (wrapping), so every march step of at most a block is bounded.
-    std::vector<float16_t> majorant(blockCount);
-    std::vector<float16_t> tight(blockCount);
-    parallelFor(
-        blockCount,
-        [&](size_t i)
+        frame.regionCount = count;
+        mpDomainRegions->setBlob(regions.data(), 0, count * sizeof(uint32_t));
+        mpDomainFrame->setBlob(&frame, 0, sizeof(frame));
+        auto run = [&](const char* name, const ref<ComputePass>& pPass, uint3 threads)
         {
-            const int3 b(int32_t(i % blockDims.x), int32_t((i / blockDims.x) % blockDims.y), int32_t(i / (size_t(blockDims.x) * blockDims.y)));
-            float value = 0.f;
-            for (int32_t z = -1; z <= 1; ++z)
-                for (int32_t y = -1; y <= 1; ++y)
-                    for (int32_t x = -1; x <= 1; ++x)
-                    {
-                        const int32_t ny = b.y + y;
-                        if (ny < 0 || ny >= int32_t(blockDims.y))
-                            continue;
-                        const uint3 n(
-                            uint32_t((b.x + x + int32_t(blockDims.x)) % int32_t(blockDims.x)),
-                            uint32_t(ny),
-                            uint32_t((b.z + z + int32_t(blockDims.z)) % int32_t(blockDims.z))
-                        );
-                        value = std::max(value, mCloudMaxBlocks[blockIndex(n)]);
-                    }
-            majorant[i] = roundedUp(value * scale);
-            tight[i] = roundedUp(mCloudMeanBlocks[i] * scale);
-        }
-    );
-    mParams.hstrMajorantDims = blockDims;
+            FALCOR_PROFILE(pRenderContext, name);
+            pPass->execute(pRenderContext, threads);
+        };
+        run("extinction", mpDomainExtinctionPass, uint3(r, dims.y, r * count));
+        run("blocks", mpDomainBlocksPass, uint3(blocksWide, blockDims.y, blocksWide * count));
+        run("majorant", mpDomainMajorantPass, uint3(majorantWide, blockDims.y, majorantWide * count));
+        run("occupancy", mpDomainOccupancyPass, uint3(cellsWide, occupancyDims.y, cellsWide * count));
+    }
+
     // The occupied vertical band, in world units, dilated by one block to cover the camera majorant's own dilation. A sea ray was
     // marched between the floor and ceiling of the whole extinction grid, so every ray crossed the empty sky above and below the
     // clouds to reach the domain boundary. majorantZeroExit skips that at 16-voxel granularity, which costs one texture load per
     // block rather than a step per voxel - 17.81 of the sea's 30 steps a pixel - but clamping the slab removes the blocks from the
     // ray instead of skipping them, and it cannot change a pixel: there is no density outside the band by construction.
-    uint32_t lowBlock = blockDims.y, highBlock = 0;
-    for (size_t i = 0; i < blockCount; ++i)
-        if (mCloudMaxBlocks[i] > 0.f)
+    // A voxel layer y is in the blocks whose trilinear support [4 b, 4 b + 4] holds it, so the tiles' content layers give the
+    // non-zero blocks' range.
+    int32_t lowVoxel = std::numeric_limits<int32_t>::max();
+    int32_t highVoxel = -1;
+    for (const auto& tile : sea.getTiles())
+        if (tile.contentLow >= 0)
         {
-            const uint32_t y = uint32_t((i / blockDims.x) % blockDims.y);
-            lowBlock = std::min(lowBlock, y);
-            highBlock = std::max(highBlock, y);
+            lowVoxel = std::min(lowVoxel, tile.contentLow);
+            highVoxel = std::max(highVoxel, tile.contentHigh);
         }
     const float gridTopY = mParams.seaOrigin.y + float(mParams.hstrExtinctionDims.y) * mParams.seaVoxelSize.y;
-    if (lowBlock > highBlock) // No density anywhere: leave the slab alone rather than inverting it.
-        mSeaContentBand = float2(mParams.seaOrigin.y, gridTopY);
+    float2 band;
+    if (highVoxel < 0) // No density anywhere: leave the slab alone rather than inverting it.
+        band = float2(mParams.seaOrigin.y, gridTopY);
     else
     {
-        const float blockVoxels = 4.f; // A majorant block is four DOMAIN voxels: majorantAt indexes with floor(v * 0.25).
+        const uint32_t lowBlock = uint32_t(std::max(lowVoxel - 1, 0)) / kDomainBlock; // ceil((y - 4) / 4), at least 0.
+        const uint32_t highBlock = std::min(uint32_t(highVoxel) / kDomainBlock, blockDims.y - 1);
+        const float blockVoxels = float(kDomainBlock); // A majorant block is four DOMAIN voxels: majorantAt indexes with floor(v * 0.25).
         const float low = float(lowBlock > 0 ? lowBlock - 1 : 0) * blockVoxels;
         const float high = float(std::min(highBlock + 2u, blockDims.y)) * blockVoxels;
-        mSeaContentBand = mParams.seaOrigin.y + float2(low, high) * mParams.seaVoxelSize.y;
+        band = mParams.seaOrigin.y + float2(low, high) * mParams.seaVoxelSize.y;
     }
-    mParams.seaContentY = mSeaContentBand;
-    logInfo(
-        "HSTRCloud: sea content band y {} to {} of {} to {} ({} of the grid's height).", mSeaContentBand.x, mSeaContentBand.y,
-        mParams.seaOrigin.y, gridTopY,
-        (mSeaContentBand.y - mSeaContentBand.x) / std::max(1e-6f, gridTopY - mParams.seaOrigin.y)
-    );
-    const uint3 occupancyDims = (blockDims + 3u) / 4u;
-    std::vector<uint8_t> occupancy(size_t(occupancyDims.x) * occupancyDims.y * occupancyDims.z, 0);
-    for (size_t i = 0; i < blockCount; ++i)
-        if (mCloudMaxBlocks[i] > 0.f)
-        {
-            const uint3 o = uint3(uint32_t(i % blockDims.x), uint32_t((i / blockDims.x) % blockDims.y), uint32_t(i / (size_t(blockDims.x) * blockDims.y))) / 4u;
-            occupancy[size_t(o.x) + size_t(occupancyDims.x) * (size_t(o.y) + size_t(occupancyDims.y) * o.z)] = 1;
-        }
-    auto* pRenderContext = mpDevice->getRenderContext();
-    auto upload = [&](ref<Texture>& texture, uint3 size, ResourceFormat format, const void* data)
+    if (any(band != mSeaContentBand))
     {
-        if (!texture || texture->getWidth() != size.x || texture->getHeight() != size.y || texture->getDepth() != size.z)
-            texture = mpDevice->createTexture3D(size.x, size.y, size.z, format, 1, data);
-        else
-            pRenderContext->updateTextureData(texture.get(), data);
-    };
-    upload(mpMajorant, blockDims, ResourceFormat::R16Float, majorant.data());
-    upload(mpTightMajorant, blockDims, ResourceFormat::R16Float, tight.data());
-    upload(mpOccupancy, occupancyDims, ResourceFormat::R8Uint, occupancy.data());
-    const std::vector<uint8_t> majorantZero = majorantZeroBlocks(majorant, blockDims);
-    upload(mpMajorantZero, occupancyDims, ResourceFormat::R8Uint, majorantZero.data());
+        mSeaContentBand = band;
+        mParams.seaContentY = mSeaContentBand;
+        logInfo(
+            "HSTRCloud: sea content band y {} to {} of {} to {} ({} of the grid's height).", mSeaContentBand.x, mSeaContentBand.y,
+            mParams.seaOrigin.y, gridTopY, (mSeaContentBand.y - mSeaContentBand.x) / std::max(1e-6f, gridTopY - mParams.seaOrigin.y)
+        );
+    }
 }
 
 void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
 {
     FALCOR_PROFILE(pRenderContext, "cloudSea");
+    mpDomainStaging->beginFrame(pRenderContext);
     const auto& camera = mpScene->getCamera();
     std::vector<uint32_t> changed;
     {
@@ -1805,11 +1883,17 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
         if (mpWorldCacheDeposit && all(mParams.worldCacheDims > uint3(0)))
         {
-            bindRenderer(pRenderContext, mpClearWorldCacheTilesPass);
-            mpClearWorldCacheTilesPass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+            // The clear reads the domain frame and the tile resets, bound with the domain passes (uploadDomainExtinction).
+            FALCOR_PROFILE(pRenderContext, "clearCache");
+            if (mpClearBoundDeposit != mpWorldCacheDeposit)
+            {
+                mpClearWorldCacheTilesPass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+                mpClearBoundDeposit = mpWorldCacheDeposit;
+            }
             mpClearWorldCacheTilesPass->execute(pRenderContext, mParams.worldCacheDims);
         }
         mWorldCacheBakeDirty = true;
+        FALCOR_PROFILE(pRenderContext, "sunPages");
         // Sun pages: the changed tiles and every tile whose sun rays cross them (up to the layer height along the sun).
         const float3 sun = normalize(mParams.sunDirection);
         const auto& seaDesc = mpCloudSea->getDesc();
@@ -1876,6 +1960,19 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     {
         FALCOR_PROFILE(pRenderContext, "residency");
         densityChanged = mpCloudResidency->update(*mpCloudSea, view, changed);
+        if (mpCloudResidency->fadesRunning())
+        {
+            FALCOR_PROFILE(pRenderContext, "fades");
+            if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), mpAdvanceFadesPass.get()) == mResidencyPassesBound.end())
+            {
+                // Only the bricks and the fade frame, which live as long as the residency.
+                ShaderVar var = mpAdvanceFadesPass->getRootVar()["CB"]["gHSTRCloud"];
+                var["hstrCloudBricksOutput"] = mpCloudResidency->getBricks();
+                var["hstrCloudFadeFrame"] = mpCloudResidency->getFadeFrame();
+                mResidencyPassesBound.push_back(mpAdvanceFadesPass.get());
+            }
+            mpAdvanceFadesPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+        }
     }
     // The staged bricks' residuals decode from the payload pool in one dispatch; then one reconstruction dispatch per level,
     // coarsest first: every brick predicts from a parent already in the atlas.
@@ -1883,24 +1980,26 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     {
         FALCOR_PROFILE(pRenderContext, "commitBricks");
         mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
-        bindRenderer(pRenderContext, mpDecodeCloudPass);
+        bindResidencyPass(pRenderContext, mpDecodeCloudPass, false);
         mpDecodeCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
         mParams.cloudStagedCount = 0;
         for (const auto& group : mpCloudResidency->getCommitGroups())
         {
             mParams.cloudCommitOffset = group.offset;
             mParams.cloudCommitCount = group.count;
-            bindRenderer(pRenderContext, mpCommitCloudPass);
-            bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
+            if (bindResidencyPass(pRenderContext, mpCommitCloudPass, false))
+                bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
             mpCommitCloudPass->execute(pRenderContext, uint3(10, 10, 10 * group.count));
         }
         mParams.cloudCommitCount = 0;
         // Then their occupancy, from the reconstructed atlas texels, for the camera marches' empty-cell skipping.
         mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
-        bindRenderer(pRenderContext, mpOccupancyCloudPass);
-        ShaderVar occupancyVar = mpOccupancyCloudPass->getRootVar()["CB"]["gHSTRCloud"];
-        occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
-        occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
+        if (bindResidencyPass(pRenderContext, mpOccupancyCloudPass, false))
+        {
+            ShaderVar occupancyVar = mpOccupancyCloudPass->getRootVar()["CB"]["gHSTRCloud"];
+            occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
+            occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
+        }
         mpOccupancyCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
         mParams.cloudStagedCount = 0;
     }
@@ -1908,6 +2007,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     if (mCloudGpuSun)
     {
         dispatchSunScheduling(pRenderContext);
+        mpCloudResidency->gpuSunDispatched();
     }
     else if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
     {
@@ -1939,10 +2039,36 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     }
 }
 
+bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<ComputePass>& pPass, bool scene)
+{
+    // A residency pass reads the residency's buffers, the samplers and the params (and the scene, for its density scale). It binds
+    // them once: every other binding bindRenderer makes would cost each dispatch its resource state tracking, and a params change
+    // rebuilds all of a pass's bindings. A full bind per dispatch cost 0.1-0.3 ms of CPU each.
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    const bool first = std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), pPass.get()) == mResidencyPassesBound.end();
+    if (first)
+    {
+        if (scene)
+            mpScene->bindShaderDataForRaytracing(pRenderContext, pPass->getRootVar()["gScene"]);
+        mpCloudResidency->bind(var);
+        var["hstrLinearClampSampler"] = mpLinearClampSampler;
+        var["hstrLinearSampler"] = mpLinearSampler;
+        mResidencyPassesBound.push_back(pPass.get());
+    }
+    var["params"].setBlob(mParams);
+    return first;
+}
+
 void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
 {
     auto& residency = *mpCloudResidency;
-    // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle.
+    // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle. The copy was
+    // recorded in an earlier frame, whose end submitted it, so the fence is signalled now rather than by flushing then.
+    if (mSunReadbackRecorded)
+    {
+        mSunReadbackPending = pRenderContext->signal(mpSunFence.get());
+        mSunReadbackRecorded = false;
+    }
     if (mSunReadbackPending != 0 && mpSunFence->getCurrentValue() >= mSunReadbackPending)
     {
         const uint32_t bakes = *static_cast<const uint32_t*>(mpSunReadback->map());
@@ -1951,43 +2077,56 @@ void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         mSunReadbackPending = 0;
     }
     const auto& sun = residency.getGpuSunFrame();
-    pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
-    if (!sun.run)
-        return;
+    const HSTRCloudSunFrame& info = sun.info;
     FALCOR_PROFILE(pRenderContext, "scheduleSun");
-    pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
-    mParams.cloudResidencyFrame = sun.frame;
-    mParams.cloudSunReleaseCount = sun.releaseCount;
-    mParams.cloudSunClassCount = sun.classCount;
-    mParams.cloudSunBakeMax = sun.bakeMax;
-    mParams.cloudBrickCapacity = sun.capacity;
-    auto run = [&](const char* name, const ref<ComputePass>& pPass, uint32_t threads)
+    // The scheduler passes read only the residency's buffers (their frame included, HSTRCloudSunFrame, so no params), which live as
+    // long as it: each pass binds them once (as bindResidencyPass does) and then dispatches with nothing changed.
+    auto run = [&](const char* name, const ref<ComputePass>& pPass, uint3 threads)
     {
         FALCOR_PROFILE(pRenderContext, name);
-        bindRenderer(pRenderContext, pPass);
-        residency.bindGpuSun(pPass->getRootVar()["CB"]["gHSTRCloud"]);
-        pPass->execute(pRenderContext, uint3(threads, 1, 1));
+        if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), pPass.get()) == mResidencyPassesBound.end())
+        {
+            // Only the residency's buffers: every other binding would still cost each dispatch its resource state tracking.
+            ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+            residency.bind(var);
+            residency.bindGpuSun(var);
+            mResidencyPassesBound.push_back(pPass.get());
+        }
+        pPass->execute(pRenderContext, threads);
     };
-    if (sun.releaseCount > 0)
-        run("release", mpReleaseSunPass, sun.releaseCount);
-    run("stale", mpStaleSunPass, (sun.capacity + 3) / 4);
-    run("scan", mpScanSunPass, sun.capacity);
-    run("select", mpSelectSunPass, 1);
-    run("emit", mpEmitSunPass, sun.capacity);
-    run("evict", mpEvictSunPass, sun.bakeMax);
-    run("assign", mpAssignSunPass, sun.bakeMax);
+    // The invalidation field ages every frame, idle or not.
+    if (info.ageRows > 0)
+        run("age", mpAgeSunPass, uint3(kCloudSunFieldWidth, info.ageRows, 1));
+    if (!sun.run)
+        return; // The counters keep the last run's (the stats read them).
+    pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
+    if (info.releaseCount > 0)
+        run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
+    // New blocks and nodes restart before this frame's changes stamp over them.
+    if (info.blockResets > 0)
+        run("resetBlocks", mpResetSunBlocksPass, uint3(info.blockLength, info.blockResets, 1));
+    if (info.nodeResets > 0)
+        run("resetNodes", mpResetSunNodesPass, uint3(kCloudSunFineEntries, info.nodeResets, 1));
+    if (info.changeCount > 0)
+        run("stamp", mpStampSunPass, uint3(info.changeCount, 1, 1));
+    run("scan", mpScanSunPass, uint3(info.capacity, 1, 1));
+    run("select", mpSelectSunPass, uint3(1));
+    run("emit", mpEmitSunPass, uint3(info.capacity, 1, 1));
+    run("evict", mpEvictSunPass, uint3(info.bakeMax, 1, 1));
+    run("assign", mpAssignSunPass, uint3(info.bakeMax, 1, 1));
     // The jobs assign wrote; entries without a slot return at once.
     {
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
-        mParams.cloudCommitCount = sun.bakeMax;
-        bindRenderer(pRenderContext, mpBakeCloudSunPass);
-        bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
-        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * sun.bakeMax));
+        mParams.cloudCommitCount = info.bakeMax;
+        if (bindResidencyPass(pRenderContext, mpBakeCloudSunPass, true))
+            bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
+        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * info.bakeMax));
         mParams.cloudCommitCount = 0;
     }
     mBeamReusable = false;
-    if (mSunReadbackPending == 0)
+    if (mSunReadbackPending == 0 && !mSunReadbackRecorded)
     {
         if (!mpSunReadback)
         {
@@ -1996,8 +2135,7 @@ void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         }
         pRenderContext->copyBufferRegion(mpSunReadback.get(), 0, residency.getGpuSunCounters().get(), 2 * sizeof(uint32_t), sizeof(uint32_t));
         residency.gpuSunQueued();
-        pRenderContext->submit(false);
-        mSunReadbackPending = pRenderContext->signal(mpSunFence.get());
+        mSunReadbackRecorded = true;
     }
 }
 

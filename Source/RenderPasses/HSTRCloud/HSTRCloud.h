@@ -13,6 +13,37 @@
 
 using namespace Falcor;
 
+/// The cloud sea's tile uploads: host-visible buffers of one packed tile volume each, kept mapped. A sea worker writes a tile
+/// straight into a free one, so taking the tile on costs the main thread one recorded copy. A buffer is free again once the GPU
+/// is past its copy (a fence signalled the frame after the copy was recorded).
+class DomainStaging : public hstrcloud::TileStaging
+{
+public:
+    DomainStaging(ref<Device> pDevice, uint32_t tileValues, uint32_t count);
+
+    int32_t acquire(uint32_t*& data) override;
+    void discard(int32_t handle) override;
+
+    const ref<Buffer>& getBuffer(int32_t handle) const { return mBuffers[handle].pBuffer; }
+    /// The buffer's copy is in this frame's command list.
+    void recorded(int32_t handle) { mRecorded.push_back(handle); }
+    /// Signals the copies recorded last frame and frees the buffers whose copies ran.
+    void beginFrame(RenderContext* pRenderContext);
+
+private:
+    struct Staged
+    {
+        ref<Buffer> pBuffer;
+        uint32_t* pData = nullptr;
+    };
+    std::vector<Staged> mBuffers;
+    std::mutex mMutex;
+    std::vector<int32_t> mFree;                            ///< Guarded by mMutex (workers take buffers).
+    std::vector<int32_t> mRecorded;                        ///< Main thread only.
+    std::vector<std::pair<uint64_t, int32_t>> mInFlight;   ///< Fence value and buffer, main thread only.
+    ref<Fence> mpFence;
+};
+
 /** Hierarchical Schur transport renderer for heterogeneous cloud volumes.
  *
  * Lighting is solved through persistent spatial-angular six-face boundary
@@ -147,7 +178,7 @@ private:
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
     float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).
     float mCloudCutTurn = 3.f;          ///< CloudView::cutTurn (degrees).
-    bool mCloudCutAsync = false;        ///< CloudView::cutAsync.
+    bool mCloudCutAsync = true;         ///< CloudView::cutAsync: the frame only takes on cuts the worker finished.
     bool mBeamShip = true;     ///< Whether the beam marches compile HSTR_SHIP where the settings allow it (beamShipping).
     /// The HSTR_SHIP groups folded when they do. MEASURED (4K, 2026-09-17, same frame everywhere): all of them (511) sped up the sea
     /// 7.25 -> 5.40 ms but slowed near 14.3 -> 19.5 and farside 11.4 -> 14.7 - a DXC codegen cliff no single group causes; every
@@ -250,6 +281,7 @@ private:
     bool mCloudVirtual = true;
     std::string mCloudSeaKey;       ///< Settings the resident sea was built for.
     std::string mCloudResidencyKey; ///< Settings the residency was built for.
+    std::unique_ptr<DomainStaging> mpDomainStaging; ///< Before the sea: its workers write into it until the sea is gone.
     std::unique_ptr<hstrcloud::CloudSea> mpCloudSea;
     std::unique_ptr<hstrcloud::CloudResidency> mpCloudResidency;
     bool mCloudInstancesUploaded = false;
@@ -264,7 +296,13 @@ private:
     bool mCloudGpuSun = true;
     ref<ComputePass> mpReleaseSunPass;
     ref<ComputePass> mpScanSunPass;
-    ref<ComputePass> mpStaleSunPass;
+    ref<ComputePass> mpStampSunPass;
+    ref<ComputePass> mpResetSunBlocksPass;
+    ref<ComputePass> mpResetSunNodesPass;
+    ref<ComputePass> mpAgeSunPass;
+    std::vector<const ComputePass*> mResidencyPassesBound; ///< Residency passes holding the current residency's bindings.
+    /// Binds a residency pass (bindResidencyPass in the .cpp) and sets its params; true on its first bind.
+    bool bindResidencyPass(RenderContext* pRenderContext, const ref<ComputePass>& pPass, bool scene);
     ref<ComputePass> mpSelectSunPass;
     ref<ComputePass> mpEmitSunPass;
     ref<ComputePass> mpEvictSunPass;
@@ -272,6 +310,7 @@ private:
     ref<Buffer> mpSunReadback; ///< The bake count of a run, read back without waiting.
     ref<Fence> mpSunFence;
     uint64_t mSunReadbackPending = 0;
+    bool mSunReadbackRecorded = false; ///< The copy is in the command list; its fence is signalled next frame.
     void dispatchSunScheduling(RenderContext* pRenderContext);
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
@@ -280,8 +319,18 @@ private:
     bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
     ref<ComputePass> mpCameraPass;            ///< That entry point.
     ref<ComputePass> mpDecayWorldCachePass;
-    std::vector<float> mCloudMeanBlocks; ///< Domain majorant blocks of the mean density (transport), unscaled.
-    std::vector<float> mCloudMaxBlocks;  ///< Domain majorant blocks of the maximum density (camera), unscaled.
+    // The sea's domain proxy on the GPU (uploadDomainExtinction).
+    ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
+    ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
+    ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).
+    ref<Buffer> mpDomainFrame;
+    ref<Buffer> mpDomainStaged;  ///< One batch of packed tile volumes, copied from the staging buffers.
+    bool mDomainPassesBound = false;         ///< The domain passes and the world cache clear hold the current resources.
+    ref<Buffer> mpClearBoundDeposit;         ///< The world cache the clear holds (a reference, so no new buffer reuses its address).
+    ref<ComputePass> mpDomainExtinctionPass;
+    ref<ComputePass> mpDomainBlocksPass;
+    ref<ComputePass> mpDomainMajorantPass;
+    ref<ComputePass> mpDomainOccupancyPass;
     /// World Y of the occupied band, from the majorant blocks, dilated by one. mParams.seaContentY carries this when cloudSlabClamp
     /// is on and an unbounded range when it is off, so the shader clamps without a branch.
     float2 mSeaContentBand = float2(-std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
@@ -293,6 +342,7 @@ private:
     ref<ComputePass> mpDecodeCloudPass;
     ref<ComputePass> mpOccupancyCloudPass;
     ref<ComputePass> mpClearWorldCacheTilesPass;
+    ref<ComputePass> mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;
     uint32_t mSamplerSeaMode = ~0u;
     std::vector<float> mHierarchyResidualBounds;

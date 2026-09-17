@@ -57,9 +57,13 @@ CloudSea::CloudSea(std::vector<CloudAsset> assets, const CloudSeaDesc& desc) : m
         const float3 extent = float3(mContentMax.back() - mContentMin.back() + 1u) * asset.voxelWorld;
         mFitScale = std::min(mFitScale, 0.98f * std::min(mDesc.tileWorld / std::max(extent.x, extent.z), mDesc.layerHeight / extent.y));
     }
-    mMean.assign(size_t(mDims.x) * mDims.y * mDims.z, 0.f);
-    mMax.assign(mMean.size(), 0.f);
     mTiles.resize(mDesc.tiles * mDesc.tiles);
+    mVolumes.resize(mTiles.size());
+    for (TileVolume& volume : mVolumes)
+    {
+        const size_t voxels = size_t(mDesc.tileVoxels) * mDims.y * mDesc.tileVoxels;
+        volume.mean.assign(voxels, 0.f);
+    }
     mRequested.assign(mTiles.size(), int2(std::numeric_limits<int32_t>::min()));
     const uint32_t workerCount = std::max(1u, std::thread::hardware_concurrency() / 4);
     for (uint32_t i = 0; i < workerCount; ++i)
@@ -147,16 +151,32 @@ CloudSea::Tile CloudSea::makeTile(int2 world) const
     return tile;
 }
 
-CloudSea::Result CloudSea::rasterize(const Job& job) const
+CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) const
 {
     Result result;
     result.slot = job.slot;
     result.tile = makeTile(job.world);
     const uint32_t r = mDesc.tileVoxels;
-    result.mean.assign(size_t(r) * mDims.y * r, 0.f);
-    result.max.assign(result.mean.size(), 0.f);
+    const size_t voxels = size_t(r) * mDims.y * r;
+    TileVolume& volume = result.volume;
+    volume.mean.assign(voxels, 0.f);
+    volume.upload = TileVolume::Upload::Zero;
     if (!result.tile.occupied)
         return result;
+    // The GPU upload is written where the main thread only has to record a copy: a staging buffer, or host memory if none is free.
+    uint32_t* packed = nullptr;
+    volume.staged = pStaging ? pStaging->acquire(packed) : -1;
+    if (volume.staged >= 0)
+    {
+        volume.upload = TileVolume::Upload::Staged;
+        std::memset(packed, 0, voxels * sizeof(uint32_t));
+    }
+    else
+    {
+        volume.upload = TileVolume::Upload::Packed;
+        volume.packed.assign(voxels, 0u);
+        packed = volume.packed.data();
+    }
     const HSTRCloudInstance& instance = result.tile.instance;
     const CloudAsset& asset = mAssets[instance.asset];
     const float3x3 a{
@@ -220,25 +240,35 @@ CloudSea::Result CloudSea::rasterize(const Job& job) const
                         for (uint32_t qx = plo.x; qx <= phi.x; ++qx)
                             maximum = std::max(maximum, asset.proxyMax[proxyIndex(uint3(qx, qy, qz))]);
                 const size_t index = size_t(x) + r * (size_t(y) + size_t(mDims.y) * size_t(z));
-                result.mean[index] = std::min(mean, maximum);
-                result.max[index] = maximum;
+                volume.mean[index] = std::min(mean, maximum);
+                // The maximum rounds up: the majorants built from it must still bound the density.
+                float16_t maximum16(maximum);
+                if (float(maximum16) < maximum)
+                    maximum16 = float16_t(maximum * (1.f + 1.f / 1024.f));
+                packed[index] = uint32_t(float16_t(volume.mean[index]).toBits()) | uint32_t(maximum16.toBits()) << 16;
+                if (maximum > 0.f)
+                {
+                    result.tile.contentLow = result.tile.contentLow < 0 ? y : std::min(result.tile.contentLow, y);
+                    result.tile.contentHigh = std::max(result.tile.contentHigh, y);
+                }
             }
     return result;
 }
 
 void CloudSea::apply(Result& result)
 {
-    const uint32_t r = mDesc.tileVoxels;
-    const uint3 corner(result.slot % mDesc.tiles * r, 0, result.slot / mDesc.tiles * r);
-    for (uint32_t z = 0; z < r; ++z)
-        for (uint32_t y = 0; y < mDims.y; ++y)
-        {
-            const size_t source = size_t(r) * (size_t(y) + size_t(mDims.y) * z);
-            const size_t target = corner.x + size_t(mDims.x) * (size_t(y) + size_t(mDims.y) * (corner.z + z));
-            std::copy_n(result.mean.begin() + source, r, mMean.begin() + target);
-            std::copy_n(result.max.begin() + source, r, mMax.begin() + target);
-        }
+    // The volume was built on the worker: taking it on is a swap (the replaced one may still hold an upload nobody took).
+    std::swap(mVolumes[result.slot], result.volume);
+    discard(result.volume);
     mTiles[result.slot] = result.tile;
+}
+
+void CloudSea::discard(TileVolume& volume)
+{
+    if (volume.staged >= 0 && mpStaging)
+        mpStaging->discard(volume.staged);
+    volume.staged = -1;
+    volume.upload = TileVolume::Upload::Done;
 }
 
 void CloudSea::worker()
@@ -246,6 +276,7 @@ void CloudSea::worker()
     for (;;)
     {
         Job job;
+        TileStaging* pStaging = nullptr;
         {
             std::unique_lock lock(mMutex);
             mWake.wait(lock, [&] { return mStop || !mJobs.empty(); });
@@ -253,9 +284,10 @@ void CloudSea::worker()
                 return;
             job = mJobs.front();
             mJobs.pop_front();
+            pStaging = mpStaging;
             ++mBusy;
         }
-        Result result = rasterize(job);
+        Result result = rasterize(job, pStaging);
         {
             std::lock_guard lock(mMutex);
             mResults.push_back(std::move(result));
@@ -314,7 +346,10 @@ std::vector<uint32_t> CloudSea::update(float3 cameraPosition, bool applyResults)
     for (Result& result : results)
     {
         if (any(mRequested[result.slot] != result.tile.world))
-            continue; // A later request replaced it.
+        {
+            discard(result.volume); // A later request replaced it.
+            continue;
+        }
         apply(result);
         changed.push_back(result.slot);
     }

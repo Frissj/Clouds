@@ -89,7 +89,7 @@ public:
         Event(const std::string& name);
 
         void start(Profiler& profiler, uint32_t frameIndex);
-        void end(uint32_t frameIndex);
+        void end(Profiler& profiler, uint32_t frameIndex);
         void endFrame(uint32_t frameIndex);
 
         std::string mName; ///< Nested event name.
@@ -110,6 +110,7 @@ public:
         struct FrameData
         {
             CpuTimer::TimePoint cpuStartTime; ///< Last event CPU start time.
+            double cpuStartOverhead = 0.0;    ///< The profiler's own overhead when the event started (Profiler::mOverhead).
             float cpuTotalTime = 0.0;         ///< Total accumulated CPU time.
 
             std::vector<ref<GpuTimer>> pTimers; ///< Pool of GPU timers.
@@ -267,12 +268,18 @@ private:
     bool mPaused = false;
 
     std::unordered_map<std::string, std::shared_ptr<Event>> mEvents; ///< Events by name.
+    /// Every event, in creation order: all of them resolve every frame, so an event that skips a frame reports zero for it (instead
+    /// of repeating its last time) and its next run does not add onto unresolved data.
+    std::vector<Event*> mAllEvents;
     std::vector<Event*> mCurrentFrameEvents;                         ///< Events registered for current frame.
     std::vector<Event*> mLastFrameEvents;                            ///< Events from last frame.
     std::string mCurrentEventName;                                   ///< Current nested event name.
     uint32_t mCurrentLevel = 0;                                      ///< Current nesting level.
     uint32_t mFrameIndex = 0;                                        ///< Current frame index.
     bool mPendingReset = false;                                      ///< Reset profiler stats at the next call to endFrame().
+    /// CPU milliseconds the profiler spent inside events on itself (creating GPU timers: two buffers each, ~0.35 ms), which events
+    /// subtract so an event's first run with the profiler on does not charge it and every enclosing event.
+    double mOverhead = 0.0;
 
     std::shared_ptr<Capture> mpCapture; ///< Currently active capture.
 

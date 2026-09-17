@@ -46,6 +46,15 @@ static const uint kSortGroupSize = 64;
 static const float kMinTransmittance = 1e-3f;
 static const float kPi = 3.14159265f;
 
+/// A GPU brick's sun scheduler entry, from its two tables (HSTRCloudRenderer::sunSched).
+struct SunSchedEntry
+{
+    float priority; ///< The last cut's priority, at bin resolution (bin / 16).
+    uint flags;     ///< Orientation classes that desired it (bits 0-15), kCloudSunInCut, kCloudSunMapped.
+    uint coord;     ///< BrickHeader::coord: level-local brick coordinates, 10 bits per axis.
+    uint asset;
+};
+
 struct HSTRCorrectionAtom
 {
     uint row;
@@ -205,6 +214,19 @@ struct HSTRCloudRenderer
     Texture3D<float> hstrTightMajorant; ///< Undilated block maxima: bound the trilinear extinction inside the block only.
     Texture3D<uint> hstrOccupancy;      ///< 1 where a 16-voxel block holds any extinction.
     Texture3D<uint> hstrMajorantZero;   ///< 0 where every majorant block of a 16-voxel block is zero (camera marches cross it at once).
+    // The sea's domain proxy, built on the GPU (HSTRCloudDomainFrame).
+    Texture3D<float2> hstrDomainVolume;                 ///< Per domain voxel: unscaled mean density and conservative maximum.
+    Texture3D<float2> hstrDomainBlocks;                 ///< Per majorant block: unscaled maximum and mean over its trilinear support.
+    RWTexture3D<float2> hstrDomainVolumeOutput;
+    StructuredBuffer<uint> hstrDomainStaged;            ///< Packed volumes of a batch's slots (CloudSea::TileVolume::packed).
+    RWTexture3D<float> hstrExtinctionOutput;
+    RWTexture3D<float2> hstrDomainBlocksOutput;
+    RWTexture3D<float> hstrMajorantOutput;
+    RWTexture3D<float> hstrTightMajorantOutput;
+    RWTexture3D<uint> hstrOccupancyOutput;
+    RWTexture3D<uint> hstrMajorantZeroOutput;
+    StructuredBuffer<uint> hstrDomainRegions;           ///< Changed slots.
+    StructuredBuffer<HSTRCloudDomainFrame> hstrDomainFrame;
     // Virtual cloud density (see CloudResidency): instances per sea tile, assets, the chunk directory and 4^3 page nodes whose
     // entries name the finest mapped brick, the resident bricks and their R8 atlas, and the staging of newly loaded bricks.
     StructuredBuffer<HSTRCloudInstance> hstrCloudInstances;
@@ -234,7 +256,10 @@ struct HSTRCloudRenderer
     // GPU sun bake scheduling (CloudResidencyDesc::gpuSun): the scheduler owns the slot table, the bake frames and the free slots.
     RWStructuredBuffer<uint> hstrCloudSunSlotsOutput;
     RWStructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakesOutput;
+    RWStructuredBuffer<HSTRCloudBrick> hstrCloudBricksOutput; ///< advanceCloudFades only.
+    StructuredBuffer<HSTRCloudFadeFrame> hstrCloudFadeFrame;
     StructuredBuffer<HSTRCloudSunSched> hstrCloudSunSched;  ///< Per GPU brick.
+    StructuredBuffer<uint> hstrCloudSunState;               ///< Per GPU brick: flags and priority bin (kCloudSunBinShift).
     RWStructuredBuffer<uint> hstrCloudSunFrames;            ///< Per pair: the residency frame it was baked in.
     RWStructuredBuffer<uint> hstrCloudSunFree;              ///< Free sun atlas slots, a stack.
     RWStructuredBuffer<uint> hstrCloudSunFreeTop;           ///< Its size.
@@ -246,8 +271,12 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrCloudSunHolders;           ///< Pairs whose slots move to candidates, cloudSunBakeMax of them.
     StructuredBuffer<uint> hstrCloudSunRelease;             ///< Bricks whose bakes are freed this frame (unloaded).
     StructuredBuffer<float4> hstrCloudSunDirections;        ///< Per orientation class: sun direction in its source voxels.
-    StructuredBuffer<uint> hstrCloudChangeFrames;           ///< Per asset, per 32^3-voxel cell: last frame a brick over it changed.
-    StructuredBuffer<uint> hstrCloudAssetChanges;           ///< Per asset: last change frame, offset of its cells.
+    RWTexture2D<uint> hstrCloudSunField;                    ///< Sun bake invalidation epochs (R16), kCloudSunFieldWidth a row.
+    StructuredBuffer<uint> hstrCloudSunFieldBlocks;         ///< Per asset, kCloudSunClasses entries: its level >= 2 block's first entry, or kCloudRefNone.
+    StructuredBuffer<uint> hstrCloudSunFieldLevels;         ///< Per asset, kCloudSunFieldLevels entries: a level's offset in a block.
+    StructuredBuffer<HSTRCloudSunChange> hstrCloudSunChanges; ///< This frame's residency changes (stampSunChanges).
+    StructuredBuffer<uint> hstrCloudSunResets;              ///< First entries of the field ranges resetSunField restarts.
+    StructuredBuffer<HSTRCloudSunFrame> hstrCloudSunFrameInfo; ///< This frame's scheduling (one element).
     StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
     StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
     Texture3D<float4> hstrCameraLighting;
@@ -2960,18 +2989,6 @@ struct HSTRCloudRenderer
         return tile.x + params.cloudTiles.x * tile.y;
     }
 
-    /// Clears the deposits of world cache cells in sea tiles whose cloud changed.
-    void clearWorldCacheCell(uint3 cell)
-    {
-        if (any(cell >= params.worldCacheDims))
-            return;
-        const uint index = worldCacheIndex(cell);
-        if (hstrCloudTileReset[worldCacheTile(index)] == 0)
-            return;
-        for (uint slot = 0; slot < kWorldCacheSlots; ++slot)
-            hstrWorldCacheDeposit[kWorldCacheSlots * index + slot] = 0;
-    }
-
     /// Writes one cell's cache means into the packed camera textures (light tracing only; the gather is read untextured).
     /// Cells without medium within a majorant block never receive deposits (depositSegment) and keep their cleared zeros.
     void bakeWorldCacheCell(uint3 cell)
@@ -3261,8 +3278,8 @@ struct HSTRCloudRenderer
     // ---------------------------------------------------------------------------------------------
     // GPU sun bake scheduling (CloudResidencyDesc::gpuSun). The CPU pass it replaces walked every mapped brick (and every held bake
     // when the slot pool was short) every frame: 9-19 ms of a moving sea's frame. Here the GPU owns the slot table and the free
-    // slots, and each frame runs release, scan, select, emit, evict and assign; the bake pass then runs over the jobs assign wrote.
-    // Nothing is read back. What it decides is what CloudResidency::scheduleSunBakes decided, except that a brick takes at most one
+    // slots, and each frame runs release, stamp, scan, select, emit, evict and assign; the bake pass then runs over the jobs assign
+    // wrote. Only the bake count is read back, asynchronously, to let the scheduler idle. What it decides is what CloudResidency::scheduleSunBakes decided, except that a brick takes at most one
     // bake per frame and the most important candidates are chosen by histogram bin rather than exact order.
 
     uint sunCandidateBin(float priority) { return uint(clamp(int(priority * 16.f), 0, int(kCloudSunBins) - 1)); }
@@ -3273,9 +3290,25 @@ struct HSTRCloudRenderer
         return wanted ? 2u + uint(clamp(int(priority * 16.f), 0, int(kCloudSunBins) - 3)) : (inCut ? 1u : 0u);
     }
 
+    /// The scheduler passes read their frame from here, never from params (HSTRCloudSunFrame).
+    HSTRCloudSunFrame sunFrame() { return hstrCloudSunFrameInfo[0]; }
+
+    /// A GPU brick's scheduler entry: where it is, its flags, and its priority at bin resolution.
+    SunSchedEntry sunSched(uint b)
+    {
+        const HSTRCloudSunSched where = hstrCloudSunSched[b];
+        const uint state = hstrCloudSunState[b];
+        SunSchedEntry s;
+        s.priority = float(state >> kCloudSunBinShift) / 16.f;
+        s.flags = state & ((1u << kCloudSunBinShift) - 1u);
+        s.coord = where.coord;
+        s.asset = where.asset;
+        return s;
+    }
+
     bool sunKeyWanted(uint key, uint flags)
     {
-        return key != kCloudRefNone && (key >> 4) == params.cloudSunGeneration && (flags & (1u << (key & 15u))) != 0;
+        return key != kCloudRefNone && (key >> 4) == sunFrame().generation && (flags & (1u << (key & 15u))) != 0;
     }
 
     void pushSunSlot(uint slot)
@@ -3290,7 +3323,7 @@ struct HSTRCloudRenderer
     {
         uint previous;
         InterlockedAdd(hstrCloudSunFreeTop[0], 0xFFFFFFFFu, previous);
-        if (previous == 0u || previous > params.cloudBrickCapacity)
+        if (previous == 0u || previous > sunFrame().capacity)
         {
             uint unused;
             InterlockedAdd(hstrCloudSunFreeTop[0], 1u, unused);
@@ -3299,37 +3332,161 @@ struct HSTRCloudRenderer
         return hstrCloudSunFree[previous - 1u];
     }
 
-    /// CloudResidency::sunBakeStale: whether any of the region a bake read (its texels with their trilinear support, swept towards
-    /// the sun by the reach) was mapped or unmapped since it was baked.
-    bool sunBakeStale(uint assetID, uint level, uint coord, float3 direction, float reach, uint bakeFrame)
+    uint2 sunFieldTexel(uint entry) { return uint2(entry & (kCloudSunFieldWidth - 1u), entry / kCloudSunFieldWidth); }
+
+    /// Brick positions of a level in an asset.
+    uint3 sunLevelDims(uint assetID, uint level)
     {
-        if (hstrCloudAssetChanges[2u * assetID] <= bakeFrame)
-            return false;
-        const uint offset = hstrCloudAssetChanges[2u * assetID + 1u];
-        const uint3 dims = (hstrCloudAssets[assetID].dims + 31u) / 32u;
-        const float scale = float(1u << level);
-        const uint3 brick = uint3(coord & 1023u, (coord >> 10) & 1023u, coord >> 20);
-        const float3 origin = float3(brick * (8u << level));
-        const float3 sweep = reach * direction;
-        const float3 lo = origin - 1.5f * scale - 0.5f + min(sweep, 0.f) - scale;
-        const float3 hi = origin + 9.5f * scale - 0.5f + max(sweep, 0.f) + scale;
-        const int3 maximum = int3(dims) - 1;
-        const int3 first = clamp(int3(floor(lo / 32.f)), 0, maximum);
-        const int3 last = clamp(int3(floor(hi / 32.f)), 0, maximum);
-        for (int z = first.z; z <= last.z; ++z)
-            for (int y = first.y; y <= last.y; ++y)
-                for (int x = first.x; x <= last.x; ++x)
-                    if (hstrCloudChangeFrames[offset + uint(x) + dims.x * (uint(y) + dims.y * uint(z))] > bakeFrame)
-                        return true;
-        return false;
+        const uint size = 8u << level;
+        return (hstrCloudAssets[assetID].dims + size - 1u) / size;
     }
 
-    float sunReach(uint assetID) { return params.sunNearVoxels * params.seaVoxelSize.x / hstrCloudAssets[assetID].sourceVoxelWorld; }
+    /// The directory node over one 32-voxel cell of an asset, which exists while fine (level 0-1) bricks are mapped there.
+    uint sunFineNode(uint assetID, uint3 cell)
+    {
+        const HSTRCloudAsset asset = hstrCloudAssets[assetID];
+        const uint3 chunk = cell >> 2;
+        if (any(chunk >= asset.chunkDims))
+            return kCloudRefNone;
+        uint entry = hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
+        if (entry == kCloudRefNone || (entry & kCloudRefNode) == 0)
+            return kCloudRefNone;
+        const uint3 local = cell & 3u;
+        entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + local.x + 4 * (local.y + 4 * local.z)];
+        return entry != kCloudRefNone && (entry & kCloudRefNode) != 0 ? entry & ~kCloudRefNode : kCloudRefNone;
+    }
+
+    /// A fine brick position's entry: per class, the node's 8 level-1 positions, then its 64 level-0 positions.
+    uint sunFineEntry(uint node, uint sunClass, uint level, uint3 brick)
+    {
+        const uint3 local = brick & (level == 0 ? 3u : 1u);
+        const uint index = level == 0 ? 8u + local.x + 4u * (local.y + 4u * local.z) : local.x + 2u * (local.y + 2u * local.z);
+        return sunFrame().fineBase + node * kCloudSunFineEntries + sunClass * 72u + index;
+    }
+
+    /// Whether a change reached an entry after a bake of bakeFrame (bakes kCloudSunAgeCap old always count as stale).
+    bool sunEntryNewer(uint entry, uint bakeFrame)
+    {
+        const uint frame = sunFrame().frame;
+        const uint bakeAge = frame - bakeFrame;
+        const uint entryAge = (frame - hstrCloudSunField[sunFieldTexel(entry)]) & 0xFFFFu;
+        return bakeAge >= kCloudSunAgeCap || entryAge < bakeAge;
+    }
+
+    /// The positions of a level whose bakes read any of the change cells in [lo, hi) voxels. A level-L brick at origin o reads the
+    /// cells floor((o + a) / 32) to floor((o + b) / 32): a and b are its texels' trilinear support and the sweep towards the sun.
+    void sunStampRange(float3 lo, float3 hi, float3 sweep, uint level, int3 dims, out int3 first, out int3 last)
+    {
+        const float s = float(1u << level);
+        const float3 a = -2.5f * s - 0.5f + min(sweep, 0.f);
+        const float3 b = 10.5f * s - 0.5f + max(sweep, 0.f);
+        first = max(int3(ceil((lo - b) / (8.f * s) - 1e-4f)), 0);
+        last = min(int3(ceil((hi - a) / (8.f * s) + 1e-4f)) - 1, dims - 1);
+    }
+
+    /// Stamp: this frame into every entry, of every class, whose bakes read the change's cells.
+    void stampSunChange(uint entry)
+    {
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (entry >= frame.changeCount)
+            return;
+        const HSTRCloudSunChange change = hstrCloudSunChanges[entry];
+        const HSTRCloudAsset asset = hstrCloudAssets[change.asset];
+        const float3 lo = float3(uint3(change.first & 1023u, (change.first >> 10) & 1023u, change.first >> 20)) * 32.f;
+        const float3 hi = (float3(uint3(change.last & 1023u, (change.last >> 10) & 1023u, change.last >> 20)) + 1.f) * 32.f;
+        const float reach = sunReach(change.asset);
+        const uint epoch = frame.frame & 0xFFFFu;
+        const uint levels = min(asset.topLevel + 1u, kCloudSunFieldLevels);
+        const uint classes = min(frame.classCount, kCloudSunClasses);
+        // Levels >= 2: the blocks of the asset's pairs.
+        for (uint c = 0; c < classes; ++c)
+        {
+            const uint block = hstrCloudSunFieldBlocks[change.asset * kCloudSunClasses + c];
+            if (block == kCloudRefNone)
+                continue;
+            const float3 sweep = reach * hstrCloudSunDirections[c].xyz;
+            for (uint level = 2; level < levels; ++level)
+            {
+                const int3 dims = int3(sunLevelDims(change.asset, level));
+                int3 first, last;
+                sunStampRange(lo, hi, sweep, level, dims, first, last);
+                const uint offset = block + hstrCloudSunFieldLevels[change.asset * kCloudSunFieldLevels + level];
+                for (int z = first.z; z <= last.z; ++z)
+                    for (int y = first.y; y <= last.y; ++y)
+                        for (int x = first.x; x <= last.x; ++x)
+                            hstrCloudSunField[sunFieldTexel(offset + uint(x + dims.x * (y + dims.y * z)))] = epoch;
+            }
+        }
+        // Levels 0-1: the positions of every class, in the nodes of the 32-voxel cells they lie in.
+        int3 firsts[2 * kCloudSunClasses];
+        int3 lasts[2 * kCloudSunClasses];
+        int3 cellFirst = int3(0x3FFFFFFF);
+        int3 cellLast = int3(-1);
+        for (uint c = 0; c < classes; ++c)
+        {
+            const float3 sweep = reach * hstrCloudSunDirections[c].xyz;
+            for (uint level = 0; level < 2; ++level)
+            {
+                const uint i = 2u * c + level;
+                sunStampRange(lo, hi, sweep, level, int3(sunLevelDims(change.asset, level)), firsts[i], lasts[i]);
+                if (all(firsts[i] <= lasts[i]))
+                {
+                    cellFirst = min(cellFirst, firsts[i] >> int(2u - level));
+                    cellLast = max(cellLast, lasts[i] >> int(2u - level));
+                }
+            }
+        }
+        for (int cz = cellFirst.z; cz <= cellLast.z; ++cz)
+            for (int cy = cellFirst.y; cy <= cellLast.y; ++cy)
+                for (int cx = cellFirst.x; cx <= cellLast.x; ++cx)
+                {
+                    const int3 cell = int3(cx, cy, cz);
+                    const uint node = sunFineNode(change.asset, uint3(cell));
+                    if (node == kCloudRefNone)
+                        continue;
+                    for (uint c = 0; c < classes; ++c)
+                        for (uint level = 0; level < 2; ++level)
+                        {
+                            const uint i = 2u * c + level;
+                            const int shift = int(2u - level);
+                            const int3 first = max(firsts[i], cell << shift);
+                            const int3 last = min(lasts[i], ((cell + 1) << shift) - 1);
+                            for (int z = first.z; z <= last.z; ++z)
+                                for (int y = first.y; y <= last.y; ++y)
+                                    for (int x = first.x; x <= last.x; ++x)
+                                        hstrCloudSunField[sunFieldTexel(sunFineEntry(node, c, level, uint3(x, y, z)))] = epoch;
+                        }
+                }
+    }
+
+    /// Reset: restarts field ranges (new pair blocks, new directory nodes) at this frame, which drops every bake they cover.
+    void resetSunField(uint2 thread, bool nodes)
+    {
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (thread.y >= (nodes ? frame.nodeResets : frame.blockResets) || thread.x >= (nodes ? kCloudSunFineEntries : frame.blockLength))
+            return;
+        const uint first = hstrCloudSunResets[(nodes ? frame.blockResets : 0u) + thread.y];
+        hstrCloudSunField[sunFieldTexel(first + thread.x)] = frame.frame & 0xFFFFu;
+    }
+
+    /// Age: entries kCloudSunAgeCap old or older are set to exactly that age, a few rows a frame, so a 16-bit age never wraps. Every
+    /// bake younger than the cap stays newer than them; older bakes are stale anyway.
+    void ageSunField(uint2 thread)
+    {
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (thread.y >= frame.ageRows)
+            return;
+        const uint2 texel = uint2(thread.x, frame.ageRow + thread.y);
+        if (((frame.frame - hstrCloudSunField[texel]) & 0xFFFFu) >= kCloudSunAgeCap)
+            hstrCloudSunField[texel] = (frame.frame - kCloudSunAgeCap) & 0xFFFFu;
+    }
+
+    float sunReach(uint assetID) { return sunFrame().reachScale / hstrCloudAssets[assetID].sourceVoxelWorld; }
 
     /// Release: the bakes of unloaded bricks give their slots back.
     void releaseSunBakes(uint entry)
     {
-        if (entry >= params.cloudSunReleaseCount)
+        if (entry >= sunFrame().releaseCount)
             return;
         const uint base = hstrCloudSunRelease[entry] * kCloudSunBakesPerBrick;
         for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
@@ -3342,12 +3499,14 @@ struct HSTRCloudRenderer
         }
     }
 
-    /// Scan: a mapped brick in the cut drops its stale bakes and counts the classes still needing one; every held bake is a holder.
+    /// Scan: a mapped brick in the cut drops its stale bakes (keeping their slots for the rebake) and counts the classes still
+    /// needing one; every held bake is a holder.
     void scanSunBakes(uint b)
     {
-        if (b >= params.cloudBrickCapacity)
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (b >= frame.capacity)
             return;
-        const HSTRCloudSunSched s = hstrCloudSunSched[b];
+        const SunSchedEntry s = sunSched(b);
         const uint base = b * kCloudSunBakesPerBrick;
         const bool inCut = (s.flags & kCloudSunInCut) != 0;
         const bool active = inCut && (s.flags & kCloudSunMapped) != 0;
@@ -3356,11 +3515,37 @@ struct HSTRCloudRenderer
         uint waiting = 0;
         if (active)
         {
-            for (uint c = 0; c < params.cloudSunClassCount; ++c)
+            // One field entry per bake: the brick's position in its class's block (levels >= 2) or in the node over its 32-voxel cell
+            // (levels 0-1). A missing block or node means nothing tracked the bake's neighbourhood: stale.
+            const uint level = hstrCloudBricks[b].info & 15u;
+            const uint3 brick = uint3(s.coord & 1023u, (s.coord >> 10) & 1023u, s.coord >> 20);
+            const bool fine = level < 2;
+            const uint fineNode = fine ? sunFineNode(s.asset, brick >> (2u - level)) : kCloudRefNone;
+            const uint3 dims = sunLevelDims(s.asset, level);
+            const uint position = hstrCloudSunFieldLevels[s.asset * kCloudSunFieldLevels + level] + brick.x + dims.x * (brick.y + dims.y * brick.z);
+            uint stale = 0;
+            for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+            {
+                const uint held = hstrCloudSunSlotsOutput[2u * (base + k)];
+                if (!sunKeyWanted(held, s.flags))
+                    continue;
+                const uint sunClass = held & 15u;
+                const uint block = hstrCloudSunFieldBlocks[s.asset * kCloudSunClasses + sunClass];
+                const bool missing = fine ? fineNode == kCloudRefNone : block == kCloudRefNone;
+                const uint entry = fine ? sunFineEntry(fineNode, sunClass, level, brick) : block + position;
+                if (missing || sunEntryNewer(entry, hstrCloudSunFrames[base + k]))
+                {
+                    hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
+                    ++stale;
+                }
+            }
+            if (stale > 0)
+                InterlockedAdd(hstrCloudSunCounters[5], stale);
+            for (uint c = 0; c < frame.classCount; ++c)
             {
                 if ((s.flags & (1u << c)) == 0)
                     continue;
-                const uint key = (params.cloudSunGeneration << 4) | c;
+                const uint key = (frame.generation << 4) | c;
                 bool have = false;
                 for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
                     have = have || hstrCloudSunSlotsOutput[2u * (base + k)] == key;
@@ -3393,43 +3578,11 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrCloudSunCounters[4], waiting);
     }
 
-    /// Stale: a quarter of the bricks each frame (thread i is brick 4 i + the frame's phase) drop the wanted bakes whose neighbourhood
-    /// changed since they were baked, keeping their slots for the rebake; the scan that follows finds those classes waiting. In its
-    /// own pass because inside the scan's loops it made the whole scan several times slower.
-    void staleSunBakes(uint thread)
-    {
-        const uint b = 4u * thread + ((4u - (params.cloudResidencyFrame & 3u)) & 3u);
-        if (b >= params.cloudBrickCapacity)
-            return;
-        const HSTRCloudSunSched s = hstrCloudSunSched[b];
-        if ((s.flags & (kCloudSunInCut | kCloudSunMapped)) != (kCloudSunInCut | kCloudSunMapped))
-            return;
-        if (hstrCloudAssetChanges[2u * s.asset] == 0u)
-            return;
-        const uint base = b * kCloudSunBakesPerBrick;
-        const uint level = hstrCloudBricks[b].info & 15u;
-        const float reach = sunReach(s.asset);
-        uint stale = 0;
-        for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
-        {
-            const uint key = hstrCloudSunSlotsOutput[2u * (base + k)];
-            if (!sunKeyWanted(key, s.flags))
-                continue;
-            if (sunBakeStale(s.asset, level, s.coord, hstrCloudSunDirections[key & 15u].xyz, reach, hstrCloudSunFrames[base + k]))
-            {
-                hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
-                ++stale;
-            }
-        }
-        if (stale > 0)
-            InterlockedAdd(hstrCloudSunCounters[5], stale);
-    }
-
     /// Select: the candidate bins that fill this frame's bakes, and the holder bins that free the slots they lack (only holders
     /// less important than the best candidate).
     void selectSunBakes()
     {
-        const uint capacity = params.cloudSunBakeMax;
+        const uint capacity = sunFrame().bakeMax;
         uint total = 0;
         uint candidateBin = 0;
         uint candidateTake = 0;
@@ -3469,9 +3622,10 @@ struct HSTRCloudRenderer
     /// Emit: the selected candidates (one bake per brick per frame) and holders into their lists.
     void emitSunBakes(uint b)
     {
-        if (b >= params.cloudBrickCapacity)
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (b >= frame.capacity)
             return;
-        const HSTRCloudSunSched s = hstrCloudSunSched[b];
+        const SunSchedEntry s = sunSched(b);
         const uint needs = hstrCloudSunNeeds[b];
         if (needs != 0)
         {
@@ -3487,7 +3641,7 @@ struct HSTRCloudRenderer
             {
                 uint index;
                 InterlockedAdd(hstrCloudSunCounters[0], 1u, index);
-                if (index < params.cloudSunBakeMax)
+                if (index < frame.bakeMax)
                     hstrCloudSunCandidates[index] = float4(float(b), float(firstbitlow(needs)), s.priority, 0.f);
             }
         }
@@ -3535,16 +3689,17 @@ struct HSTRCloudRenderer
     /// Assign: a candidate takes a pair holding a slot it may reuse, else an empty pair and a free slot, and writes its bake job.
     void assignSunBake(uint entry)
     {
-        if (entry >= params.cloudSunBakeMax)
+        const HSTRCloudSunFrame frame = sunFrame();
+        if (entry >= frame.bakeMax)
             return;
         HSTRCloudSunBake job = {};
         job.slot = kCloudRefNone;
-        if (entry < min(hstrCloudSunCounters[0], params.cloudSunBakeMax))
+        if (entry < min(hstrCloudSunCounters[0], frame.bakeMax))
         {
             const float4 candidate = hstrCloudSunCandidates[entry];
             const uint b = uint(candidate.x);
             const uint sunClass = uint(candidate.y);
-            const HSTRCloudSunSched s = hstrCloudSunSched[b];
+            const SunSchedEntry s = sunSched(b);
             const uint base = b * kCloudSunBakesPerBrick;
             uint chosen = kCloudRefNone;
             uint slot = kCloudRefNone;
@@ -3568,9 +3723,9 @@ struct HSTRCloudRenderer
             }
             if (chosen != kCloudRefNone)
             {
-                hstrCloudSunSlotsOutput[2u * (base + chosen)] = (params.cloudSunGeneration << 4) | sunClass;
+                hstrCloudSunSlotsOutput[2u * (base + chosen)] = (frame.generation << 4) | sunClass;
                 hstrCloudSunSlotsOutput[2u * (base + chosen) + 1u] = slot;
-                hstrCloudSunFrames[base + chosen] = params.cloudResidencyFrame;
+                hstrCloudSunFrames[base + chosen] = frame.frame;
                 const HSTRCloudAsset asset = hstrCloudAssets[s.asset];
                 job.brick = b;
                 job.slot = slot;
@@ -5401,10 +5556,35 @@ void decayWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
     }
 }
 
-[numthreads(4, 4, 4)]
-void clearWorldCacheTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+/// The running fades of the residency's bricks at this frame (CloudResidency::setFade computes the same).
+[numthreads(256, 1, 1)]
+void advanceCloudFades(uint3 id: SV_DispatchThreadID)
 {
-    gHSTRCloud.clearWorldCacheCell(dispatchThreadId);
+    const HSTRCloudFadeFrame frame = gHSTRCloud.hstrCloudFadeFrame[0];
+    if (id.x >= frame.brickCount)
+        return;
+    const HSTRCloudBrick brick = gHSTRCloud.hstrCloudBricksOutput[id.x];
+    if ((brick.fadeStart & (kCloudFadeIn | kCloudFadeOut)) == 0)
+        return;
+    const float delta = frame.step * float((frame.frame - brick.fadeStart) & kCloudFadeFrameMask);
+    gHSTRCloud.hstrCloudBricksOutput[id.x].fade =
+        (brick.fadeStart & kCloudFadeIn) != 0 ? min(1.f, brick.fadeBase + delta) : max(0.f, brick.fadeBase - delta);
+}
+
+[numthreads(4, 4, 4)]
+void clearWorldCacheTiles(uint3 cell: SV_DispatchThreadID)
+{
+    // Clears the deposits of world cache cells in sea tiles whose cloud changed. Bound once like the domain passes, so it reads
+    // the domain frame rather than the params (worldCacheIndex and worldCacheTile with the frame's fields).
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    if (any(cell >= frame.cacheDims))
+        return;
+    const uint2 tile = min(cell.xz * frame.cacheCellVoxels / frame.tileVoxels, frame.tiles - 1u);
+    if (gHSTRCloud.hstrCloudTileReset[tile.x + frame.tiles * tile.y] == 0)
+        return;
+    const uint index = cell.x + frame.cacheDims.x * (cell.y + frame.cacheDims.y * cell.z);
+    for (uint slot = 0; slot < kWorldCacheSlots; ++slot)
+        gHSTRCloud.hstrWorldCacheDeposit[kWorldCacheSlots * index + slot] = 0;
 }
 
 [numthreads(64, 1, 1)]
@@ -5497,9 +5677,27 @@ void releaseSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
 }
 
 [numthreads(256, 1, 1)]
-void staleSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
+void resetSunBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    gHSTRCloud.staleSunBakes(dispatchThreadId.x);
+    gHSTRCloud.resetSunField(dispatchThreadId.xy, false);
+}
+
+[numthreads(64, 16, 1)]
+void resetSunNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.resetSunField(dispatchThreadId.xy, true);
+}
+
+[numthreads(64, 4, 1)]
+void ageSunField(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.ageSunField(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void stampSunChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.stampSunChange(dispatchThreadId.x);
 }
 
 [numthreads(256, 1, 1)]
@@ -5530,4 +5728,134 @@ void evictSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
 void assignSunBakes(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.assignSunBake(dispatchThreadId.x);
+}
+
+// The cloud sea's domain proxy (HSTRCloud::uploadDomainExtinction): one dispatch per stage over every changed slot, each after the
+// stage it reads. Thread z is a slot's region depth times its index plus the offset in it; regions wrap around the toroidal domain
+// in x and z. What each stage writes is what the CPU built before, from the tiles' float16 volumes.
+
+/// float16_t(value), rounded up: majorants must bound what they cover after the half-float write.
+float domainRoundedUp(float value)
+{
+    const float rounded = f16tof32(f32tof16(value));
+    return rounded < value ? value * (1.f + 1.f / 1024.f) : value;
+}
+
+/// The block (in a region starting `border` blocks before its tile) a thread writes, wrapped; false past the region.
+bool domainRegionBlock(uint3 id, uint width, uint height, uint border, uint unit, out uint3 cell)
+{
+    cell = 0;
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    const uint region = id.z / width;
+    if (region >= frame.regionCount || id.x >= width || id.y >= height)
+        return false;
+    const uint slot = gHSTRCloud.hstrDomainRegions[region] & kDomainRegionSlot;
+    const uint tileCells = frame.tileVoxels / unit;
+    const uint cellsX = frame.tiles * tileCells;
+    const uint x = (slot % frame.tiles * tileCells + cellsX - border + id.x) % cellsX;
+    const uint z = (slot / frame.tiles * tileCells + cellsX - border + id.z % width) % cellsX;
+    cell = uint3(x, id.y, z);
+    return true;
+}
+
+/// A changed tile's voxels: its packed volume (region i of the batch is volume i of hstrDomainStaged) and their extinction.
+[numthreads(8, 8, 8)]
+void domainExtinction(uint3 id: SV_DispatchThreadID)
+{
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    uint3 voxel;
+    if (!domainRegionBlock(id, frame.tileVoxels, frame.dims.y, 0u, 1u, voxel))
+        return;
+    const uint r = frame.tileVoxels;
+    const uint region = id.z / r;
+    const uint flags = gHSTRCloud.hstrDomainRegions[region];
+    float2 value = 0.f;
+    if ((flags & kDomainRegionKeep) != 0)
+        value = gHSTRCloud.hstrDomainVolumeOutput[voxel];
+    else if ((flags & kDomainRegionZero) == 0)
+    {
+        const uint packed = gHSTRCloud.hstrDomainStaged[(region * r + id.z % r) * frame.dims.y * r + id.x + r * id.y];
+        value = float2(f16tof32(packed & 0xffff), f16tof32(packed >> 16));
+        gHSTRCloud.hstrDomainVolumeOutput[voxel] = value;
+    }
+    else
+        gHSTRCloud.hstrDomainVolumeOutput[voxel] = value;
+    gHSTRCloud.hstrExtinctionOutput[voxel] = value.x * frame.scale;
+}
+
+/// Block maxima over 4^3 voxels plus the voxels one past the upper faces (trilinear support), for the blocks that read a changed
+/// tile: from one block before it.
+[numthreads(4, 4, 4)]
+void domainBlocks(uint3 id: SV_DispatchThreadID)
+{
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    uint3 block;
+    if (!domainRegionBlock(id, frame.tileVoxels / kDomainBlock + 1u, frame.blockDims.y, 1u, kDomainBlock, block))
+        return;
+    float meanValue = 0.f;
+    float maxValue = 0.f;
+    const uint yLast = min(block.y * kDomainBlock + kDomainBlock, frame.dims.y - 1u);
+    for (uint z = 0; z <= kDomainBlock; ++z)
+        for (uint y = block.y * kDomainBlock; y <= yLast; ++y)
+            for (uint x = 0; x <= kDomainBlock; ++x)
+            {
+                const int4 voxel = int4((block.x * kDomainBlock + x) % frame.dims.x, y, (block.z * kDomainBlock + z) % frame.dims.z, 0);
+                const float2 value = gHSTRCloud.hstrDomainVolume.Load(voxel);
+                meanValue = max(meanValue, value.x);
+                maxValue = max(maxValue, max(value.x, value.y));
+            }
+    gHSTRCloud.hstrDomainBlocksOutput[block] = float2(maxValue, meanValue);
+}
+
+/// The camera majorant (block maxima dilated by one block, wrapping) and the tight one (undilated block means) of the blocks whose
+/// maxima changed: from two blocks before the tile.
+[numthreads(4, 4, 4)]
+void domainMajorant(uint3 id: SV_DispatchThreadID)
+{
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    uint3 block;
+    if (!domainRegionBlock(id, frame.tileVoxels / kDomainBlock + 3u, frame.blockDims.y, 2u, kDomainBlock, block))
+        return;
+    float value = 0.f;
+    for (int z = -1; z <= 1; ++z)
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+            {
+                const int ny = int(block.y) + y;
+                if (ny < 0 || ny >= int(frame.blockDims.y))
+                    continue;
+                const uint3 n = uint3(
+                    (int(block.x) + x + int(frame.blockDims.x)) % int(frame.blockDims.x), ny,
+                    (int(block.z) + z + int(frame.blockDims.z)) % int(frame.blockDims.z)
+                );
+                value = max(value, gHSTRCloud.hstrDomainBlocks.Load(int4(n, 0)).x);
+            }
+    gHSTRCloud.hstrMajorantOutput[block] = domainRoundedUp(value * frame.scale);
+    gHSTRCloud.hstrTightMajorantOutput[block] = domainRoundedUp(gHSTRCloud.hstrDomainBlocks.Load(int4(block, 0)).y * frame.scale);
+}
+
+/// Occupancy (any block maximum) and majorant-zero (any dilated majorant) of the 16-voxel cells over the changed majorant blocks:
+/// from one cell before the tile.
+[numthreads(4, 4, 4)]
+void domainOccupancy(uint3 id: SV_DispatchThreadID)
+{
+    const HSTRCloudDomainFrame frame = gHSTRCloud.hstrDomainFrame[0];
+    uint3 cell;
+    const uint unit = kDomainBlock * kDomainOccupancy;
+    if (!domainRegionBlock(id, frame.tileVoxels / unit + 2u, (frame.blockDims.y + kDomainOccupancy - 1u) / kDomainOccupancy, 1u, unit, cell))
+        return;
+    uint occupied = 0;
+    uint majorant = 0;
+    for (uint z = 0; z < kDomainOccupancy; ++z)
+        for (uint y = 0; y < kDomainOccupancy; ++y)
+            for (uint x = 0; x < kDomainOccupancy; ++x)
+            {
+                const uint3 block = cell * kDomainOccupancy + uint3(x, y, z);
+                if (block.y >= frame.blockDims.y)
+                    continue;
+                occupied |= gHSTRCloud.hstrDomainBlocks.Load(int4(block, 0)).x > 0.f ? 1u : 0u;
+                majorant |= gHSTRCloud.hstrMajorant.Load(int4(block, 0)) > 0.f ? 1u : 0u;
+            }
+    gHSTRCloud.hstrOccupancyOutput[cell] = occupied;
+    gHSTRCloud.hstrMajorantZeroOutput[cell] = majorant;
 }

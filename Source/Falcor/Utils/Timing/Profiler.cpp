@@ -161,7 +161,7 @@ void Profiler::Event::start(Profiler& profiler, uint32_t frameIndex)
     // Update CPU time.
     frameData.cpuStartTime = CpuTimer::getCurrentTimePoint();
 
-    // Update GPU time.
+    // Update GPU time. A new timer's cost is the profiler's own, taken out of this event and the ones around it (see end()).
     FALCOR_ASSERT(frameData.pActiveTimer == nullptr);
     FALCOR_ASSERT(frameData.currentTimer <= frameData.pTimers.size());
     if (frameData.currentTimer == frameData.pTimers.size())
@@ -169,21 +169,25 @@ void Profiler::Event::start(Profiler& profiler, uint32_t frameIndex)
         ref<GpuTimer> timer = GpuTimer::create(profiler.mpDevice);
         timer->breakStrongReferenceToDevice();
         frameData.pTimers.push_back(timer);
+        profiler.mOverhead += CpuTimer::calcDuration(frameData.cpuStartTime, CpuTimer::getCurrentTimePoint());
     }
+    frameData.cpuStartOverhead = profiler.mOverhead;
+    frameData.cpuStartTime = CpuTimer::getCurrentTimePoint();
     frameData.pActiveTimer = frameData.pTimers[frameData.currentTimer++].get();
     frameData.pActiveTimer->begin();
     frameData.valid = false;
 }
 
-void Profiler::Event::end(uint32_t frameIndex)
+void Profiler::Event::end(Profiler& profiler, uint32_t frameIndex)
 {
     if (--mTriggered != 0)
         return;
 
     auto& frameData = mFrameData[frameIndex % 2];
 
-    // Update CPU time.
-    frameData.cpuTotalTime += (float)CpuTimer::calcDuration(frameData.cpuStartTime, CpuTimer::getCurrentTimePoint());
+    // Update CPU time, less what the profiler spent on itself meanwhile (GPU timers the events inside created).
+    const double overhead = profiler.mOverhead - frameData.cpuStartOverhead;
+    frameData.cpuTotalTime += (float)std::max(0.0, CpuTimer::calcDuration(frameData.cpuStartTime, CpuTimer::getCurrentTimePoint()) - overhead);
 
     // Update GPU time.
     FALCOR_ASSERT(frameData.pActiveTimer != nullptr);
@@ -204,19 +208,19 @@ void Profiler::Event::endFrame(uint32_t frameIndex)
         }
     }
 
-    // Update CPU/GPU time from last frame measurement.
+    // Update CPU/GPU time from last frame measurement: zero if the event did not run last frame (every event resolves every frame).
     auto& frameData = mFrameData[(frameIndex + 1) % 2];
-
-    // Skip update if there are no measurements last frame.
-    if (!frameData.valid)
-        return;
-
-    mCpuTime = frameData.cpuTotalTime;
+    mCpuTime = 0.f;
     mGpuTime = 0.f;
-    for (size_t i = 0; i < frameData.currentTimer; ++i)
-        mGpuTime += (float)frameData.pTimers[i]->getElapsedTime();
+    if (frameData.valid)
+    {
+        mCpuTime = frameData.cpuTotalTime;
+        for (size_t i = 0; i < frameData.currentTimer; ++i)
+            mGpuTime += (float)frameData.pTimers[i]->getElapsedTime();
+    }
     frameData.cpuTotalTime = 0.f;
     frameData.currentTimer = 0;
+    frameData.valid = false;
 
     // Update EMA.
     mCpuTimeAverage = mCpuTimeAverage < 0.f ? mCpuTime : (kSigma * mCpuTimeAverage + (1.f - kSigma) * mCpuTime);
@@ -284,6 +288,14 @@ void Profiler::Capture::captureEvents(const std::vector<Event*>& events)
             mLanes[i * 2 + 1].records.reserve(mReservedFrames);
         }
         return; // Exit as no data is available on first capture.
+    }
+
+    // Events first seen during the capture get lanes that read zero for the frames before (events is in creation order).
+    for (size_t i = mEvents.size(); i < events.size(); ++i)
+    {
+        mEvents.push_back(events[i]);
+        mLanes.push_back({events[i]->getName() + "/cpu_time", {}, std::vector<float>(mFrameCount, 0.f)});
+        mLanes.push_back({events[i]->getName() + "/gpu_time", {}, std::vector<float>(mFrameCount, 0.f)});
     }
 
     // Record CPU/GPU timing on subsequent captures.
@@ -358,7 +370,7 @@ void Profiler::endEvent(RenderContext* pRenderContext, const std::string& name, 
         Event* pEvent = getEvent(mCurrentEventName);
         FALCOR_ASSERT(pEvent != nullptr);
         if (!mPaused)
-            pEvent->end(mFrameIndex);
+            pEvent->end(*this, mFrameIndex);
 
         mCurrentEventName.erase(mCurrentEventName.find_last_of("/"));
     }
@@ -387,7 +399,7 @@ void Profiler::endFrame(RenderContext* pRenderContext)
     if (mFenceValue != uint64_t(-1))
         mpFence->wait();
 
-    for (Event* pEvent : mCurrentFrameEvents)
+    for (Event* pEvent : mAllEvents)
     {
         pEvent->endFrame(mFrameIndex);
     }
@@ -397,7 +409,7 @@ void Profiler::endFrame(RenderContext* pRenderContext)
     mFenceValue = pRenderContext->signal(mpFence.get());
 
     if (mpCapture)
-        mpCapture->captureEvents(mCurrentFrameEvents);
+        mpCapture->captureEvents(mAllEvents);
 
     mLastFrameEvents = std::move(mCurrentFrameEvents);
     ++mFrameIndex;
@@ -439,6 +451,7 @@ Profiler::Event* Profiler::createEvent(const std::string& name)
 {
     auto pEvent = std::shared_ptr<Event>(new Event(name));
     mEvents.emplace(name, pEvent);
+    mAllEvents.push_back(pEvent.get());
     return pEvent.get();
 }
 

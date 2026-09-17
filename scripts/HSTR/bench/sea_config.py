@@ -24,7 +24,7 @@ BEAM = {
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 0,
     "beamDepthTolerance": 0.05, "beamShip": True, "beamRefreshDebug": 0, "beamParallax": 0.0,
     "beamCarryTolerance": 0.0, "beamRefreshBlock": 1, "beamRefreshCentres": 0,
-    "cloudCutMargin": 8.0, "beamShipMask": 509, "cloudCutAsync": False,
+    "cloudCutMargin": 8.0, "beamShipMask": 509, "cloudCutAsync": True,
 }
 
 
