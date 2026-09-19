@@ -63,6 +63,8 @@ def reference(name):
 
 
 def measure(props, block):
+    # compareExact selects the stored exact-march frame, so it must stay false here: the loaded path trace is the authority. The
+    # comparison pass still fills its per-pixel histogram for the percentile quality gate.
     hstr.set_properties(dict(props, compareTarget=15, compareSubstitute=0, compareBlock=block, compareExact=False))
     for i in range(8):
         m.renderFrame()
@@ -70,7 +72,8 @@ def measure(props, block):
     m.renderFrame()
     p = hstr.properties
     hstr.set_properties({"compareReference": False, "compareBlock": 1})
-    return float(p["referenceLogError"]), float(p["referenceNoiseLogError"])
+    return (float(p["referenceLogError"]), float(p["referenceNoiseLogError"]), float(p["referenceLogP999"]),
+            float(p["referenceLogMax"]))
 
 
 for name, position, target in views:
@@ -84,12 +87,12 @@ for name, position, target in views:
     samples, seconds = reference(name)
     log(f"{name}: settled in {frames} frames; path-traced reference {samples} spp ({seconds:.0f} s this run)")
     for test, properties in TESTS:
-        full, full_noise = measure(dict(BASE, **properties), 1)
-        block, block_noise = measure(dict(BASE, **properties), BLOCK)
+        full, full_noise, p999, maximum = measure(dict(BASE, **properties), 1)
+        block, block_noise, _, _ = measure(dict(BASE, **properties), BLOCK)
         with open(f"{OUT}/{TAG}_test.jsonl", "a") as f:
             f.write(json.dumps({"view": name, "test": test, "log": full, "noise": full_noise, "block": block,
-                                "blockNoise": block_noise, "spp": samples}) + "\n")
+                                "blockNoise": block_noise, "p999": p999, "max": maximum, "spp": samples}) + "\n")
         log(f"{name:8s} {test:16s} log err {full:.4f} (reference noise {full_noise:.4f})   {BLOCK}x{BLOCK} blocks {block:.4f} "
-            f"(noise {block_noise:.4f})")
+            f"(noise {block_noise:.4f})   p99.9 {p999:.4f} max {maximum:.4f}")
     hstr.set_properties({"cloudResidencyFrozen": False})
 exit()

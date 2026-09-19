@@ -233,6 +233,8 @@ struct HSTRCloudRenderer
     StructuredBuffer<HSTRCloudAsset> hstrCloudAssets;
     StructuredBuffer<uint> hstrCloudDirectory;
     StructuredBuffer<uint> hstrCloudNodes;
+    StructuredBuffer<uint> hstrCloudPages;
+    RWStructuredBuffer<uint> hstrCloudPagesOutput;
     StructuredBuffer<HSTRCloudBrick> hstrCloudBricks;
     Texture3D<float> hstrCloudAtlas;
     RWTexture3D<unorm float> hstrCloudAtlasOutput;
@@ -748,18 +750,11 @@ struct HSTRCloudRenderer
         const int3 i = int3(floor(x + 0.5f));
         if (any(i < 0) || any(i >= int3(asset.dims)))
             return false;
-        const uint3 chunk = uint3(i) >> 7u;
-        uint entry = hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
-        if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
-        {
-            const uint3 cell = (uint3(i) >> 5u) & 3u;
-            entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + cell.x + 4 * (cell.y + 4 * cell.z)];
-            if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
-            {
-                const uint3 sub = (uint3(i) >> 3u) & 3u;
-                entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + sub.x + 4 * (sub.y + 4 * sub.z)];
-            }
-        }
+        const uint3 brick = uint3(i) >> 3u;
+        const uint3 brickDims = asset.dims >> 3u;
+        // One stable spatial lookup replaces directory -> node -> node. WaveMatch sharing was also tested here, but its subgroup
+        // bookkeeping lost 0.07 ms parked and 0.74/1.18 ms in the 2/20-unit flights, so coherent hardware caching is left to work.
+        uint entry = hstrCloudPages[asset.pageOffset + brick.x + brickDims.x * (brick.y + brickDims.y * brick.z)];
         if (entry == kCloudRefNone)
             return false;
         // 5 stops with the directory/node descent done and nothing after it, so mode 5 minus mode 3 is the descent alone - the part a
@@ -806,15 +801,20 @@ struct HSTRCloudRenderer
             const uint3 cell = uint3(clamp(int3(floor((local + 0.5f) * 0.5f)), 0, 3));
             const uint index = cell.x + 4u * cell.y + 16u * cell.z;
             const uint code = (hstrCloudOccupancy[entry * kCloudCellWords + (index >> 3u)] >> ((index & 7u) * 4u)) & 15u;
-            // The bounds of the cell, of its octant and of the whole brick, for the march's step length (cloudLocalStep).
-            const uint octants = hstrCloudOccupancy[entry * kCloudCellWords + 8u];
-            const uint octant = (cell.x >> 1u) + 2u * (cell.y >> 1u) + 4u * (cell.z >> 1u);
-            uint brickCode = 0;
-            for (uint o = 0; o < 8; ++o)
-                brickCode = max(brickCode, (octants >> (o * 4u)) & 15u);
-            sample.bounds = code | (((octants >> (octant * 4u)) & 15u) << 4u) | (brickCode << 8u) |
-                            (cell.x << 12u) | (cell.y << 14u) | (cell.z << 16u);
-            sample.cellLo = (brickOrigin + 2.f * float3(cell)) * levelScale - 0.5f;
+            // The bounds of the cell, of its octant and of the whole brick, for the march's step length (cloudLocalStep), and the
+            // cell the transfer probe keys on. Only those two read them, and both ship off, so the octant word - a second dependent
+            // read of the occupancy of every brick sample - is loaded only where they are compiled in.
+            if (SHIP(cloudLocalStep, 0u) != 0 || SHIP(cloudTransferClasses, 0u) != 0)
+            {
+                const uint octants = hstrCloudOccupancy[entry * kCloudCellWords + 8u];
+                const uint octant = (cell.x >> 1u) + 2u * (cell.y >> 1u) + 4u * (cell.z >> 1u);
+                uint brickCode = 0;
+                for (uint o = 0; o < 8; ++o)
+                    brickCode = max(brickCode, (octants >> (o * 4u)) & 15u);
+                sample.bounds = code | (((octants >> (octant * 4u)) & 15u) << 4u) | (brickCode << 8u) |
+                                (cell.x << 12u) | (cell.y << 14u) | (cell.z << 16u);
+                sample.cellLo = (brickOrigin + 2.f * float3(cell)) * levelScale - 0.5f;
+            }
             // Codes below cellCode are skippable: bound(q) = 2^(2q - 30) <= thin  <=>  q <= (log2(thin) + 30) / 2.
             const float thin = thinDensity / levelScale;
             sample.cellCode = thin > 0.f ? uint(clamp(floor((log2(thin) + 30.f) * 0.5f) + 1.f, 1.f, 15.f)) : 1u;
@@ -3235,9 +3235,9 @@ struct HSTRCloudRenderer
             return;
         float4 error = 0.f;
         uint count = 0;
-        if (params.compareExact != 0)
-            for (uint b = 0; b < kCompareBins; ++b)
-                hstrReferenceRowHistogram[row * kCompareBins + b] = 0.f;
+        // The histogram is target-independent: exact-march and loaded path-traced comparisons both need the same tail-quality gate.
+        for (uint b = 0; b < kCompareBins; ++b)
+            hstrReferenceRowHistogram[row * kCompareBins + b] = 0.f;
         for (uint x = 0; x < params.frameDim.x; ++x)
         {
             const uint2 pixel = uint2(x, row);
@@ -3264,13 +3264,18 @@ struct HSTRCloudRenderer
                 continue;
             const float3 halfDifference = abs(target.first - target.second);
             const float3 halfLogDifference = abs(log(1.f + max(target.first, 0.f)) - log(1.f + max(target.second, 0.f)));
+            const float logError = dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f);
             error += float4(
                 dot(abs(value - reference), 1.f / 3.f),
-                dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f),
+                logError,
                 0.5f * dot(halfDifference, 1.f / 3.f),
                 0.5f * dot(halfLogDifference, 1.f / 3.f)
             );
             ++count;
+            const uint bin = logError <= kCompareBinFloor ? 0u : min(uint(4.f * log2(logError / kCompareBinFloor)) + 1u, kCompareBins - 2u);
+            hstrReferenceRowHistogram[row * kCompareBins + bin] += 1.f;
+            hstrReferenceRowHistogram[row * kCompareBins + kCompareBins - 1u] =
+                max(hstrReferenceRowHistogram[row * kCompareBins + kCompareBins - 1u], logError);
         }
         hstrReferenceRowError[row] = error / float(max(count, 1u));
     }
@@ -5410,6 +5415,48 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
             }
     for (uint w = 0; w < kCloudCellWords; ++w)
         gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + w] = words[w];
+}
+
+/// Rebuilds the exact dense virtual page table from the sparse residency tree after its CPU edits. This runs only when mappings
+/// change; camera queries then replace the directory and two dependent node reads with one spatially coherent page read.
+[numthreads(256, 1, 1)]
+void buildCloudPages(uint3 id: SV_DispatchThreadID)
+{
+    uint assetCount;
+    uint stride;
+    gHSTRCloud.hstrCloudAssets.GetDimensions(assetCount, stride);
+    uint assetIndex = kCloudRefNone;
+    HSTRCloudAsset asset = {};
+    for (uint a = 0; a < assetCount; ++a)
+    {
+        const HSTRCloudAsset candidate = gHSTRCloud.hstrCloudAssets[a];
+        const uint3 dims = candidate.dims >> 3u;
+        const uint count = dims.x * dims.y * dims.z;
+        if (id.x >= candidate.pageOffset && id.x - candidate.pageOffset < count)
+        {
+            assetIndex = a;
+            asset = candidate;
+            break;
+        }
+    }
+    if (assetIndex == kCloudRefNone)
+        return;
+    const uint3 brickDims = asset.dims >> 3u;
+    const uint p = id.x - asset.pageOffset;
+    const uint3 brick = uint3(p % brickDims.x, (p / brickDims.x) % brickDims.y, p / (brickDims.x * brickDims.y));
+    const uint3 chunk = brick >> 4u;
+    uint entry = gHSTRCloud.hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
+    if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+    {
+        const uint3 cell = (brick >> 2u) & 3u;
+        entry = gHSTRCloud.hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + cell.x + 4u * (cell.y + 4u * cell.z)];
+        if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+        {
+            const uint3 sub = brick & 3u;
+            entry = gHSTRCloud.hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + sub.x + 4u * (sub.y + 4u * sub.z)];
+        }
+    }
+    gHSTRCloud.hstrCloudPagesOutput[id.x] = entry;
 }
 
 /// Sun bakes of this frame (cloudCommitOffset, cloudCommitCount): for every atlas texel of a brick, the optical depth (in source

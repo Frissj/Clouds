@@ -68,7 +68,7 @@ struct HSTRCloudAsset
     uint3 chunkDims;
     uint topLevel;
     float sourceVoxelWorld; ///< World size of one source voxel at instance scale 1.
-    uint padAsset0;
+    uint pageOffset; ///< First level-0 virtual brick in hstrCloudPages (dense, stable spatial addressing).
     uint padAsset1;
     uint padAsset2;
 };

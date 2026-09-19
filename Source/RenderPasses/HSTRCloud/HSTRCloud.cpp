@@ -1048,6 +1048,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpOccupancyCloudPass = createPass("occupancyCloudBricks");
+    mpBuildCloudPagesPass = createPass("buildCloudPages");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
     mpScanSunPass = createPass("scanSunBakes");
@@ -1972,6 +1973,17 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             }
             mpAdvanceFadesPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
         }
+    }
+    if (mpCloudResidency->consumePageChanged())
+    {
+        FALCOR_PROFILE(pRenderContext, "buildCloudPages");
+        if (bindResidencyPass(pRenderContext, mpBuildCloudPagesPass, false))
+        {
+            ShaderVar pageVar = mpBuildCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"];
+            pageVar["hstrCloudPages"] = ref<Buffer>();
+            pageVar["hstrCloudPagesOutput"] = mpCloudResidency->getPages();
+        }
+        mpBuildCloudPagesPass->execute(pRenderContext, uint3(mpCloudResidency->getPageCount(), 1, 1));
     }
     // The staged bricks' residuals decode from the payload pool in one dispatch; then one reconstruction dispatch per level,
     // coarsest first: every brick predicts from a parent already in the atlas.
@@ -3786,7 +3798,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mReferenceNoiseLogError = total.w / float(rows.size());
         mReferenceLogP999 = -1.f;
         mReferenceLogMax = -1.f;
-        if (mParams.compareExact != 0 && mParams.compareBlock <= 1)
+        if (mParams.compareBlock <= 1)
         {
             const std::vector<float> histogram = mpReferenceRowHistogram->getElements<float>(0, rowCount * kCompareBins);
             std::vector<double> bins(kCompareBins - 1, 0.0);

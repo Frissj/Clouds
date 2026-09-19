@@ -315,7 +315,9 @@ private:
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
-    bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
+    /// Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE). Brick/ancestor bakes covered the tested sea
+    /// exactly: compiling this out preserved the 66-spp path-reference result and cut live 2/20-unit flight 13.89/23.02 -> 6.51/7.64 ms.
+    bool mCloudSunLiveMarch = false;
     bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
     ref<ComputePass> mpCameraPass;            ///< That entry point.
     ref<ComputePass> mpDecayWorldCachePass;
@@ -341,6 +343,7 @@ private:
     ref<ComputePass> mpCommitCloudPass;
     ref<ComputePass> mpDecodeCloudPass;
     ref<ComputePass> mpOccupancyCloudPass;
+    ref<ComputePass> mpBuildCloudPagesPass;
     ref<ComputePass> mpClearWorldCacheTilesPass;
     ref<ComputePass> mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;

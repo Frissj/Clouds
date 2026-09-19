@@ -14,6 +14,21 @@
 
 namespace hstrcloud
 {
+/// Free physical IDs addressed by their spatial "home". A byte map makes the nearest-free search cheap at the pool's measured
+/// occupancy (normally tens to hundreds of probes) and avoids the allocation/cache cost of the first std::set implementation.
+class SpatialFreeList
+{
+public:
+    void reset(uint32_t capacity);
+    bool empty() const { return mCount == 0; }
+    void insert(uint32_t value);
+    uint32_t takeNearest(uint32_t target);
+
+private:
+    std::vector<uint8_t> mFree;
+    uint32_t mCount = 0;
+};
+
 struct CloudResidencyDesc
 {
     std::vector<std::filesystem::path> files; ///< The packages the pages stream from (CloudLibrary::files).
@@ -135,6 +150,9 @@ public:
     bool fadesRunning() const { return mActiveFades > 0; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
+    const ref<Buffer>& getPages() const { return mpPages; }
+    uint32_t getPageCount() const { return uint32_t(mPages.size()); }
+    bool consumePageChanged() { return std::exchange(mPageChanged, false); }
     const ref<Buffer>& getFadeFrame() const { return mpFadeFrame; }
     void waitForCut() const
     {
@@ -233,6 +251,7 @@ private:
         uint32_t coarseStore = kNone;
         uint64_t top = kNoHandle;
         uint32_t directoryOffset = 0;
+        uint32_t pageOffset = 0;
         std::vector<uint32_t> chunkStores; ///< Per chunk: store index, kNone or kPendingStore.
         std::vector<uint64_t> chunkBrick;  ///< Per chunk: handle of its level-4 brick.
         uint3 changeDims = uint3(0);
@@ -355,10 +374,13 @@ private:
     // GPU mirrors.
     std::vector<uint32_t> mDirectory;
     std::vector<uint32_t> mNodes; ///< 64 entries per node.
+    /// Dense level-0 virtual brick table: stable spatial identity -> current physical brick. Rebuilt exactly on the GPU only when
+    /// sparse mappings change; camera queries never follow the mutable node allocation.
+    std::vector<uint32_t> mPages;
     std::vector<uint32_t> mFreeNodes;
     std::vector<HSTRCloudBrick> mBricks;
-    std::vector<uint32_t> mFreeBricks;
-    std::vector<uint32_t> mFreeSlots;
+    SpatialFreeList mFreeBricks;
+    SpatialFreeList mFreeSlots;
     std::vector<uint64_t> mBrickOwner;
     std::vector<HSTRCloudStaging> mStagingInfo;
     std::vector<uint64_t> mStaged; ///< Handles staged this frame, in staging order before grouping.
@@ -373,6 +395,8 @@ private:
     ref<Buffer> mpAssets;
     ref<Buffer> mpDirectory;
     ref<Buffer> mpNodes;
+    ref<Buffer> mpPages;
+    bool mPageChanged = true;
     ref<Buffer> mpBricks;
     ref<Texture> mpAtlas;
     ref<Buffer> mpOccupancy; ///< kCloudCellWords words per GPU brick: 4-bit cell density bounds (occupancyCloudBricks).
