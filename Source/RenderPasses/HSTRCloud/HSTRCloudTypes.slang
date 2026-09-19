@@ -68,9 +68,25 @@ struct HSTRCloudAsset
     uint3 chunkDims;
     uint topLevel;
     float sourceVoxelWorld; ///< World size of one source voxel at instance scale 1.
-    uint padAsset0;
+    uint pageOffset; ///< First level-0 virtual page in the persistent dense page table.
     uint padAsset1;
     uint padAsset2;
+};
+
+/// One camera-hot virtual page. The parent and fade remain in HSTRCloudBrick, so transition state is not duplicated per page.
+struct HSTRCloudVirtualPage
+{
+    uint physicalRef;
+    uint mappedLevel;
+};
+
+/// A virtual region invalidated by one canonical CPU hierarchy edit. workEnd is the inclusive prefix end in expanded page work.
+struct HSTRCloudDirtyPageRegion
+{
+    uint3 origin;
+    uint asset;
+    uint3 extent;
+    uint workEnd;
 };
 
 /// A resident brick: an atlas slot (or a constant), its quantisation and its place in the pyramid.
@@ -503,6 +519,10 @@ struct HSTRCloudParams
     float cloudFineMinVoxels = 0.05f; ///< Shortest camera step inside fine bricks, in domain voxels.
     uint cloudCommitOffset = 0;
     uint cloudStagedCount = 0; ///< Staged bricks whose residuals decodeCloudResiduals decodes this frame.
+    uint cloudPageRegionCount = 0; ///< Canonical hierarchy regions expanded into the unique dirty-page queue this frame.
+    uint padCloudPage0 = 0;
+    uint padCloudPage1 = 0;
+    uint padCloudPage2 = 0;
 
     uint3 fineSunOffset = { 0, 0, 0 }; ///< First voxel of the sun page region computeFineSun updates.
     uint cloudSunGeneration = 0; ///< Changes with everything the baked sun depth depends on (sun, density scale, reach).

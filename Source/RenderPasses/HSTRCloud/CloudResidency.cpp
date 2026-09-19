@@ -64,6 +64,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mAssetRecords.push_back(&asset);
         AssetState state;
         state.directoryOffset = uint32_t(mDirectory.size());
+        state.pageOffset = uint32_t(mPages.size());
         const uint32_t chunkCount = asset.chunkDims.x * asset.chunkDims.y * asset.chunkDims.z;
         mDirectory.resize(mDirectory.size() + chunkCount, kCloudRefNone);
         state.chunkStores.assign(chunkCount, kNone);
@@ -97,6 +98,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         gpu.chunkDims = asset.chunkDims;
         gpu.topLevel = asset.topLevel;
         gpu.sourceVoxelWorld = asset.voxelWorld * sea.getFitScale();
+        gpu.pageOffset = mAssets[a].pageOffset;
+        const uint3 brickDims = asset.dims / kCloudBrickCore;
+        mPages.resize(mPages.size() + size_t(brickDims.x) * brickDims.y * brickDims.z, {kCloudRefNone, 0u});
         gpuAssets.push_back(gpu);
     }
     if (mDirectory.empty())
@@ -116,6 +120,26 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     );
     mpNodes =
         mpDevice->createStructuredBuffer(sizeof(uint32_t), uint32_t(mNodes.size()), shaderResource, MemoryType::DeviceLocal, mNodes.data(), false);
+    const auto pageFlags = shaderResource | ResourceBindFlags::UnorderedAccess;
+    mpPages = mpDevice->createStructuredBuffer(
+        sizeof(HSTRCloudVirtualPage), uint32_t(mPages.size()), pageFlags, MemoryType::DeviceLocal, mPages.data(), false
+    );
+    mpDirtyPageRegions = mpDevice->createStructuredBuffer(
+        sizeof(HSTRCloudDirtyPageRegion), 2u * brickCapacity, shaderResource, MemoryType::DeviceLocal, nullptr, false
+    );
+    const uint32_t bitWords = (uint32_t(mPages.size()) + 31u) / 32u;
+    std::vector<uint32_t> zeros(std::max(bitWords, 4u), 0u);
+    mpDirtyPageBits = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), std::max(bitWords, 1u), pageFlags, MemoryType::DeviceLocal, zeros.data(), false
+    );
+    mpDirtyPages = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), uint32_t(mPages.size()), pageFlags, MemoryType::DeviceLocal, nullptr, false
+    );
+    mpDirtyPageCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1, pageFlags, MemoryType::DeviceLocal, zeros.data(), false);
+    mpDirtyPageArgs = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), 3, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, zeros.data(), false
+    );
+    mDirtyPageRegions.reserve(2u * brickCapacity);
     // Read-write: advanceCloudFades runs the fades in it.
     mpBricks = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudBrick), uint32_t(mBricks.size()), shaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
@@ -659,6 +683,8 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
 {
     const auto startTime = std::chrono::steady_clock::now();
     ++mFrame;
+    mDirtyPageRegions.clear();
+    mDirtyPageWorkCount = 0;
     bool changed = false;
     const auto& tiles = sea.getTiles();
     auto* pRenderContext = mpDevice->getRenderContext();
@@ -1697,6 +1723,7 @@ uint32_t CloudResidency::ensureNode(uint32_t& entry)
 
 void CloudResidency::paint(uint32_t assetID, const BrickHeader& record, uint32_t ref)
 {
+    dirtyPages(assetID, record);
     const CloudAsset& asset = *mAssetRecords[assetID];
     const uint32_t level = record.level;
     const uint3 lo = record.brick() * (8u << level);
@@ -1745,6 +1772,7 @@ void CloudResidency::paint(uint32_t assetID, const BrickHeader& record, uint32_t
 
 void CloudResidency::replace(uint32_t assetID, const BrickHeader& record, uint32_t ref, uint32_t replacement)
 {
+    dirtyPages(assetID, record);
     // Only the entries inside the brick's region can name it: walk those, collapsing nodes that became uniform.
     const CloudAsset& asset = *mAssetRecords[assetID];
     const uint32_t level = record.level;
@@ -1807,6 +1835,21 @@ void CloudResidency::replace(uint32_t assetID, const BrickHeader& record, uint32
             }
 }
 
+void CloudResidency::dirtyPages(uint32_t assetID, const BrickHeader& record)
+{
+    FALCOR_ASSERT(mDirtyPageRegions.size() < mpDirtyPageRegions->getElementCount());
+    const uint3 dims = mAssetRecords[assetID]->dims / kCloudBrickCore;
+    const uint3 origin = record.brick() * (1u << record.level);
+    const uint3 hi = min(origin + (1u << record.level), dims);
+    if (any(origin >= hi))
+        return;
+    const uint3 extent = hi - origin;
+    const uint64_t volume = uint64_t(extent.x) * extent.y * extent.z;
+    FALCOR_ASSERT(volume <= UINT32_MAX && uint64_t(mDirtyPageWorkCount) + volume <= UINT32_MAX);
+    mDirtyPageWorkCount += uint32_t(volume);
+    mDirtyPageRegions.push_back({origin, assetID, extent, mDirtyPageWorkCount});
+}
+
 void CloudResidency::touchDirectory(size_t index)
 {
     mDirectoryDirty[0] = std::min(mDirectoryDirty[0], index);
@@ -1825,6 +1868,8 @@ void CloudResidency::touchBrick(uint32_t gpu)
 
 void CloudResidency::upload()
 {
+    if (!mDirtyPageRegions.empty())
+        mpDirtyPageRegions->setBlob(mDirtyPageRegions.data(), 0, mDirtyPageRegions.size() * sizeof(HSTRCloudDirtyPageRegion));
     if (mInstancesDirty)
     {
         mpInstances->setBlob(mInstances.data(), 0, mInstances.size() * sizeof(HSTRCloudInstance));
@@ -2400,6 +2445,7 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudAssets"] = mpAssets;
     var["hstrCloudDirectory"] = mpDirectory;
     var["hstrCloudNodes"] = mpNodes;
+    var["hstrCloudPages"] = mpPages;
     var["hstrCloudBricks"] = mpBricks;
     var["hstrCloudAtlas"] = mpAtlas;
     var["hstrCloudOccupancy"] = mpOccupancy;
@@ -2409,6 +2455,14 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudPayload"] = mpPayload->getBuffer();
     var["hstrCloudResiduals"] = mpResiduals;
     var["hstrCloudStagingInfo"] = mpStagingInfo;
+}
+
+void CloudResidency::bindPageUpdates(const ShaderVar& var) const
+{
+    var["hstrCloudDirtyRegions"] = mpDirtyPageRegions;
+    var["hstrCloudDirtyBits"] = mpDirtyPageBits;
+    var["hstrCloudDirtyPages"] = mpDirtyPages;
+    var["hstrCloudDirtyPageCount"] = mpDirtyPageCount;
 }
 
 void CloudResidency::bindGpuSun(const ShaderVar& var) const

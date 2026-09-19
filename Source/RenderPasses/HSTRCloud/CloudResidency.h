@@ -73,6 +73,9 @@ public:
         uint32_t slotsUsed = 0;
         uint32_t nodesUsed = 0;
         uint32_t pagesLoaded = 0;
+        uint32_t pageRegions = 0;  ///< Canonical hierarchy regions invalidated this frame.
+        uint32_t pageExpanded = 0; ///< Page candidates before bitmap deduplication.
+        uint32_t pageUnique = 0;   ///< Exact compacted pages resolved by the GPU.
         double residentMB = 0.0;
         double payloadMB = 0.0; ///< Payload pool in use.
         double cutMilliseconds = 0.0;
@@ -119,6 +122,7 @@ public:
     bool update(const CloudSea& sea, const CloudView& view, const std::vector<uint32_t>& changedSlots);
 
     void bind(const ShaderVar& var) const;
+    void bindPageUpdates(const ShaderVar& var) const;
     ref<Texture> getAtlas() const { return mpAtlas; }
     ref<Buffer> getOccupancy() const { return mpOccupancy; }
     ref<Texture> getSunAtlas() const { return mpSunAtlas; }
@@ -135,6 +139,22 @@ public:
     bool fadesRunning() const { return mActiveFades > 0; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
+    const ref<Buffer>& getPages() const { return mpPages; }
+    const ref<Buffer>& getDirtyPageRegions() const { return mpDirtyPageRegions; }
+    const ref<Buffer>& getDirtyPageBits() const { return mpDirtyPageBits; }
+    const ref<Buffer>& getDirtyPages() const { return mpDirtyPages; }
+    const ref<Buffer>& getDirtyPageCount() const { return mpDirtyPageCount; }
+    const ref<Buffer>& getDirtyPageArgs() const { return mpDirtyPageArgs; }
+    uint32_t getDirtyPageRegionCount() const { return uint32_t(mDirtyPageRegions.size()); }
+    uint32_t getDirtyPageWorkCount() const { return mDirtyPageWorkCount; }
+    void readPageStats() { mStats.pageUnique = mpDirtyPageCount->getElement<uint32_t>(0); }
+    void pageUpdatesDispatched()
+    {
+        mStats.pageRegions = uint32_t(mDirtyPageRegions.size());
+        mStats.pageExpanded = mDirtyPageWorkCount;
+        mDirtyPageRegions.clear();
+        mDirtyPageWorkCount = 0;
+    }
     const ref<Buffer>& getFadeFrame() const { return mpFadeFrame; }
     void waitForCut() const
     {
@@ -233,6 +253,7 @@ private:
         uint32_t coarseStore = kNone;
         uint64_t top = kNoHandle;
         uint32_t directoryOffset = 0;
+        uint32_t pageOffset = 0;
         std::vector<uint32_t> chunkStores; ///< Per chunk: store index, kNone or kPendingStore.
         std::vector<uint64_t> chunkBrick;  ///< Per chunk: handle of its level-4 brick.
         uint3 changeDims = uint3(0);
@@ -286,6 +307,7 @@ private:
     void replace(uint32_t asset, const BrickHeader& record, uint32_t ref, uint32_t replacement);
     void paintEntry(uint32_t& entry, uint32_t ref, uint32_t level);
     void replaceEntry(uint32_t& entry, uint32_t ref, uint32_t replacement);
+    void dirtyPages(uint32_t asset, const BrickHeader& record);
     uint32_t ensureNode(uint32_t& entry);
     void touchDirectory(size_t index);
     void touchNode(size_t node);
@@ -355,6 +377,9 @@ private:
     // GPU mirrors.
     std::vector<uint32_t> mDirectory;
     std::vector<uint32_t> mNodes; ///< 64 entries per node.
+    std::vector<HSTRCloudVirtualPage> mPages;
+    std::vector<HSTRCloudDirtyPageRegion> mDirtyPageRegions;
+    uint32_t mDirtyPageWorkCount = 0;
     std::vector<uint32_t> mFreeNodes;
     std::vector<HSTRCloudBrick> mBricks;
     std::vector<uint32_t> mFreeBricks;
@@ -373,6 +398,12 @@ private:
     ref<Buffer> mpAssets;
     ref<Buffer> mpDirectory;
     ref<Buffer> mpNodes;
+    ref<Buffer> mpPages;
+    ref<Buffer> mpDirtyPageRegions;
+    ref<Buffer> mpDirtyPageBits;
+    ref<Buffer> mpDirtyPages;
+    ref<Buffer> mpDirtyPageCount;
+    ref<Buffer> mpDirtyPageArgs;
     ref<Buffer> mpBricks;
     ref<Texture> mpAtlas;
     ref<Buffer> mpOccupancy; ///< kCloudCellWords words per GPU brick: 4-bit cell density bounds (occupancyCloudBricks).

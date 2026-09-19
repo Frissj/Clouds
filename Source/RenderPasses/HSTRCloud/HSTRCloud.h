@@ -341,6 +341,10 @@ private:
     ref<ComputePass> mpCommitCloudPass;
     ref<ComputePass> mpDecodeCloudPass;
     ref<ComputePass> mpOccupancyCloudPass;
+    ref<ComputePass> mpClearDirtyCloudPagesPass;
+    ref<ComputePass> mpMarkDirtyCloudPagesPass;
+    ref<ComputePass> mpCloudPageArgsPass;
+    ref<ComputePass> mpResolveDirtyCloudPagesPass;
     ref<ComputePass> mpClearWorldCacheTilesPass;
     ref<ComputePass> mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;

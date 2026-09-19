@@ -837,6 +837,7 @@ Properties HSTRCloud::getProperties() const
     if (mpCloudResidency)
     {
         mpCloudResidency->readGpuSunStats();
+        mpCloudResidency->readPageStats();
         const auto& stats = mpCloudResidency->getStats();
         Properties cloud;
         cloud["loaded"] = stats.loaded;
@@ -847,6 +848,9 @@ Properties HSTRCloud::getProperties() const
         cloud["slotsUsed"] = stats.slotsUsed;
         cloud["nodesUsed"] = stats.nodesUsed;
         cloud["pagesLoaded"] = stats.pagesLoaded;
+        cloud["pageRegions"] = stats.pageRegions;
+        cloud["pageExpanded"] = stats.pageExpanded;
+        cloud["pageUnique"] = stats.pageUnique;
         cloud["residentMB"] = stats.residentMB;
         cloud["payloadMB"] = stats.payloadMB;
         cloud["cutMs"] = stats.cutMilliseconds;
@@ -1048,6 +1052,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpOccupancyCloudPass = createPass("occupancyCloudBricks");
+    mpClearDirtyCloudPagesPass = createPass("clearDirtyCloudPages");
+    mpMarkDirtyCloudPagesPass = createPass("markDirtyCloudPages");
+    mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
+    mpResolveDirtyCloudPagesPass = createPass("resolveDirtyCloudPages");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
     mpScanSunPass = createPass("scanSunBakes");
@@ -2001,6 +2009,39 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         }
         mpOccupancyCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
         mParams.cloudStagedCount = 0;
+    }
+    // The CPU hierarchy is canonical. Regions touched by paint/replace are marked into a persistent bitmap, atomically compacted,
+    // then resolved exactly once per unique page. Clearing follows last frame's compact queue, never the full virtual address space.
+    {
+        FALCOR_PROFILE(pRenderContext, "updateCloudPages");
+        auto& residency = *mpCloudResidency;
+        if (bindResidencyPass(pRenderContext, mpClearDirtyCloudPagesPass, false))
+            residency.bindPageUpdates(mpClearDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"]);
+        mpClearDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
+        pRenderContext->clearUAV(residency.getDirtyPageCount()->getUAV().get(), uint4(0));
+
+        mParams.cloudPageRegionCount = residency.getDirtyPageRegionCount();
+        if (mParams.cloudPageRegionCount > 0)
+        {
+            if (bindResidencyPass(pRenderContext, mpMarkDirtyCloudPagesPass, false))
+                residency.bindPageUpdates(mpMarkDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"]);
+            mpMarkDirtyCloudPagesPass->execute(pRenderContext, uint3(residency.getDirtyPageWorkCount(), 1, 1));
+        }
+        if (bindResidencyPass(pRenderContext, mpCloudPageArgsPass, false))
+            residency.bindPageUpdates(mpCloudPageArgsPass->getRootVar()["CB"]["gHSTRCloud"]);
+        mpCloudPageArgsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrCloudDirtyPageArgs"] = residency.getDirtyPageArgs();
+        mpCloudPageArgsPass->execute(pRenderContext, uint3(1));
+        if (mParams.cloudPageRegionCount > 0)
+        {
+            if (bindResidencyPass(pRenderContext, mpResolveDirtyCloudPagesPass, false))
+                residency.bindPageUpdates(mpResolveDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"]);
+            ShaderVar pageVar = mpResolveDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"];
+            pageVar["hstrCloudPages"] = ref<Buffer>();
+            pageVar["hstrCloudPagesOutput"] = residency.getPages();
+            mpResolveDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
+        }
+        mParams.cloudPageRegionCount = 0;
+        residency.pageUpdatesDispatched();
     }
     // Sun bakes last: they read the bricks and occupancy committed above.
     if (mCloudGpuSun)

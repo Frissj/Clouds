@@ -233,6 +233,13 @@ struct HSTRCloudRenderer
     StructuredBuffer<HSTRCloudAsset> hstrCloudAssets;
     StructuredBuffer<uint> hstrCloudDirectory;
     StructuredBuffer<uint> hstrCloudNodes;
+    StructuredBuffer<HSTRCloudVirtualPage> hstrCloudPages;
+    RWStructuredBuffer<HSTRCloudVirtualPage> hstrCloudPagesOutput;
+    StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudDirtyRegions;
+    RWStructuredBuffer<uint> hstrCloudDirtyBits;
+    RWStructuredBuffer<uint> hstrCloudDirtyPages;
+    RWStructuredBuffer<uint> hstrCloudDirtyPageCount;
+    RWStructuredBuffer<uint> hstrCloudDirtyPageArgs;
     StructuredBuffer<HSTRCloudBrick> hstrCloudBricks;
     Texture3D<float> hstrCloudAtlas;
     RWTexture3D<unorm float> hstrCloudAtlasOutput;
@@ -748,18 +755,10 @@ struct HSTRCloudRenderer
         const int3 i = int3(floor(x + 0.5f));
         if (any(i < 0) || any(i >= int3(asset.dims)))
             return false;
-        const uint3 chunk = uint3(i) >> 7u;
-        uint entry = hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
-        if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
-        {
-            const uint3 cell = (uint3(i) >> 5u) & 3u;
-            entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + cell.x + 4 * (cell.y + 4 * cell.z)];
-            if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
-            {
-                const uint3 sub = (uint3(i) >> 3u) & 3u;
-                entry = hstrCloudNodes[(entry & ~kCloudRefNode) * 64 + sub.x + 4 * (sub.y + 4 * sub.z)];
-            }
-        }
+        const uint3 brick = uint3(i) >> 3u;
+        const uint3 brickDims = asset.dims >> 3u;
+        const HSTRCloudVirtualPage page = hstrCloudPages[asset.pageOffset + brick.x + brickDims.x * (brick.y + brickDims.y * brick.z)];
+        uint entry = page.physicalRef;
         if (entry == kCloudRefNone)
             return false;
         // 5 stops with the directory/node descent done and nothing after it, so mode 5 minus mode 3 is the descent alone - the part a
@@ -768,7 +767,7 @@ struct HSTRCloudRenderer
         if (SHIP(cloudCostProbe, 0u) == 5)
             return false;
         sample.brick = true;
-        uint level = hstrCloudBricks[entry].info & 15u;
+        uint level = page.mappedLevel;
         sample.mappedLevel = level;
         if (desired < level)
         {
@@ -5410,6 +5409,97 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
             }
     for (uint w = 0; w < kCloudCellWords; ++w)
         gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + w] = words[w];
+}
+
+/// Clears only bitmap entries named by the previous compact queue.
+[numthreads(256, 1, 1)]
+void clearDirtyCloudPages(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= gHSTRCloud.hstrCloudDirtyPageCount[0]) return;
+    const uint page = gHSTRCloud.hstrCloudDirtyPages[id.x];
+    uint unused;
+    InterlockedAnd(gHSTRCloud.hstrCloudDirtyBits[page >> 5u], ~(1u << (page & 31u)), unused);
+}
+
+/// Expands invalidated regions and appends only the first marker for each virtual page.
+[numthreads(256, 1, 1)]
+void markDirtyCloudPages(uint3 id: SV_DispatchThreadID)
+{
+    const uint count = gHSTRCloud.params.cloudPageRegionCount;
+    if (count == 0 || id.x >= gHSTRCloud.hstrCloudDirtyRegions[count - 1u].workEnd) return;
+    uint lo = 0, hi = count;
+    while (lo < hi)
+    {
+        const uint mid = (lo + hi) >> 1u;
+        if (id.x < gHSTRCloud.hstrCloudDirtyRegions[mid].workEnd) hi = mid; else lo = mid + 1u;
+    }
+    const HSTRCloudDirtyPageRegion region = gHSTRCloud.hstrCloudDirtyRegions[lo];
+    const uint begin = lo == 0 ? 0u : gHSTRCloud.hstrCloudDirtyRegions[lo - 1u].workEnd;
+    const uint local = id.x - begin;
+    const uint3 p = uint3(local % region.extent.x, (local / region.extent.x) % region.extent.y,
+                          local / (region.extent.x * region.extent.y)) + region.origin;
+    const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[region.asset];
+    const uint3 dims = asset.dims >> 3u;
+    const uint page = asset.pageOffset + p.x + dims.x * (p.y + dims.y * p.z);
+    const uint bit = 1u << (page & 31u);
+    uint previous;
+    InterlockedOr(gHSTRCloud.hstrCloudDirtyBits[page >> 5u], bit, previous);
+    if ((previous & bit) == 0)
+    {
+        uint slot;
+        InterlockedAdd(gHSTRCloud.hstrCloudDirtyPageCount[0], 1u, slot);
+        gHSTRCloud.hstrCloudDirtyPages[slot] = page;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void writeDirtyCloudPageArgs()
+{
+    gHSTRCloud.hstrCloudDirtyPageArgs[0] = (gHSTRCloud.hstrCloudDirtyPageCount[0] + 255u) / 256u;
+    gHSTRCloud.hstrCloudDirtyPageArgs[1] = 1u;
+    gHSTRCloud.hstrCloudDirtyPageArgs[2] = 1u;
+}
+
+/// Resolves final canonical hierarchy state once per unique page; no operation ordering or physical-ID comparison is involved.
+[numthreads(256, 1, 1)]
+void resolveDirtyCloudPages(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= gHSTRCloud.hstrCloudDirtyPageCount[0]) return;
+    const uint pageIndex = gHSTRCloud.hstrCloudDirtyPages[id.x];
+    uint assetCount, stride;
+    gHSTRCloud.hstrCloudAssets.GetDimensions(assetCount, stride);
+    HSTRCloudAsset asset = {};
+    bool found = false;
+    for (uint a = 0; a < assetCount; ++a)
+    {
+        const HSTRCloudAsset candidate = gHSTRCloud.hstrCloudAssets[a];
+        const uint3 d = candidate.dims >> 3u;
+        const uint n = d.x * d.y * d.z;
+        if (pageIndex >= candidate.pageOffset && pageIndex - candidate.pageOffset < n)
+        {
+            asset = candidate;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return;
+    const uint3 dims = asset.dims >> 3u;
+    const uint linear = pageIndex - asset.pageOffset;
+    const uint3 brick = uint3(linear % dims.x, (linear / dims.x) % dims.y, linear / (dims.x * dims.y));
+    const uint3 chunk = brick >> 4u;
+    uint entry = gHSTRCloud.hstrCloudDirectory[asset.directoryOffset + chunk.x + asset.chunkDims.x * (chunk.y + asset.chunkDims.y * chunk.z)];
+    if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+    {
+        const uint3 cell = (brick >> 2u) & 3u;
+        entry = gHSTRCloud.hstrCloudNodes[(entry & ~kCloudRefNode) * 64u + cell.x + 4u * (cell.y + 4u * cell.z)];
+        if (entry != kCloudRefNone && (entry & kCloudRefNode) != 0)
+        {
+            const uint3 sub = brick & 3u;
+            entry = gHSTRCloud.hstrCloudNodes[(entry & ~kCloudRefNode) * 64u + sub.x + 4u * (sub.y + 4u * sub.z)];
+        }
+    }
+    HSTRCloudVirtualPage page = {entry, entry == kCloudRefNone ? 0u : (gHSTRCloud.hstrCloudBricks[entry].info & 15u)};
+    gHSTRCloud.hstrCloudPagesOutput[pageIndex] = page;
 }
 
 /// Sun bakes of this frame (cloudCommitOffset, cloudCommitCount): for every atlas texel of a brick, the optical depth (in source
