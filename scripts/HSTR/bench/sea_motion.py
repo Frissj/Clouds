@@ -15,6 +15,8 @@ TESTS = json.loads(os.environ["HSTR_TESTS"])
 MOTIONS = json.loads(os.environ.get("HSTR_MOTIONS", '[["fly 2", 2.0, 0.0], ["fly 20", 20.0, 0.0], ["yaw", 0.0, 0.004]]'))
 WARM, TIMED, STEPS = 16, 48, int(os.environ.get("HSTR_STEPS", "12"))
 TRACE_SUN = os.environ.get("HSTR_TRACE_SUN", "0") != "0"  # Sums the sun scheduler's per-frame counts over the timed flight.
+CHURN = int(os.environ.get("HSTR_CHURN", "0"))  # Frames flown with residency running before it is frozen for the timed flight.
+CHURN_SPEED = float(os.environ.get("HSTR_CHURN_SPEED", "0"))  # Units a frame the churn flies at (0: the motion's own speed).
 m.script("scripts/HSTR/CloudSea.py")
 # HSTR_RES=1920x1080 settles in a fraction of the time, for residency diagnostics (the cut and the timings are not the 4K ones).
 m.resizeFrameBuffer(*[int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")])
@@ -123,6 +125,21 @@ log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun ba
 for motion, forward, yaw in MOTIONS:
     for test, properties in TESTS:
         hstr.set_properties(dict(BASE, **properties))
+        if CHURN:
+            # Flies the path with residency running and then freezes it, so the timed flight marches a churned resident set with
+            # nothing streaming into it. Frozen straight from the settle the set is still allocated in cut order; this separates
+            # what the streaming costs while it runs from what it leaves behind.
+            #
+            # The churn ends where the warm-up starts, so the frozen set is the one that flight arrives with and the timed frames
+            # are not marching a stale set. HSTR_CHURN_SPEED flies the churn at its own speed: a parked timed flight after a
+            # churning flight is the same view as a parked one, resident on a set the churn allocated instead of the settle.
+            speed = CHURN_SPEED if CHURN_SPEED else forward
+            last = forward * (-WARM - TIMED) / speed if speed else 0.0
+            hstr.set_properties({"cloudResidencyFrozen": False})
+            for i in range(CHURN):
+                pose(last - (CHURN - 1 - i), speed, yaw)
+                m.renderFrame()
+            hstr.set_properties({"cloudResidencyFrozen": True})
         for i in range(WARM):
             pose(i - WARM - TIMED, forward, yaw)
             m.renderFrame()
