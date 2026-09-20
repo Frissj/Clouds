@@ -1,121 +1,863 @@
-![](docs/images/teaser.png)
+# Clouds
 
-# Falcor
+A research renderer for real-time, high-quality volumetric clouds at 4K.
 
-Falcor is a real-time rendering framework supporting DirectX 12 and Vulkan. It aims to improve productivity of research and prototype projects.
+The performance target is **below 2 ms at 3840×2160** while preserving the required image quality against the saved path-traced reference.
 
-Features include:
-* Abstracting many common graphics operations, such as shader compilation, model loading, and scene rendering
-* Raytracing support
-* Python scripting support
-* Render graph system to build modular renderers
-* Common rendering techniques such post-processing effects
-* Unbiased path tracer
-* Integration of various RTX SDKs such as DLSS, RTXDI and NRD
+This project is pursuing a **radical camera-rendering architecture**. It is **not** trying to make conventional volumetric ray marching incrementally faster.
 
-## Prerequisites
-- Windows 10 version 20H2 (October 2020 Update) or newer, OS build revision .789 or newer
-- Visual Studio 2022
-- [Windows 10 SDK (10.0.19041.0) for Windows 10, version 2004](https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk/)
-- A GPU which supports DirectX Raytracing, such as the NVIDIA Titan V or GeForce RTX
-- NVIDIA driver 466.11 or newer
+---
 
-Optional:
-- Windows 10 Graphics Tools. To run DirectX 12 applications with the debug layer enabled, you must install this. There are two ways to install it:
-    - Click the Windows button and type `Optional Features`, in the window that opens click `Add a feature` and select `Graphics Tools`.
-    - Download an offline package from [here](https://docs.microsoft.com/en-us/windows-hardware/test/hlk/windows-hardware-lab-kit#supplemental-content-for-graphics-media-and-mean-time-between-failures-mtbf-tests). Choose a ZIP file that matches the OS version you are using (not the SDK version used for building Falcor). The ZIP includes a document which explains how to install the graphics tools.
-- NVAPI, CUDA, OptiX (see below)
+# Read This Before Changing the Renderer
 
-## Building Falcor
-Falcor uses the [CMake](https://cmake.org) build system. Additional information on how to use Falcor with CMake is available in the [CMake](docs/development/cmake.md) development documetation page.
+## The final renderer is NOT a ray marcher
 
-### Visual Studio
-If you are working with Visual Studio 2022, you can setup a native Visual Studio solution by running `setup_vs2022.bat` after cloning this repository. The solution files are written to `build/windows-vs2022` and the binary output is located in `build/windows-vs2022/bin`.
+The fundamental design goal is:
 
-### Visual Studio Code
-If you are working with Visual Studio Code, run `setup.bat` after cloning this repository. This will setup a VS Code workspace in the `.vscode` folder with sensible defaults (only if `.vscode` does not exist yet). When opening the project folder in VS Code, it will prompt to install recommended extensions. We recommend you do, but at least make sure that _CMake Tools_ is installed. To build Falcor, you can select the configure preset by executing the _CMake: Select Configure Preset_ action (Ctrl+Shift+P). Choose the _Windows Ninja/MSVC_ preset. Then simply hit _Build_ (or press F7) to build the project. The binary output is located in `build/windows-ninja-msvc/bin`.
+> **Camera rays must stop being the primary unit of rendering work.**
 
-Warning: Do not start VS Code from _Git Bash_, it will modify the `PATH` environment variable to an incompatible format, leading to issues with CMake.
+The final architecture must not render the image by selecting some set of screen positions and then running an expensive density march for each one.
 
-### Linux
-Falcor has experimental support for Ubuntu 22.04. To build Falcor on Linux, run `setup.sh` after cloning this repository. You also need to install some system library headers using:
+This includes seemingly clever variants such as:
 
-```
-sudo apt install xorg-dev libgtk-3-dev
+```text
+adaptive tiles
+    ↓
+sparse sample positions
+    ↓
+marchBeam()
+    ↓
+interpolate
 ```
 
-You can use the same instructions for building Falcor as described in the _Visual Studio Code_ section above, simply choose the _Linux/GCC_ preset.
+That is still a ray marcher.
 
-### Configure Presets
-Falcor uses _CMake Presets_ store in `CMakePresets.json` to provide a set of commonly used build configurations. You can get the full list of available configure presets running `cmake --list-presets`:
+It merely ray marches fewer pixels.
 
+It is **not the architecture this project is trying to build**.
+
+---
+
+# Final Architecture
+
+The renderer should operate primarily on:
+
+```text
+projected transport regions
+×
+screen-space beam tiles
 ```
-$ cmake --list-presets
-Available configure presets:
 
-  "windows-vs2022"           - Windows VS2022
-  "windows-ninja-msvc"       - Windows Ninja/MSVC
-  "linux-clang"              - Linux Ninja/Clang
-  "linux-gcc"                - Linux Ninja/GCC
+rather than:
+
+```text
+camera rays
+×
+volume steps
 ```
 
-Use `cmake --preset <preset name>` to generate the build tree for a given preset. The build tree is written to the `build/<preset name>` folder and the binary output files are in `build/<preset name>/bin`.
+The intended dataflow is:
 
-An existing build tree can be compiled using `cmake --build build/<preset name>`.
+```text
+                    WORLD SPACE
 
-## Falcor In Python
-For more information on how to use Falcor as a Python module see [Falcor In Python](docs/falcor-in-python.md).
+cloud density / virtual residency
+             ↓
+world-space transport representation
+             ↓
+adaptive HSTR transport cut
+             ↓
+accepted nodes carrying compact transport information
+             ↓
+high-frequency information represented separately as residuals
 
-## Microsoft DirectX 12 Agility SDK
-Falcor uses the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/) to get access to the latest DirectX 12 features. Applications can enable the Agility SDK by putting `FALCOR_EXPORT_D3D12_AGILITY_SDK` in the main `.cpp` file. `Mogwai`, `FalcorTest` and `RenderGraphEditor` have the Agility SDK enabled by default.
 
-## NVAPI
-To enable NVAPI support, head over to https://developer.nvidia.com/nvapi and download the latest version of NVAPI (this build is tested against version R535).
-Extract the content of the zip file into `external/packman/` and rename `R535-developer` to `nvapi`.
+                    CAMERA SPACE
 
-## NSight Aftermath
-To enable NSight Aftermath support, head over to https://developer.nvidia.com/nsight-aftermath and download the latest version of Aftermath (this build is tested against version 2023.1).
-Extract the content of the zip file into `external/packman/aftermath`.
+accepted transport cut
+             ↓
+project nodes into screen space
+             ↓
+bin nodes into adaptive BeamTiles
+             ↓
+front-to-back tile/node work
+             ↓
+evaluate node transfer directly into tile coefficients
+             ↓
+adaptive BeamTile subdivision where required
+             ↓
+compact residual work queue for genuinely unresolved detail
+             ↓
+BeamTile coefficient field
+             ↓
+cheap full-resolution reconstruction
+             ↓
+3840×2160 output
+```
 
-## CUDA
-To enable CUDA support, download and install [CUDA 11.6.2](https://developer.nvidia.com/cuda-11-6-2-download-archive) or later and reconfigure the build.
+The critical transformation is:
 
-See the `CudaInterop` sample application located in `Source/Samples/CudaInterop` for an example of how to use CUDA.
+```text
+OLD
 
-## OptiX
-If you want to use Falcor's OptiX functionality (specifically the `OptixDenoiser` render pass) download the [OptiX SDK](https://developer.nvidia.com/designworks/optix/download) (Falcor is currently tested against OptiX version 7.3) After running the installer, link or copy the OptiX SDK folder into `external/packman/optix` (i.e., file `external/packman/optix/include/optix.h` should exist).
+screen sample
+    ↓
+walk through volume
+    ↓
+sample density repeatedly
+    ↓
+sample lighting repeatedly
+    ↓
+accumulate radiance
+```
 
-Note: You also need CUDA installed to compile the `OptixDenoiser` render pass, see above for details.
+becoming:
 
-## NVIDIA RTX SDKs
-Falcor ships with the following NVIDIA RTX SDKs:
+```text
+FINAL
 
-- DLSS (https://github.com/NVIDIA/DLSS)
-- RTXDI (https://github.com/NVIDIAGameWorks/RTXDI)
-- NRD (https://github.com/NVIDIAGameWorks/RayTracingDenoiser)
+projected transport node
+       ×
+screen BeamTile
+       ↓
+evaluate compact transfer representation
+       ↓
+accumulate tile coefficients
+```
 
-Note that these SDKs are not under the same license as Falcor, see [LICENSE.md](LICENSE.md) for details.
+The ordinary camera path should therefore have **no conventional volume march**.
 
-## Resources
-- [Falcor](https://github.com/NVIDIAGameWorks/Falcor): Falcor's GitHub page.
-- [Documentation](./docs/index.md): Additional information and tutorials.
-    - [Getting Started](./docs/getting-started.md)
-    - [Render Graph Tutorials](./docs/tutorials/index.md)
-- [Rendering Resources](https://benedikt-bitterli.me/resources) A collection of scenes loadable in Falcor (pbrt-v4 format).
-- [ORCA](https://developer.nvidia.com/orca): A collection of scenes and assets optimized for Falcor.
-- [Slang](https://github.com/shader-slang/slang): Falcor's shading language and compiler.
+---
 
-## Citation
-If you use Falcor in a research project leading to a publication, please cite the project.
-The BibTex entry is
+# What “Beam” Means
 
-```bibtex
-@Misc{Kallweit22,
-   author =      {Simon Kallweit and Petrik Clarberg and Craig Kolb and Tom{'a}{\v s} Davidovi{\v c} and Kai-Hwa Yao and Theresa Foley and Yong He and Lifan Wu and Lucy Chen and Tomas Akenine-M{\"o}ller and Chris Wyman and Cyril Crassin and Nir Benty},
-   title =       {The {Falcor} Rendering Framework},
-   year =        {2022},
-   month =       {8},
-   url =         {https://github.com/NVIDIAGameWorks/Falcor},
-   note =        {\url{https://github.com/NVIDIAGameWorks/Falcor}}
+Beam is not just an interpolation layer placed after ray marching.
+
+Beam is intended to become the **camera-space rendering representation itself**.
+
+A `BeamTile` represents the radiometric behaviour of a screen region.
+
+Conceptually it contains coefficients sufficient to reconstruct quantities such as:
+
+* optical depth / transmittance;
+* cached multiple-scattered radiance;
+* direct/single-scattered contribution;
+* depth or opacity moment information;
+* any additional terms required for view-dependent reconstruction.
+
+For example:
+
+```text
+BeamTile
+{
+    screen bounds
+    hierarchy level
+
+    transmittance coefficients
+    multiple-scattering coefficients
+    single-scattering coefficients
+    depth/moment coefficients
+
+    residual information
+    error bound
 }
 ```
+
+The exact coefficient basis may evolve.
+
+The architectural requirement does not:
+
+> **BeamTiles are produced from the projected transport representation, not from a set of fully ray-marched camera samples.**
+
+---
+
+# What HSTR Is — and Is Not
+
+The repository contains HSTR transport infrastructure.
+
+HSTR may remain extremely valuable as the **world-space transport representation/backend**.
+
+It contains machinery such as:
+
+* hierarchical transport nodes;
+* transmittance pages;
+* solved lighting information;
+* residual representation;
+* adaptive cuts;
+* error information;
+* world-space cache data.
+
+That does **not** mean the final camera renderer should run an HSTR density march for every Beam sample.
+
+The distinction is:
+
+```text
+HSTR
+=
+world-space transport representation
+
+
+Beam
+=
+final camera-space rendering architecture
+```
+
+The intended relationship is:
+
+```text
+HSTR transport representation
+          ↓
+projected transport cut
+          ↓
+BeamTile coefficient construction
+          ↓
+screen reconstruction
+```
+
+NOT:
+
+```text
+Beam query
+    ↓
+march through HSTR/cloud density
+    ↓
+BeamResult
+```
+
+If normal Beam rendering still spends most of its time inside a function such as:
+
+```cpp
+marchBeam(...)
+```
+
+then the architecture has not been implemented yet.
+
+---
+
+# Existing Projected-Cut Infrastructure
+
+The repository already contains important pieces of the intended architecture.
+
+Examples include:
+
+```text
+projectCutNodes
+binCutNodes
+sortTileCuts
+HSTRCutNode
+hstrNodeProjection
+hstrNodeDepth
+hstrNodeOrder
+hstrTileNodes
+transmittance pages
+residual pages
+camera lighting
+```
+
+This infrastructure projects the solved transport hierarchy into screen-space regions and builds ordered per-tile node lists.
+
+That concept is much closer to the final design than running independent density marches at Beam sample positions.
+
+Existing functionality such as:
+
+```cpp
+integratePage(...)
+```
+
+is important because it demonstrates the intended principle:
+
+> Accepted hierarchy nodes should be evaluated from their compact transport representation rather than reconstructed by resampling the original volume.
+
+However, even a design that runs a full `traverseCut()` independently for many Beam basis rays should be regarded as an **intermediate step**, not necessarily the endpoint.
+
+The final design should attempt to amortize work across the entire BeamTile.
+
+---
+
+# Final Work Unit
+
+The desired work item is approximately:
+
+```text
+BeamTile × ProjectedTransportNode
+```
+
+not:
+
+```text
+BeamSample × RayStep
+```
+
+A projected node should contribute directly to a tile's coefficients.
+
+Conceptually:
+
+```text
+for each visible accepted transport node
+    project node to screen
+
+    for each overlapping BeamTile
+        determine node/tile transfer
+        accumulate contribution into BeamTile coefficients
+```
+
+This enables neighbouring pixels and basis locations to share transport work.
+
+The expensive hierarchy discovery and transport representation are therefore amortized spatially.
+
+---
+
+# Residual Detail
+
+The compact transport representation will not perfectly describe every part of every cloud.
+
+That is expected.
+
+High-frequency or insufficiently represented regions must be handled as **exceptions**, not as the normal rendering path.
+
+The intended structure is:
+
+```text
+projected node
+     ↓
+representation satisfies error bound?
+     │
+     ├── yes
+     │    ↓
+     │ direct BeamTile coefficient contribution
+     │
+     └── no
+          ↓
+     residual descriptor
+          ↓
+     compact residual work queue
+```
+
+Residual processing may perform expensive fine-density evaluation when genuinely necessary.
+
+But:
+
+> **Fine marching is a residual path, not the renderer.**
+
+If 20%, 40%, or 80% of the image falls into the residual marcher, the answer is not to optimize that marcher forever.
+
+The representation or error model needs improvement.
+
+---
+
+# Required Complexity Change
+
+A conventional renderer tends toward cost resembling:
+
+```text
+screen samples
+×
+steps per ray
+×
+density lookup cost
+×
+lighting lookup cost
+```
+
+The final renderer should instead approach:
+
+```text
+projected cut-node / BeamTile overlaps
++
+sparse residual work
++
+cheap full-resolution reconstruction
+```
+
+This complexity change is the entire point of the project.
+
+An optimization that merely makes:
+
+```text
+N expensive rays
+```
+
+become:
+
+```text
+0.7N expensive rays
+```
+
+may be useful diagnostically, but it is not the central research result.
+
+---
+
+# Sparse Beam Hierarchy
+
+The adaptive screen hierarchy remains useful.
+
+For example:
+
+```text
+32×32
+  ↓
+16×16
+  ↓
+8×8
+  ↓
+4×4
+```
+
+But subdivision must represent **adaptive BeamTile coefficient resolution**, not simply choose how densely to call `marchBeam()`.
+
+A region should remain coarse when its projected transport can be represented within the error budget.
+
+A region should subdivide when:
+
+* projected transport complexity is too high;
+* coefficient approximation error is too large;
+* silhouettes require additional resolution;
+* residual frequency requires additional resolution;
+* depth/transmittance variation requires it.
+
+Therefore:
+
+```text
+adaptive Beam hierarchy
+```
+
+is part of the final architecture.
+
+```text
+adaptive hierarchy of exact ray-march locations
+```
+
+is not.
+
+---
+
+# No Dense Lattice as the Work Definition
+
+A regular screen lattice must not define which expensive work exists.
+
+The old idea:
+
+```text
+screen lattice
+    ↓
+corners and centres
+    ↓
+queries
+```
+
+must not be the foundation of the final renderer.
+
+A dense texture may temporarily exist for:
+
+* debugging;
+* compatibility comparison;
+* visualization;
+* validation.
+
+But it must not determine the renderer's workload.
+
+The authoritative structures should eventually be sparse structures such as:
+
+```text
+BeamTile[]
+ProjectedNodeWork[]
+ResidualWork[]
+BeamCoefficient[]
+```
+
+or equivalent representations.
+
+---
+
+# `marchBeam()` Is Not the Final Renderer
+
+This rule is deliberately explicit because it has already caused architectural confusion.
+
+`marchBeam()` performs conventional camera-ray volume integration.
+
+At the time of writing it ultimately reaches code equivalent to:
+
+```text
+marchSegmentMoment
+    ↓
+majorant lookup
+    ↓
+step
+    ↓
+cameraExtinctionAtVoxel
+    ↓
+brick/page lookup
+    ↓
+density
+    ↓
+lighting
+    ↓
+sun
+    ↓
+repeat
+```
+
+This is exactly the cost the radical architecture is supposed to avoid.
+
+Therefore:
+
+## `marchBeam()` may be used for
+
+* reference comparisons;
+* debugging;
+* validation;
+* residual/fallback work;
+* temporary migration A/Bs.
+
+## `marchBeam()` must NOT be
+
+* the normal Beam evaluator;
+* the source of every BeamTile coefficient;
+* the implementation behind ordinary adaptive Beam queries;
+* optimized indefinitely as if it were the final architecture.
+
+If an optimization proposal begins with:
+
+> “make `marchBeam()` faster…”
+
+ask first whether the proposed work belongs in the final residual path.
+
+If not, stop.
+
+---
+
+# Exact Basis Rays Are Also Not the End Goal
+
+A transitional architecture may evaluate:
+
+```text
+corner
+corner
+corner
+corner
+centre
+```
+
+using the projected HSTR cut.
+
+That is already better than marching raw density because accepted nodes can use compact page integration.
+
+But the final design should go further.
+
+Instead of:
+
+```text
+five independent traversals of the same projected node list
+```
+
+prefer:
+
+```text
+one tile/node interaction
+     ↓
+derive contribution to the tile's basis coefficients
+```
+
+This is the deeper source of cross-ray reuse.
+
+Do not stop merely because `marchBeam()` has been replaced by `traverseCut()`.
+
+---
+
+# Lighting
+
+Lighting should follow the same philosophy.
+
+Expensive lighting work should be solved or cached in world space whenever possible.
+
+The ordinary Beam construction path should consume compact lighting/transport information.
+
+Rare cases requiring expensive live lighting should go into a separate exceptional-work path.
+
+Do not place rare fallback logic inside the normal high-frequency kernel if doing so increases:
+
+* register pressure;
+* divergence;
+* occupancy cost;
+* code size;
+* instruction-cache pressure.
+
+---
+
+# Empty Space
+
+Empty-space acceleration remains useful, particularly for residual work.
+
+However, do not confuse:
+
+```text
+faster ray marching
+```
+
+with:
+
+```text
+eliminating ray marching
+```
+
+Distance-to-density structures, majorants, occupancy hierarchies and similar accelerators are valuable for the residual path.
+
+They do not replace the central Beam architecture.
+
+---
+
+# Temporal Reuse
+
+Temporal reuse is a later multiplier, not the foundation of correctness.
+
+The final system may reuse:
+
+* BeamTile coefficients;
+* projected cuts;
+* residual classifications;
+* prior tile refinement decisions.
+
+Temporal data may help scheduling or reconstruction.
+
+It must not be required to hide an intrinsically expensive steady-state architecture.
+
+First make a fresh frame fast.
+
+Then exploit time.
+
+---
+
+# Quality Authority
+
+The quality authority is the saved path-traced reference.
+
+Not:
+
+* agreement with the old marcher;
+* agreement with `marchBeam()`;
+* agreement with an old dense lattice;
+* exact-match percentage against a legacy implementation.
+
+Legacy exact-march comparisons are useful during development, but they must not force the new architecture to reproduce errors or unnecessary detail from the old renderer.
+
+Report, where available:
+
+* mean error;
+* share above the configured error threshold;
+* p99;
+* p99.9;
+* maximum error;
+* spatial/block metrics.
+
+The project should preserve the required perceptual/path-reference quality, not mathematical loyalty to legacy code.
+
+---
+
+# Performance Target
+
+Primary target:
+
+```text
+3840 × 2160
+< 2 ms GPU
+```
+
+The renderer must be evaluated under:
+
+* parked/static camera;
+* slow camera motion;
+* fast camera motion;
+* residency churn;
+* close cloud views;
+* distant cloud views;
+* representative lighting conditions.
+
+A static-camera cache hit is not sufficient.
+
+Neither is a single easy camera view.
+
+---
+
+# Performance Budget Philosophy
+
+The desired final cost distribution looks more like:
+
+```text
+project / classify transport       small
+BeamTile/node accumulation         dominant but cheap
+residual work                      sparse
+reconstruction                     small
+residency maintenance              very small
+```
+
+It must NOT look like:
+
+```text
+exact camera marching              70–90%
+everything else                    10–30%
+```
+
+If profiling shows exact camera integration dominating the final renderer, the architecture is wrong or incomplete.
+
+---
+
+# Architectural Invariants
+
+These rules are non-negotiable unless this README is explicitly changed.
+
+### 1. Camera rays are not the normal unit of work.
+
+### 2. `marchBeam()` is not the final Beam evaluator.
+
+### 3. A dense lattice must not define expensive work.
+
+### 4. Accepted world-space transport must be reused directly.
+
+### 5. Expensive fine-density evaluation belongs in a sparse residual path.
+
+### 6. BeamTiles must eventually consume projected transport directly.
+
+### 7. Quality is judged against the path-traced reference.
+
+### 8. Optimizations should reduce algorithmic work, not merely shuffle or micro-optimize millions of equivalent operations.
+
+### 9. 4K output does not imply 4K volumetric integration work.
+
+### 10. The final architecture must materially change scaling relative to conventional ray marching.
+
+---
+
+# AI / Coding-Agent Rules
+
+Before implementing any substantial optimization, answer:
+
+```text
+1. Which FINAL architecture component does this advance?
+
+2. Does it reduce dependence on camera-ray marching?
+
+3. Will this code still be useful after marchBeam() stops being the normal renderer?
+
+4. Is this final infrastructure, or explicitly temporary compatibility code?
+
+5. Does it move complexity from
+   rays × steps
+   toward
+   projected transport × tiles?
+```
+
+If the answer to #3 is **no**, do not spend significant development time on it without explicit instruction.
+
+---
+
+## Automatic Red Flags
+
+An AI agent should stop and reconsider if its proposed design says things like:
+
+> “We can make each Beam ray cheaper…”
+
+> “Let's optimize `marchBeam()` first…”
+
+> “Emit sparse Beam queries, then run the existing exact march…”
+
+> “Use a coarser lattice to reduce the number of full marches…”
+
+> “Tune the verifier until fewer rays fall back…”
+
+> “Improve the density lookup for every Beam query…”
+
+These can be diagnostic experiments.
+
+They are not the final architecture.
+
+---
+
+# Transitional Code
+
+Some transitional infrastructure is acceptable.
+
+Examples:
+
+```text
+legacy-vs-new A/B switch
+compatibility lattice output
+exact marcher reference path
+debug visualizations
+temporary basis-ray evaluation
+```
+
+Such code should be clearly marked:
+
+```text
+TEMPORARY_COMPAT
+```
+
+or equivalently documented.
+
+Do not allow temporary compatibility code to become the architecture by inertia.
+
+---
+
+# Current Direction
+
+The implementation path should move toward:
+
+```text
+1. Keep world-space transport/residency infrastructure.
+
+2. Produce a camera-visible adaptive transport cut.
+
+3. Project accepted nodes into screen space.
+
+4. Bin/sort them into adaptive BeamTile regions.
+
+5. Replace normal Beam ray marches with direct page/transport evaluation.
+
+6. Convert repeated per-basis cut traversal into tile × node coefficient accumulation.
+
+7. Generate residual work only where the compact representation cannot satisfy the error bound.
+
+8. Reconstruct the final 4K image from BeamTile coefficients.
+
+9. Add temporal reuse only after fresh-frame performance is strong.
+
+10. Optimize residual marching independently because it is no longer the common path.
+```
+
+---
+
+# The Architecture Test
+
+At any point, profile the renderer.
+
+If the result looks like:
+
+```text
+10 ms  camera / Beam marching
+0.2 ms verification
+0.5 ms classification
+0.8 ms reconstruction
+```
+
+the renderer has **not reached the intended architecture**.
+
+The intended result should eventually look structurally more like:
+
+```text
+projected transport work
+Beam coefficient generation
+sparse exceptional residuals
+cheap reconstruction
+```
+
+with no large normal-path camera marching stage.
+
+---
+
+# One-Sentence Definition
+
+If there is any doubt about the project direction, use this:
+
+> **The final renderer projects a solved hierarchical cloud-transport representation into adaptive screen-space BeamTiles and directly constructs their radiometric coefficients; conventional density ray marching exists only for sparse unresolved residuals, not as the normal way Beam samples are evaluated.**
+
+That is the architecture.
