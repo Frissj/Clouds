@@ -1061,8 +1061,10 @@ struct HSTRCloudParams
     uint beamStationary = 0;
     /// The camera still has the anchor orientation, so reference and screen coordinates differ by translation alone.
     uint beamRefAligned = 0;
-    uint padBeamStationary1 = 0;
-    uint padBeamStationary2 = 0;
+    /// Column window of the reference comparison, [low, high). high 0 means the whole row. A whole-frame aggregate cannot show
+    /// that a localised band is clean, so this restricts the same statistics to one, e.g. the last beamTileSize columns.
+    uint compareColumnLow = 0;
+    uint compareColumnHigh = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

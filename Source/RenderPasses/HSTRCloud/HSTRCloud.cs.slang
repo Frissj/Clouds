@@ -3507,7 +3507,9 @@ struct HSTRCloudRenderer
         if (params.compareExact != 0)
             for (uint b = 0; b < kCompareBins; ++b)
                 hstrReferenceRowHistogram[row * kCompareBins + b] = 0.f;
-        for (uint x = 0; x < params.frameDim.x; ++x)
+        const uint columnLow = min(params.compareColumnLow, params.frameDim.x);
+        const uint columnHigh = params.compareColumnHigh == 0 ? params.frameDim.x : min(params.compareColumnHigh, params.frameDim.x);
+        for (uint x = columnLow; x < columnHigh; ++x)
         {
             const uint2 pixel = uint2(x, row);
             if (params.compareExact != 0)

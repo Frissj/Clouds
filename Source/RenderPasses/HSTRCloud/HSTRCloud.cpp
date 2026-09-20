@@ -77,6 +77,8 @@ const char kBeamSegments[] = "beamSegments";
 const char kBeamTemporal[] = "beamTemporal";
 const char kBeamAdaptiveRoot[] = "beamAdaptiveRoot";
 const char kCompareBlock[] = "compareBlock";
+const char kCompareColumnLow[] = "compareColumnLow";
+const char kCompareColumnHigh[] = "compareColumnHigh";
 const char kCompareMapScale[] = "compareMapScale";
 const char kWorldCacheModulation[] = "worldCacheModulation";
 const char kWorldCacheModulationDepth[] = "worldCacheModulationDepth";
@@ -276,6 +278,16 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
+        if (key == kCompareColumnLow)
+        {
+            mParams.compareColumnLow = uint32_t(value);
+            continue;
+        }
+        if (key == kCompareColumnHigh)
+        {
+            mParams.compareColumnHigh = uint32_t(value);
+            continue;
+        }
         if (key == kBeamOracle)
         {
             mParams.beamOracle = uint32_t(value);
@@ -813,6 +825,8 @@ Properties HSTRCloud::getProperties() const
     props[kBeamTemporal] = mParams.beamTemporal != 0;
     props[kBeamAdaptiveRoot] = mParams.beamAdaptiveRoot != 0;
     props[kCompareBlock] = mParams.compareBlock;
+    props[kCompareColumnLow] = mParams.compareColumnLow;
+    props[kCompareColumnHigh] = mParams.compareColumnHigh;
     props[kCompareMapScale] = mParams.compareMapScale;
     props[kWorldCacheModulation] = mWorldCacheModulation;
     props[kWorldCacheModulationDepth] = mParams.worldCacheModulationDepth;
