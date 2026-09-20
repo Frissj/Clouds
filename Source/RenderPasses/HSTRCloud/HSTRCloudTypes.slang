@@ -18,7 +18,15 @@ static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache 
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
-static const uint kBeamCountSlots = kBeamMaxLevels + 3;
+// The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
+// remaining entries are sparse-query instrumentation (see kBeamSparse* below).
+static const uint kBeamCountSlots = 16;
+static const uint kBeamSparseRoots = 7;
+static const uint kBeamSparseEmpty = 8;
+static const uint kBeamSparseCandidates = 9;
+static const uint kBeamSparseUnique = 10;
+static const uint kBeamSparseFinal = 11;
+static const uint kBeamSparseStarts = 12; ///< Four entries, one per starting level.
 static const uint kBeamQueueBuckets = 4;   ///< Lists of queued root queries by predicted cost (beamQueue).
 static const uint kCompareBins = 64;       ///< Exact comparison histogram entries per row: log error bins, then the maximum.
 static const float kCompareBinFloor = 1e-4f; ///< Upper edge of the first log error bin; 4 bins per octave above.
@@ -149,6 +157,29 @@ struct HSTRCloudSunSched
 {
     uint coord;     ///< BrickHeader::coord: level-local brick coordinates, 10 bits per axis.
     uint asset;
+};
+
+/// Durable sparse beam interfaces. Query IDs, rather than lattice coordinates, are
+/// the identity consumed by tiles. The dense beam lattice is only a compatibility
+/// scatter until reconstruction reads these buffers directly.
+struct BeamResult
+{
+    uint depthCache01; ///< Half-packed cache.rg.
+    uint depthCache23; ///< Half-packed cache.b and optical depth.
+    uint single01;     ///< Half-packed single.rg.
+    uint single23;     ///< Half-packed single.b and opacity-weighted distance.
+    float steps;
+};
+
+struct BeamTile
+{
+    uint2 origin;
+    uint level;
+    uint q00;
+    uint q10;
+    uint q01;
+    uint q11;
+    uint qc;
 };
 
 /// Sun bake invalidation (CloudResidencyDesc::gpuSun). A bake of a level-L brick read the change cells (32^3 source voxels) over its

@@ -119,6 +119,7 @@ for name, position, target in views:
             hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
             p = hstr.properties
+            beam_stats = p.get("cloudStats", {})
             hstr.set_properties({"compareReference": False, "compareExact": False})
             capture(f"{TAG}_{name}_{label.replace(' ', '_')}_{test.replace(' ', '_')}")
             parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
@@ -128,10 +129,13 @@ for name, position, target in views:
                 f.write(json.dumps({"view": name, "config": label, "test": test, "a": a, "b": b, "anchor": local, "ratio": ratio,
                                     "marched": marched, "log": float(p["referenceLogError"]), "over02": float(p["referenceNoiseError"]),
                                     "over10": float(p["referenceNoiseLogError"]), "p999": float(p["referenceLogP999"]),
-                                    "max": float(p["referenceLogMax"])}) + "\n")
+                                    "max": float(p["referenceLogMax"]),
+                                    "beam": {k: beam_stats.get(k, 0) for k in ("beamRootTiles", "beamEmptyTiles", "beamCandidates",
+                                             "beamUniqueQueries", "beamFinalTiles", "beamStart0", "beamStart1", "beamStart2", "beamStart3")}}) + "\n")
             log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms "
                 f"[x{ratio:5.3f} of anchor {local:6.2f}] ({parts}); "
                 f"marched {100 * marched:4.1f}%; B vs A: log {float(p['referenceLogError']):.2e}, "
                 f">0.02 {100 * float(p['referenceNoiseError']):.3f}%, >0.1 {100 * float(p['referenceNoiseLogError']):.3f}%, "
-                f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}")
+                f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}; "
+                f"queries {int(beam_stats.get('beamUniqueQueries', 0))}, candidates {int(beam_stats.get('beamCandidates', 0))}")
 exit()

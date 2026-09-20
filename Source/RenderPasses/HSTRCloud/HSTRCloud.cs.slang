@@ -20,6 +20,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_SHIP
 #define HSTR_SHIP 0
 #endif
+#ifndef HSTR_BEAM_SPARSE_MIN_LEVEL
+#define HSTR_BEAM_SPARSE_MIN_LEVEL 2
+#endif
 #define SHIP_BIT_cloudTransferClasses 1
 #define SHIP_BIT_cloudCostProbe 2
 #define SHIP_BIT_cloudEmptySkip 4
@@ -335,6 +338,12 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
     RWStructuredBuffer<uint> hstrBeamArgs;
+    RWStructuredBuffer<uint> hstrBeamSparseCandidates; ///< Candidate tiles, partitioned by level.
+    RWStructuredBuffer<uint> hstrBeamSparseArgs;       ///< emit and verify indirect arguments.
+    RWStructuredBuffer<BeamResult> hstrBeamResults;
+    RWStructuredBuffer<BeamTile> hstrBeamFinalTiles;
+    RWTexture2D<uint> hstrBeamQueryMap; ///< Query ID per lattice coordinate; 0xffffffff is unclaimed.
+    RWTexture2D<uint> hstrBeamTileMap;  ///< Final BeamTile ID per finest cell; sentinels are empty/fallback.
     RWStructuredBuffer<uint> hstrBeamQueue;       ///< beamQueue: kBeamQueueBuckets lists of beamQueueCapacity packed positions.
     RWStructuredBuffer<uint> hstrBeamQueueCounts; ///< beamQueue: entries per list.
     RWStructuredBuffer<uint> hstrBeamQueueArgs;   ///< beamQueue: dispatch arguments per list (bound by its own pass only).
@@ -3973,6 +3982,315 @@ struct HSTRCloudRenderer
         hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 0.f, 0.f, 0.f);
     }
 
+    uint beamSparseListOffset(uint level)
+    {
+        const uint roots = params.beamTileDims.x * params.beamTileDims.y;
+        return roots * (((1u << (2u * level)) - 1u) / 3u);
+    }
+
+    /// A conservative no-medium proof for the unbounded sea slab. The y component
+    /// of an unnormalised camera ray is affine over a screen tile, so four corners
+    /// all pointing away from a slab on the other side proves every enclosed ray
+    /// misses. Finite volumes currently return false and remain quality-neutral.
+    bool beamRootProvablyEmpty(uint2 tile)
+    {
+        if (params.cloudDomain == 0 || params.seaMode == 0)
+            return false;
+        const float bottom = max(params.seaOrigin.y, params.seaContentY.x);
+        const float top = min(params.seaOrigin.y + float(params.hstrExtinctionDims.y) * params.seaVoxelSize.y, params.seaContentY.y);
+        if (bottom >= top)
+            return true;
+        const uint s = params.beamTileSize;
+        const float2 p[4] = {
+            float2(tile * s), float2(tile * s + uint2(s, 0)),
+            float2(tile * s + uint2(0, s)), float2(tile * s + s),
+        };
+        float lo = 1e30f;
+        float hi = -1e30f;
+        for (uint i = 0; i < 4; ++i)
+        {
+            const float y = cameraRayDirection(p[i]).y;
+            lo = min(lo, y);
+            hi = max(hi, y);
+        }
+        const float cameraY = gScene.camera.data.posW.y;
+        return (cameraY < bottom && hi <= 0.f) || (cameraY > top && lo >= 0.f);
+    }
+
+    /// Cheap domain-metadata scheduling hint. It never accepts a tile: it only
+    /// chooses the first level at which the exact radiometric verifier runs.
+    uint beamMetadataStartLevel(uint2 root)
+    {
+        const uint last = params.beamLevels - 1u;
+        if (last == 0)
+            return 0;
+        const uint s = params.beamTileSize;
+        const float2 p[5] = {
+            float2(root * s), float2(root * s + uint2(s, 0)), float2(root * s + uint2(0, s)),
+            float2(root * s + s), float2(root * s + s / 2u),
+        };
+        uint covered = 0;
+        float centreLo = 1e30f;
+        float centreHi = -1e30f;
+        float lengthLo = 1e30f;
+        float lengthHi = 0.f;
+        float majorantLo = 1e30f;
+        float majorantHi = 0.f;
+        const GridVolume volume = gScene.getGridVolume(0);
+        for (uint i = 0; i < 5; ++i)
+        {
+            const float3 w = cameraRayDirection(p[i]);
+            float2 interval;
+            if (!mediumInterval(gScene.camera.data.posW, w, volume, interval))
+                continue;
+            interval.x = max(interval.x, 0.f);
+            if (interval.y <= interval.x)
+                continue;
+            ++covered;
+            const float centre = 0.5f * (interval.x + interval.y);
+            const float length = interval.y - interval.x;
+            centreLo = min(centreLo, centre);
+            centreHi = max(centreHi, centre);
+            lengthLo = min(lengthLo, length);
+            lengthHi = max(lengthHi, length);
+            const float3 v = worldToVoxel(gScene.camera.data.posW + centre * w, volume);
+            const float m = majorantAt(v);
+            majorantLo = min(majorantLo, m);
+            majorantHi = max(majorantHi, m);
+        }
+        // Mixed coverage is a silhouette candidate. Large depth or majorant spread
+        // likewise begins finer; exact surplus/silhouette tests still decide acceptance.
+        if (covered != 0 && covered != 5)
+            return last;
+        if (covered == 0)
+            return 0;
+        // Compare the interval geometry *between* the five rays. Using the union's
+        // exit-entry distance here measured slab thickness instead and forced every
+        // 4K near-view root to level 2 (8160/8160, 286155 unique queries).
+        const float centreSpread = (centreHi - centreLo) / max(abs(0.5f * (centreHi + centreLo)), 1e-3f);
+        const float lengthSpread = (lengthHi - lengthLo) / max(lengthHi, 1e-3f);
+        const float depthSpread = max(centreSpread, lengthSpread);
+        const float densitySpread = (majorantHi - majorantLo) / max(majorantHi, 1e-6f);
+        if (depthSpread > 0.35f || densitySpread > 0.75f)
+            return min(last, 2u);
+        if (depthSpread > 0.12f || densitySpread > 0.35f)
+            return min(last, 1u);
+        return 0;
+    }
+
+    void appendBeamSparseCandidate(uint level, uint2 tile)
+    {
+        uint slot;
+        InterlockedAdd(hstrBeamCounts[level], 1u, slot);
+        hstrBeamSparseCandidates[beamSparseListOffset(level) + slot] = packBeamTile(tile);
+        uint unused;
+        InterlockedAdd(hstrBeamCounts[kBeamSparseCandidates], 1u, unused);
+    }
+
+    /// Metadata phase: produce candidate leaves before any exact query is emitted.
+    void classifyBeamRoot(uint thread)
+    {
+        const uint roots = params.beamTileDims.x * params.beamTileDims.y;
+        if (thread >= roots)
+            return;
+        const uint2 root = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+        uint unused;
+        InterlockedAdd(hstrBeamCounts[kBeamSparseRoots], 1u, unused);
+        if (beamRootProvablyEmpty(root))
+        {
+            InterlockedAdd(hstrBeamCounts[kBeamSparseEmpty], 1u, unused);
+            const uint finest = beamTileEdge(params.beamLevels - 1u);
+            const uint cells = params.beamTileSize / finest;
+            const uint2 first = root * cells;
+            for (uint y = 0; y < cells; ++y)
+                for (uint x = 0; x < cells; ++x)
+                {
+                    const uint2 cell = first + uint2(x, y);
+                    if (all(cell < params.beamLevelDims))
+                    {
+                        hstrBeamLevelOutput[cell] = params.beamLevels + 1u;
+                        hstrBeamTileMap[cell] = 0xfffffffeu;
+                    }
+                }
+            return;
+        }
+        const uint level = max(min(uint(HSTR_BEAM_SPARSE_MIN_LEVEL), params.beamLevels - 1u), beamMetadataStartLevel(root));
+        InterlockedAdd(hstrBeamCounts[kBeamSparseStarts + level], 1u, unused);
+        const uint n = 1u << level;
+        for (uint y = 0; y < n; ++y)
+            for (uint x = 0; x < n; ++x)
+                appendBeamSparseCandidate(level, root * n + uint2(x, y));
+    }
+
+    void emitBeamSparseQuery(uint thread)
+    {
+        const uint level = params.beamPassLevel;
+        const uint entry = thread / 5u;
+        if (entry >= hstrBeamCounts[level])
+            return;
+        const uint2 tile = unpackBeamTile(hstrBeamSparseCandidates[beamSparseListOffset(level) + entry]);
+        const uint s = beamTileEdge(level);
+        const uint2 offsets[5] = { uint2(0, 0), uint2(s, 0), uint2(0, s), uint2(s, s), uint2(s / 2u, s / 2u) };
+        const uint2 position = tile * s + offsets[thread % 5u];
+        const uint2 texel = position / params.beamLatticeStep;
+        // The lattice coordinate is the durable virtual query identity. This avoids
+        // shuffling coherent screen-space work through a globally atomic compact ID
+        // queue (4K near: 78,783 queries but 12.2 ms in the compacted pipeline).
+        const uint queryId = texel.x + params.beamLatticeDims.x * texel.y;
+        uint prior;
+        InterlockedCompareExchange(hstrBeamQueryMap[texel], 0xffffffffu, queryId, prior);
+        if (prior != 0xffffffffu)
+            return;
+        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        const float4 depthCache = float4(q.cache, q.depth);
+        const float4 single = float4(q.single, q.distance);
+        const BeamResult result = makeBeamResult(depthCache, single, q.steps);
+        hstrBeamResults[queryId] = result;
+        // Transitional adapter for controlled reconstruction A/B only. No sparse
+        // work is generated from this texture.
+        writeBeamQuery(position, depthCache, single, result.steps);
+        uint unused;
+        InterlockedAdd(hstrBeamCounts[kBeamSparseUnique], 1u, unused);
+    }
+
+    uint beamPackHalf2(float2 v) { return uint(f32tof16(v.x)) | (uint(f32tof16(v.y)) << 16); }
+
+    float2 beamUnpackHalf2(uint v) { return float2(f16tof32(v & 0xffffu), f16tof32(v >> 16)); }
+
+    BeamResult makeBeamResult(float4 depthCache, float4 single, float steps)
+    {
+        BeamResult result;
+        result.depthCache01 = beamPackHalf2(depthCache.xy);
+        result.depthCache23 = beamPackHalf2(depthCache.zw);
+        result.single01 = beamPackHalf2(single.xy);
+        result.single23 = beamPackHalf2(single.zw);
+        result.steps = steps;
+        return result;
+    }
+
+    float4 beamResultDepthCache(BeamResult result)
+    {
+        return float4(beamUnpackHalf2(result.depthCache01), beamUnpackHalf2(result.depthCache23));
+    }
+
+    float4 beamResultSingle(BeamResult result)
+    {
+        return float4(beamUnpackHalf2(result.single01), beamUnpackHalf2(result.single23));
+    }
+
+    uint beamSparseQueryId(uint2 position) { return hstrBeamQueryMap[position / params.beamLatticeStep]; }
+
+    void verifyBeamSparseTile(uint thread)
+    {
+        const uint level = params.beamPassLevel;
+        if (thread >= hstrBeamCounts[level])
+            return;
+        const uint2 tile = unpackBeamTile(hstrBeamSparseCandidates[beamSparseListOffset(level) + thread]);
+        if (any(tile * beamTileEdge(level) >= params.frameDim))
+            return;
+        if (!beamTileRefines(level, tile))
+        {
+            const uint s = beamTileEdge(level);
+            const uint2 origin = tile * s;
+            BeamTile finalTile;
+            finalTile.origin = origin;
+            finalTile.level = level;
+            finalTile.q00 = beamSparseQueryId(origin);
+            finalTile.q10 = beamSparseQueryId(origin + uint2(s, 0));
+            finalTile.q01 = beamSparseQueryId(origin + uint2(0, s));
+            finalTile.q11 = beamSparseQueryId(origin + s);
+            finalTile.qc = beamSparseQueryId(origin + s / 2u);
+            uint slot;
+            InterlockedAdd(hstrBeamCounts[kBeamSparseFinal], 1u, slot);
+            hstrBeamFinalTiles[slot] = finalTile;
+            writeBeamLevel(level, tile, level);
+            const uint finest = beamTileEdge(params.beamLevels - 1u);
+            const uint cells = s / finest;
+            const uint2 first = tile * cells;
+            for (uint y = 0; y < cells; ++y)
+                for (uint x = 0; x < cells; ++x)
+                {
+                    const uint2 cell = first + uint2(x, y);
+                    if (all(cell < params.beamLevelDims))
+                        hstrBeamTileMap[cell] = slot;
+                }
+            return;
+        }
+        if (level + 1u < params.beamLevels)
+        {
+            for (uint child = 0; child < 4; ++child)
+                appendBeamSparseCandidate(level + 1u, 2u * tile + uint2(child & 1u, child >> 1));
+        }
+        else
+        {
+            uint slot;
+            InterlockedAdd(hstrBeamCounts[params.beamLevels], 1u, slot);
+            hstrBeamLists[beamListOffset(params.beamLevels) + slot] = packBeamTile(tile);
+            writeBeamLevel(level, tile, params.beamLevels);
+            hstrBeamTileMap[tile] = 0xffffffffu;
+        }
+    }
+
+    void writeBeamSparseArgs()
+    {
+        const uint count = hstrBeamCounts[params.beamPassLevel];
+        hstrBeamSparseArgs[0] = (count * 5u + 63u) / 64u;
+        hstrBeamSparseArgs[1] = 1u;
+        hstrBeamSparseArgs[2] = 1u;
+        hstrBeamSparseArgs[3] = (count + 63u) / 64u;
+        hstrBeamSparseArgs[4] = 1u;
+        hstrBeamSparseArgs[5] = 1u;
+        hstrBeamSparseArgs[6] = 0u;
+        hstrBeamSparseArgs[7] = 1u;
+        hstrBeamSparseArgs[8] = 1u;
+    }
+
+    float3 beamSparseReconstruct(uint tileIndex, uint2 pixel)
+    {
+        const BeamTile tile = hstrBeamFinalTiles[tileIndex];
+        const uint s = beamTileEdge(tile.level);
+        const BeamResult r00 = hstrBeamResults[tile.q00];
+        const BeamResult r10 = hstrBeamResults[tile.q10];
+        const BeamResult r01 = hstrBeamResults[tile.q01];
+        const BeamResult r11 = hstrBeamResults[tile.q11];
+        const BeamResult rc = hstrBeamResults[tile.qc];
+        const float2 f = (float2(pixel - tile.origin) + 0.5f) / float(s);
+        const float4 a00 = beamResultDepthCache(r00);
+        const float4 a10 = beamResultDepthCache(r10);
+        const float4 a01 = beamResultDepthCache(r01);
+        const float4 a11 = beamResultDepthCache(r11);
+        const float4 ac = beamResultDepthCache(rc);
+        const float4 b00 = beamResultSingle(r00);
+        const float4 b10 = beamResultSingle(r10);
+        const float4 b01 = beamResultSingle(r01);
+        const float4 b11 = beamResultSingle(r11);
+        const float4 bc = beamResultSingle(rc);
+        float4 a = bilinear(a00, a10, a01, a11, f);
+        float4 b = bilinear(b00, b10, b01, b11, f);
+        const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
+        a += (ac - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
+        b += (bc - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
+    }
+
+    void resolveBeamSparsePixel(uint2 pixel)
+    {
+        if (any(pixel >= params.frameDim))
+            return;
+        const uint finest = beamTileEdge(params.beamLevels - 1u);
+        const uint tile = hstrBeamTileMap[pixel / finest];
+        if (tile == 0xffffffffu)
+            return;
+        if (tile == 0xfffffffeu)
+        {
+            const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+            color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
+            return;
+        }
+        color[pixel] = float4(beamSparseReconstruct(tile, pixel), 1.f);
+    }
+
     /// Queues a root query for the march pass of its predicted cost (beamQueue).
     void beamEnqueue(uint2 position)
     {
@@ -4445,6 +4763,12 @@ struct HSTRCloudRenderer
             return;
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[pixel / finest];
+        if (level == params.beamLevels + 1u)
+        {
+            const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+            color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
+            return;
+        }
         if (level >= params.beamLevels)
             return;
         color[pixel] = float4(beamReconstruct(level, pixel), 1.f);
@@ -5121,6 +5445,12 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID)
 }
 
 [numthreads(8, 8, 1)]
+void resolveBeamSparse(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.resolveBeamSparsePixel(dispatchThreadId.xy);
+}
+
+[numthreads(8, 8, 1)]
 void beamGuide(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.beamGuidePixel(dispatchThreadId.xy);
@@ -5172,6 +5502,30 @@ void writeBeamQueueArgs(uint3 dispatchThreadId: SV_DispatchThreadID)
 void writeBeamArgs(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.writeBeamArgs();
+}
+
+[numthreads(64, 1, 1)]
+void classifyBeamRoots(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.classifyBeamRoot(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void emitBeamSparseQueries(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.emitBeamSparseQuery(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void verifyBeamSparseTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.verifyBeamSparseTile(dispatchThreadId.x);
+}
+
+[numthreads(1, 1, 1)]
+void writeBeamSparseArgs(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.writeBeamSparseArgs();
 }
 
 [numthreads(8, 8, 1)]

@@ -87,6 +87,8 @@ private:
     static_assert(sizeof(CorrectionAtom) == 16);
     static_assert(sizeof(HSTRCutNode) == 96);
     static_assert(sizeof(HSTRTileBasis) == 96);
+    static_assert(sizeof(BeamResult) == 20);
+    static_assert(sizeof(BeamTile) == 32);
 
     void parseProperties(const Properties& props);
     void buildHierarchy();
@@ -155,10 +157,19 @@ private:
     ref<ComputePass> mpBeamTilePass;
     ref<ComputePass> mpBeamArgsPass;
     ref<ComputePass> mpBeamResolvePass;
+    ref<ComputePass> mpBeamSparseResolvePass;
     ref<ComputePass> mpBeamMarchPass;
+    ref<ComputePass> mpBeamClassifyPass;
+    ref<ComputePass> mpBeamSparseEmitPass;
+    ref<ComputePass> mpBeamSparseVerifyPass;
+    ref<ComputePass> mpBeamSparseArgsPass;
     ref<ComputePass> mpBeamGridQueryPass;  ///< Root lattice queries as a 2D dispatch over the corner (or centre) grid.
     ref<ComputePass> mpBeamGridMarchPass;  ///< Per-pixel refinement as a full-frame 2D dispatch that skips accepted tiles.
     bool mBeamGridDispatch = false;        ///< Whether the beam view uses the two passes above (beamSegments 1, per-level build).
+    bool mBeamSparse = true;               ///< Metadata-led sparse query compiler; false keeps the legacy lattice generator for A/B.
+    bool mBeamSparseDirect = true;         ///< Read packed sparse results directly; false retains the lattice adapter for controlled A/B.
+    uint32_t mBeamSparseMinLevel = 2;       ///< Lowest metadata-selected verifier level; benchmark knob outside the shared shader ABI.
+    bool mBeamSparseBuilt = false;          ///< The current beam buffers were produced by the sparse compiler.
     // beamRefresh: the previous build's lattice and level map (swapped with the current ones every build), its marched pixels
     // (the two alternate), and its camera.
     ref<Texture> mpBeamLatticePrev;
@@ -192,6 +203,12 @@ private:
     float3 mBeamPrevCamera = float3(0.f);
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
+    ref<Texture> mpBeamQueryMap; ///< Sparse query ID per possible lattice coordinate.
+    ref<Texture> mpBeamTileMap;  ///< Final sparse tile ID per finest cell.
+    ref<Buffer> mpBeamSparseCandidates;
+    ref<Buffer> mpBeamSparseArgs;
+    ref<Buffer> mpBeamResults;
+    ref<Buffer> mpBeamFinalTiles;
     ref<ComputePass> mpBeamGuidePass;
     ref<Texture> mpBeamGuide; ///< Full-resolution beam guide: optical depth, distance and sun depth where it reaches one.
     ref<ComputePass> mpBeamTemporalTilePass;
