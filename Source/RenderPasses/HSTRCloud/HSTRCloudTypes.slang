@@ -1084,6 +1084,14 @@ struct HSTRCloudParams
     /// 1 when the residual march covers the same regions as the query and tile passes instead of the whole beam image. A unit
     /// can only need marching where its tile's classification or its own carry could have changed, which is those regions.
     uint beamUnitGenerated = 0;
+    /// PROBE, not a feature. 1 routes every lattice read through a page table instead of addressing the texture directly. The
+    /// table is filled with the identity, so the data, the layout and every result are unchanged and only the cost of the
+    /// indirection is measured: one dependent buffer read plus the page arithmetic, in a path the resolve walks thirteen times
+    /// per pixel. A sparse paged direction atlas - the design that removes re-anchoring without allocating the sphere - cannot
+    /// be built if that indirection is expensive here, and this measures it before anything is built on top of it.
+    uint beamPageIndirect = 0;
+    uint beamPageShift = 4;            ///< Lattice points per page edge, as a shift.
+    uint2 beamPageDims = { 0, 0 };     ///< Pages covering the lattice.
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

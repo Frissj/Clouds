@@ -250,6 +250,7 @@ private:
     float4x4 mBeamPrevViewProj;
     float3 mBeamPrevCamera = float3(0.f);
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
+    ref<Buffer> mpBeamPageTable; ///< Identity page table for the beamPageIndirect probe.
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
     ref<Texture> mpBeamQueryMap; ///< Sparse query ID per possible lattice coordinate.
     ref<Texture> mpBeamTileMap;  ///< Final sparse tile ID per finest cell.

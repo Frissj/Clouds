@@ -283,6 +283,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamRefPrebuild = bool(value);
             continue;
         }
+        if (key == "beamPageIndirect")
+        {
+            mParams.beamPageIndirect = uint32_t(value);
+            continue;
+        }
+        if (key == "beamPageShift")
+        {
+            mParams.beamPageShift = std::max(uint32_t(value), 1u);
+            continue;
+        }
         if (key == kCompareColumnLow)
         {
             mParams.compareColumnLow = uint32_t(value);
@@ -831,6 +841,8 @@ Properties HSTRCloud::getProperties() const
     props[kBeamAdaptiveRoot] = mParams.beamAdaptiveRoot != 0;
     props[kCompareBlock] = mParams.compareBlock;
     props["beamRefPrebuild"] = mBeamRefPrebuild;
+    props["beamPageIndirect"] = mParams.beamPageIndirect;
+    props["beamPageShift"] = mParams.beamPageShift;
     props[kCompareColumnLow] = mParams.compareColumnLow;
     props[kCompareColumnHigh] = mParams.compareColumnHigh;
     props[kCompareMapScale] = mParams.compareMapScale;
@@ -3000,6 +3012,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // The indirect argument buffer is bound only by the pass that writes it: a dispatch cannot read it as arguments and
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
+    var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
@@ -3726,6 +3739,24 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const uint32_t tileCount = mParams.beamTileDims.x * mParams.beamTileDims.y;
         if (!mpBeamLattice || mpBeamLattice->getWidth() != latticeDims.x || mpBeamLattice->getHeight() != latticeDims.y)
             mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
+        // Identity page table for the indirection probe: one entry per page of the lattice, entry i = i. Rebuilt only when the
+        // lattice is resized, so it costs nothing per frame; what it buys is the ability to pay a sparse atlas's addressing cost
+        // without building a sparse atlas.
+        {
+            const uint32_t shift = std::max(mParams.beamPageShift, 1u);
+            const uint2 pageDims = (latticeDims + ((1u << shift) - 1u)) >> shift;
+            mParams.beamPageDims = pageDims;
+            const uint32_t pages = pageDims.x * pageDims.y;
+            if (pages > 0 && (!mpBeamPageTable || mpBeamPageTable->getElementCount() != pages))
+            {
+                std::vector<uint32_t> identity(pages);
+                for (uint32_t i = 0; i < pages; ++i)
+                    identity[i] = i;
+                mpBeamPageTable = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), pages, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, identity.data(), false
+                );
+            }
+        }
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
         // Full-resolution guide for the tile tests. Near view at 4K (one segment per query, moving camera), 4x1 tiles, mean 8-bit

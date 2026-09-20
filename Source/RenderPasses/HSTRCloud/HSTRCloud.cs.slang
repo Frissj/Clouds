@@ -332,6 +332,8 @@ struct HSTRCloudRenderer
     // the per-level lists of refined tiles (list beamLevels: finest tiles marched per pixel), their counts and indirect
     // arguments; and the stored exact frame for comparisons.
     Texture2DArray<float4> hstrBeamLattice;
+    /// Identity page table for the indirection probe (params.beamPageIndirect).
+    StructuredBuffer<uint> hstrBeamPageTable;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
@@ -4165,8 +4167,37 @@ struct HSTRCloudRenderer
 
     uint2 unpackBeamTile(uint value) { return uint2(value & 0xFFFFu, value >> 16); }
 
+    /// Lattice texel of a pixel-corner position. With beamPageIndirect the position resolves through a page table first, which
+    /// is what a sparse direction atlas would have to do on every one of these reads; the table holds the identity, so the texel
+    /// it returns is the one the direct path would have used and only the cost differs.
+    uint3 beamLatticeTexel(uint2 position, uint slice)
+    {
+        uint2 texel = position / params.beamLatticeStep;
+        if (params.beamPageIndirect == 1)
+        {
+            const uint shift = params.beamPageShift;
+            const uint2 page = min(texel >> shift, params.beamPageDims - 1u);
+            const uint entry = hstrBeamPageTable[page.y * params.beamPageDims.x + page.x];
+            const uint2 base = uint2(entry % params.beamPageDims.x, entry / params.beamPageDims.x) << shift;
+            texel = base | (texel & ((1u << shift) - 1u));
+        }
+        return uint3(texel, slice);
+    }
+
+    /// One page resolution, without using its result to address anything. beamPageIndirect 2 calls this once per resolve pixel
+    /// and then reads the lattice directly, which is what an apron-paged atlas does: a page stores its own one-texel border, so a
+    /// tile's whole 2 x 2 neighbourhood is guaranteed in-page and thirteen reads share one lookup. Mode 1 looks up on every read
+    /// instead, so the pair brackets the real design from above and below. The sentinel compare is never true with the identity
+    /// table; it is there so the dependent read cannot be optimised away.
+    bool beamPageMissing(uint2 position)
+    {
+        const uint shift = params.beamPageShift;
+        const uint2 page = min((position / params.beamLatticeStep) >> shift, params.beamPageDims - 1u);
+        return hstrBeamPageTable[page.y * params.beamPageDims.x + page.x] == 0xFFFFFFFFu;
+    }
+
     /// Lattice query at a pixel-corner position (a multiple of beamLatticeStep).
-    float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[uint3(position / params.beamLatticeStep, slice)]; }
+    float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[beamLatticeTexel(position, slice)]; }
 
     /// Pixel-corner position of query q. Per level: the current pass level, over the lists refined this frame. Temporal: every
     /// level in one dispatch, level 0 first, then each finer level over the tiles refined last frame.
@@ -5504,12 +5535,12 @@ struct HSTRCloudRenderer
     /// direction, which does not move, so there is nothing for a ping-pong to do and the query pass reads and updates the one
     /// image in place. A point that turns off screen therefore keeps its value and carries again when it turns back, which the
     /// ping-ponged pair could not express. Everywhere else this is the previous build's lattice, as before.
-    float4 beamLatticePrevAt(uint2 position, uint slice) { return hstrBeamLatticePrev[uint3(position / params.beamLatticeStep, slice)]; }
+    float4 beamLatticePrevAt(uint2 position, uint slice) { return hstrBeamLatticePrev[beamLatticeTexel(position, slice)]; }
 
     /// The persistent lattice read through the image the query pass is writing. Kept apart from beamLatticePrevAt because the
     /// screen path calls that one about thirteen times per carried point through beamPreviousLattice, and putting a branch on
     /// beamRefFrame inside it cost the screen carry 1.81 -> 2.81 ms of basis at 4K for a value the compiler cannot hoist.
-    float4 beamLatticeHeldAt(uint2 position, uint slice) { return hstrBeamLatticeOutput[uint3(position / params.beamLatticeStep, slice)]; }
+    float4 beamLatticeHeldAt(uint2 position, uint slice) { return hstrBeamLatticeOutput[beamLatticeTexel(position, slice)]; }
 
     /// Whether a persistent basis point holds a value marched since the frame was anchored.
     bool beamLatticeValid(uint2 position) { return beamLatticeHeldAt(position, 2).y > 0.5f; }
@@ -5518,7 +5549,7 @@ struct HSTRCloudRenderer
     /// that build's camera. The radiance and the validity are already in place and are not rewritten.
     void carryBeamQuery(uint2 position, float4 single)
     {
-        hstrBeamLatticeOutput[uint3(position / params.beamLatticeStep, 1)] = single;
+        hstrBeamLatticeOutput[beamLatticeTexel(position, 1)] = single;
     }
 
     /// Whether the previous camera's ray through the point at distance d along w is within beamParallax pixels of w.
@@ -5553,6 +5584,12 @@ struct HSTRCloudRenderer
         const uint s = params.beamTileSize;
         const uint2 tile = min(uint2(q) / s, params.beamTileDims - 1u);
         const uint2 origin = tile * s;
+        if (params.beamPageIndirect == 2 && beamPageMissing(origin))
+        {
+            a = 0.f;
+            b = 0.f;
+            return false;
+        }
         const float2 f = saturate((q - float2(origin)) / float(s));
         const float4 a00 = beamLatticePrevAt(origin, 0);
         const float4 a10 = beamLatticePrevAt(origin + uint2(s, 0), 0);
