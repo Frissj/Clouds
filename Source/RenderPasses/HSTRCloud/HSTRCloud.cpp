@@ -3075,6 +3075,7 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     {
         mParams.beamFrameDim = frameDim;
         mParams.beamRefValid = 0;
+        mParams.beamRefAligned = 0;
         mParams.beamScreenBounds = float4(0.f, 0.f, float(frameDim.x), float(frameDim.y));
         mBeamRefAnchored = false;
         return;
@@ -3126,9 +3127,14 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     }
     if (anchor)
     {
-        mBeamRefU = camera.cameraU * widen;
-        mBeamRefV = camera.cameraV * widen;
+        // Match the basis to the integer image size we actually allocated. Together with the centred shader projection this makes
+        // an anchor-frame screen ray and its reference-image ray numerically identical instead of merely algebraically identical.
+        mBeamRefU = camera.cameraU * (float(beamDim.x) / float(frameDim.x));
+        mBeamRefV = camera.cameraV * (float(beamDim.y) / float(frameDim.y));
         mBeamRefW = camera.cameraW;
+        mBeamRefCameraU = camera.cameraU;
+        mBeamRefCameraV = camera.cameraV;
+        mBeamRefCameraW = camera.cameraW;
         mBeamRefAnchored = true;
         ++mBeamRefAnchors;
         // Nothing of the previous basis is addressable in the new frame, so this build starts from nothing.
@@ -3142,6 +3148,10 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamRefU = mBeamRefU;
     mParams.beamRefV = mBeamRefV;
     mParams.beamRefW = mBeamRefW;
+    mParams.beamRefAligned = all(camera.cameraU == mBeamRefCameraU) && all(camera.cameraV == mBeamRefCameraV) &&
+                                     all(camera.cameraW == mBeamRefCameraW)
+                                 ? 1u
+                                 : 0u;
     inverseRows(mBeamRefU, mBeamRefV, mBeamRefW, rows);
     mParams.beamRefInverse0 = rows[0];
     mParams.beamRefInverse1 = rows[1];

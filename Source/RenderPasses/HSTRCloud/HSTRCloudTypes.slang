@@ -1059,7 +1059,8 @@ struct HSTRCloudParams
     /// 1 when the camera has not translated since the build that wrote the persistent lattice. A rotation alone cannot move a
     /// basis point that is addressed by direction, so such a build reads and writes nothing for a carried point.
     uint beamStationary = 0;
-    uint padBeamStationary0 = 0;
+    /// The camera still has the anchor orientation, so reference and screen coordinates differ by translation alone.
+    uint beamRefAligned = 0;
     uint padBeamStationary1 = 0;
     uint padBeamStationary2 = 0;
 };

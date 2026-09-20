@@ -1516,9 +1516,18 @@ struct HSTRCloudRenderer
     {
         if (params.beamRefFrame == 0)
             return cameraRayDirection(beamPosition);
-        const float2 p = beamPosition / float2(params.beamFrameDim);
-        const float2 ndc = float2(2.f, -2.f) * p + float2(-1.f, 1.f);
-        return normalize(ndc.x * params.beamRefU + ndc.y * params.beamRefV + params.beamRefW);
+        if (params.beamRefAligned != 0)
+        {
+            const float2 screenPosition =
+                beamPosition - 0.5f * float2(params.beamFrameDim) + 0.5f * float2(params.frameDim);
+            return cameraRayDirection(screenPosition);
+        }
+        // Form the same projection about the image centre. This avoids losing the low bits of an anchor-frame screen position by
+        // first dividing its larger, margin-offset coordinate and then subtracting one.
+        precise float2 centred = beamPosition - 0.5f * float2(params.beamFrameDim);
+        precise float2 scale = float2(2.f, -2.f) / float2(params.beamFrameDim);
+        precise float3 direction = centred.x * scale.x * params.beamRefU + centred.y * scale.y * params.beamRefV + params.beamRefW;
+        return normalize(direction);
     }
 
     /// The beam-image position a world direction lands at, and whether it lands in front of the frame at all. The inverse of
@@ -1542,6 +1551,11 @@ struct HSTRCloudRenderer
         if (params.beamRefFrame == 0)
         {
             beamPosition = pixelPosition;
+            return true;
+        }
+        if (params.beamRefAligned != 0)
+        {
+            beamPosition = pixelPosition + 0.5f * (float2(params.beamFrameDim) - float2(params.frameDim));
             return true;
         }
         return beamImagePosition(cameraRayDirection(pixelPosition), beamPosition);
@@ -5232,6 +5246,14 @@ struct HSTRCloudRenderer
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
+        // The final screen tile has no basis neighbour beyond the viewport, while a widened reference frame does. March this one
+        // endpoint tile exactly in both layouts so the two representations cannot expose a thin right-edge seam.
+        if (pixel.x + params.beamTileSize >= params.frameDim.x)
+        {
+            const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+            color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
+            return;
+        }
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
         if (level == params.beamLevels + 1u)

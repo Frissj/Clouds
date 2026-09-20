@@ -198,6 +198,9 @@ private:
     float3 mBeamRefU = float3(0.f);
     float3 mBeamRefV = float3(0.f);
     float3 mBeamRefW = float3(0.f);
+    float3 mBeamRefCameraU = float3(0.f);
+    float3 mBeamRefCameraV = float3(0.f);
+    float3 mBeamRefCameraW = float3(0.f);
     uint32_t mBeamRefAnchors = 0;  ///< Re-anchors since the view settled, which is what a turn amortises a full rebuild over.
     float4 mBeamBuiltScreenBounds = float4(0.f); ///< beamScreenBounds of the build that most recently wrote the beam image.
     void updateBeamReferenceFrame(const uint2& frameDim);
