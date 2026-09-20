@@ -5140,15 +5140,32 @@ struct HSTRCloudRenderer
 
     /// Tile test of the current pass level. Accepted tiles write their level into the level map. Refined tiles join the next
     /// level's list, or at the finest level are marked for per-pixel marching (level beamLevels).
-    void testBeamTile(uint thread)
+    void testBeamTile(uint thread) { testBeamTile(uint2(thread, 0)); }
+
+    void testBeamTile(uint2 gridTile)
     {
+        const uint thread = gridTile.x;
         const uint level = params.beamPassLevel;
         uint2 tile;
         if (level == 0)
         {
-            if (thread >= params.beamTileDims.x * params.beamTileDims.y)
-                return;
-            tile = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+            // Generated exactly as the query dispatch is (see beamGridBlocks): a tile can only change its classification where
+            // one of its basis points was re-marched, so the pass covers those regions rather than every tile in the image.
+            if (params.beamTileGenerated != 0)
+            {
+                const uint rb = max(params.beamRefreshBlock, 1u);
+                tile = params.beamGridBlocks != 0
+                           ? (params.beamGridOrigin + (gridTile / rb) * params.beamGridBlockStride) * rb + (gridTile % rb)
+                           : gridTile + params.beamGridOrigin;
+                if (any(tile >= params.beamTileDims))
+                    return;
+            }
+            else
+            {
+                if (thread >= params.beamTileDims.x * params.beamTileDims.y)
+                    return;
+                tile = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+            }
         }
         else
         {
@@ -6052,7 +6069,7 @@ void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupTh
 [numthreads(64, 1, 1)]
 void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    gHSTRCloud.testBeamTile(dispatchThreadId.x);
+    gHSTRCloud.testBeamTile(dispatchThreadId.xy);
 }
 
 [numthreads(64, 1, 1)]

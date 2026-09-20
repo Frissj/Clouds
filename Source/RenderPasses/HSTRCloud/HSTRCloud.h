@@ -197,6 +197,16 @@ private:
     /// direction that has never been marched. This is the gate on a persistent world-direction cache: if yaw then costs what
     /// parked costs, the yaw penalty really is newly exposed directions and the cache is worth building.
     bool mBeamRefPrebuild = false;
+    /// How the query dispatch was generated, counted since the view settled: swept over the region, generated from the refresh
+    /// phase alone, or that plus the strips a rotation exposed. Reported so an arm that should be generating and is not says so.
+    uint32_t mBeamGridSweeps = 0;
+    uint32_t mBeamGridGenerated = 0;
+    uint32_t mBeamGridStrips = 0;
+    uint32_t mBeamGridThreads = 0;
+    /// The regions this build's query dispatch covered, replayed by the level-0 tile pass: a tile can only change its
+    /// classification where one of its basis points was re-marched. Empty means the tile pass sweeps, as it always did.
+    std::vector<uint4> mBeamGridRegions;   ///< origin.xy, size.xy
+    std::vector<uint32_t> mBeamGridRegionMode; ///< 1 where that region is block-mapped (the refresh phase), 0 where it is a box.
     float mBeamRefMargin = 0.15f; ///< Fraction of the frame the reference image reaches past each screen edge before re-anchoring.
     bool mBeamRefAnchored = false;
     float3 mBeamRefU = float3(0.f);

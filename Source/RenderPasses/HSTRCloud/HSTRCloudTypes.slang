@@ -1079,6 +1079,9 @@ struct HSTRCloudParams
     /// else in the image is carrying a value it already holds, which is exactly what the sweep was launching threads to discover.
     uint beamGridBlocks = 0;
     uint beamGridBlockStride = 1;
+    /// 1 when the level-0 tile pass is generated from the same regions as the query dispatch rather than swept over every tile.
+    uint beamTileGenerated = 0;
+    uint padBeamTileGenerated = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

@@ -957,6 +957,10 @@ Properties HSTRCloud::getProperties() const
         cloud["beamCutResidualSteps"] = mBeamLevelCounts[kBeamSparseCutResidualSteps];
         cloud["beamCutPaged"] = mBeamLevelCounts[kBeamSparseCutPaged];
         cloud["beamRefAnchors"] = mBeamRefAnchors;
+        cloud["beamGridSweeps"] = mBeamGridSweeps;
+        cloud["beamGridGenerated"] = mBeamGridGenerated;
+        cloud["beamGridStrips"] = mBeamGridStrips;
+        cloud["beamGridThreads"] = mBeamGridThreads;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -4048,9 +4052,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // has entered). Then the refresh set is a closed form: blocks whose index is congruent to the phase
                             // cell, which at beamRefresh 256 over 208 x 117 blocks is one block of 16 tiles, or none at all.
                             const uint32_t phases = mBeamRefresh;
-                            const bool generated = mBeamRefFrame && mParams.beamRefValid != 0 && mParams.beamHistoryValid != 0 &&
-                                                   mParams.beamStationary != 0 && phases > 2 &&
-                                                   all(mParams.beamScreenBounds == mParams.beamPrevScreenBounds);
+                            // A camera that has not translated cannot have failed a parallax test anywhere, so the only points
+                            // that can need work are the refresh phase's blocks plus whatever the screen box newly covers. The
+                            // second part is exact rectangle subtraction: current tile box minus the box the last build wrote,
+                            // which for a rotation is one or two thin strips. Nothing else in the image can have changed.
+                            const bool carrying = mBeamRefFrame && mParams.beamRefValid != 0 && mParams.beamHistoryValid != 0 &&
+                                                  mParams.beamStationary != 0 && phases > 2;
+                            const bool sameBox = all(mParams.beamScreenBounds == mParams.beamPrevScreenBounds);
+                            const bool generated = carrying;
                             const uint32_t refreshBlock = std::max(mParams.beamRefreshBlock, 1u);
                             const uint32_t cell = generated ? (mParams.beamFrame % (phases * phases)) : 0u;
                             const uint2 firstBlock(cell % phases, cell / phases);
@@ -4082,12 +4091,63 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     mParams.beamGridOrigin = origin;
                                     threads = end - origin;
                                 }
-                                if (threads.x == 0 || threads.y == 0)
-                                    continue;
                                 mParams.beamGridCentres = centres;
-                                bindRenderer(pRenderContext, mpBeamGridQueryPass);
-                                bindOutput(mpBeamGridQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
-                                mpBeamGridQueryPass->execute(pRenderContext, uint3(threads, 1));
+                                if (centres == 0)
+                                {
+                                    mBeamGridRegions.clear();
+                                    mBeamGridRegionMode.clear();
+                                }
+                                auto dispatch = [&](uint2 at, uint2 size, uint32_t blocks)
+                                {
+                                    if (size.x == 0 || size.y == 0)
+                                        return;
+                                    if (centres == 0 && generated)
+                                    {
+                                        mBeamGridRegions.push_back(uint4(at.x, at.y, size.x, size.y));
+                                        mBeamGridRegionMode.push_back(blocks);
+                                    }
+                                    mParams.beamGridOrigin = at;
+                                    mParams.beamGridBlocks = blocks;
+                                    mBeamGridThreads += size.x * size.y;
+                                    bindRenderer(pRenderContext, mpBeamGridQueryPass);
+                                    bindOutput(mpBeamGridQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                    mpBeamGridQueryPass->execute(pRenderContext, uint3(size, 1));
+                                };
+                                if (!generated)
+                                {
+                                    dispatch(origin, threads, 0u);
+                                    if (centres == 0)
+                                        ++mBeamGridSweeps;
+                                    continue;
+                                }
+                                dispatch(firstBlock, threads, 1u); // The refresh phase, wherever the camera is looking.
+                                if (sameBox)
+                                {
+                                    if (centres == 0)
+                                        ++mBeamGridGenerated;
+                                    continue;
+                                }
+                                // The strips the screen newly covers, as current box minus previous box. Clamped to the grid,
+                                // and taken with the same two-tile reach beamPointOnScreen uses so a strip carries its guard.
+                                const int2 pf = int2(std::floor(mParams.beamPrevScreenBounds.x / tile), std::floor(mParams.beamPrevScreenBounds.y / tile)) - 2;
+                                const int2 pl = int2(std::ceil(mParams.beamPrevScreenBounds.z / tile), std::ceil(mParams.beamPrevScreenBounds.w / tile)) + 3;
+                                const int2 cf(std::max(0, first.x), std::max(0, first.y));
+                                const int2 cl(std::min(int32_t(dims.x), last.x + 1), std::min(int32_t(dims.y), last.y + 1));
+                                const int2 pfc(std::max(cf.x, pf.x), std::max(cf.y, pf.y));
+                                const int2 plc(std::min(cl.x, pl.x), std::min(cl.y, pl.y));
+                                auto strip = [&](int2 lo, int2 hi)
+                                {
+                                    if (hi.x > lo.x && hi.y > lo.y)
+                                        dispatch(uint2(lo), uint2(hi - lo), 0u);
+                                };
+                                strip(cf, int2(std::min(cl.x, pfc.x), cl.y));                 // left of the old box
+                                strip(int2(std::max(cf.x, plc.x), cf.y), cl);                 // right of it
+                                const int2 midLow(std::max(cf.x, pfc.x), cf.y);
+                                const int2 midHigh(std::min(cl.x, plc.x), cl.y);
+                                strip(midLow, int2(midHigh.x, std::min(cl.y, pfc.y)));        // above it
+                                strip(int2(midLow.x, std::max(cf.y, plc.y)), midHigh);        // below it
+                                if (centres == 0)
+                                    ++mBeamGridStrips;
                             }
                             mParams.beamGridCentres = 0;
                             mParams.beamGridOrigin = uint2(0);
@@ -4129,7 +4189,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     bindRenderer(pRenderContext, mpBeamTilePass);
                     bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
                     mpBeamTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
-                    if (level == 0)
+                    if (level == 0 && !mBeamGridRegions.empty())
+                    {
+                        // Only the tiles whose basis points this build touched can have changed classification.
+                        mParams.beamTileGenerated = 1;
+                        for (size_t r = 0; r < mBeamGridRegions.size(); ++r)
+                        {
+                            const uint4& region = mBeamGridRegions[r];
+                            mParams.beamGridOrigin = uint2(region.x, region.y);
+                            mParams.beamGridBlocks = mBeamGridRegionMode[r];
+                            bindRenderer(pRenderContext, mpBeamTilePass);
+                            bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                            mpBeamTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                            mpBeamTilePass->execute(pRenderContext, uint3(region.z, region.w, 1));
+                        }
+                        mParams.beamTileGenerated = 0;
+                        mParams.beamGridBlocks = 0;
+                        mParams.beamGridOrigin = uint2(0);
+                    }
+                    else if (level == 0)
                         mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
                     else
                         mpBeamTilePass->executeIndirect(pRenderContext, mpBeamArgs.get(), 24 * level + 12);
