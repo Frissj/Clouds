@@ -4032,14 +4032,66 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
+                            // Launch over the screen box, not the whole beam image. beamPointOnScreen keeps a point while any
+                            // tile that could read it is on screen, and its reach is two tiles, so a point matters only where
+                            // point * tileSize + 2 * tileSize >= bounds.min and point * tileSize - 2 * tileSize <= bounds.max.
+                            // Outside that the thread was launched solely to fail that test - 1.69x the screen at the shipping
+                            // margin, and 4x at beamRefMargin 0.5, which is why enlarging the frame kept costing more than it saved.
+                            const float tile = float(std::max(1u, mParams.beamTileSize));
+                            const float4 box = mParams.beamScreenBounds;
+                            const int2 first = int2(std::floor(box.x / tile), std::floor(box.y / tile)) - 2;
+                            const int2 last = int2(std::ceil(box.z / tile), std::ceil(box.w / tile)) + 2;
+                            const uint2 origin = uint2(std::max(0, first.x), std::max(0, first.y));
+                            // Nothing in the image can need work except the blocks this build's refresh phase selects, WHEN the
+                            // camera has not translated (so no parallax can have failed), the frame is not re-anchoring, the
+                            // history is valid, and the screen covers the same box as the build that wrote it (so no direction
+                            // has entered). Then the refresh set is a closed form: blocks whose index is congruent to the phase
+                            // cell, which at beamRefresh 256 over 208 x 117 blocks is one block of 16 tiles, or none at all.
+                            const uint32_t phases = mBeamRefresh;
+                            const bool generated = mBeamRefFrame && mParams.beamRefValid != 0 && mParams.beamHistoryValid != 0 &&
+                                                   mParams.beamStationary != 0 && phases > 2 &&
+                                                   all(mParams.beamScreenBounds == mParams.beamPrevScreenBounds);
+                            const uint32_t refreshBlock = std::max(mParams.beamRefreshBlock, 1u);
+                            const uint32_t cell = generated ? (mParams.beamFrame % (phases * phases)) : 0u;
+                            const uint2 firstBlock(cell % phases, cell / phases);
+                            mParams.beamGridBlocks = generated ? 1u : 0u;
+                            mParams.beamGridBlockStride = phases;
                             for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
                             {
+                                const uint2 dims = mParams.beamTileDims + (centres ? 0u : 1u);
+                                uint2 threads;
+                                if (generated)
+                                {
+                                    // Blocks firstBlock + k * phases that are still inside the grid, each contributing its tiles.
+                                    const uint2 blocks = (dims + refreshBlock - 1u) / refreshBlock;
+                                    const uint2 count(
+                                        firstBlock.x < blocks.x ? (blocks.x - firstBlock.x + phases - 1u) / phases : 0u,
+                                        firstBlock.y < blocks.y ? (blocks.y - firstBlock.y + phases - 1u) / phases : 0u
+                                    );
+                                    mParams.beamGridOrigin = firstBlock;
+                                    threads = count * refreshBlock;
+                                }
+                                else
+                                {
+                                    const uint2 end = uint2(
+                                        std::min<int32_t>(int32_t(dims.x), std::max(0, last.x + 1)),
+                                        std::min<int32_t>(int32_t(dims.y), std::max(0, last.y + 1))
+                                    );
+                                    if (any(end <= origin))
+                                        continue;
+                                    mParams.beamGridOrigin = origin;
+                                    threads = end - origin;
+                                }
+                                if (threads.x == 0 || threads.y == 0)
+                                    continue;
                                 mParams.beamGridCentres = centres;
                                 bindRenderer(pRenderContext, mpBeamGridQueryPass);
                                 bindOutput(mpBeamGridQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
-                                mpBeamGridQueryPass->execute(pRenderContext, uint3(mParams.beamTileDims + (centres ? 0u : 1u), 1));
+                                mpBeamGridQueryPass->execute(pRenderContext, uint3(threads, 1));
                             }
                             mParams.beamGridCentres = 0;
+                            mParams.beamGridOrigin = uint2(0);
+                            mParams.beamGridBlocks = 0;
                             if (queue)
                             {
                                 writeBeamQueueArgs(pRenderContext, 1);

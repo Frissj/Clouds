@@ -5352,9 +5352,21 @@ struct HSTRCloudRenderer
     }
 
     /// Root lattice query at grid point p as a 2D dispatch (beamGridDispatch): a tile corner, or a tile centre with beamGridCentres.
-    void buildBeamGridQuery(uint2 point)
+    void buildBeamGridQuery(uint2 gridPoint)
     {
         const bool centre = params.beamGridCentres != 0;
+        // Either the dispatch covers a region and a thread's point is its index plus the origin, or it is GENERATED and the
+        // thread maps to one of the blocks this build's refresh phase selects (see beamGridBlocks). beamRefreshes still decides
+        // in both cases; generating only avoids launching threads whose answer is already known to be "carry".
+        uint2 point;
+        if (params.beamGridBlocks != 0)
+        {
+            const uint rb = max(params.beamRefreshBlock, 1u);
+            const uint2 block = params.beamGridOrigin + (gridPoint / rb) * params.beamGridBlockStride;
+            point = block * rb + (gridPoint % rb);
+        }
+        else
+            point = gridPoint + params.beamGridOrigin;
         if (any(point >= (centre ? params.beamTileDims : params.beamTileDims + 1u)))
             return;
         if (centre && params.beamAdaptiveRoot != 0 && params.beamLevels >= 2 && beamRootDifficult(point))

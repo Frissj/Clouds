@@ -1065,6 +1065,20 @@ struct HSTRCloudParams
     /// that a localised band is clean, so this restricts the same statistics to one, e.g. the last beamTileSize columns.
     uint compareColumnLow = 0;
     uint compareColumnHigh = 0;
+    /// Tile-space origin of the grid query dispatch, so it can cover a REGION of the beam image rather than all of it.
+    ///
+    /// MEASURED, and bounding it to the screen box is worth NOTHING on its own: parked 0.91 -> 0.90 ms, yaw 1.87 -> 1.87, every
+    /// prebuilt arm unchanged. The threads beamPointOnScreen rejects were already almost free - they exit after two reads - so
+    /// the query pass's cost is not them. It is the threads that PASS the screen test and then find their point already valid,
+    /// and those are inside the box by definition, which no dispatch bound can help. Removing that cost needs a compact list of
+    /// the points that actually need work (the refresh phase, the entering strip, parallax failures); this origin is kept as the
+    /// mechanism such a list would dispatch through, not as an optimisation in its own right.
+    uint2 beamGridOrigin = { 0, 0 };
+    /// When non-zero the grid query dispatch is GENERATED rather than swept: beamGridOrigin is the first refresh block instead of
+    /// a point origin, and threads map through beamGridBlockStride to the blocks this build's refresh phase selects. Everything
+    /// else in the image is carrying a value it already holds, which is exactly what the sweep was launching threads to discover.
+    uint beamGridBlocks = 0;
+    uint beamGridBlockStride = 1;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
