@@ -35,3 +35,7 @@ Run from the Falcor root with PowerShell:
 ```powershell
 cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul 2>nul && "C:\packman-repo\chk\cmake\3.24.1+nv3-windows-x86_64\bin\cmake.exe" --build "C:\Users\Friss\Documents\Falcor\build\windows-ninja-msvc" --config Release --target HSTRCloud 2>&1' | Select-String -Pattern "error|FAILED|Linking" | Select-Object -First 10
 ```
+
+When I say commit, you fucking commit on the spot instantly without hesitation unless I give additional instructions. What I say goes. 
+
+DO NOT MONITOR THE LOGS OF RUNNING BUILDS IN THE BACKGROUND, THIS USES UP MY TOKENS AND THEREFORE MY MONEY WHICH IS BOLD OF YOU TO DO WITHOUT MY PERMISSION. WHEN THE RUNNING TASK FINISHES, YOU AUTOMATICALLY GET AN UPDATE ANYWAY SO JUST SHUT UP AND STOP RUNNING IN THE BACKGROUND TO PRESERVE TOKENS.

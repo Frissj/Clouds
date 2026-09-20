@@ -57,7 +57,7 @@ for name, position, target in views:
     hstr.set_properties({"storeExact": True})
     m.renderFrame()
     hstr.set_properties({"hstComponents": 3})
-    k = {mode: mean_of(mode) for mode in range(1, 30) if mode != 19}
+    k = {mode: mean_of(mode) for mode in list(range(1, 30)) + [30, 31, 32, 33, 34] if mode != 19}
     q = max(k[1], 1e-9)
     log(f"{name}: {k[1]:6.2f} sun queries per pixel: own bake {100 * k[2] / q:5.1f}%, ancestor's bake {100 * k[18] / q:5.1f}%, proxy {100 * k[3] / q:5.1f}%, "
         f"live: finer than asked {100 * k[4] / q:5.1f}%, no bake {100 * k[5] / q:5.1f}%, empty {100 * k[6] / q:5.1f}%")
@@ -83,6 +83,14 @@ for name, position, target in views:
     # What a transfer cache would face on the path that ships: brick crossings it could serve against the distinct (asset brick,
     # source-space direction class, entry cell) entries it would have to produce. Break-even is Z / (Z - 1) with Z the events per
     # crossing above, so about 1.45. The beam view traces far fewer rays than there are pixels, which is the whole question.
+    # Whether a transport hierarchy over the resident brick pyramid could make integratePage() the common case. Each brick sample is
+    # asked whether the brick's own trilinear page - the eight shared corner densities, which is exactly what HSTRCutNode carries for
+    # an HST leaf - reproduces the density the camera actually read there, at the level residency already chose for this footprint.
+    # A page that cannot stand in for the samples the march already takes cannot be selected by any adaptive cut over that pyramid,
+    # so this bounds the page/residual ratio from above before any hierarchy is built.
+    b = max(k[30], 1e-9)
+    log(f"{name}: brick-page fit over {k[30]:6.2f} brick samples/px ({k[33]:5.2f} contributing): within 10% of the brick's peak "
+        f"{100 * k[31] / b:5.1f}%, within 2% {100 * k[34] / b:5.1f}%; mean relative page error {k[32] / b:6.3f}")
     hstr.set_properties(dict(PROPS, debugView=9, hstComponents=15))
     for edge in (4, 8, 16):
         hstr.set_properties({"cloudTransferClasses": edge})

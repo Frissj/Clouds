@@ -20,13 +20,19 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 16;
+static const uint kBeamCountSlots = 28;
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;
 static const uint kBeamSparseUnique = 10;
 static const uint kBeamSparseFinal = 11;
 static const uint kBeamSparseStarts = 12; ///< Four entries, one per starting level.
+static const uint kBeamSparseAccepted = 16; ///< Four entries, accepted tiles per level.
+static const uint kBeamSparseLevelUnique = 20; ///< Four entries, newly marched queries per level.
+static const uint kBeamSparseCutResidualQueries = 24; ///< Cut-evaluated queries that still fine-marched at least one step.
+static const uint kBeamSparseCutResidualSteps = 25;   ///< Fine-march steps remaining across cut-evaluated queries.
+static const uint kBeamSparseCutPaged = 26;    ///< Cut cells a basis ray hit and took from their page.
+static const uint kBeamSparseCutMarched = 27;  ///< Cut cells a basis ray hit whose page could not carry its optical depth.
 static const uint kBeamQueueBuckets = 4;   ///< Lists of queued root queries by predicted cost (beamQueue).
 static const uint kCompareBins = 64;       ///< Exact comparison histogram entries per row: log error bins, then the maximum.
 static const float kCompareBinFloor = 1e-4f; ///< Upper edge of the first log error bin; 4 bins per octave above.
@@ -159,16 +165,14 @@ struct HSTRCloudSunSched
     uint asset;
 };
 
-/// Durable sparse beam interfaces. Query IDs, rather than lattice coordinates, are
-/// the identity consumed by tiles. The dense beam lattice is only a compatibility
-/// scatter until reconstruction reads these buffers directly.
+/// Durable sparse beam interfaces. Tiles consume stable virtual query IDs backed
+/// directly by the result buffer; the legacy dense lattice is not part of this path.
 struct BeamResult
 {
     uint depthCache01; ///< Half-packed cache.rg.
     uint depthCache23; ///< Half-packed cache.b and optical depth.
     uint single01;     ///< Half-packed single.rg.
     uint single23;     ///< Half-packed single.b and opacity-weighted distance.
-    float steps;
 };
 
 struct BeamTile
@@ -1005,6 +1009,53 @@ struct HSTRCloudParams
     uint beamRefreshCentres = 0;
     /// Set per dispatch: the first row of the band of the path-traced reference being traced (HSTRCloud::mReferenceBandRows).
     uint referenceRowOffset = 0;
+    /// The params upload is a raw copy, so the host and shader layouts must agree to the byte: the int3 below would start a new
+    /// 16-byte row in the shader and pack tight on the host without this (the layout check in bindRenderer catches it).
+    uint2 padCutOrigin = { 0, 0 };
+
+    /// Cloud-sea transport cut. The sea has no CPU Schur tree, so its cut is the regular grid of 16^3-voxel domain cells placed as
+    /// the camera-centred window of hstrLeafDims cells whose corner sits at this leaf cell (X/Z wrap into the torus, so the window
+    /// tiles the reachable space exactly once; Y spans the whole layer and its origin is 0). Node coordinates are window-local,
+    /// which keeps them small and exact however far the camera has flown from the domain origin: the traversal subtracts the
+    /// origin from the ray once and every density lookup keeps the unshifted position.
+    int3 hstrCutOriginLeaf = { 0, 0, 0 };
+    uint hstrCutFlat = 0; ///< 1 while the flat domain cut replaces a CPU-built hierarchy (no parents, no ancestor antichain).
+
+    /// Rotation-invariant beam basis frame (beamRefFrame).
+    ///
+    /// The beam basis is a function of WORLD DIRECTION, not of screen position: turning the camera does not invalidate a single
+    /// basis ray, it only moves where that ray lands. Keying the basis to the screen lattice hides that, because the direction a
+    /// pixel needs after a turn falls between the previous lattice points and the carried value has to be resampled through the
+    /// previous basis - which is what beamReprojectQuery's "a turning camera, which reprojects exactly, still tripled the error"
+    /// comment records, and why yaw is the most expensive motion there is.
+    ///
+    /// So the whole beam build - lattice, tiles, levels, verifier, basis - runs in a reference image that does NOT rotate with the
+    /// camera. beamRefU/V/W are that image's camera basis (the anchor pose's, widened by beamRefMargin so the screen stays inside
+    /// it) and a reference position maps to a direction exactly as cameraRayDirection does for a pixel. beamRefInverse is the
+    /// inverse of [U V W], which sends a world direction back to a reference position for the resolve. The frame is re-anchored
+    /// only when the camera turns far enough that the screen would leave it, and beamRefValid is 0 for that one build.
+    float3 beamRefU = { 0, 0, 0 };
+    float padBeamRefU = 0.f;
+    float3 beamRefV = { 0, 0, 0 };
+    float padBeamRefV = 0.f;
+    float3 beamRefW = { 0, 0, 0 };
+    float padBeamRefW = 0.f;
+    float3 beamRefInverse0 = { 0, 0, 0 };
+    float padBeamRefInverse0 = 0.f;
+    float3 beamRefInverse1 = { 0, 0, 0 };
+    float padBeamRefInverse1 = 0.f;
+    float3 beamRefInverse2 = { 0, 0, 0 };
+    float padBeamRefInverse2 = 0.f;
+    uint2 beamFrameDim = { 0, 0 }; ///< The reference image's size in beam units (frameDim at 1 + beamRefMargin), or frameDim when off.
+    uint beamRefFrame = 0;         ///< 1 while the beam build runs in the reference frame rather than in screen space.
+    uint beamRefValid = 0;         ///< 0 on the build that re-anchors the frame: nothing of the previous basis is addressable.
+    /// The screen's box in the beam image, with a tile of guard. Only what it covers is built: the margin the frame carries so a
+    /// turn does not leave it holds no basis until it turns on screen, and a direction that turns ON screen has no history to carry
+    /// whatever the margin is. So a turn marches the entering strip and nothing else.
+    float4 beamScreenBounds = { 0, 0, 0, 0 };
+    /// The same box for the build that wrote the history. A beam unit only holds a marched value if the previous build covered it,
+    /// so this is what tells the per-pixel fallback that a unit which has just turned on screen has nothing to carry.
+    float4 beamPrevScreenBounds = { 0, 0, 0, 0 };
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

@@ -23,6 +23,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_BEAM_SPARSE_MIN_LEVEL
 #define HSTR_BEAM_SPARSE_MIN_LEVEL 2
 #endif
+#ifndef HSTR_BEAM_SPARSE_CUT
+#define HSTR_BEAM_SPARSE_CUT 1
+#endif
 #define SHIP_BIT_cloudTransferClasses 1
 #define SHIP_BIT_cloudCostProbe 2
 #define SHIP_BIT_cloudEmptySkip 4
@@ -204,6 +207,7 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint2> hstrCorrectionRanges;
     StructuredBuffer<HSTRCorrectionAtom> hstrCorrectionAtoms;
     StructuredBuffer<HSTRCutNode> hstrCutNodes;
+    RWStructuredBuffer<HSTRCutNode> hstrDomainCutNodes;
     StructuredBuffer<uint> hstrCutNodeParents;
     RWStructuredBuffer<float4> hstrNodeProjection;
     RWStructuredBuffer<float2> hstrNodeDepth;
@@ -334,6 +338,7 @@ struct HSTRCloudRenderer
     Texture2DArray<float4> hstrBeamLatticePrev; ///< beamRefresh: the previous build's lattice.
     Texture2D<uint> hstrBeamLevelPrev;          ///< beamRefresh: the previous build's level map.
     Texture2D<float4> hstrBeamPixelPrev;        ///< beamRefresh: the previous build's marched pixels (rgb radiance, a distance).
+    Texture2D<float4> hstrBeamPixels;           ///< beamRefFrame: this build's marched beam units, which the resolve samples.
     RWTexture2D<float4> hstrBeamPixelOutput;    ///< beamRefresh: this build's marched pixels.
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
@@ -1189,8 +1194,59 @@ struct HSTRCloudRenderer
 
     float3 cutNodeWorldPosition(uint3 leafPosition, GridVolume volume)
     {
+        // Flat domain cut: node coordinates are window-local leaf cells, and the sea's index space is the domain voxel grid
+        // (voxel i centred at seaOrigin + (i + 0.5) size), not the scene grid's transform.
+        if (params.hstrCutFlat != 0)
+        {
+            const float3 voxel = float3(int3(leafPosition) + params.hstrCutOriginLeaf) * float(params.hstrCellWidth);
+            return params.seaOrigin + (voxel + 0.5f) * params.seaVoxelSize;
+        }
         const float3 indexPosition = float3(params.hstrGridMin) + float(params.hstrCellWidth) * float3(leafPosition);
         return mul(volume.data.transform, float4(indexPosition, 1.f)).xyz;
+    }
+
+    /// Window-local leaf index of a flat-cut node, and the camera in the same coordinates.
+    uint3 domainCutIndex(uint nodeID)
+    {
+        const uint3 dims = params.hstrLeafDims;
+        return uint3(nodeID % dims.x, (nodeID / dims.x) % dims.y, nodeID / (dims.x * dims.y));
+    }
+
+    float3 domainCutCameraPosition(GridVolume volume)
+    {
+        return worldToVoxel(gScene.camera.data.posW, volume) / float(params.hstrCellWidth) - float3(params.hstrCutOriginLeaf);
+    }
+
+    /// Front-to-back key of a cell of the regular domain cut. The window grid is a binary space partition in its own right: pad
+    /// each axis to a power of two and split the longest remaining axis in half, most significant bit first. A bit is 0 while the
+    /// cell is on the camera's side of that split, so the key orders every pair of disjoint cells exactly as the painter would,
+    /// for every ray leaving the eye - the same guarantee the Schur tree's ancestor path gives, without a tree to walk.
+    uint domainCutOrderKey(uint nodeID)
+    {
+        const uint3 index = domainCutIndex(nodeID);
+        const float3 camera = domainCutCameraPosition(gScene.getGridVolume(0));
+        uint3 size = 1u;
+        [unroll]
+        for (uint axis = 0; axis < 3; ++axis)
+            [loop] while (size[axis] < params.hstrLeafDims[axis])
+                size[axis] <<= 1;
+        uint3 low = 0u;
+        uint key = 0;
+        uint depth = 0;
+        [loop]
+        while (any(size > 1u) && depth < 30u)
+        {
+            const uint axis = size.x >= size.y && size.x >= size.z ? 0u : (size.y >= size.z ? 1u : 2u);
+            const uint half = size[axis] >> 1u;
+            const uint middle = low[axis] + half;
+            const bool upper = index[axis] >= middle;
+            const bool cameraUpper = camera[axis] >= float(middle);
+            key = (key << 1u) | (upper == cameraUpper ? 0u : 1u);
+            low[axis] = upper ? middle : low[axis];
+            size[axis] = half;
+            ++depth;
+        }
+        return depth == 0 ? 0u : key << (32u - depth);
     }
 
     void projectCutNode(uint nodeID)
@@ -1222,7 +1278,16 @@ struct HSTRCloudRenderer
             minimumDepth = min(minimumDepth, dot(worldPosition - gScene.camera.data.posW, gScene.camera.data.cameraW));
             maximumDepth = max(maximumDepth, dot(worldPosition - gScene.camera.data.posW, gScene.camera.data.cameraW));
         }
-        if (crossesCamera)
+        // A node the camera sits among has no finite screen box, so it claims the whole frame. A node entirely BEHIND the camera
+        // has no screen box either and must claim nothing: the cloud sea puts the camera inside its window, so half the cut is
+        // behind the eye, and treating those as full-screen would bin a thousand cells into every tile of the frame and overflow
+        // every tile list there is.
+        if (maximumDepth <= 0.f)
+        {
+            minimumPixel = 0.f;
+            maximumPixel = 0.f;
+        }
+        else if (crossesCamera)
         {
             minimumPixel = 0.f;
             maximumPixel = float2(params.frameDim);
@@ -1237,6 +1302,8 @@ struct HSTRCloudRenderer
     /// painter's order of every ray leaving the eye, so a tile's cut sorted by it composites correctly for all its pixels.
     uint bspOrderKey(uint nodeID, GridVolume volume)
     {
+        if (params.hstrCutFlat != 0)
+            return domainCutOrderKey(nodeID);
         const float3 cameraIndex = mul(volume.data.invTransform, float4(gScene.camera.data.posW, 1.f)).xyz;
         const float3 camera = (cameraIndex - float3(params.hstrGridMin)) / float(params.hstrCellWidth);
         uint path = 0;
@@ -1325,6 +1392,99 @@ struct HSTRCloudRenderer
             }
     }
 
+    /// Trilinear page of a node evaluated at a point of its unit cube.
+    float domainPageAt(float4 corners0, float4 corners1, float3 local)
+    {
+        const float x00 = lerp(corners0.x, corners0.y, local.x);
+        const float x10 = lerp(corners0.z, corners0.w, local.x);
+        const float x01 = lerp(corners1.x, corners1.y, local.x);
+        const float x11 = lerp(corners1.z, corners1.w, local.x);
+        return lerp(lerp(x00, x10, local.y), lerp(x01, x11, local.y), local.z);
+    }
+
+    /// One cell of the cloud sea's transport cut.
+    ///
+    /// The sea has no CPU Schur tree - its content is rasterized on worker threads into a toroidal domain proxy - so the cut is
+    /// built here instead: the regular grid of 16^3-voxel domain cells, placed as the camera-centred window that tiles the
+    /// reachable space (seaViewDistance is under half the domain, so each domain cell needs exactly one periodic image). Each cell
+    /// carries the same page the CPU builder writes for an HST leaf: the eight shared corner extinctions of its trilinear page,
+    /// the extinction range, and the page residual that decides per ray whether the page stands in for the cell or the cell is
+    /// marched. Cells the domain holds nothing in get a zero range and binCutNode drops them, so empty sky never reaches a tile
+    /// list at all.
+    void buildDomainCutNode(uint nodeID)
+    {
+        const uint3 dims = params.hstrLeafDims;
+        if (params.hstrCutFlat == 0 || nodeID >= dims.x * dims.y * dims.z || gScene.getGridVolumeCount() == 0)
+            return;
+        const uint3 index = domainCutIndex(nodeID);
+        const float cellWidth = float(params.hstrCellWidth);
+        // Domain voxel corner of this cell. X/Z may lie outside the domain: every lookup below wraps into the torus.
+        const float3 base = float3(int3(index) + params.hstrCutOriginLeaf) * cellWidth;
+
+        HSTRCutNode node;
+        node.minLeft = uint4(index, ~0u);       ///< Leaf: nothing below it to refine to.
+        node.maxRight = uint4(index + 1u, ~0u);
+        float4 corners0;
+        float4 corners1;
+        {
+            // Sampled where neighbouring cells share them, so the page is continuous across the cut.
+            const float4 x = float4(base.x, base.x + cellWidth, base.x, base.x + cellWidth);
+            const float4 y = float4(base.y, base.y, base.y + cellWidth, base.y + cellWidth);
+            corners0 = float4(
+                extinctionAtVoxel(float3(x.x, y.x, base.z)), extinctionAtVoxel(float3(x.y, y.y, base.z)),
+                extinctionAtVoxel(float3(x.z, y.z, base.z)), extinctionAtVoxel(float3(x.w, y.w, base.z))
+            );
+            corners1 = float4(
+                extinctionAtVoxel(float3(x.x, y.x, base.z + cellWidth)), extinctionAtVoxel(float3(x.y, y.y, base.z + cellWidth)),
+                extinctionAtVoxel(float3(x.z, y.z, base.z + cellWidth)), extinctionAtVoxel(float3(x.w, y.w, base.z + cellWidth))
+            );
+        }
+        // The cell's extinction range and the page's worst error over it. The majorant blocks bound the trilinear extinction the
+        // march would read anywhere inside the block, which is what the page has to stand for; the interior lattice adds the
+        // signed error, which the block maxima alone cannot see (a page above the density is as wrong as one below it).
+        const uint blocks = params.hstrCellWidth / kDomainBlock;
+        float maximum = 0.f;
+        float minimum = 1e30f;
+        float residual = 0.f;
+        [loop]
+        for (uint b = 0; b < blocks * blocks * blocks; ++b)
+        {
+            const uint3 block = uint3(b % blocks, (b / blocks) % blocks, b / (blocks * blocks));
+            const float3 centre = base + (float3(block) + 0.5f) * float(kDomainBlock);
+            const float bound = majorantAt(centre);
+            maximum = max(maximum, bound);
+            if (bound <= 0.f)
+                continue;
+            // The page over a sub-box is bounded by the page at that box's own corners (it is trilinear, hence monotone in each
+            // axis between them), so this is a true bound on the page-minus-density error over the block.
+            float pageLow = 1e30f;
+            [unroll]
+            for (uint corner = 0; corner < 8; ++corner)
+            {
+                const float3 local =
+                    (float3(block) + float3(corner & 1u, (corner >> 1u) & 1u, corner >> 2u)) * float(kDomainBlock) / cellWidth;
+                pageLow = min(pageLow, domainPageAt(corners0, corners1, local));
+            }
+            residual = max(residual, bound - pageLow);
+        }
+        [loop]
+        for (uint s = 0; s < 125; ++s)
+        {
+            const uint3 lattice = uint3(s % 5u, (s / 5u) % 5u, s / 25u);
+            const float3 local = float3(lattice) * 0.25f;
+            const float density = extinctionAtVoxel(base + local * cellWidth);
+            minimum = min(minimum, density);
+            residual = max(residual, abs(density - domainPageAt(corners0, corners1, local)));
+        }
+        node.statistics = float4(maximum > 0.f ? minimum : 0.f, maximum, 0.f, 0.f);
+        // x is the page residual traverseCut turns into an optical-depth error per ray; y marks a leaf that holds samples, which is
+        // what the CPU builder writes for an HST leaf with content.
+        node.transmittancePage = float4(maximum > 0.f ? residual : 0.f, maximum > 0.f ? 1.f : 0.f, 0.f, 0.f);
+        node.transmittanceCorners0 = maximum > 0.f ? corners0 : 0.f;
+        node.transmittanceCorners1 = maximum > 0.f ? corners1 : 0.f;
+        hstrDomainCutNodes[nodeID] = node;
+    }
+
     bool intersectCutNode(HSTRCutNode node, float3 origin, float3 direction, out float2 interval)
     {
         const bool3 parallel = abs(direction) < 1e-8f;
@@ -1348,6 +1508,43 @@ struct HSTRCloudRenderer
         const float2 p = pixelPosition / float2(params.frameDim);
         const float2 ndc = float2(2.f, -2.f) * p + float2(-1.f, 1.f);
         return normalize(ndc.x * gScene.camera.data.cameraU + ndc.y * gScene.camera.data.cameraV + gScene.camera.data.cameraW);
+    }
+
+    /// World direction of a position in the beam basis image. With beamRefFrame off this is the screen, so the beam build is
+    /// unchanged; with it on the image is the anchored reference frame, which does not turn with the camera.
+    float3 beamRayDirection(float2 beamPosition)
+    {
+        if (params.beamRefFrame == 0)
+            return cameraRayDirection(beamPosition);
+        const float2 p = beamPosition / float2(params.beamFrameDim);
+        const float2 ndc = float2(2.f, -2.f) * p + float2(-1.f, 1.f);
+        return normalize(ndc.x * params.beamRefU + ndc.y * params.beamRefV + params.beamRefW);
+    }
+
+    /// The beam-image position a world direction lands at, and whether it lands in front of the frame at all. The inverse of
+    /// beamRayDirection, up to the positive scale the direction was normalised by.
+    bool beamImagePosition(float3 w, out float2 beamPosition)
+    {
+        beamPosition = 0.f;
+        if (params.beamRefFrame == 0)
+            return false;
+        const float3 c = float3(dot(params.beamRefInverse0, w), dot(params.beamRefInverse1, w), dot(params.beamRefInverse2, w));
+        if (c.z <= 1e-6f)
+            return false;
+        const float2 ndc = c.xy / c.z;
+        beamPosition = (ndc * float2(0.5f, -0.5f) + 0.5f) * float2(params.beamFrameDim);
+        return true;
+    }
+
+    /// The beam-image position of a screen pixel: the same point of the same ray, expressed where the basis lives.
+    bool beamPixelPosition(float2 pixelPosition, out float2 beamPosition)
+    {
+        if (params.beamRefFrame == 0)
+        {
+            beamPosition = pixelPosition;
+            return true;
+        }
+        return beamImagePosition(cameraRayDirection(pixelPosition), beamPosition);
     }
 
     /// Voxel position of a world position: the cloud sea domain (voxel i centred at seaOrigin + (i + 0.5) size), or the scene grid.
@@ -1904,6 +2101,36 @@ struct HSTRCloudRenderer
     /// terminated by transmittance, 22 more than 32 steps, 23 more than 64 steps, 24 in a block whose undilated majorant is zero,
     /// 25 the same and far enough inside the block that a tight test could reject them, 26 brick samples that change the pixel,
     /// 27 the distinct brick entries holding at least one of those (26 over 27 is the contributing run length).
+    /// The trilinear page a brick-level transport node would carry, evaluated at asset source position x: the brick's own eight
+    /// shared corner densities (the apron texels, so neighbouring bricks agree on them) interpolated over the brick. This is the
+    /// same representation HSTRCutNode.transmittanceCorners holds for an HST leaf, one level of the resident pyramid at a time.
+    float cloudBrickPage(uint entry, float3 x)
+    {
+        const HSTRCloudBrick brick = hstrCloudBricks[entry];
+        if ((brick.info & kCloudBrickConstant) != 0)
+            return brick.minValue;
+        const uint level = brick.info & 15u;
+        const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
+        const int3 i = int3(floor(x + 0.5f));
+        const int3 brickCoord = (i >> int(level)) >> 3;
+        const float3 local = clamp(levelPosition - float3(brickCoord * 8), -0.5f, 7.5f);
+        const uint shift = params.cloudAtlasShift;
+        const uint mask = (1u << shift) - 1u;
+        const uint3 slot = uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift));
+        const float3 f = (local + 0.5f) / 8.f;
+        float page = 0.f;
+        [unroll]
+        for (uint corner = 0; corner < 8; ++corner)
+        {
+            const float3 c = float3(corner & 1u, (corner >> 1u) & 1u, corner >> 2u);
+            const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + (c * 8.f - 0.5f);
+            const float t = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudAtlasInvSize, 0.f);
+            const float3 weights = lerp(1.f - f, f, c);
+            page += (brick.minValue + brick.range * t * t) * weights.x * weights.y * weights.z;
+        }
+        return page;
+    }
+
     float probeMarch(CutRay ray, uint mode)
     {
         const float cellWidth = float(params.hstrCellWidth);
@@ -1933,7 +2160,27 @@ struct HSTRCloudRenderer
             {
                 const float3 midpoint = (ray.position + (t + 0.5f * dt) * ray.direction) * cellWidth;
                 const float footprint = rayFootprint(ray, t + 0.5f * dt);
-                const float alpha = 1.f - exp(-cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample) * dt * ray.worldLength);
+                const float sigma = cameraExtinctionAtVoxel(midpoint, footprint, fineVoxels, sample);
+                const float alpha = 1.f - exp(-sigma * dt * ray.worldLength);
+                // Whether a brick-level transport page could have stood in for this density sample, which is the prerequisite for a
+                // transport hierarchy over the resident pyramid: if a page cannot reproduce the samples the camera already takes at
+                // the level residency already chose, no adaptive cut over that pyramid can make integratePage() the common case.
+                // 30 counts the samples that read a brick, 31 those a page reproduces to 10% of the brick's peak density, 34 to 2%,
+                // and 32 sums the relative page error so 32 over 30 is its mean. The page is exactly HSTRCutNode's representation:
+                // the brick's eight shared corner densities, trilinearly interpolated (cloudBrickPage).
+                if (mode >= 30 && mode <= 34 && sample.brick && !sample.empty && sample.entry != kCloudRefNone)
+                {
+                    const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
+                    const float peak = max(brick.minValue + brick.range, 1e-12f);
+                    // sigma carries the instance's density scale and the distance fade; the page does not, so compare stored values.
+                    const float stored = cloudBrickDensity(sample.entry, sample.x, int3(floor(sample.x + 0.5f)));
+                    const float error = abs(cloudBrickPage(sample.entry, sample.x) - stored) / peak;
+                    result += mode == 30 ? 1.f : 0.f;
+                    result += mode == 31 && error <= 0.1f ? 1.f : 0.f;
+                    result += mode == 34 && error <= 0.02f ? 1.f : 0.f;
+                    result += mode == 32 ? error : 0.f;
+                    result += mode == 33 && alpha > 1e-6f ? 1.f : 0.f;
+                }
                 result += mode == 7 ? 1.f : 0.f;
                 result += mode == 10 && stepVoxels <= minimumStep ? 1.f : 0.f;
                 result += mode == 11 && stepVoxels >= params.maxStepVoxels ? 1.f : 0.f;
@@ -3862,6 +4109,29 @@ struct HSTRCloudRenderer
 
     uint beamTileEdge(uint level) { return params.beamTileSize >> level; }
 
+    /// Whether a box of the beam image is one the screen can see. With the reference frame off the beam image IS the screen and
+    /// everything qualifies; with it on, the image reaches past the screen so that turning does not leave it, and that surplus is
+    /// never built - a direction only earns a basis when it turns on screen, and then it has no history to carry anyway.
+    bool beamBoxOnScreen(float2 low, float2 high)
+    {
+        if (params.beamRefFrame == 0)
+            return true;
+        return all(high >= params.beamScreenBounds.xy) && all(low <= params.beamScreenBounds.zw);
+    }
+
+    bool beamTileOnScreen(uint level, uint2 tile)
+    {
+        const float s = float(beamTileEdge(level));
+        return beamBoxOnScreen(float2(tile) * s, (float2(tile) + 1.f) * s);
+    }
+
+    /// A basis point is kept while any tile that could read it is on screen: the tile tests reach a tile beyond their own.
+    bool beamPointOnScreen(uint2 position)
+    {
+        const float s = float(params.beamTileSize);
+        return beamBoxOnScreen(float2(position) - s, float2(position) + s);
+    }
+
     /// Queries covering a grid of lattice points in blocks of 8 x 4.
     uint beamBlockQueries(uint2 grid) { return ((grid.x + 7u) / 8u) * ((grid.y + 3u) / 4u) * 32u; }
 
@@ -3923,6 +4193,8 @@ struct HSTRCloudRenderer
             if (any(point >= grid))
                 return false;
             position = point * s + (centre ? s / 2 : 0u);
+            if (!beamPointOnScreen(position))
+                return false;
             // Only the centre belongs to the root tile alone. Its corners are the outer corners of its children too - a refined
             // tile's own eight queries are the edge midpoints and the child centres, nothing else - so a skipped corner would
             // leave those children interpolating a stale lattice. Corners are always marched; a tile predicted to fail its own
@@ -3979,7 +4251,10 @@ struct HSTRCloudRenderer
         const uint2 texel = position / params.beamLatticeStep;
         hstrBeamLatticeOutput[uint3(texel, 0)] = depthCache;
         hstrBeamLatticeOutput[uint3(texel, 1)] = single;
-        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 0.f, 0.f, 0.f);
+        // .y stamps the build that wrote this point. In the reference frame the image reaches past the screen and only the part the
+        // screen covers is ever built, so a point that has just turned ON screen holds whatever it held before it turned off - the
+        // stamp is what tells a carry that the previous build actually marched this ray.
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, float(params.beamFrame), 0.f, 0.f);
     }
 
     uint beamSparseListOffset(uint level)
@@ -4009,7 +4284,7 @@ struct HSTRCloudRenderer
         float hi = -1e30f;
         for (uint i = 0; i < 4; ++i)
         {
-            const float y = cameraRayDirection(p[i]).y;
+            const float y = beamRayDirection(p[i]).y;
             lo = min(lo, y);
             hi = max(hi, y);
         }
@@ -4039,7 +4314,7 @@ struct HSTRCloudRenderer
         const GridVolume volume = gScene.getGridVolume(0);
         for (uint i = 0; i < 5; ++i)
         {
-            const float3 w = cameraRayDirection(p[i]);
+            const float3 w = beamRayDirection(p[i]);
             float2 interval;
             if (!mediumInterval(gScene.camera.data.posW, w, volume, interval))
                 continue;
@@ -4078,13 +4353,30 @@ struct HSTRCloudRenderer
         return 0;
     }
 
-    void appendBeamSparseCandidate(uint level, uint2 tile)
+    /// Reserves one contiguous run of a level's candidate list.
+    ///
+    /// The list is what the emit dispatch reads, five basis positions per entry, so neighbouring entries are what a wave marches
+    /// together. Taking one slot per tile puts them in the order threads happened to finish, which scatters a wave's lanes across
+    /// the frame: they then share no bricks, no sun bakes and no cache cells, and the wave waits for whichever of its unrelated
+    /// rays is longest. Reserving a tile's whole family in one atomic keeps the family contiguous, so a wave stays inside one
+    /// screen block. This is the same coherence the beamQueue experiment lost by construction (see beamQueue).
+    uint reserveBeamSparseCandidates(uint level, uint count)
     {
         uint slot;
-        InterlockedAdd(hstrBeamCounts[level], 1u, slot);
-        hstrBeamSparseCandidates[beamSparseListOffset(level) + slot] = packBeamTile(tile);
+        InterlockedAdd(hstrBeamCounts[level], count, slot);
         uint unused;
-        InterlockedAdd(hstrBeamCounts[kBeamSparseCandidates], 1u, unused);
+        InterlockedAdd(hstrBeamCounts[kBeamSparseCandidates], count, unused);
+        return slot;
+    }
+
+    void writeBeamSparseCandidate(uint level, uint slot, uint2 tile)
+    {
+        hstrBeamSparseCandidates[beamSparseListOffset(level) + slot] = packBeamTile(tile);
+    }
+
+    void appendBeamSparseCandidate(uint level, uint2 tile)
+    {
+        writeBeamSparseCandidate(level, reserveBeamSparseCandidates(level, 1u), tile);
     }
 
     /// Metadata phase: produce candidate leaves before any exact query is emitted.
@@ -4094,6 +4386,8 @@ struct HSTRCloudRenderer
         if (thread >= roots)
             return;
         const uint2 root = uint2(thread % params.beamTileDims.x, thread / params.beamTileDims.x);
+        if (!beamTileOnScreen(0, root))
+            return;
         uint unused;
         InterlockedAdd(hstrBeamCounts[kBeamSparseRoots], 1u, unused);
         if (beamRootProvablyEmpty(root))
@@ -4117,9 +4411,139 @@ struct HSTRCloudRenderer
         const uint level = max(min(uint(HSTR_BEAM_SPARSE_MIN_LEVEL), params.beamLevels - 1u), beamMetadataStartLevel(root));
         InterlockedAdd(hstrBeamCounts[kBeamSparseStarts + level], 1u, unused);
         const uint n = 1u << level;
+        const uint slot = reserveBeamSparseCandidates(level, n * n);
         for (uint y = 0; y < n; ++y)
             for (uint x = 0; x < n; ++x)
-                appendBeamSparseCandidate(level, root * n + uint2(x, y));
+                writeBeamSparseCandidate(level, slot + y * n + x, root * n + uint2(x, y));
+    }
+
+    /// Accepted cut cell: two-point Gauss quadrature of its trilinear extinction page, with the split frame's two source terms
+    /// taken once at each node. This is integratePage's quadrature with the beam's terms: the cache comes from the world cache
+    /// (the sea's lighting field) rather than the HST camera lighting texture, and single scattering is the proxy sun depth, which
+    /// is the field the page's own extinction was derived from.
+    void integrateDomainPage(
+        HSTRCutNode node,
+        CutRay ray,
+        float3 cutPosition,
+        float2 segment,
+        bool withCache,
+        bool withSingle,
+        inout float3 cache,
+        inout float3 single,
+        inout float transmittance,
+        inout float opacityDistance
+    )
+    {
+        static const float kGaussOffset = 0.2886751345948129f;
+        const float midpoint = 0.5f * (segment.x + segment.y);
+        const float span = segment.y - segment.x;
+        const float2 t = float2(midpoint - kGaussOffset * span, midpoint + kGaussOffset * span);
+        const float3 local0 =
+            (cutPosition + t.x * ray.direction - float3(node.minLeft.xyz)) / float3(node.maxRight.xyz - node.minLeft.xyz);
+        const float3 local1 =
+            (cutPosition + t.y * ray.direction - float3(node.minLeft.xyz)) / float3(node.maxRight.xyz - node.minLeft.xyz);
+        // The sea fades out over the last 30% of the view distance so tiles entering the window never pop in; a paged cell has to
+        // carry the same fade the marched cell beside it does (cameraExtinctionAtVoxel).
+        const float2 fade = params.seaViewDistance > 0.f
+                                ? saturate((1.f - (ray.entryDistance + t * ray.worldLength) / params.seaViewDistance) / 0.3f)
+                                : float2(1.f);
+        const float sigma0 = fade.x * domainPageAt(node.transmittanceCorners0, node.transmittanceCorners1, saturate(local0));
+        const float sigma1 = fade.y * domainPageAt(node.transmittanceCorners0, node.transmittanceCorners1, saturate(local1));
+        const float depth = 0.5f * ray.worldLength * span * (sigma0 + sigma1);
+        if (depth <= 1e-8f)
+            return;
+        const float alpha = 1.f - exp(-depth);
+        if (withCache || withSingle)
+        {
+            // Where the node's opacity actually sits along the segment: the two nodes weighted by their own extinction under the
+            // transmittance they see, which is what integratePage's source weights are.
+            const float weight0 = sigma0 * exp(-depth * (0.5f - kGaussOffset));
+            const float weight1 = sigma1 * exp(-depth * (0.5f + kGaussOffset));
+            const float split = weight1 / max(1e-8f, weight0 + weight1);
+            const float tSource = lerp(t.x, t.y, split);
+            const float3 v = (ray.position + tSource * ray.direction) * float(params.hstrCellWidth);
+            if (withCache)
+                cache += transmittance * alpha * worldCacheRadiance(v, ray.viewDirection);
+            if (withSingle)
+                single += transmittance * alpha * residualAtDepth(v, sunDepthProxy(v), ray.sunOctaves);
+        }
+        opacityDistance += transmittance * alpha * (ray.entryDistance + midpoint * ray.worldLength);
+        transmittance *= 1.f - alpha;
+    }
+
+    /// Composites one basis ray through the cloud sea's projected transport cut. The tile's cut list is already the front-to-back
+    /// antichain of non-empty domain cells covering this pixel, so the ray never sees empty sky and never re-derives an ordering:
+    /// each cell is either taken from its page (cheap, constant work) or, where the page cannot carry its optical depth, marched
+    /// over that cell's segment alone, starting from the transmittance the cells in front of it left.
+    void traverseDomainCut(
+        CutRay ray,
+        uint tileID,
+        inout float3 cache,
+        inout float3 single,
+        inout float transmittance,
+        inout float opacityDistance,
+        inout uint paged,
+        inout uint marched,
+        inout uint steps
+    )
+    {
+        const bool withCache = beamWithCache();
+        const bool withSingle = beamWithSingle();
+        const uint count = hstrTileNodeCounts[tileID];
+        if (count > params.hstrMaxTileNodes)
+        {
+            // The tile's cut overflowed its list: march the whole volume segment, as the HST camera path does.
+            marchSegmentMoment(ray, float2(0.f, 1.f), withCache, withSingle, cache, single, transmittance, steps, opacityDistance);
+            ++marched;
+            return;
+        }
+        // Node boxes are window-local; the ray keeps its domain position so every density and lighting lookup still wraps.
+        const float3 cutPosition = ray.position - float3(params.hstrCutOriginLeaf);
+        const uint base = tileID * params.hstrMaxTileNodes;
+        [loop]
+        for (uint i = 0; i < count && transmittance > params.cloudMinTransmittance; ++i)
+        {
+            const HSTRCutNode node = hstrCutNodes[hstrTileNodes[base + i]];
+            float2 segment;
+            if (!intersectCutNode(node, cutPosition, ray.direction, segment))
+                continue;
+            const float pageError = transmittance * (1.f - exp(-node.transmittancePage.x * ray.worldLength * (segment.y - segment.x)));
+            if (pageError > params.cutTransmittanceTolerance)
+            {
+                marchSegmentMoment(ray, segment, withCache, withSingle, cache, single, transmittance, steps, opacityDistance);
+                ++marched;
+            }
+            else
+            {
+                integrateDomainPage(node, ray, cutPosition, segment, withCache, withSingle, cache, single, transmittance, opacityDistance);
+                ++paged;
+            }
+        }
+    }
+
+    /// Evaluate a sparse basis position from the already projected, front-to-back transport cut instead of from a full-volume
+    /// march. Cells the cut resolves cost a page evaluation; only the unresolved residual enters the marcher.
+    BeamSample evaluateBeamCut(uint2 position, out uint paged, out uint marched, out uint steps)
+    {
+        BeamSample result = {};
+        paged = 0u;
+        marched = 0u;
+        steps = 0u;
+        const GridVolume volume = gScene.getGridVolume(0);
+        CutRay ray;
+        if (!makeCutRay(gScene.camera.data.posW, beamRayDirection(float2(position)), volume, ray))
+            return result;
+        // The beam applies the phase per pixel, so octave 0 carries a unit weight here as it does in marchBeam().
+        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+        const uint2 tile = min(position / params.hstrTileSize, params.hstrTileDims - 1u);
+        const uint tileID = tile.x + params.hstrTileDims.x * tile.y;
+        float transmittance = 1.f;
+        float opacityDistance = 0.f;
+        traverseDomainCut(ray, tileID, result.cache, result.single, transmittance, opacityDistance, paged, marched, steps);
+        result.depth = -log(max(transmittance, 1e-12f));
+        result.steps = float(steps);
+        result.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
+        return result;
     }
 
     void emitBeamSparseQuery(uint thread)
@@ -4141,30 +4565,44 @@ struct HSTRCloudRenderer
         InterlockedCompareExchange(hstrBeamQueryMap[texel], 0xffffffffu, queryId, prior);
         if (prior != 0xffffffffu)
             return;
-        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        uint paged = 0u;
+        uint marched = 0u;
+        uint steps = 0u;
+#if HSTR_BEAM_SPARSE_CUT
+        const BeamSample q = evaluateBeamCut(position, paged, marched, steps);
+#else
+        const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
+        steps = uint(q.steps);
+#endif
         const float4 depthCache = float4(q.cache, q.depth);
         const float4 single = float4(q.single, q.distance);
-        const BeamResult result = makeBeamResult(depthCache, single, q.steps);
+        const BeamResult result = makeBeamResult(depthCache, single);
         hstrBeamResults[queryId] = result;
-        // Transitional adapter for controlled reconstruction A/B only. No sparse
-        // work is generated from this texture.
-        writeBeamQuery(position, depthCache, single, result.steps);
         uint unused;
         InterlockedAdd(hstrBeamCounts[kBeamSparseUnique], 1u, unused);
+        InterlockedAdd(hstrBeamCounts[kBeamSparseLevelUnique + level], 1u, unused);
+#if HSTR_BEAM_SPARSE_CUT
+        // What the cut left unresolved: the queries that still had to march at all, the steps they spent there, and the split of
+        // the cells a ray actually hit between the page and the marcher. Accumulated per ray, so this is two atomics a query.
+        if (steps > 0u)
+            InterlockedAdd(hstrBeamCounts[kBeamSparseCutResidualQueries], 1u, unused);
+        InterlockedAdd(hstrBeamCounts[kBeamSparseCutResidualSteps], steps, unused);
+        InterlockedAdd(hstrBeamCounts[kBeamSparseCutPaged], paged, unused);
+        InterlockedAdd(hstrBeamCounts[kBeamSparseCutMarched], marched, unused);
+#endif
     }
 
     uint beamPackHalf2(float2 v) { return uint(f32tof16(v.x)) | (uint(f32tof16(v.y)) << 16); }
 
     float2 beamUnpackHalf2(uint v) { return float2(f16tof32(v & 0xffffu), f16tof32(v >> 16)); }
 
-    BeamResult makeBeamResult(float4 depthCache, float4 single, float steps)
+    BeamResult makeBeamResult(float4 depthCache, float4 single)
     {
         BeamResult result;
         result.depthCache01 = beamPackHalf2(depthCache.xy);
         result.depthCache23 = beamPackHalf2(depthCache.zw);
         result.single01 = beamPackHalf2(single.xy);
         result.single23 = beamPackHalf2(single.zw);
-        result.steps = steps;
         return result;
     }
 
@@ -4180,15 +4618,31 @@ struct HSTRCloudRenderer
 
     uint beamSparseQueryId(uint2 position) { return hstrBeamQueryMap[position / params.beamLatticeStep]; }
 
+    /// Sparse verifier/reconstruction source. Unclaimed coordinates occur only in
+    /// conservatively empty neighbouring roots and represent transparent sky.
+    float4 beamSparseAt(uint2 position, uint slice)
+    {
+        const uint id = beamSparseQueryId(position);
+        if (id == 0xffffffffu || id == 0xfffffffeu)
+            return 0.f;
+        const BeamResult result = hstrBeamResults[id];
+        return slice == 0 ? beamResultDepthCache(result) : beamResultSingle(result);
+    }
+
+    float4 beamVerifierAt(uint2 position, uint slice, bool sparse)
+    {
+        return sparse ? beamSparseAt(position, slice) : beamLatticeAt(position, slice);
+    }
+
     void verifyBeamSparseTile(uint thread)
     {
         const uint level = params.beamPassLevel;
         if (thread >= hstrBeamCounts[level])
             return;
         const uint2 tile = unpackBeamTile(hstrBeamSparseCandidates[beamSparseListOffset(level) + thread]);
-        if (any(tile * beamTileEdge(level) >= params.frameDim))
+        if (any(tile * beamTileEdge(level) >= params.beamFrameDim))
             return;
-        if (!beamTileRefines(level, tile))
+        if (!beamTileRefines(level, tile, true))
         {
             const uint s = beamTileEdge(level);
             const uint2 origin = tile * s;
@@ -4202,6 +4656,8 @@ struct HSTRCloudRenderer
             finalTile.qc = beamSparseQueryId(origin + s / 2u);
             uint slot;
             InterlockedAdd(hstrBeamCounts[kBeamSparseFinal], 1u, slot);
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamSparseAccepted + level], 1u, unused);
             hstrBeamFinalTiles[slot] = finalTile;
             writeBeamLevel(level, tile, level);
             const uint finest = beamTileEdge(params.beamLevels - 1u);
@@ -4218,8 +4674,9 @@ struct HSTRCloudRenderer
         }
         if (level + 1u < params.beamLevels)
         {
+            const uint slot = reserveBeamSparseCandidates(level + 1u, 4u);
             for (uint child = 0; child < 4; ++child)
-                appendBeamSparseCandidate(level + 1u, 2u * tile + uint2(child & 1u, child >> 1));
+                writeBeamSparseCandidate(level + 1u, slot + child, 2u * tile + uint2(child & 1u, child >> 1));
         }
         else
         {
@@ -4245,7 +4702,7 @@ struct HSTRCloudRenderer
         hstrBeamSparseArgs[8] = 1u;
     }
 
-    float3 beamSparseReconstruct(uint tileIndex, uint2 pixel)
+    float3 beamSparseReconstruct(uint tileIndex, float2 beamPosition, float3 w)
     {
         const BeamTile tile = hstrBeamFinalTiles[tileIndex];
         const uint s = beamTileEdge(tile.level);
@@ -4254,7 +4711,7 @@ struct HSTRCloudRenderer
         const BeamResult r01 = hstrBeamResults[tile.q01];
         const BeamResult r11 = hstrBeamResults[tile.q11];
         const BeamResult rc = hstrBeamResults[tile.qc];
-        const float2 f = (float2(pixel - tile.origin) + 0.5f) / float(s);
+        const float2 f = saturate((beamPosition - float2(tile.origin)) / float(s));
         const float4 a00 = beamResultDepthCache(r00);
         const float4 a10 = beamResultDepthCache(r10);
         const float4 a01 = beamResultDepthCache(r01);
@@ -4270,7 +4727,6 @@ struct HSTRCloudRenderer
         const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
         a += (ac - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
         b += (bc - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
-        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
     }
 
@@ -4278,17 +4734,20 @@ struct HSTRCloudRenderer
     {
         if (any(pixel >= params.frameDim))
             return;
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        float2 beamPosition;
+        if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
+            return;
         const uint finest = beamTileEdge(params.beamLevels - 1u);
-        const uint tile = hstrBeamTileMap[pixel / finest];
+        const uint tile = hstrBeamTileMap[uint2(beamPosition) / finest];
         if (tile == 0xffffffffu)
             return;
         if (tile == 0xfffffffeu)
         {
-            const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
             color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
             return;
         }
-        color[pixel] = float4(beamSparseReconstruct(tile, pixel), 1.f);
+        color[pixel] = float4(beamSparseReconstruct(tile, beamPosition, w), 1.f);
     }
 
     /// Queues a root query for the march pass of its predicted cost (beamQueue).
@@ -4309,7 +4768,7 @@ struct HSTRCloudRenderer
         if (thread >= min(hstrBeamQueueCounts[bucket], params.beamQueueCapacity))
             return;
         const uint2 position = unpackBeamTile(hstrBeamQueue[bucket * params.beamQueueCapacity + thread]);
-        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
     }
 
@@ -4369,7 +4828,7 @@ struct HSTRCloudRenderer
     /// Transmittance range of the lattice queries around a tile. A silhouette can cross a tile between its own five queries, but
     /// then reaches one of these: at the coarsest level the corners and centres of the tile and its eight neighbours (all queried),
     /// at a finer level the thirteen queries of its parent (corners, edge midpoints, centre and the children's centres).
-    float beamTransmittanceRange(uint level, uint2 tile)
+    float beamTransmittanceRange(uint level, uint2 tile, bool sparse)
     {
         float lo = 1.f;
         float hi = 0.f;
@@ -4381,14 +4840,14 @@ struct HSTRCloudRenderer
             for (int y = first.y; y <= min(int(tile.y) + 2, corners.y); ++y)
                 for (int x = first.x; x <= min(int(tile.x) + 2, corners.x); ++x)
                 {
-                    const float t = exp(-beamLatticeAt(uint2(x, y) * s, 0).a);
+                    const float t = exp(-beamVerifierAt(uint2(x, y) * s, 0, sparse).a);
                     lo = min(lo, t);
                     hi = max(hi, t);
                 }
             for (int y = first.y; y <= min(int(tile.y) + 1, corners.y - 1) && params.beamCentreless == 0; ++y)
                 for (int x = first.x; x <= min(int(tile.x) + 1, corners.x - 1); ++x)
                 {
-                    const float t = exp(-beamLatticeAt(uint2(x, y) * s + s / 2, 0).a);
+                    const float t = exp(-beamVerifierAt(uint2(x, y) * s + s / 2, 0, sparse).a);
                     lo = min(lo, t);
                     hi = max(hi, t);
                 }
@@ -4404,7 +4863,7 @@ struct HSTRCloudRenderer
         };
         for (uint i = 0; i < 13; ++i)
         {
-            const float t = exp(-beamLatticeAt(origin + offsets[i], 0).a);
+            const float t = exp(-beamVerifierAt(origin + offsets[i], 0, sparse).a);
             lo = min(lo, t);
             hi = max(hi, t);
         }
@@ -4462,7 +4921,7 @@ struct HSTRCloudRenderer
         const bool frontValid = c00.valid && c10.valid && c01.valid && c11.valid && cc.valid;
         const float3 frontBubble = cc.front - 0.25f * (c00.front + c10.front + c01.front + c11.front);
         const float3 frontTolerance = float3(params.beamGuideDepth, params.beamGuideSun, params.beamGuideSun);
-        const uint2 last = min(origin + s, params.frameDim);
+        const uint2 last = min(origin + s, params.beamFrameDim);
         for (uint y = origin.y; y < last.y; ++y)
             for (uint x = origin.x; x < last.x; ++x)
             {
@@ -4489,42 +4948,44 @@ struct HSTRCloudRenderer
     }
 
     /// Pixel of a tile reconstructed from its basis: bilinear corners plus the centre's bubble (none for a centreless root tile).
-    float3 beamReconstruct(uint level, uint2 pixel)
+    float3 beamReconstruct(uint level, float2 beamPosition, float3 w, bool sparse)
     {
         const uint s = beamTileEdge(level);
-        const uint2 origin = pixel / s * s;
-        const float4 a00 = beamLatticeAt(origin, 0);
-        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
-        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
-        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
-        const float4 b00 = beamLatticeAt(origin, 1);
-        const float4 b10 = beamLatticeAt(origin + uint2(s, 0), 1);
-        const float4 b01 = beamLatticeAt(origin + uint2(0, s), 1);
-        const float4 b11 = beamLatticeAt(origin + uint2(s, s), 1);
-        const float2 f = (float2(pixel - origin) + 0.5f) / float(s);
+        const uint2 origin = uint2(beamPosition) / s * s;
+        const float4 a00 = beamVerifierAt(origin, 0, sparse);
+        const float4 a10 = beamVerifierAt(origin + uint2(s, 0), 0, sparse);
+        const float4 a01 = beamVerifierAt(origin + uint2(0, s), 0, sparse);
+        const float4 a11 = beamVerifierAt(origin + uint2(s, s), 0, sparse);
+        const float4 b00 = beamVerifierAt(origin, 1, sparse);
+        const float4 b10 = beamVerifierAt(origin + uint2(s, 0), 1, sparse);
+        const float4 b01 = beamVerifierAt(origin + uint2(0, s), 1, sparse);
+        const float4 b11 = beamVerifierAt(origin + uint2(s, s), 1, sparse);
+        const float2 f = saturate((beamPosition - float2(origin)) / float(s));
         float4 a = bilinear(a00, a10, a01, a11, f);
         float4 b = bilinear(b00, b10, b01, b11, f);
         if (!(level == 0 && params.beamCentreless != 0))
         {
             const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
-            a += (beamLatticeAt(origin + s / 2, 0) - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
-            b += (beamLatticeAt(origin + s / 2, 1) - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
+            a += (beamVerifierAt(origin + s / 2, 0, sparse) - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
+            b += (beamVerifierAt(origin + s / 2, 1, sparse) - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
         }
-        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        // The phase and the background belong to the pixel's own ray, which the caller knows exactly; only the basis is read in
+        // the beam image.
         return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
     }
 
     /// Oracle tile test (beamOracle): the tile's own reconstruction against the stored exact frame, in the compare metric.
-    bool beamTileOracleFails(uint level, uint2 tile)
+    bool beamTileOracleFails(uint level, uint2 tile, bool sparse)
     {
         const uint s = beamTileEdge(level);
         const uint2 origin = tile * s;
-        const uint2 last = min(origin + s, params.frameDim);
+        const uint2 last = min(origin + s, params.beamFrameDim);
         uint failing = 0;
         for (uint y = origin.y; y < last.y; ++y)
             for (uint x = origin.x; x < last.x; ++x)
             {
-                const float3 value = beamReconstruct(level, uint2(x, y));
+                const float2 point = float2(x, y) + 0.5f;
+                const float3 value = beamReconstruct(level, point, beamRayDirection(point), sparse);
                 const float3 reference = max(hstrExactFrame[uint2(x, y)].rgb, 0.f);
                 if (dot(abs(log(1.f + value) - log(1.f + reference)), 1.f / 3.f) > params.beamOracleBar)
                     ++failing;
@@ -4533,26 +4994,26 @@ struct HSTRCloudRenderer
     }
 
     /// log(1 + radiance) of a coarsest corner, in corner units, clamped to the lattice.
-    float3 beamCornerLog(int2 corner)
+    float3 beamCornerLog(int2 corner, bool sparse)
     {
         const uint2 position = uint2(clamp(corner, 0, int2(params.beamTileDims))) * params.beamTileSize;
-        const float4 a = beamLatticeAt(position, 0);
-        const float4 b = beamLatticeAt(position, 1);
-        const float3 w = cameraRayDirection(float2(position));
+        const float4 a = beamVerifierAt(position, 0, sparse);
+        const float4 b = beamVerifierAt(position, 1, sparse);
+        const float3 w = beamRayDirection(float2(position));
         return log(1.f + beamRadiance(a.rgb, b.rgb, a.a, w, gScene.getGridVolume(0).data.albedo));
     }
 
     /// Centreless root test: the largest second difference of log radiance along either axis at the tile's corners, which is what a
     /// bilinear basis cannot reproduce.
-    float beamCornerCurvature(uint2 tile)
+    float beamCornerCurvature(uint2 tile, bool sparse)
     {
         float curvature = 0.f;
         for (uint k = 0; k < 4; ++k)
         {
             const int2 c = int2(tile) + int2(k & 1u, k >> 1);
-            const float3 centre = beamCornerLog(c);
-            const float3 dxx = beamCornerLog(c - int2(1, 0)) - 2.f * centre + beamCornerLog(c + int2(1, 0));
-            const float3 dyy = beamCornerLog(c - int2(0, 1)) - 2.f * centre + beamCornerLog(c + int2(0, 1));
+            const float3 centre = beamCornerLog(c, sparse);
+            const float3 dxx = beamCornerLog(c - int2(1, 0), sparse) - 2.f * centre + beamCornerLog(c + int2(1, 0), sparse);
+            const float3 dyy = beamCornerLog(c - int2(0, 1), sparse) - 2.f * centre + beamCornerLog(c + int2(0, 1), sparse);
             curvature = max(curvature, max(maxComponent(abs(dxx)), maxComponent(abs(dyy))));
         }
         return curvature;
@@ -4560,36 +5021,36 @@ struct HSTRCloudRenderer
 
     /// Surplus test of one tile: the centre as the bilinear corner basis predicts it, against the exact centre query, in
     /// log(1 + radiance); and the silhouette test of beamTransmittanceRange against beamEdgeContrast.
-    bool beamTileRefines(uint level, uint2 tile)
+    bool beamTileRefines(uint level, uint2 tile, bool sparse)
     {
         if (params.beamOracle != 0)
-            return beamTileOracleFails(level, tile);
+            return beamTileOracleFails(level, tile, sparse);
         const uint s = beamTileEdge(level);
         const uint2 origin = tile * s;
         const bool centreless = level == 0 && params.beamCentreless != 0;
-        const float4 a00 = beamLatticeAt(origin, 0);
-        const float4 a10 = beamLatticeAt(origin + uint2(s, 0), 0);
-        const float4 a01 = beamLatticeAt(origin + uint2(0, s), 0);
-        const float4 a11 = beamLatticeAt(origin + uint2(s, s), 0);
-        const float4 ac = beamLatticeAt(origin + s / 2, 0);
-        const float4 bp = 0.25f * (beamLatticeAt(origin, 1) + beamLatticeAt(origin + uint2(s, 0), 1) + beamLatticeAt(origin + uint2(0, s), 1) +
-                                   beamLatticeAt(origin + uint2(s, s), 1));
-        const float4 bc = beamLatticeAt(origin + s / 2, 1);
+        const float4 a00 = beamVerifierAt(origin, 0, sparse);
+        const float4 a10 = beamVerifierAt(origin + uint2(s, 0), 0, sparse);
+        const float4 a01 = beamVerifierAt(origin + uint2(0, s), 0, sparse);
+        const float4 a11 = beamVerifierAt(origin + uint2(s, s), 0, sparse);
+        const float4 ac = beamVerifierAt(origin + s / 2, 0, sparse);
+        const float4 bp = 0.25f * (beamVerifierAt(origin, 1, sparse) + beamVerifierAt(origin + uint2(s, 0), 1, sparse) +
+                                   beamVerifierAt(origin + uint2(0, s), 1, sparse) + beamVerifierAt(origin + uint2(s, s), 1, sparse));
+        const float4 bc = beamVerifierAt(origin + s / 2, 1, sparse);
         const float4 ap = 0.25f * (a00 + a10 + a01 + a11);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        const float3 wc = cameraRayDirection(float2(origin + s / 2));
+        const float3 wc = beamRayDirection(float2(origin + s / 2));
         const float3 exactCentre = beamRadiance(ac.rgb, bc.rgb, ac.a, wc, albedo);
         const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
         if (centreless)
         {
-            bool refine = beamCornerCurvature(tile) > params.beamTolerance;
+            bool refine = beamCornerCurvature(tile, sparse) > params.beamTolerance;
             if (!refine && params.beamEdgeContrast > 0.f)
-                refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
+                refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
             return refine;
         }
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
         if (!refine && params.beamEdgeContrast > 0.f)
-            refine = beamTransmittanceRange(level, tile) > params.beamEdgeContrast;
+            refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
         if (!refine && (params.beamGuide == 1 || (params.beamGuide == 2 && level + 1 < params.beamLevels)))
             refine = beamTileGuideFails(level, tile);
         return refine;
@@ -4675,10 +5136,10 @@ struct HSTRCloudRenderer
             const uint child = thread % 4;
             tile = 2u * unpackBeamTile(hstrBeamLists[beamListOffset(level) + entry]) + uint2(child & 1u, child >> 1);
         }
-        if (any(tile * beamTileEdge(level) >= params.frameDim))
+        if (any(tile * beamTileEdge(level) >= params.beamFrameDim) || !beamTileOnScreen(level, tile))
             return;
         // A root tile the previous frame refined all the way down skips its own test: its lattice points were not marched.
-        if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile))
+        if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile, false))
         {
             writeBeamLevel(level, tile, level);
             return;
@@ -4706,9 +5167,9 @@ struct HSTRCloudRenderer
             --depth;
             const uint2 tile = unpackBeamTile(stackTile[depth]);
             const uint level = stackLevel[depth];
-            if (any(tile * beamTileEdge(level) >= params.frameDim))
+            if (any(tile * beamTileEdge(level) >= params.beamFrameDim) || !beamTileOnScreen(level, tile))
                 continue;
-            if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile))
+            if (!(level == 0 && beamRootDifficult(tile)) && !beamTileRefines(level, tile, false))
             {
                 writeBeamLevel(level, tile, level);
                 continue;
@@ -4761,17 +5222,35 @@ struct HSTRCloudRenderer
     {
         if (any(pixel >= params.frameDim))
             return;
+        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        float2 beamPosition;
+        if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
+            return;
         const uint finest = beamTileEdge(params.beamLevels - 1);
-        const uint level = hstrBeamLevel[pixel / finest];
+        const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
         if (level == params.beamLevels + 1u)
         {
-            const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
             color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
             return;
         }
         if (level >= params.beamLevels)
+        {
+            // A tile the basis could not carry. In the reference frame its residual lives in the beam image beside the basis, so
+            // the resolve reads it here instead of a separate screen-space march pass writing colour directly.
+            if (params.beamRefFrame != 0)
+            {
+                const float2 texel = beamPosition - 0.5f;
+                const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
+                const float2 g = saturate(texel - float2(base));
+                const float4 v = bilinear(
+                    hstrBeamPixels[uint2(base)], hstrBeamPixels[uint2(base + int2(1, 0))], hstrBeamPixels[uint2(base + int2(0, 1))],
+                    hstrBeamPixels[uint2(base + int2(1, 1))], g
+                );
+                color[pixel] = float4(v.rgb, 1.f);
+            }
             return;
-        color[pixel] = float4(beamReconstruct(level, pixel), 1.f);
+        }
+        color[pixel] = float4(beamReconstruct(level, beamPosition, w, false), 1.f);
     }
 
     /// One pixel of a finest tile that failed its surplus test, marched exactly.
@@ -4789,9 +5268,51 @@ struct HSTRCloudRenderer
     }
 
     /// marchBeamPixel as a full-frame dispatch (beamGridDispatch): every pixel whose finest tile was not accepted.
+    /// One beam unit of a finest tile the basis could not carry, in the rotation-invariant frame.
+    ///
+    /// This is the per-pixel fallback moved into the beam image, for the same reason the basis was: the residual is a function of
+    /// world direction, so turning the camera neither invalidates one nor moves one relative to another. A unit that the previous
+    /// build marched is read back at its own index - no reprojection, no search, no agreement test between neighbours - and only a
+    /// unit that has turned on screen, whose tile has just started failing, or whose parallax the camera's translation broke, is
+    /// marched again. The resolve samples this image where a pixel's tile failed.
+    void marchBeamUnit(uint2 unit)
+    {
+        if (any(unit >= params.beamFrameDim) || !beamBoxOnScreen(float2(unit), float2(unit) + 1.f))
+            return;
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        if (hstrBeamLevel[unit / finest] < params.beamLevels)
+            return; // The basis carries this tile; the resolve reconstructs it.
+        const float3 w = beamRayDirection(float2(unit) + 0.5f);
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        // Carried where the previous build marched this very unit and the camera has not moved past its parallax.
+        if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest) &&
+            hstrBeamLevelPrev[unit / finest] >= params.beamLevels &&
+            all(float2(unit) + 1.f >= params.beamPrevScreenBounds.xy) && all(float2(unit) <= params.beamPrevScreenBounds.zw))
+        {
+            const float4 previous = hstrBeamPixelPrev[unit];
+            const float d = previous.a > 0.f ? beamCurrentDistance(previous.a, w) : 0.f;
+            if (previous.a <= 0.f || (d > 0.f && beamParallaxAllows(d, w)))
+            {
+                hstrBeamPixelOutput[unit] = float4(previous.rgb, d);
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamMaxLevels], 1u, unused);
+                return;
+            }
+        }
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
+    }
+
     void marchBeamGridPixel(uint2 pixel)
     {
-        if (any(pixel >= params.frameDim) || hstrBeamLevel[pixel / beamTileEdge(params.beamLevels - 1)] < params.beamLevels)
+        if (any(pixel >= params.frameDim))
+            return;
+        // The level map lives in the beam image; the march itself is the screen pixel's own ray, at full resolution. That keeps the
+        // one part of the frame the basis cannot represent free of any resampling.
+        float2 beamPosition;
+        if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
+            return;
+        if (hstrBeamLevel[uint2(beamPosition) / beamTileEdge(params.beamLevels - 1)] < params.beamLevels)
             return;
         marchBeamAt(pixel);
     }
@@ -4806,6 +5327,8 @@ struct HSTRCloudRenderer
             return;
         const uint s = params.beamTileSize;
         const uint2 position = point * s + (centre ? s / 2 : 0u);
+        if (!beamPointOnScreen(position))
+            return;
         float4 depthCache;
         float4 single;
         if (!beamRefreshes(point, centre) && beamReprojectQuery(position, depthCache, single))
@@ -4824,7 +5347,7 @@ struct HSTRCloudRenderer
             beamEnqueue(position);
             return;
         }
-        const BeamSample q = marchBeam(cameraRayDirection(float2(position)), float2(0.f, 1.f));
+        const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
         if (params.beamRefreshDebug == 7)
         {
@@ -4838,7 +5361,10 @@ struct HSTRCloudRenderer
         const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
         float4 value;
-        if (params.beamRefresh != 0 && !beamRefreshes(pixel / beamTileEdge(params.beamLevels - 1)) && beamReprojectPixel(pixel, w, value))
+        // The per-pixel fallback keeps marching in the reference frame: it is the part of the image the basis cannot carry, its
+        // carry resamples the previous SCREEN, and isolating the basis is what makes the frame's effect measurable.
+        if (params.beamRefFrame == 0 && params.beamRefresh != 0 &&
+            !beamRefreshes(pixel / beamTileEdge(params.beamLevels - 1)) && beamReprojectPixel(pixel, w, value))
         {
             color[pixel] = float4(value.rgb, 1.f);
             hstrBeamPixelOutput[pixel] = value;
@@ -4978,9 +5504,27 @@ struct HSTRCloudRenderer
     {
         depthCache = 0.f;
         single = 0.f;
-        const float3 w = cameraRayDirection(float2(position));
+        const float3 w = beamRayDirection(float2(position));
         const float3 camera = gScene.camera.data.posW;
         const float stored = beamLatticePrevAt(position, 1).a;
+        // In the reference frame a basis point IS a world direction, and the frame did not turn with the camera, so the previous
+        // build marched this very ray and its value sits at this very index. Nothing is reprojected and nothing is resampled: the
+        // only thing that can invalidate it is the camera having MOVED, which parallax answers. This is the whole point of the
+        // frame - rotation costs nothing, and the resampling that "tripled the error" for a turning camera cannot happen.
+        if (params.beamRefFrame != 0)
+        {
+            if (params.beamRefValid == 0 || beamLatticePrevAt(position, 2).y != float(params.beamFrame) - 1.f)
+                return false;
+            depthCache = beamLatticePrevAt(position, 0);
+            single = beamLatticePrevAt(position, 1);
+            if (stored <= 0.f)
+                return true; // The ray saw no opacity: no parallax can move what is not there.
+            const float moved = beamCurrentDistance(stored, w);
+            if (moved <= 0.f || !beamParallaxAllows(moved, w))
+                return false;
+            single.a = moved;
+            return true;
+        }
         float d;
         if (stored > 0.f)
             d = beamCurrentDistance(stored, w);
@@ -5406,7 +5950,7 @@ void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupTh
     BeamSample sample = {};
     if (valid)
         sample = gHSTRCloud.marchBeam(
-            gHSTRCloud.cameraRayDirection(float2(position)), float2(float(segment), float(segment + 1)) / float(segments)
+            gHSTRCloud.beamRayDirection(float2(position)), float2(float(segment), float(segment + 1)) / float(segments)
         );
     gBeamDepthCache[groupThreadId.x] = float4(sample.cache, sample.depth);
     gBeamSingle[groupThreadId.x] = float4(sample.single, 0.f);
@@ -5436,6 +5980,13 @@ void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 void testBeamTilesTemporal(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.testBeamTileTemporal(dispatchThreadId.x);
+}
+
+/// The per-pixel fallback in the rotation-invariant frame: one thread per beam unit of a tile the basis could not carry.
+[numthreads(8, 8, 1)]
+void marchBeamUnits(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.marchBeamUnit(dispatchThreadId.xy);
 }
 
 [numthreads(8, 8, 1)]
@@ -5598,6 +6149,12 @@ void projectCutNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
 void binCutNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.binCutNode(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void buildDomainCutNodes(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.buildDomainCutNode(dispatchThreadId.x);
 }
 
 groupshared uint gSortKeys[kMaxTileNodes];

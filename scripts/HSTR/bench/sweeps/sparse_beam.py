@@ -14,8 +14,9 @@ COMMON = dict(
 )
 
 TESTS = [
-    ("legacy lattice", mk(**COMMON, beamSparse=False)),
-    ("sparse start 0", mk(**COMMON, beamSparse=True, beamSparseDirect=True, beamSparseMinLevel=0)),
-    ("sparse start 1", mk(**COMMON, beamSparse=True, beamSparseDirect=True, beamSparseMinLevel=1)),
-    ("sparse start 2", mk(**COMMON, beamSparse=True, beamSparseDirect=True, beamSparseMinLevel=2)),
+    ("shipping 4x1", mk(beamSparse=False)),
+    ("sparse volume", mk(**COMMON, beamSparse=True, beamSparseCut=False, beamSparseMinLevel=2)),
+    ("sparse cut start 2", mk(**COMMON, beamSparse=True, beamSparseCut=True, beamSparseMinLevel=2)),
+    ("sparse cut start 1", mk(**COMMON, beamSparse=True, beamSparseCut=True, beamSparseMinLevel=1)),
+    ("sparse cut start 0", mk(**COMMON, beamSparse=True, beamSparseCut=True, beamSparseMinLevel=0)),
 ]

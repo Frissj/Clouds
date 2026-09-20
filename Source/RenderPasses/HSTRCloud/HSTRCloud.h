@@ -87,7 +87,7 @@ private:
     static_assert(sizeof(CorrectionAtom) == 16);
     static_assert(sizeof(HSTRCutNode) == 96);
     static_assert(sizeof(HSTRTileBasis) == 96);
-    static_assert(sizeof(BeamResult) == 20);
+    static_assert(sizeof(BeamResult) == 16);
     static_assert(sizeof(BeamTile) == 32);
 
     void parseProperties(const Properties& props);
@@ -121,6 +121,7 @@ private:
     ref<ComputePass> mpProjectPass;
     ref<ComputePass> mpCutPass;
     ref<ComputePass> mpSortPass;
+    ref<ComputePass> mpDomainCutPass; ///< Builds the cloud-sea's regular 16^3-cell cut and trilinear pages on the GPU.
     ref<ComputePass> mpQueryPass;
     ref<ComputePass> mpTileBasisPass;
     ref<ComputePass> mpFineSunPass;
@@ -165,11 +166,41 @@ private:
     ref<ComputePass> mpBeamSparseArgsPass;
     ref<ComputePass> mpBeamGridQueryPass;  ///< Root lattice queries as a 2D dispatch over the corner (or centre) grid.
     ref<ComputePass> mpBeamGridMarchPass;  ///< Per-pixel refinement as a full-frame 2D dispatch that skips accepted tiles.
+    ref<ComputePass> mpBeamUnitMarchPass;  ///< The same refinement in the rotation-invariant beam image, where it carries (beamRefFrame).
     bool mBeamGridDispatch = false;        ///< Whether the beam view uses the two passes above (beamSegments 1, per-level build).
     bool mBeamSparse = true;               ///< Metadata-led sparse query compiler; false keeps the legacy lattice generator for A/B.
-    bool mBeamSparseDirect = true;         ///< Read packed sparse results directly; false retains the lattice adapter for controlled A/B.
+    /// Evaluate sparse bases through the projected transport cut (traverseCut/integratePage) instead of full-volume marchBeam().
+    /// This is the first intermediate form of the intended architecture: the basis query still exists, but it composites the tile's
+    /// front-to-back cut instead of re-solving transport down the whole ray.
+    ///
+    /// MEASURED and OFF for the cloud sea (4K near, parked, 2026-09-20, against the same stored exact frame). It is correct and
+    /// quality-neutral - log 1.48e-3 against the volume evaluator's 1.39e-3, p99.9 4.31e-2 either way - and it is a large net loss,
+    /// for a reason that is about the sea's representation rather than this code: of the 1.28 million cut cells the basis rays hit,
+    /// 379 were resolved by their page at the shipping tolerance and 6,744 at five times it, 0.03% and 0.5%. Everything else fell
+    /// through to the marcher, so the basis queries rose 10.1 -> 15.3 ms (a cell restart drops the held lighting and sun depth) and
+    /// building the cut - projecting 2048 domain cells, binning them into 129,600 8-pixel tiles, sorting each list - cost 23.4 ms.
+    ///
+    /// The blocker is the resolution of the transport the cut can carry, and it is structural. The sea's only world-space field
+    /// outside the virtual brick pyramid is the domain proxy at 5.16 world units per voxel; a cut cell is 16 of those, 83 units. At
+    /// the far end of the sea's 960-unit view distance one PROXY VOXEL still subtends about ten 4K pixels, so there is no distance
+    /// inside this scene at which a trilinear page over a cut cell resolves what the camera sees. Accumulating BeamTile x node
+    /// coefficients from these pages would accumulate the 0.5% and leave the rest to the residual queue. Making the radical path
+    /// pay here needs the cut built at fine-brick resolution - transport compressed from the resident pyramid, not downsampled 16x
+    /// from the proxy - which is the "solve/compress transport in world space" step the sea currently has no representation for.
+    bool mBeamSparseCut = false;
     uint32_t mBeamSparseMinLevel = 2;       ///< Lowest metadata-selected verifier level; benchmark knob outside the shared shader ABI.
     bool mBeamSparseBuilt = false;          ///< The current beam buffers were produced by the sparse compiler.
+    /// Rotation-invariant beam basis frame: the whole beam build runs in an image anchored to a world orientation instead of to the
+    /// screen, so turning the camera neither invalidates a basis ray nor resamples one. See HSTRCloudParams::beamRefU.
+    bool mBeamRefFrame = false;
+    float mBeamRefMargin = 0.15f; ///< Fraction of the frame the reference image reaches past each screen edge before re-anchoring.
+    bool mBeamRefAnchored = false;
+    float3 mBeamRefU = float3(0.f);
+    float3 mBeamRefV = float3(0.f);
+    float3 mBeamRefW = float3(0.f);
+    uint32_t mBeamRefAnchors = 0;  ///< Re-anchors since the view settled, which is what a turn amortises a full rebuild over.
+    float4 mBeamBuiltScreenBounds = float4(0.f); ///< beamScreenBounds of the build that most recently wrote the beam image.
+    void updateBeamReferenceFrame(const uint2& frameDim);
     // beamRefresh: the previous build's lattice and level map (swapped with the current ones every build), its marched pixels
     // (the two alternate), and its camera.
     ref<Texture> mpBeamLatticePrev;
@@ -377,6 +408,7 @@ private:
     bool mFirstFrame = true;
     bool mCameraLightingDirty = true;
     bool mCutDirty = true;
+    bool mDomainCutOriginValid = false; ///< Whether hstrCutOriginLeaf holds a window placed for the current camera.
     bool mResidualDirty = true;
     bool mBasisDirty = true;
     bool mCameraLightingPoseValid = false;

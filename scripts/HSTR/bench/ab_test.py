@@ -120,6 +120,10 @@ for name, position, target in views:
             m.renderFrame()
             p = hstr.properties
             beam_stats = p.get("cloudStats", {})
+            beam_keys = ("beamRootTiles", "beamEmptyTiles", "beamCandidates", "beamUniqueQueries", "beamFinalTiles",
+                         "beamCutResidualQueries", "beamCutResidualSteps", "beamCutPaged", "beamCutMarched")
+            for level in range(4):
+                beam_keys += (f"beamStart{level}", f"beamCandidates{level}", f"beamAccepted{level}", f"beamUniqueQueries{level}")
             hstr.set_properties({"compareReference": False, "compareExact": False})
             capture(f"{TAG}_{name}_{label.replace(' ', '_')}_{test.replace(' ', '_')}")
             parts = " ".join(f"{k} {v:.1f}" for k, v in b.items() if v >= 1.0 and k != "HSTRCloud")
@@ -130,12 +134,18 @@ for name, position, target in views:
                                     "marched": marched, "log": float(p["referenceLogError"]), "over02": float(p["referenceNoiseError"]),
                                     "over10": float(p["referenceNoiseLogError"]), "p999": float(p["referenceLogP999"]),
                                     "max": float(p["referenceLogMax"]),
-                                    "beam": {k: beam_stats.get(k, 0) for k in ("beamRootTiles", "beamEmptyTiles", "beamCandidates",
-                                             "beamUniqueQueries", "beamFinalTiles", "beamStart0", "beamStart1", "beamStart2", "beamStart3")}}) + "\n")
+                                    "beam": {k: beam_stats.get(k, 0) for k in beam_keys}}) + "\n")
             log(f"{name} {label:10s} {test:14s} A {a.get('HSTRCloud', 0):7.2f} ms, B {b.get('HSTRCloud', 0):7.2f} ms "
                 f"[x{ratio:5.3f} of anchor {local:6.2f}] ({parts}); "
                 f"marched {100 * marched:4.1f}%; B vs A: log {float(p['referenceLogError']):.2e}, "
                 f">0.02 {100 * float(p['referenceNoiseError']):.3f}%, >0.1 {100 * float(p['referenceNoiseLogError']):.3f}%, "
                 f"p99.9 {float(p['referenceLogP999']):.2e}, max {float(p['referenceLogMax']):.2e}; "
-                f"queries {int(beam_stats.get('beamUniqueQueries', 0))}, candidates {int(beam_stats.get('beamCandidates', 0))}")
+                f"queries {int(beam_stats.get('beamUniqueQueries', 0))}, candidates {int(beam_stats.get('beamCandidates', 0))}; "
+                f"per-level q/a " + ",".join(f"{int(beam_stats.get(f'beamUniqueQueries{level}', 0))}/"
+                                               f"{int(beam_stats.get(f'beamAccepted{level}', 0))}" for level in range(4)) +
+                # What the projected cut resolved: cells taken from a page against cells handed back to the marcher, and the
+                # residual march those left (queries that marched at all, and their steps per query).
+                f"; cut paged/marched {int(beam_stats.get('beamCutPaged', 0))}/{int(beam_stats.get('beamCutMarched', 0))}"
+                f", residual {int(beam_stats.get('beamCutResidualQueries', 0))} q "
+                f"{int(beam_stats.get('beamCutResidualSteps', 0)) / max(1, int(beam_stats.get('beamUniqueQueries', 0))):.1f} steps/q")
 exit()
