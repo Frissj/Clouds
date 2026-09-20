@@ -1081,7 +1081,9 @@ struct HSTRCloudParams
     uint beamGridBlockStride = 1;
     /// 1 when the level-0 tile pass is generated from the same regions as the query dispatch rather than swept over every tile.
     uint beamTileGenerated = 0;
-    uint padBeamTileGenerated = 0;
+    /// 1 when the residual march covers the same regions as the query and tile passes instead of the whole beam image. A unit
+    /// can only need marching where its tile's classification or its own carry could have changed, which is those regions.
+    uint beamUnitGenerated = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

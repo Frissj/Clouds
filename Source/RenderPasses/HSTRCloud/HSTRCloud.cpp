@@ -4287,7 +4287,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         else
         {
             bindMarch();
-            if (unitMarch)
+            if (unitMarch && !mBeamGridRegions.empty())
+            {
+                // Only the units whose tile this build could have reclassified, or whose own carry could have expired: the same
+                // regions the query and tile passes covered. Everything else already holds a residual for its own direction.
+                const uint32_t ts = std::max(mParams.beamTileSize, 1u);
+                mParams.beamUnitGenerated = 1;
+                for (size_t r = 0; r < mBeamGridRegions.size(); ++r)
+                {
+                    const uint4& region = mBeamGridRegions[r];
+                    mParams.beamGridOrigin = uint2(region.x, region.y);
+                    mParams.beamGridBlocks = mBeamGridRegionMode[r];
+                    bindMarch();
+                    pMarch->execute(pRenderContext, uint3(region.z * ts, region.w * ts, 1));
+                }
+                mParams.beamUnitGenerated = 0;
+                mParams.beamGridBlocks = 0;
+                mParams.beamGridOrigin = uint2(0);
+            }
+            else if (unitMarch)
                 pMarch->execute(pRenderContext, uint3(mParams.beamFrameDim, 1));
             else if (gridMarch)
                 pMarch->execute(pRenderContext, uint3(mParams.frameDim, 1));

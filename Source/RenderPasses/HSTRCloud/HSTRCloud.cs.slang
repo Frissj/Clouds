@@ -5314,8 +5314,23 @@ struct HSTRCloudRenderer
     /// build marched is read back at its own index - no reprojection, no search, no agreement test between neighbours - and only a
     /// unit that has turned on screen, whose tile has just started failing, or whose parallax the camera's translation broke, is
     /// marched again. The resolve samples this image where a pixel's tile failed.
-    void marchBeamUnit(uint2 unit)
+    void marchBeamUnit(uint2 gridUnit)
     {
+        uint2 unit = gridUnit;
+        if (params.beamUnitGenerated != 0)
+        {
+            // Generated like the query and tile passes: the thread's unit is a tile inside one of this build's regions, plus
+            // its offset within that tile. Everything outside them is carrying a residual it already holds.
+            const uint ts = max(params.beamTileSize, 1u);
+            const uint rb = max(params.beamRefreshBlock, 1u);
+            const uint2 local = gridUnit / ts;
+            const uint2 tile = params.beamGridBlocks != 0
+                                   ? (params.beamGridOrigin + (local / rb) * params.beamGridBlockStride) * rb + (local % rb)
+                                   : local + params.beamGridOrigin;
+            if (any(tile >= params.beamTileDims))
+                return;
+            unit = tile * ts + (gridUnit % ts);
+        }
         if (any(unit >= params.beamFrameDim) || !beamBoxOnScreen(float2(unit), float2(unit) + 1.f))
             return;
         // MEASURED and REMOVED: marching a one-unit apron around every failed tile, so the resolve's bilinear never reaches into
