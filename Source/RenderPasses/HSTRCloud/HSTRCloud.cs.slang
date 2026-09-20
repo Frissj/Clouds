@@ -4125,10 +4125,13 @@ struct HSTRCloudRenderer
         return beamBoxOnScreen(float2(tile) * s, (float2(tile) + 1.f) * s);
     }
 
-    /// A basis point is kept while any tile that could read it is on screen: the tile tests reach a tile beyond their own.
+    /// A basis point is kept while any tile that could read it is on screen. beamTransmittanceRange reads the corners and centres
+    /// of a tile's eight neighbours at level 0, so the reach is two tiles, not one - at one tile the tests on the outermost built
+    /// tiles read lattice this build never wrote. Widened for that reason alone: it did NOT move the 720p screen-edge error the
+    /// reference frame shows (max log 7.88e-2 on about 0.002% of pixels, bit-identical before and after), which is still open.
     bool beamPointOnScreen(uint2 position)
     {
-        const float s = float(params.beamTileSize);
+        const float s = 2.f * float(params.beamTileSize);
         return beamBoxOnScreen(float2(position) - s, float2(position) + s);
     }
 
@@ -4254,7 +4257,10 @@ struct HSTRCloudRenderer
         // .y stamps the build that wrote this point. In the reference frame the image reaches past the screen and only the part the
         // screen covers is ever built, so a point that has just turned ON screen holds whatever it held before it turned off - the
         // stamp is what tells a carry that the previous build actually marched this ray.
-        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, float(params.beamFrame), 0.f, 0.f);
+        // .y marks the point as holding a marched value. With the ping-ponged pair that had to be a build stamp, because the
+        // image it was written into became the history exactly once; the persistent lattice is cleared when the frame re-anchors
+        // and a mark then stands until then.
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, 0.f, 0.f);
     }
 
     uint beamSparseListOffset(uint level)
@@ -5279,6 +5285,10 @@ struct HSTRCloudRenderer
     {
         if (any(unit >= params.beamFrameDim) || !beamBoxOnScreen(float2(unit), float2(unit) + 1.f))
             return;
+        // MEASURED and REMOVED: marching a one-unit apron around every failed tile, so the resolve's bilinear never reaches into
+        // an accepted neighbour's unwritten units. Failed tiles are 4 units square and scattered, so a one-unit border is 2.25x
+        // their area and the march went 0.59 -> 1.71 ms parked and 0.75 -> 3.39 under yaw - and it did not move the seam it was
+        // aimed at (720p max log error 7.88e-2, bit-identical before and after), so the seam is something else.
         const uint finest = beamTileEdge(params.beamLevels - 1);
         if (hstrBeamLevel[unit / finest] < params.beamLevels)
             return; // The basis carries this tile; the resolve reconstructs it.
@@ -5329,13 +5339,27 @@ struct HSTRCloudRenderer
         const uint2 position = point * s + (centre ? s / 2 : 0u);
         if (!beamPointOnScreen(position))
             return;
+        // A parked camera cannot move a persistent point: it already holds the value, measured from this very camera, so the
+        // carry has nothing to read, nothing to test and nothing to write.
+        const bool persistent = params.beamRefFrame != 0;
+        if (persistent && params.beamStationary != 0 && params.beamRefValid != 0 && !beamRefreshes(point, centre) &&
+            beamLatticeValid(position))
+        {
+            uint held;
+            InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, held);
+            return;
+        }
         float4 depthCache;
         float4 single;
         if (!beamRefreshes(point, centre) && beamReprojectQuery(position, depthCache, single))
         {
             // The carried value keeps the cost last measured here, so the prediction survives until the point is marched again.
-            const float carriedSteps = params.beamHistoryValid != 0 ? beamLatticePrevAt(position, 2).x : 0.f;
-            writeBeamQuery(position, depthCache, single, carriedSteps);
+            const float carriedSteps =
+                params.beamHistoryValid == 0 ? 0.f : (persistent ? beamLatticeHeldAt(position, 2).x : beamLatticePrevAt(position, 2).x);
+            if (persistent)
+                carryBeamQuery(position, single); // Only the distance moves; the radiance and the mark are already in place.
+            else
+                writeBeamQuery(position, depthCache, single, carriedSteps);
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, unused);
             if (params.beamRefreshDebug == 7)
@@ -5408,7 +5432,26 @@ struct HSTRCloudRenderer
     /// Distance from the current camera along w of a point the previous build saw at distance d along a ray close to w.
     float beamCurrentDistance(float d, float3 w) { return d + dot(params.beamPrevCamera - gScene.camera.data.posW, w); }
 
+    /// The basis a carry reads. In the reference frame the lattice is PERSISTENT - the index of a basis point is its world
+    /// direction, which does not move, so there is nothing for a ping-pong to do and the query pass reads and updates the one
+    /// image in place. A point that turns off screen therefore keeps its value and carries again when it turns back, which the
+    /// ping-ponged pair could not express. Everywhere else this is the previous build's lattice, as before.
     float4 beamLatticePrevAt(uint2 position, uint slice) { return hstrBeamLatticePrev[uint3(position / params.beamLatticeStep, slice)]; }
+
+    /// The persistent lattice read through the image the query pass is writing. Kept apart from beamLatticePrevAt because the
+    /// screen path calls that one about thirteen times per carried point through beamPreviousLattice, and putting a branch on
+    /// beamRefFrame inside it cost the screen carry 1.81 -> 2.81 ms of basis at 4K for a value the compiler cannot hoist.
+    float4 beamLatticeHeldAt(uint2 position, uint slice) { return hstrBeamLatticeOutput[uint3(position / params.beamLatticeStep, slice)]; }
+
+    /// Whether a persistent basis point holds a value marched since the frame was anchored.
+    bool beamLatticeValid(uint2 position) { return beamLatticeHeldAt(position, 2).y > 0.5f; }
+
+    /// Updates only the distance a carried point is measured from, so the next build's parallax test still reads it relative to
+    /// that build's camera. The radiance and the validity are already in place and are not rewritten.
+    void carryBeamQuery(uint2 position, float4 single)
+    {
+        hstrBeamLatticeOutput[uint3(position / params.beamLatticeStep, 1)] = single;
+    }
 
     /// Whether the previous camera's ray through the point at distance d along w is within beamParallax pixels of w.
     bool beamParallaxAllows(float d, float3 w)
@@ -5506,17 +5549,17 @@ struct HSTRCloudRenderer
         single = 0.f;
         const float3 w = beamRayDirection(float2(position));
         const float3 camera = gScene.camera.data.posW;
-        const float stored = beamLatticePrevAt(position, 1).a;
+        const float stored = params.beamRefFrame != 0 ? beamLatticeHeldAt(position, 1).a : beamLatticePrevAt(position, 1).a;
         // In the reference frame a basis point IS a world direction, and the frame did not turn with the camera, so the previous
         // build marched this very ray and its value sits at this very index. Nothing is reprojected and nothing is resampled: the
         // only thing that can invalidate it is the camera having MOVED, which parallax answers. This is the whole point of the
         // frame - rotation costs nothing, and the resampling that "tripled the error" for a turning camera cannot happen.
         if (params.beamRefFrame != 0)
         {
-            if (params.beamRefValid == 0 || beamLatticePrevAt(position, 2).y != float(params.beamFrame) - 1.f)
+            if (params.beamRefValid == 0 || !beamLatticeValid(position))
                 return false;
-            depthCache = beamLatticePrevAt(position, 0);
-            single = beamLatticePrevAt(position, 1);
+            depthCache = 0.f; // Already in place: the persistent lattice is not rewritten for a carry.
+            single = beamLatticeHeldAt(position, 1);
             if (stored <= 0.f)
                 return true; // The ray saw no opacity: no parallax can move what is not there.
             const float moved = beamCurrentDistance(stored, w);

@@ -1056,6 +1056,12 @@ struct HSTRCloudParams
     /// The same box for the build that wrote the history. A beam unit only holds a marched value if the previous build covered it,
     /// so this is what tells the per-pixel fallback that a unit which has just turned on screen has nothing to carry.
     float4 beamPrevScreenBounds = { 0, 0, 0, 0 };
+    /// 1 when the camera has not translated since the build that wrote the persistent lattice. A rotation alone cannot move a
+    /// basis point that is addressed by direction, so such a build reads and writes nothing for a carried point.
+    uint beamStationary = 0;
+    uint padBeamStationary0 = 0;
+    uint padBeamStationary1 = 0;
+    uint padBeamStationary2 = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

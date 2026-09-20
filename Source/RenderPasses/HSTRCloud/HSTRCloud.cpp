@@ -3147,8 +3147,8 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamRefInverse1 = rows[1];
     mParams.beamRefInverse2 = rows[2];
     mParams.beamRefValid = anchor ? 0u : 1u;
-    // One tile of guard each way: a tile test reads the lattice of the tile beyond its own.
-    const float slack = float(guard);
+    // Two tiles of guard each way: at level 0 a tile test reads the corners and centres of all eight neighbours.
+    const float slack = 2.f * float(guard);
     mParams.beamScreenBounds = float4(
         std::max(0.f, low.x - slack), std::max(0.f, low.y - slack), std::min(float(beamDim.x), high.x + slack),
         std::min(float(beamDim.y), high.y + slack)
@@ -3741,7 +3741,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mParams.beamQueue = queue ? 1u : 0u;
         if (history)
         {
-            if (!mpBeamLatticePrev || mpBeamLatticePrev->getWidth() != latticeDims.x || mpBeamLatticePrev->getHeight() != latticeDims.y)
+            // The reference frame's lattice is persistent: a basis point's index is its world direction, so there is nothing for a
+            // second image to hold and the query pass updates the one in place. That halves the lattice's memory, which is most of
+            // what beamRefMargin costs, and lets a direction that turns off screen keep its basis until it turns back.
+            if (mBeamRefFrame)
+                mpBeamLatticePrev = nullptr;
+            else if (!mpBeamLatticePrev || mpBeamLatticePrev->getWidth() != latticeDims.x ||
+                     mpBeamLatticePrev->getHeight() != latticeDims.y)
             {
                 mpBeamLatticePrev = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
                 mBeamRefreshValid = false;
@@ -3917,7 +3923,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 if (history)
                 {
                     // Last build's lattice and levels become the history; this build writes every root point and tile again.
-                    std::swap(mpBeamLattice, mpBeamLatticePrev);
+                    // The persistent lattice is never swapped - it IS the history - but the level map still is, because the
+                    // residual march needs to know which tiles failed last build.
+                    if (!mBeamRefFrame)
+                        std::swap(mpBeamLattice, mpBeamLatticePrev);
                     std::swap(mpBeamLevel, mpBeamLevelPrev);
                     mParams.beamHistoryValid = mBeamRefreshValid ? 1u : 0u;
                     mParams.beamPrevViewProj = mBeamPrevViewProj;
@@ -3926,10 +3935,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     // only the covered part holds marched values, so a unit that has just turned on screen has nothing to carry.
                     mParams.beamPrevScreenBounds = mBeamBuiltScreenBounds;
                     mBeamBuiltScreenBounds = mParams.beamScreenBounds;
+                    // A build the camera did not translate for cannot have moved any persistent point, so its carries touch memory
+                    // only to re-measure a distance that has not changed - which is to say, not at all.
+                    mParams.beamStationary = all(cameraPosition == mBeamPrevCamera) ? 1u : 0u;
                     ++mParams.beamFrame;
                 }
                 else
+                {
                     mParams.beamHistoryValid = 0;
+                    mParams.beamStationary = 0;
+                }
+                // A re-anchored frame shares no index with the one before it, so every mark in the persistent lattice goes.
+                if (mBeamRefFrame && mParams.beamRefValid == 0 && mpBeamLattice)
+                    pRenderContext->clearUAV(mpBeamLattice->getUAV().get(), float4(0.f));
                 const bool gridDispatch = (mBeamGridDispatch || history) && mParams.beamSegments == 1;
                 for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                 {

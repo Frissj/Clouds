@@ -27,6 +27,12 @@ BASE = dict(
     beamTolerance=0.05, beamEdgeContrast=0.5, beamShip=True, beamShipMask=509, beamSparse=False, beamSparseCut=False,
     beamRefreshBlock=4, beamCarryTolerance=0.0, beamDepthTolerance=0.05, beamRefMargin=0.15,
 )
+# Diagnostics. HSTR_MARGIN 0 makes the beam image the screen image exactly - same dims, zero offset, one beam unit per pixel - so
+# anything that still differs from the screen build is in the residual/resolve plumbing rather than in the frame mapping.
+# HSTR_TOL huge accepts every tile, leaving the basis alone with no residual at all.
+BASE["beamRefMargin"] = float(os.environ.get("HSTR_MARGIN", "0.15"))
+BASE["beamTolerance"] = float(os.environ.get("HSTR_TOL", "0.05"))
+BASE["beamEdgeContrast"] = float(os.environ.get("HSTR_EDGE", "0.5"))
 
 
 def aim(yaw):
