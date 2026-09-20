@@ -1,0 +1,12 @@
+HST
+Copyright (c) 2026 Sam Frisby.
+
+HST is based in part on NVIDIA Falcor.
+Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+Falcor-derived portions are licensed under NVIDIA's BSD 3-Clause license.
+
+HST-specific original work authored by Sam Frisby is licensed under the
+Apache License, Version 2.0.
+
+See LICENSE.md, LICENSES/, and THIRD_PARTY_NOTICES.md for the applicable
+license texts and third-party notices.

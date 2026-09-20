@@ -4,6 +4,10 @@ A research renderer for real-time, high-quality volumetric clouds at 4K.
 
 The performance target is **below 2 ms at 3840×2160** while preserving the required image quality against the saved path-traced reference.
 
+## Licensing
+
+HST is derived from NVIDIA Falcor. HST-specific original work authored by Sam Frisby is licensed under Apache-2.0. Falcor-derived portions remain subject to NVIDIA's BSD 3-Clause license, and bundled third-party components retain their own licenses. See [LICENSE.md](LICENSE.md), [LICENSES](LICENSES), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 This project is pursuing a **radical camera-rendering architecture**. It is **not** trying to make conventional volumetric ray marching incrementally faster.
 
 ---
