@@ -45,7 +45,9 @@ elif args.harness == "truth":
     env.update(HSTR_VIEWS=args.views, HSTR_SPP=str(args.spp))
     script = "scripts/HSTR/bench/sea_truth.py"
 else:
-    motions = [[m.split()[0].replace("_", " "), float(m.split()[1]), float(m.split()[2])] for m in args.motions] if args.motions else None
+    # "label forward yaw" or "label forward yaw sunRadiansPerFrame" - the sun rate is optional and per motion, so one run can
+    # hold a static-sun control beside a moving-sun arm instead of comparing across runs.
+    motions = [[m.split()[0].replace("_", " ")] + [float(v) for v in m.split()[1:]] for m in args.motions] if args.motions else None
     if motions:
         env["HSTR_MOTIONS"] = json.dumps(motions)
     env.update(HSTR_STEPS=str(args.steps), HSTR_FREEZE="0" if args.live else "1")

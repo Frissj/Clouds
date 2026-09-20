@@ -193,6 +193,10 @@ private:
     /// Rotation-invariant beam basis frame: the whole beam build runs in an image anchored to a world orientation instead of to the
     /// screen, so turning the camera neither invalidates a basis ray nor resamples one. See HSTRCloudParams::beamRefU.
     bool mBeamRefFrame = false;
+    /// EXPERIMENT. Build and keep the WHOLE reference image rather than only the part the screen covers, so a turn reveals no
+    /// direction that has never been marched. This is the gate on a persistent world-direction cache: if yaw then costs what
+    /// parked costs, the yaw penalty really is newly exposed directions and the cache is worth building.
+    bool mBeamRefPrebuild = false;
     float mBeamRefMargin = 0.15f; ///< Fraction of the frame the reference image reaches past each screen edge before re-anchoring.
     bool mBeamRefAnchored = false;
     float3 mBeamRefU = float3(0.f);
@@ -337,6 +341,11 @@ private:
     std::unique_ptr<hstrcloud::CloudResidency> mpCloudResidency;
     bool mCloudInstancesUploaded = false;
     uint32_t mCloudFrames = 0;
+    /// What invalidated the carried beam basis on the LAST frame, and how often each has since the view settled. A fixed refresh
+    /// rate is insurance against exactly these, so their frequency and coverage decide whether it can become event-driven.
+    bool mDensityChangedFrame = false;
+    uint32_t mDensityChangedFrames = 0;
+    uint32_t mSunBakeFrames = 0;
     float mSeaViewDistance = 4000.f; ///< Requested view distance; the sea clamps it to its resident window.
     float mCloudCacheKeep = 1.f;         ///< Pending decay of the world cache after sun changes.
     std::vector<uint32_t> mSunPageQueue; ///< Sea tiles whose sun pages refresh over the next frames, nearest first.

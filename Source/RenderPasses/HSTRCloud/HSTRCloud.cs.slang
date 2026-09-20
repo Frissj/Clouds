@@ -5310,19 +5310,27 @@ struct HSTRCloudRenderer
             return; // The basis carries this tile; the resolve reconstructs it.
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        // Carried where the previous build marched this very unit and the camera has not moved past its parallax.
-        if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest) &&
-            hstrBeamLevelPrev[unit / finest] >= params.beamLevels &&
-            all(float2(unit) + 1.f >= params.beamPrevScreenBounds.xy) && all(float2(unit) <= params.beamPrevScreenBounds.zw))
+        // Carried where THIS unit already holds a value marched for this direction, and the camera has not moved past its
+        // parallax. The residual image is persistent, so the question is about the unit itself rather than about what the
+        // previous build happened to cover: alpha < 0 means never marched since the frame was anchored, and that is the only
+        // thing that makes a unit new. That replaces two conditions that were really proxies for it - the previous level map
+        // (did this tile fail last build) and beamPrevScreenBounds (did the previous build reach this far) - and it lets a unit
+        // that leaves the screen and comes back carry, which neither proxy could express.
+        if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest))
         {
-            const float4 previous = hstrBeamPixelPrev[unit];
-            const float d = previous.a > 0.f ? beamCurrentDistance(previous.a, w) : 0.f;
-            if (previous.a <= 0.f || (d > 0.f && beamParallaxAllows(d, w)))
+            const float4 previous = hstrBeamPixelOutput[unit];
+            if (previous.a >= 0.f)
             {
-                hstrBeamPixelOutput[unit] = float4(previous.rgb, d);
-                uint unused;
-                InterlockedAdd(hstrBeamCounts[kBeamMaxLevels], 1u, unused);
-                return;
+                const float d = previous.a > 0.f ? beamCurrentDistance(previous.a, w) : 0.f;
+                if (previous.a == 0.f || (d > 0.f && beamParallaxAllows(d, w)))
+                {
+                    // A camera that has not translated cannot have moved this unit, so the carry writes nothing at all.
+                    if (params.beamStationary == 0 && previous.a > 0.f)
+                        hstrBeamPixelOutput[unit] = float4(previous.rgb, d);
+                    uint unused;
+                    InterlockedAdd(hstrBeamCounts[kBeamMaxLevels], 1u, unused);
+                    return;
+                }
             }
         }
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));

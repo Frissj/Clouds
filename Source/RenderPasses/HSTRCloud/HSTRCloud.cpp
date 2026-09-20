@@ -278,6 +278,11 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
+        if (key == "beamRefPrebuild")
+        {
+            mBeamRefPrebuild = bool(value);
+            continue;
+        }
         if (key == kCompareColumnLow)
         {
             mParams.compareColumnLow = uint32_t(value);
@@ -825,6 +830,7 @@ Properties HSTRCloud::getProperties() const
     props[kBeamTemporal] = mParams.beamTemporal != 0;
     props[kBeamAdaptiveRoot] = mParams.beamAdaptiveRoot != 0;
     props[kCompareBlock] = mParams.compareBlock;
+    props["beamRefPrebuild"] = mBeamRefPrebuild;
     props[kCompareColumnLow] = mParams.compareColumnLow;
     props[kCompareColumnHigh] = mParams.compareColumnHigh;
     props[kCompareMapScale] = mParams.compareMapScale;
@@ -951,6 +957,9 @@ Properties HSTRCloud::getProperties() const
         cloud["beamCutResidualSteps"] = mBeamLevelCounts[kBeamSparseCutResidualSteps];
         cloud["beamCutPaged"] = mBeamLevelCounts[kBeamSparseCutPaged];
         cloud["beamRefAnchors"] = mBeamRefAnchors;
+        cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
+        cloud["densityChangedFrames"] = mDensityChangedFrames;
+        cloud["sunBakeFrames"] = mSunBakeFrames;
         cloud["beamCutMarched"] = mBeamLevelCounts[kBeamSparseCutMarched];
         for (uint32_t level = 0; level < kBeamMaxLevels; ++level)
         {
@@ -2160,8 +2169,14 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mParams.cloudCommitCount = 0;
         mBeamReusable = false;
     }
+    if (mpCloudResidency->getStats().sunBakesFrame > 0)
+        ++mSunBakeFrames;
+    mDensityChangedFrame = densityChanged;
     if (densityChanged)
+    {
         mBeamReusable = false;
+        ++mDensityChangedFrames;
+    }
     if (++mCloudFrames % 240 == 0)
     {
         const auto& stats = mpCloudResidency->getStats();
@@ -2832,8 +2847,14 @@ void HSTRCloud::solveLighting()
     if (mParams.cloudDomain != 0)
     {
         // The sea has no Schur hierarchy: its transport is the world cache and the sun pages, rebuilt for the new lights.
+        //
+        // updateSunVoxelDirection has just queued EVERY tile, nearest to the camera first, for the throttle at the top of execute
+        // to spread over mCloudSunTilesPerFrame frames. Setting mResidualDirty here threw that queue away (see the else branch
+        // beside the throttle) and rebuilt the whole fine-sun volume in ONE dispatch on every frame the sun moved: residualPages
+        // 1.08 ms through a 0.57 deg/frame sweep, against nothing at all for a static sun, which was most of the 0.91 -> 2.60 ms
+        // a moving sun cost parked. A sun move invalidates lighting, not density, and the beam basis carries through it
+        // unharmed - refresh 16 and refresh 256 score the same 0.024% under the sweep - so it does not have to be paid at once.
         updateSunVoxelDirection();
-        mResidualDirty = true;
         return;
     }
     if (mHierarchy.getRoot() == hstr::HierarchyNode::kInvalid)
@@ -2978,8 +2999,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
-    var["hstrBeamPixelPrev"] = mpBeamPixels[mBeamParity ^ 1u];
-    var["hstrBeamPixels"] = mpBeamPixels[mBeamParity];
+    var["hstrBeamPixelPrev"] = mpBeamPixels[mBeamRefFrame ? 0u : (mBeamParity ^ 1u)];
+    var["hstrBeamPixels"] = mpBeamPixels[mBeamRefFrame ? 0u : mBeamParity];
     var["hstrBeamQueue"] = mpBeamQueue;
     var["hstrBeamQueueCounts"] = mpBeamQueueCounts;
     var["hstrBeamLists"] = mpBeamLists[mBeamParity];
@@ -3020,6 +3041,7 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     if (!mpLeafResidual || mpLeafResidual->getElementCount() != leafCount)
         mpLeafResidual = mpDevice->createStructuredBuffer(sizeof(uint32_t), leafCount, flags, MemoryType::DeviceLocal, nullptr, false);
 
+    FALCOR_PROFILE(pRenderContext, "fineSun");
     if (mParams.cloudDomain != 0 && !mResidualDirty)
     {
         // Sea tiles whose cloud changed, and the tiles in their shadow, recompute their sun pages; the rest stays valid. The residual
@@ -3052,7 +3074,10 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     }
     mSunPageSlots.clear();
 
-    // Octaves 1-3: scatterer-weighted sun arrival on a 2-voxel grid, spread by a separable Gaussian.
+    // Octaves 1-3: scatterer-weighted sun arrival on a 2-voxel grid, spread by a separable Gaussian. This runs over the WHOLE
+    // volume however few tiles were dirty, so throttling the fine-sun tiles above does not reduce it - which is why the sea's
+    // per-tile path did not make residualPages any cheaper under a moving sun. Scoped separately to price the two halves.
+    FALCOR_PROFILE(pRenderContext, "sunOctaves");
     const uint3 octaveDims = (fineDims + 1u) / 2u;
     mParams.hstrOctaveDims = octaveDims;
     for (auto& texture : mpSunOctaves)
@@ -3155,6 +3180,13 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
         mBeamHistoryValid = false;
         mParams.beamHistoryValid = 0;
         mBeamReusable = false;
+        low = float2(0.f);
+        high = float2(beamDim);
+    }
+    // See mBeamRefPrebuild: the whole image is the build region, so nothing is ever "off screen" to the basis, the residual or
+    // the carry, and a turn only changes which already-built directions are resolved.
+    if (mBeamRefPrebuild)
+    {
         low = float2(0.f);
         high = float2(beamDim);
     }
@@ -3776,7 +3808,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamLatticePrev = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
                 mBeamRefreshValid = false;
             }
-            if (!mpBeamLevelPrev || mpBeamLevelPrev->getWidth() != levelDims.x || mpBeamLevelPrev->getHeight() != levelDims.y)
+            if (mBeamRefFrame)
+                mpBeamLevelPrev = nullptr; // Persistent: never read, never swapped.
+            else if (!mpBeamLevelPrev || mpBeamLevelPrev->getWidth() != levelDims.x || mpBeamLevelPrev->getHeight() != levelDims.y)
             {
                 mpBeamLevelPrev = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 mBeamRefreshValid = false;
@@ -3947,11 +3981,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 if (history)
                 {
                     // Last build's lattice and levels become the history; this build writes every root point and tile again.
-                    // The persistent lattice is never swapped - it IS the history - but the level map still is, because the
-                    // residual march needs to know which tiles failed last build.
+                    // Nothing in the reference frame is swapped: lattice, level map and residual are all addressed by world
+                    // direction, so each IS its own history and the build updates it in place. The residual carries its validity
+                    // in its own alpha (negative until marched since the anchor), which is what replaced asking the previous
+                    // level map which tiles failed and the previous screen box which units it covered.
                     if (!mBeamRefFrame)
+                    {
                         std::swap(mpBeamLattice, mpBeamLatticePrev);
-                    std::swap(mpBeamLevel, mpBeamLevelPrev);
+                        std::swap(mpBeamLevel, mpBeamLevelPrev);
+                    }
                     mParams.beamHistoryValid = mBeamRefreshValid ? 1u : 0u;
                     mParams.beamPrevViewProj = mBeamPrevViewProj;
                     mParams.beamPrevCamera = mBeamPrevCamera;
@@ -3970,8 +4008,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mParams.beamStationary = 0;
                 }
                 // A re-anchored frame shares no index with the one before it, so every mark in the persistent lattice goes.
-                if (mBeamRefFrame && mParams.beamRefValid == 0 && mpBeamLattice)
-                    pRenderContext->clearUAV(mpBeamLattice->getUAV().get(), float4(0.f));
+                if (mBeamRefFrame && mParams.beamRefValid == 0)
+                {
+                    if (mpBeamLattice)
+                        pRenderContext->clearUAV(mpBeamLattice->getUAV().get(), float4(0.f));
+                    if (mpBeamPixels[0])
+                        pRenderContext->clearUAV(mpBeamPixels[0]->getUAV().get(), float4(0.f, 0.f, 0.f, -1.f));
+                }
                 const bool gridDispatch = (mBeamGridDispatch || history) && mParams.beamSegments == 1;
                 for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                 {
@@ -4091,7 +4134,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             bindRenderer(pRenderContext, pMarch);
             pMarch->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
             pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] =
-                (mParams.beamRefresh != 0 || unitMarch) ? mpBeamPixels[mBeamParity] : ref<Texture>();
+                (mParams.beamRefresh != 0 || unitMarch) ? mpBeamPixels[unitMarch ? 0u : mBeamParity] : ref<Texture>();
             // The unit march writes the same texture the resolve reads, so its read view goes away for this dispatch.
             if (unitMarch)
                 pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixels"] = ref<Texture>();

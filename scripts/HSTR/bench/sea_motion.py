@@ -47,9 +47,19 @@ def settle():
     return 1500
 
 
-def pose(frame, forward, yaw):
+# Radians of sun rotation per frame, as a motion's optional fourth element ["label", forward, yaw, sun]; HSTR_SUN_RATE is the
+# default for motions that do not give one. A carried beam basis holds LIGHTING as well as transport, so a moving sun is the one
+# hazard a fixed refresh rate is genuinely insurance against, and no other motion here exercises it. The per-step oracle is
+# captured at the same sun as the frame it scores, so correctness needs no special handling.
+SUN_RATE = float(os.environ.get("HSTR_SUN_RATE", "0"))
+
+
+def pose(frame, forward, yaw, sun=0.0):
     # Frame 0 is the settled view; the path runs through it, so every flight starts WARM frames before it.
     import math
+    if sun != 0.0:
+        a = sun * frame
+        hstr.set_properties({"sunDirection": float3(math.cos(a) * 0.6, 0.75, math.sin(a) * 0.6)})
     offset = float3(0, 0, forward * frame)
     angle = yaw * frame
     view = START_TARGET - START_POSITION
@@ -58,7 +68,7 @@ def pose(frame, forward, yaw):
     cam.target = START_POSITION + offset + turned
 
 
-def timed(frames, first, forward, yaw):
+def timed(frames, first, forward, yaw, sun=0.0):
     import time
     m.profiler.enabled = True
     m.profiler.start_capture()
@@ -68,7 +78,7 @@ def timed(frames, first, forward, yaw):
     trace = {"sunStale": 0, "sunBakesFrame": 0}
     peak = {"unmapBacklog": 0, "mapBacklog": 0, "activeFades": 0, "undesiredFadingOut": 0}
     for i in range(frames):
-        pose(first + i, forward, yaw)
+        pose(first + i, forward, yaw, sun)
         m.renderFrame()
         if TRACE_SUN:  # Reads the counts back every frame: the timings are not the shipping ones.
             s = stats()
@@ -120,16 +130,17 @@ hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": os.environ.
 settled = stats()
 log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun baked {settled.get('sunBaked', 0)}, waiting "
     f"{settled.get('sunWaiting', 0)}, slots free {settled.get('sunSlotsFree', 0)})")
-for motion, forward, yaw in MOTIONS:
+for motion, forward, yaw, *rest in MOTIONS:
+    sun = float(rest[0]) if rest else SUN_RATE
     for test, properties in TESTS:
         hstr.set_properties(dict(BASE, **properties))
         for i in range(WARM):
-            pose(i - WARM - TIMED, forward, yaw)
+            pose(i - WARM - TIMED, forward, yaw, sun)
             m.renderFrame()
-        t = timed(TIMED, -TIMED, forward, yaw)
+        t = timed(TIMED, -TIMED, forward, yaw, sun)
         errors = []
         for step in range(STEPS):
-            pose(step, forward, yaw)
+            pose(step, forward, yaw, sun)
             hstr.set_properties(BASE)
             m.renderFrame()
             hstr.set_properties({"storeExact": True})
