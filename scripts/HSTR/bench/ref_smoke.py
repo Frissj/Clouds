@@ -1,6 +1,10 @@
 import json
 import os
+import sys
 from falcor import *
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sea_config import REFERENCE
 
 # Fast check that the rotation-invariant beam basis frame renders the same image as the screen-space build, parked and after a turn.
 # It answers "is the reference frame correct and does a turn stop rebuilding it", not "is it fast" - use run_sea.py motion for that.
@@ -54,8 +58,15 @@ hstr.set_properties({"worldCacheUpdates": 0})
 
 def measure(label, props, yaw):
     # The exact per-pixel frame of THIS camera is the reference, so a turn is compared against its own truth.
+    #
+    # This MUST be sea_config.REFERENCE: debugView 8, the world-cache march at one-voxel steps. Until 2026-09-20 this smoke
+    # captured its "exact" frame at debugView 9 - the BEAM renderer in screen layout with reuse off - so every number it produced
+    # measured "does the reference layout agree with the screen layout", not "is the reference layout correct". That is not a
+    # pedantic difference here: the widened reference image HOLDS basis values past the viewport, so its adaptive test has
+    # strictly MORE information at a screen-edge tile than the screen layout has. Disagreement there was read as the reference
+    # frame being wrong, when it may be the screen layout that is.
     aim(yaw)
-    hstr.set_properties(dict(BASE, beamRefresh=0, beamRefFrame=False))
+    hstr.set_properties(dict(REFERENCE, **({} if os.environ.get("HSTR_TRUTH", "pixel") == "pixel" else dict(BASE, beamRefresh=0, beamRefFrame=False))))
     m.renderFrame()
     hstr.set_properties({"storeExact": True})
     m.renderFrame()

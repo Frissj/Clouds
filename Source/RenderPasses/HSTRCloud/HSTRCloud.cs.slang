@@ -5246,14 +5246,6 @@ struct HSTRCloudRenderer
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
-        // The final screen tile has no basis neighbour beyond the viewport, while a widened reference frame does. March this one
-        // endpoint tile exactly in both layouts so the two representations cannot expose a thin right-edge seam.
-        if (pixel.x + params.beamTileSize >= params.frameDim.x)
-        {
-            const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
-            color[pixel] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo), 1.f);
-            return;
-        }
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
         if (level == params.beamLevels + 1u)
