@@ -288,6 +288,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamGuard")
+        {
+            mBeamGuard = bool(value);
+            continue;
+        }
+        if (key == "beamAssumeCarry")
+        {
+            mParams.beamAssumeCarry = uint32_t(bool(value));
+            continue;
+        }
         if (key == "beamReset")
         {
             // Drops the persistent beam image so the next build starts from nothing. The octahedral image is fixed to the WORLD
@@ -885,6 +895,8 @@ Properties HSTRCloud::getProperties() const
     props["beamOctFull"] = mBeamOctFull;
     props["beamOctAxis"] = mBeamOctAxis;
     props["beamScreenResidual"] = mBeamScreenResidual;
+    props["beamAssumeCarry"] = mParams.beamAssumeCarry != 0;
+    props["beamGuard"] = mBeamGuard;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
@@ -3059,6 +3071,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamPageTable"] = mpBeamPageTable;
+    var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
+    var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
@@ -3176,6 +3190,7 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamOct = mBeamOct && mBeamRefFrame && mpScene ? 1u : 0u;
     mParams.beamOctFull = mBeamOctFull ? 1u : 0u;
     mParams.beamOctAxis = mBeamOctAxis;
+    mParams.beamGuard = mBeamGuard && mBeamRefFrame && mpScene ? 1u : 0u;
     mParams.beamScreenResidual = mBeamOct && mBeamScreenResidual && mBeamRefFrame && mpScene ? 1u : 0u;
     if (!mBeamRefFrame || !mpScene)
     {
@@ -3275,12 +3290,25 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamRefInverse1 = rows[1];
     mParams.beamRefInverse2 = rows[2];
     mParams.beamRefValid = anchor ? 0u : 1u;
+    // A block's angular reach: its own points, plus the two tiles a reconstruction can read past them. The beam image widens the
+    // screen's angle and its pixel count by the same factor, so a beam pixel spans the angle a screen pixel does, and the centre
+    // value is the largest one a perspective frame has.
+    mParams.beamGuardAngle = beamGuardReach(frameDim, camera) * (2.f * length(camera.cameraU)) /
+                             (std::max(length(camera.cameraW), 1e-6f) * float(frameDim.x));
     // Two tiles of guard each way: at level 0 a tile test reads the corners and centres of all eight neighbours.
     const float slack = 2.f * float(guard);
     mParams.beamScreenBounds = float4(
         std::max(0.f, low.x - slack), std::max(0.f, low.y - slack), std::min(float(beamDim.x), high.x + slack),
         std::min(float(beamDim.y), high.y + slack)
     );
+}
+
+/// Beam pixels a translation guard block reaches across: its own lattice points, plus the two tiles a level-0 tile test reads past
+/// them. The bound the guard certifies is conservative in this reach, so it is taken at the outside.
+float HSTRCloud::beamGuardReach(const uint2& frameDim, const CameraData& camera) const
+{
+    const uint32_t block = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
+    return float(block + 2u * std::max(mParams.beamTileSize, 1u));
 }
 
 /// Places the octahedral beam image. There is no anchor and so no re-anchor: the image is the sphere, a direction's texel is
@@ -3348,6 +3376,9 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
         pad = 0.f;
     }
     mParams.beamFrameDim = uint2(dim, dim);
+    // An octahedral texel is anisotropic - at the diamond mid-edge the map's singular values are 2.36 and 1.20 - so the reach has
+    // to be taken along the worst axis, not on average, or the guard would certify blocks it has no right to.
+    mParams.beamGuardAngle = beamGuardReach(frameDim, camera) * 2.36f * 2.f / float(dim);
     mParams.beamRefU = camera.cameraU;
     mParams.beamRefV = camera.cameraV;
     mParams.beamRefW = camera.cameraW;
@@ -3899,6 +3930,18 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 );
             }
         }
+        // Translation guard: one entry per block of beamRefreshBlock lattice points, the same blocks the refresh phase uses.
+        {
+            const uint2 guardDims = (latticeDims + (std::max(mParams.beamRefreshBlock, 1u) - 1u)) / std::max(mParams.beamRefreshBlock, 1u);
+            if (!mpBeamGuardDepth || mpBeamGuardDepth->getWidth() != guardDims.x || mpBeamGuardDepth->getHeight() != guardDims.y)
+            {
+                mpBeamGuardDepth =
+                    mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                mpBeamGuardCamera =
+                    mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+                mBeamGuardCleared = false;
+            }
+        }
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
         // Full-resolution guide for the tile tests. Near view at 4K (one segment per query, moving camera), 4x1 tiles, mean 8-bit
@@ -4183,6 +4226,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 {
                     mParams.beamHistoryValid = 0;
                     mParams.beamStationary = 0;
+                }
+                // The guard claims a block was verified from a camera; a rebuilt image makes every such claim false, and an
+                // uncleared one holds whatever the allocation left behind. Either way it has to be emptied before it is believed.
+                if (mpBeamGuardDepth && (!mBeamGuardCleared || (mBeamRefFrame && mParams.beamRefValid == 0)))
+                {
+                    pRenderContext->clearUAV(mpBeamGuardDepth->getUAV().get(), uint4(0xFFFFFFFFu));
+                    pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
+                    mBeamGuardCleared = true;
                 }
                 // A re-anchored frame shares no index with the one before it, so every mark in the persistent lattice goes.
                 if (mBeamRefFrame && mParams.beamRefValid == 0)

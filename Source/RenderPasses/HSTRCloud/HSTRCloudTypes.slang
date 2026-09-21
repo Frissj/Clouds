@@ -1123,6 +1123,31 @@ struct HSTRCloudParams
     /// the residual's carry - every failed pixel marches every build. That is the trade this exposes: marching time against the
     /// memory a higher-resolution sphere would need.
     uint beamScreenResidual = 0;
+    /// PROBE, not a feature: 1 lets a TRANSLATED point take the stationary carry path without testing its parallax.
+    ///
+    /// The image it produces is wrong - nothing is ever invalidated by moving - and the point is the timing. Measured, 98.93% of
+    /// points survive translation at 20 units per frame, yet every one of the 1.067M swept points runs beamReprojectQuery, which
+    /// reads a thirteen-sample neighbourhood to discover it. A per-block parallax certificate would let a surviving block skip
+    /// that read entirely, and this prices what such a certificate could win before any of it is built.
+    uint beamAssumeCarry = 0;
+    /// 1 when a translated point may be certified as surviving by its BLOCK instead of by testing itself.
+    ///
+    /// The renderer asks a million points whether translation invalidated them to find the eleven thousand that it did - 98.93%
+    /// survive at 20 units per frame - and each question reads a thirteen-sample neighbourhood through beamReprojectQuery. A
+    /// block keeps the smallest distance any of its points has stored and the camera position it was last verified from. The
+    /// stored depth of a sample and the depth predicted for it can then differ by at most |dP| * theta over the block's angular
+    /// reach, so while
+    ///
+    ///     |P - verifiedFrom| * beamGuardAngle <= beamDepthTolerance * blockMinDistance
+    ///
+    /// every point in it still agrees and none of them need to be asked. Measured ceiling for this, with the test skipped
+    /// outright: the level-0 query pass goes 0.86 ms to 0.07 at fly 20, and the whole frame 2.09 to 1.15.
+    uint beamGuard = 0;
+    /// Angular reach of a block in radians: its points, plus the two tiles a reconstruction can read past them. In the octahedral
+    /// image a texel is anisotropic, so this uses the LARGEST singular value of the map - 2.36 at the diamond mid-edge - because
+    /// the bound has to hold along the worst axis rather than on average.
+    float beamGuardAngle = 0.f;
+    uint2 beamGuardReserved = { 0, 0 };
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

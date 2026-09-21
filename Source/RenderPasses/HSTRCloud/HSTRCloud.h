@@ -225,6 +225,7 @@ private:
     float4 mBeamBuiltScreenBounds = float4(0.f); ///< beamScreenBounds of the build that most recently wrote the beam image.
     void updateBeamReferenceFrame(const uint2& frameDim);
     void updateBeamOctFrame(const uint2& frameDim, const CameraData& camera);
+    float beamGuardReach(const uint2& frameDim, const CameraData& camera) const;
     // beamRefresh: the previous build's lattice and level map (swapped with the current ones every build), its marched pixels
     // (the two alternate), and its camera.
     ref<Texture> mpBeamLatticePrev;
@@ -258,6 +259,10 @@ private:
     float3 mBeamPrevCamera = float3(0.f);
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
     ref<Buffer> mpBeamPageTable; ///< Identity page table for the beamPageIndirect probe.
+    ref<Texture> mpBeamGuardDepth;  ///< Per block: the smallest distance any of its lattice points holds.
+    ref<Texture> mpBeamGuardCamera; ///< Per block: the camera position its points were last tested against.
+    bool mBeamGuard = false;        ///< Certify translation survival per block instead of per point.
+    bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
     ref<Texture> mpBeamQueryMap; ///< Sparse query ID per possible lattice coordinate.
     ref<Texture> mpBeamTileMap;  ///< Final sparse tile ID per finest cell.

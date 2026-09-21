@@ -334,6 +334,10 @@ struct HSTRCloudRenderer
     Texture2DArray<float4> hstrBeamLattice;
     /// Identity page table for the indirection probe (params.beamPageIndirect).
     StructuredBuffer<uint> hstrBeamPageTable;
+    /// Per block of lattice points: the smallest distance any of its points holds, and the camera it was last verified from.
+    /// Together they certify that translation cannot have invalidated the block (params.beamGuard).
+    RWTexture2D<uint> hstrBeamGuardDepth;
+    RWTexture2D<float4> hstrBeamGuardCamera;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
@@ -5491,7 +5495,12 @@ struct HSTRCloudRenderer
         // A parked camera cannot move a persistent point: it already holds the value, measured from this very camera, so the
         // carry has nothing to read, nothing to test and nothing to write.
         const bool persistent = params.beamRefFrame != 0;
-        if (persistent && params.beamStationary != 0 && params.beamRefValid != 0 && !beamRefreshes(point, centre) &&
+        // beamAssumeCarry answers "what if a translated point could be certified as surviving without testing it": it takes the
+        // same early-out a parked camera takes. The result is not a correct image, only a floor on what the test costs.
+        // beamGuard is that early-out earned rather than assumed - see beamBlockCertified.
+        const bool stationary =
+            params.beamStationary != 0 || params.beamAssumeCarry != 0 || beamBlockCertified(position);
+        if (persistent && stationary && params.beamRefValid != 0 && !beamRefreshes(point, centre) &&
             beamLatticeValid(position))
         {
             uint held;
@@ -5509,6 +5518,8 @@ struct HSTRCloudRenderer
                 carryBeamQuery(position, single); // Only the distance moves; the radiance and the mark are already in place.
             else
                 writeBeamQuery(position, depthCache, single, carriedSteps);
+            // This point was tested in full against this camera, so it is entitled to vouch for its block.
+            beamGuardVerified(position, single.a);
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, unused);
             if (params.beamRefreshDebug == 7)
@@ -5522,6 +5533,7 @@ struct HSTRCloudRenderer
         }
         const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+        beamGuardVerified(position, q.distance);
         if (params.beamRefreshDebug == 7)
         {
             uint unused;
@@ -5595,6 +5607,55 @@ struct HSTRCloudRenderer
 
     /// Whether a persistent basis point holds a value marched since the frame was anchored.
     bool beamLatticeValid(uint2 position) { return beamLatticeHeldAt(position, 2).y > 0.5f; }
+
+    /// The guard entry covering a lattice point: blocks are beamRefreshBlock points square, the same blocks the refresh phase uses.
+    uint2 beamGuardCell(uint2 position)
+    {
+        return (position / params.beamLatticeStep) / max(params.beamRefreshBlock, 1u);
+    }
+
+    /// Whether translation since this block was last verified is small enough that none of its points can have failed.
+    ///
+    /// A sample stored at distance s for direction w_s is asked to stand for a point at predicted distance d along w. Under a
+    /// camera displacement dP those two move by dot(dP, w_s) and dot(dP, w), so they can separate by at most |dP| * |w_s - w|,
+    /// which over a block of angular reach theta is |dP| * theta. The per-point test accepts while the separation stays within
+    /// beamDepthTolerance of the distance, so the block as a whole is safe while that bound stays under the tolerance times the
+    /// SMALLEST distance any of its points holds. Everything here is conservative: an unverified block (depth still at the clear
+    /// value) is never certified, and a stale minimum is always too small rather than too large.
+    bool beamBlockCertified(uint2 position)
+    {
+        if (params.beamGuard == 0 || params.beamRefFrame == 0 || params.beamHistoryValid == 0)
+            return false;
+        const uint2 cell = beamGuardCell(position);
+        const uint stored = hstrBeamGuardDepth[cell];
+        if (stored == 0xFFFFFFFFu)
+            return false; // Never verified, so nothing is known about it.
+        const float minimum = asfloat(stored);
+        if (!(minimum > 0.f))
+            return false;
+        const float4 verified = hstrBeamGuardCamera[cell];
+        if (verified.w < 0.5f)
+            return false;
+        const float moved = length(gScene.camera.data.posW - verified.xyz);
+        return moved * params.beamGuardAngle <= params.beamDepthTolerance * minimum;
+    }
+
+    /// Records what a point that took the full test this build proves about its block: the camera it was verified from, and a
+    /// running minimum of the distances its points hold. The minimum is never raised - a block that has drifted nearer keeps the
+    /// smaller value and is simply re-verified sooner, which costs work rather than correctness.
+    void beamGuardVerified(uint2 position, float distance)
+    {
+        if (params.beamGuard == 0)
+            return;
+        const uint2 cell = beamGuardCell(position);
+        if (distance > 0.f)
+        {
+            uint previous;
+            InterlockedMin(hstrBeamGuardDepth[cell], asuint(distance), previous);
+        }
+        // Every thread of the block writes the same camera, so the race between them has one outcome.
+        hstrBeamGuardCamera[cell] = float4(gScene.camera.data.posW, 1.f);
+    }
 
     /// Updates only the distance a carried point is measured from, so the next build's parallax test still reads it relative to
     /// that build's camera. The radiance and the validity are already in place and are not rewritten.

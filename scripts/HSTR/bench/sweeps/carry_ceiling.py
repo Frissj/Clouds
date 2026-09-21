@@ -1,34 +1,38 @@
 from sea_config import mk
 
-# What a carried basis could be worth under rotation, before building a rotation-invariant basis frame.
+# What would a per-block parallax certificate be worth?
 #
-# beamReprojectQuery already reprojects properly: it takes the point's own stored distance, projects it through beamPrevViewProj and
-# reconstructs the previous lattice there. Under pure rotation that reprojection is EXACT - no world-space ray becomes invalid, only
-# its screen address moves. What costs quality is that the needed direction does not land on the previous lattice, so the value is
-# resampled through the previous basis, and the source comment records the consequence: "a turning camera, which reprojects exactly,
-# still tripled the error - resampled through failing tiles, every frame".
+# At 20 units per frame 98.93% of the 1.067M swept points survive translation, but every one of them runs beamReprojectQuery to
+# find that out, and that reads a thirteen-sample neighbourhood. A certificate - one conservative depth bound per block of points -
+# would let a surviving block skip the read entirely. beamAssumeCarry prices the ceiling on that before it is built: it lets a
+# translated point take the same early-out a parked camera takes, without testing anything.
 #
-# These arms price that. "checked" is the shipped carry. "unchecked" disables the three rejections (the failing-tile test via
-# beamRefreshDebug 5, the depth agreement via a tolerance nothing can exceed, the carry spread via beamCarryTolerance 0), so every
-# point the pattern does not refresh is carried whatever the resampling did. That is the CEILING of any carry scheme on this basis:
-# its time is what a rotation-invariant basis would cost, and its error is what the resampling costs. refresh 16 pushes the same
-# question further - one point in sixteen marched - so the two together separate "how cheap can carrying get" from "how wrong".
+# The image it produces is WRONG. Nothing is ever invalidated by moving, so quality in that arm is meaningless and only its time is
+# being read. The dispatch is left sweeping in both arms, so the difference is the per-thread test alone and not the work
+# generation that would come after it.
 COMMON = dict(
-    beamSparse=False,
-    beamSparseCut=False,
-    beamSparseMinLevel=2,
-    beamQueue=False,
-    beamGridDispatch=False,
+    beamTileSize=4,
+    beamLevels=1,
     beamSegments=1,
     beamTemporal=False,
+    beamSparse=False,
+    beamSparseCut=False,
+    beamQueue=False,
+    beamGridDispatch=False,
     beamRefreshBlock=4,
     beamCarryTolerance=0.0,
+    beamDepthTolerance=0.05,
+    beamRefreshDebug=0,
+    beamRefFrame=True,
+    beamRefresh=256,
+    beamTolerance=0.05,
 )
-UNCHECKED = dict(beamRefreshDebug=5, beamDepthTolerance=1.0e9)
 
+RECT = dict(COMMON, beamOct=False, beamRefMargin=0.15)
+OCT = dict(COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0)
 TESTS = [
-    ("no reuse", mk(**COMMON, beamRefresh=0, beamRefreshDebug=0, beamDepthTolerance=0.05)),
-    ("refresh4 checked", mk(**COMMON, beamRefresh=4, beamRefreshDebug=0, beamDepthTolerance=0.05)),
-    ("refresh4 unchecked", mk(**COMMON, beamRefresh=4, **UNCHECKED)),
-    ("refresh16 unchecked", mk(**COMMON, beamRefresh=16, **UNCHECKED)),
+    ("rect", mk(**RECT, beamAssumeCarry=False)),
+    ("rect ceiling", mk(**RECT, beamAssumeCarry=True)),
+    ("oct", mk(**OCT, beamAssumeCarry=False)),
+    ("oct ceiling", mk(**OCT, beamAssumeCarry=True)),
 ]
