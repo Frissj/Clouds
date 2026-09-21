@@ -267,6 +267,8 @@ private:
     ref<Texture> mpBeamGuardDepth;  ///< Per block: the smallest distance any of its lattice points holds.
     ref<Texture> mpBeamGuardCamera; ///< Per block: the camera position its points were last tested against.
     bool mBeamGuard = false;        ///< Certify translation survival per block instead of per point.
+    bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
+    float mBeamGuardParallax = 1.f; ///< Texels of parallax a guard block may accumulate before it is re-marched.
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
     ref<Buffer> mpBeamDirtyCount;
@@ -284,6 +286,9 @@ private:
     ref<ComputePass> mpBeamDirtyArgsPass;
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
+    ref<ComputePass> mpBeamDirtyTilePass;
+    ref<ComputePass> mpBeamRefreshListPass;
+    bool mBeamGuardDriven = false; ///< This build's blocks all came from the guard's dirty list: no grid regions, no sweeps.
     bool mBeamDirtyActive = false; ///< This build listed invalidated blocks, so the residual has to cover them too.
     uint32_t mBeamClassifyCells = 0; ///< Guard blocks the classification examined, against the whole grid it used to walk.
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.

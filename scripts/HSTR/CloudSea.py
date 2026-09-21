@@ -54,6 +54,8 @@ g.addPass(createPass("HSTRCloud", {
     "beamOctFull": False,
     "beamOctScale": 1.0,
     "beamGuard": True,
+    # The anchoring build covers the whole sphere (about 97 ms once, at 4K), so a turn lands on directions already built.
+    "beamPrebuild": True,
     "beamRefresh": 256,
     "beamRefreshBlock": 4,
     "beamDepthTolerance": 0.05,

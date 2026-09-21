@@ -96,6 +96,8 @@ static const uint kPhotonAlive = 1u << 17;
 /// hstrBeamCoarseState: one bit per child of a 4 x 4 coarse cell (beamCoarseShift 2 is the most sixteen bits hold), and a flag.
 static const uint kBeamCoarseChildren = 0xFFFF;
 static const uint kBeamCoarseQueued = 1u << 16;
+/// Root tiles around a dirty block whose test reads its basis (beamTransmittanceRange reaches two tiles), see testBeamDirtyTile.
+static const uint kBeamDirtyApron = 2;
 
 /// Reference averages of a set of components over the even-frame half, the odd-frame half, and both.
 struct ReferenceHalves
@@ -4201,7 +4203,7 @@ struct HSTRCloudRenderer
     /// never built - a direction only earns a basis when it turns on screen, and then it has no history to carry anyway.
     bool beamBoxOnScreen(float2 low, float2 high)
     {
-        if (params.beamRefFrame == 0)
+        if (params.beamRefFrame == 0 || params.beamBuildAll != 0)
             return true;
         if (params.beamOct != 0 && params.beamOctNdcPerTexel > 0.f)
         {
@@ -4221,9 +4223,41 @@ struct HSTRCloudRenderer
         return all(high >= params.beamScreenBounds.xy) && all(low <= params.beamScreenBounds.zw);
     }
 
+    /// With the translation guard, whether anything is built at all is decided per GUARD BLOCK, never per point, tile or unit.
+    ///
+    /// The guard certifies a block from the points of it that were verified, and from then on nobody asks about the block again
+    /// until the camera moves. If a block straddling the screen edge had only its on-screen part built, the certificate vouched
+    /// for points, tiles and units that were skipped - and when a turn brought them on screen nothing listed them, because the
+    /// block was "done". Measured, 4K flick from a reset: dashed seams through the clouds along the edges of everything built
+    /// earlier, which survived both the turn-driven dirty list and the tile apron. So a block is built whole or not at all:
+    /// its tiles and units while the block is on screen, and its basis points while the block or any block whose tiles read them
+    /// (beamTransmittanceRange reaches two tiles, rounded up to whole blocks) is.
+    bool beamGuardBlocks() { return params.beamGuard != 0 && params.beamRefFrame != 0 && params.beamDirtyBlockEdge != 0; }
+
+    bool beamGuardBlockOnScreen(uint2 cell, uint dilate)
+    {
+        const float edge = float(params.beamDirtyBlockEdge);
+        return beamBoxOnScreen((float2(cell) - float(dilate)) * edge, (float2(cell) + 1.f + float(dilate)) * edge);
+    }
+
+    /// Guard blocks around a block whose tiles read its basis points.
+    uint beamGuardReachBlocks()
+    {
+        return (2u * params.beamTileSize + params.beamDirtyBlockEdge - 1u) / max(params.beamDirtyBlockEdge, 1u);
+    }
+
+    bool beamUnitOnScreen(uint2 unit)
+    {
+        if (beamGuardBlocks())
+            return beamGuardBlockOnScreen(unit / params.beamDirtyBlockEdge, 0);
+        return beamBoxOnScreen(float2(unit), float2(unit) + 1.f);
+    }
+
     bool beamTileOnScreen(uint level, uint2 tile)
     {
         const float s = float(beamTileEdge(level));
+        if (level == 0 && beamGuardBlocks())
+            return beamGuardBlockOnScreen(tile * beamTileEdge(0) / params.beamDirtyBlockEdge, 0);
         return beamBoxOnScreen(float2(tile) * s, (float2(tile) + 1.f) * s);
     }
 
@@ -4233,6 +4267,8 @@ struct HSTRCloudRenderer
     /// reference frame shows (max log 7.88e-2 on about 0.002% of pixels, bit-identical before and after), which is still open.
     bool beamPointOnScreen(uint2 position)
     {
+        if (beamGuardBlocks())
+            return beamGuardBlockOnScreen(position / params.beamDirtyBlockEdge, beamGuardReachBlocks());
         const float s = 2.f * float(params.beamTileSize);
         return beamBoxOnScreen(float2(position) - s, float2(position) + s);
     }
@@ -5303,6 +5339,41 @@ struct HSTRCloudRenderer
             writeBeamLevel(level, tile, params.beamLevels);
     }
 
+    /// The root tile test over the guard's dirty list: every tile of every listed block, after the dirty query has re-marched
+    /// their basis. Without it a listed block got new lattice and a new residual but kept whatever classification it had - and
+    /// a block no build had reached kept the level map's clear value, "failed", so every pixel of it went to the residual.
+    ///
+    /// Over the block AND the two tiles around it (kBeamDirtyApron). A tile's test reads the corners and centres of its eight
+    /// neighbours, so new basis in a block changes the answer of tiles up to two away that the block does not contain. Tested
+    /// over the block alone, the edge tiles of whatever had been built beside a never-built region kept a classification made
+    /// against lattice nobody had written yet: after a flick from a reset, the outline of every earlier sliver stayed on screen
+    /// as a dashed seam through the clouds.
+    void testBeamDirtyTile(uint thread)
+    {
+        const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
+        const uint padded = side + 2u * kBeamDirtyApron;
+        const uint index = thread / (padded * padded);
+        if (index >= min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
+            return;
+        const uint packed = hstrBeamDirty[index];
+        const uint local = thread % (padded * padded);
+        const int2 signedTile = int2(uint2(packed & 0xFFFFu, packed >> 16) * side + uint2(local % padded, local / padded)) -
+                                int(kBeamDirtyApron);
+        if (any(signedTile < 0))
+            return;
+        const uint2 tile = uint2(signedTile);
+        if (any(tile >= params.beamTileDims) || any(tile * beamTileEdge(0) >= params.beamFrameDim) || !beamTileOnScreen(0, tile))
+            return;
+        if (!beamTileRefines(0, tile, false))
+        {
+            writeBeamLevel(0, tile, 0);
+            return;
+        }
+        recordBeamRefinement(0, tile);
+        if (params.beamLevels <= 1)
+            writeBeamLevel(0, tile, params.beamLevels);
+    }
+
     /// Temporal tile tests: one thread walks one coarsest tile down through the levels whose queries exist this frame (children
     /// of tiles refined last frame). A tile that needs refining but whose children were not queried keeps its own basis for
     /// this frame; its refinement is recorded, so the next frame queries them.
@@ -5509,14 +5580,14 @@ struct HSTRCloudRenderer
     }
 
     /// The residual for one beam unit, once a dispatch has decided which unit this thread owns.
-    void marchBeamUnitAt(uint2 unit)
+    void marchBeamUnitAt(uint2 unit, bool force = false)
     {
         // MEASURED and REVERTED: bounding a SWEPT residual to the box the screen covers, on the theory that dispatching a thread
         // per texel of the octahedral sphere to have almost all of them fail the test below was the 1.28 ms of a 1.79 ms sprint
         // frame. It was not - sprint went 1.79 to 1.85 - and it cost coverage: the resolve reads a 2x2 neighbourhood, so units
         // just outside the box are read after all, and a parked octahedral frame went from 1.663% of pixels over 0.02 to 7.790%.
         // The residual's cost under translation is units genuinely re-marching, not threads arriving to be rejected.
-        if (any(unit >= params.beamFrameDim) || !beamBoxOnScreen(float2(unit), float2(unit) + 1.f))
+        if (any(unit >= params.beamFrameDim) || !beamUnitOnScreen(unit))
             return;
         // MEASURED and REMOVED: marching a one-unit apron around every failed tile, so the resolve's bilinear never reaches into
         // an accepted neighbour's unwritten units. Failed tiles are 4 units square and scattered, so a one-unit border is 2.25x
@@ -5533,7 +5604,17 @@ struct HSTRCloudRenderer
         // thing that makes a unit new. That replaces two conditions that were really proxies for it - the previous level map
         // (did this tile fail last build) and beamPrevScreenBounds (did the previous build reach this far) - and it lets a unit
         // that leaves the screen and comes back carry, which neither proxy could express.
-        if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest))
+        // With the guard the unit is kept exactly when its block's certificate holds - it was marched from close enough to here -
+        // and otherwise re-marched; nothing is carried in place with a moved distance (see beamCellCertified). force is set for
+        // the units of a block the dirty list re-verified this build, whose certificate now names this camera although these
+        // units were marched from the old one.
+        if (params.beamGuard != 0 && params.beamRefFrame != 0)
+        {
+            if (!force && params.beamRefValid != 0 && !beamRefreshes(unit / finest) && hstrBeamPixelOutput[unit].a >= 0.f &&
+                beamCellCertified(unit / max(params.beamDirtyBlockEdge, 1u)))
+                return;
+        }
+        else if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest))
         {
             const float4 previous = hstrBeamPixelOutput[unit];
             if (previous.a >= 0.f)
@@ -5552,6 +5633,17 @@ struct HSTRCloudRenderer
         }
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
+        // A failed tile's unit can see nearer cloud than any basis point of its block, and the block is only as safe as its
+        // nearest sample.
+        if (params.beamGuard != 0 && params.beamRefFrame != 0)
+        {
+            const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);
+            const uint depth = asuint(exact.distance > 0.f ? exact.distance : 3.4e38f);
+            uint previous;
+            InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
+            if (depth < previous)
+                beamGuardDropCoarse(cell);
+        }
     }
 
     void marchBeamGridPixel(uint2 pixel)
@@ -5768,31 +5860,59 @@ struct HSTRCloudRenderer
         return (position / params.beamLatticeStep) / max(params.beamRefreshBlock, 1u);
     }
 
-    /// Whether translation since this block was last verified is small enough that none of its points can have failed.
+    /// Whether the camera is still close enough to where this block was marched from that its values still hold.
     ///
-    /// A sample stored at distance s for direction w_s is asked to stand for a point at predicted distance d along w. Under a
-    /// camera displacement dP those two move by dot(dP, w_s) and dot(dP, w), so they can separate by at most |dP| * |w_s - w|,
-    /// which over a block of angular reach theta is |dP| * theta. The per-point test accepts while the separation stays within
-    /// beamDepthTolerance of the distance, so the block as a whole is safe while that bound stays under the tolerance times the
-    /// SMALLEST distance any of its points holds. Everything here is conservative: an unverified block (depth still at the clear
-    /// value) is never certified, and a stale minimum is always too small rather than too large.
+    /// A value in the persistent image is the radiance along a world direction AS SEEN FROM the camera that marched it. From
+    /// anywhere else the content behind that direction has shifted, by at most |dP| / distance radians. So a block is valid
+    /// while |P - capturedFrom| <= beamGuardParallaxAngle * (the smallest distance any of its samples holds), and past that it
+    /// is re-marched, never carried: an in-place carry keeps the radiance of a direction and so is only ever right for a camera
+    /// that has not moved.
+    ///
+    /// This replaced a bound on how far depths within a block could diverge (|dP| * block angle against beamDepthTolerance *
+    /// distance), which is a statement about the old per-point depth test and not about the image: at 4K it certified blocks
+    /// for tens of thousands of units, nothing was ever invalidated by translation, and walk scored 24.9% and sprint 34.6% of
+    /// pixels over 0.02 against the exact march. That was hidden until the benchmark stopped re-anchoring before every scored
+    /// frame. Conservative as before: an unverified block is never certified, and a stale minimum is only ever too small.
     bool beamBlockCertified(uint2 position) { return beamCellCertified(beamGuardCell(position)); }
+
+    /// The nearest distance any sample of the block OR of the eight around it holds: what can shift into the block.
+    ///
+    /// A block's own depths bound how far its own content moves, but not what moves in. A block of empty sky holds no distance at
+    /// all, and bounded by itself it was certified for ever - so under translation cloud slid into sky that was never re-marched:
+    /// 4K walk, cloud edges cut into a sawtooth along block boundaries and a whole small cloud missing, 4.8% of pixels over 0.02
+    /// with every other block re-marched each frame. Content can only arrive from within the parallax budget, which is held under
+    /// one block (beamGuardParallax is clamped to the block edge on the host), so the ring of neighbours is enough.
+    float beamCellReachDepth(uint2 cell)
+    {
+        float nearest = 3.4e38f;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+            {
+                const int2 n = int2(cell) + int2(x, y);
+                if (any(n < 0) || any(n >= int2(params.beamGuardDims)))
+                    continue;
+                const uint stored = hstrBeamGuardDepth[uint2(n)];
+                if (stored == 0xFFFFFFFFu)
+                    continue; // Never built: it can hold nothing that moves in, and is listed on its own when it is needed.
+                nearest = min(nearest, asfloat(stored));
+            }
+        return nearest;
+    }
 
     bool beamCellCertified(uint2 cell)
     {
         if (params.beamGuard == 0 || params.beamRefFrame == 0 || params.beamHistoryValid == 0)
             return false;
-        const uint stored = hstrBeamGuardDepth[cell];
-        if (stored == 0xFFFFFFFFu)
+        if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu)
             return false; // Never verified, so nothing is known about it.
-        const float minimum = asfloat(stored);
+        const float minimum = beamCellReachDepth(cell);
         if (!(minimum > 0.f))
             return false;
         const float4 verified = hstrBeamGuardCamera[cell];
         if (verified.w < 0.5f)
             return false;
         const float moved = length(gScene.camera.data.posW - verified.xyz);
-        return moved * params.beamGuardAngle <= params.beamDepthTolerance * minimum;
+        return moved <= params.beamGuardParallaxAngle * minimum;
     }
 
     /// Appends the block to this build's work list if translation could have invalidated anything in it.
@@ -5807,11 +5927,10 @@ struct HSTRCloudRenderer
     /// has none, and an empty one - no sample hit anything - has an unbounded one, which is what lets empty sky collapse.
     float beamCellRadius(uint2 cell)
     {
-        const uint stored = hstrBeamGuardDepth[cell];
-        if (stored == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
+        if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
             return -1.f;
-        const float minimum = asfloat(stored);
-        return minimum > 0.f ? params.beamDepthTolerance * minimum / max(params.beamGuardAngle, 1e-9f) : -1.f;
+        const float minimum = beamCellReachDepth(cell);
+        return minimum > 0.f ? params.beamGuardParallaxAngle * minimum : -1.f;
     }
 
     /// The beam-image box a coarse cell covers, so its on-screen test is the same test its children would have run.
@@ -5942,11 +6061,9 @@ struct HSTRCloudRenderer
         const uint2 cell = thread + params.beamGuardOrigin;
         if (any(cell >= params.beamGuardDims))
             return false;
-        // The block's pixel extent, with the same two-tile reach beamPointOnScreen keeps, so a block on the edge of the screen is
-        // not dropped by a test that its own points would have passed.
-        const float edge = float(params.beamDirtyBlockEdge);
-        const float2 low = float2(cell) * edge;
-        if (!beamBoxOnScreen(low - 2.f * float(params.beamTileSize), low + edge + 2.f * float(params.beamTileSize)))
+        // Exactly the test that decides whether this block's points are built (beamPointOnScreen), so a block is listed if and
+        // only if the build would have touched it.
+        if (!beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
             return false;
         if (beamCellCertified(cell))
             return false;
@@ -5966,17 +6083,48 @@ struct HSTRCloudRenderer
         return true;
     }
 
+    /// Appends this build's refresh-phase blocks to the dirty list, so the refresh is marched by the split dirty query like
+    /// everything else the guard lists. One thread per guard block of each phase block (beamGridOrigin + k * beamGridBlockStride,
+    /// in refresh blocks), which is a handful.
+    ///
+    /// The refresh used to go through the grid query at one thread per ray: a few hundred long rays, so it cost the latency of
+    /// the longest - 4K flick over a prebuilt sphere, 0.4-0.9 ms of queries and 0.1-0.4 of march whenever the phase landed on
+    /// dense cloud, which it does parked as well.
+    void listBeamRefreshBlock(uint2 thread)
+    {
+        const uint edge = max(params.beamDirtyBlockEdge, 1u);
+        const uint g = max(max(params.beamRefreshBlock, 1u) * params.beamTileSize / edge, 1u);
+        const uint2 cell = (params.beamGridOrigin + (thread / g) * params.beamGridBlockStride) * g + thread % g;
+        if (any(cell >= params.beamGuardDims) || !beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
+            return;
+        uint slot;
+        InterlockedAdd(hstrBeamDirtyCount[0], 1u, slot);
+        if (slot < params.beamDirtyCapacity)
+            hstrBeamDirty[slot] = (cell.y << 16) | (cell.x & 0xFFFFu);
+        // Its points are about to be verified again, which zeroes the coarse certificate over it (beamGuardVerified).
+        if (params.beamCoarseShift != 0)
+            beamQueueRebuild(cell >> params.beamCoarseShift);
+    }
+
     /// One thread per beam unit of a listed block: the residual, over the same blocks.
+    /// Over the same apron as testBeamDirtyTile, since a tile there can have just started failing and then needs its units.
     void marchBeamDirtyUnit(uint thread)
     {
         const uint edge = max(params.beamDirtyBlockEdge, 1u);
-        const uint per = edge * edge;
+        const uint apron = kBeamDirtyApron * max(params.beamTileSize, 1u);
+        const uint padded = edge + 2u * apron;
+        const uint per = padded * padded;
         const uint index = thread / per;
         if (index >= min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
             return;
         const uint packed = hstrBeamDirty[index];
         const uint local = thread % per;
-        marchBeamUnitAt(uint2(packed & 0xFFFFu, packed >> 16) * edge + uint2(local % edge, local / edge));
+        const int2 unit = int2(uint2(packed & 0xFFFFu, packed >> 16) * edge + uint2(local % padded, local / padded)) - int(apron);
+        if (any(unit < 0))
+            return;
+        // The block's own units are re-marched whatever its (just renewed) certificate says; the apron's are asked as usual.
+        const uint2 inner = uint2(local % padded, local / padded);
+        marchBeamUnitAt(uint2(unit), all(inner >= apron) && all(inner < apron + edge));
     }
 
     /// Records what a point that took the full test this build proves about its block: the camera it was verified from, and a
@@ -5998,8 +6146,22 @@ struct HSTRCloudRenderer
         // The coarse certificate over this block was derived from the sphere just replaced, so it no longer follows. A block the
         // dirty list reached has its cell queued and rebuilt after this pass anyway; this is for the paths that verify blocks
         // behind the hierarchy's back - a refreshing point, a full sweep - whose cells would otherwise keep vouching for them.
-        if (params.beamCoarseShift != 0)
-            hstrBeamCoarse[cell >> params.beamCoarseShift] = float4(0.f);
+        beamGuardDropCoarse(cell);
+    }
+
+    /// Zeroes the coarse certificates that may have been derived from this block's depth: its own cell's, and - because a
+    /// block's certificate reads its neighbours' depths (beamCellReachDepth) - the cells of the eight around it.
+    void beamGuardDropCoarse(uint2 cell)
+    {
+        if (params.beamCoarseShift == 0)
+            return;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+            {
+                const int2 n = int2(cell) + int2(x, y);
+                if (all(n >= 0) && all(n < int2(params.beamGuardDims)))
+                    hstrBeamCoarse[uint2(n) >> params.beamCoarseShift] = float4(0.f);
+            }
     }
 
     /// Updates only the distance a carried point is measured from, so the next build's parallax test still reads it relative to
@@ -6118,6 +6280,11 @@ struct HSTRCloudRenderer
         // frame - rotation costs nothing, and the resampling that "tripled the error" for a turning camera cannot happen.
         if (params.beamRefFrame != 0)
         {
+            // With the guard, a point whose block is certified never gets here (beamQueryNeedsMarch keeps it as it is), so one
+            // that does is in a block the camera has moved too far from. Its value is the radiance seen from somewhere else, and
+            // keeping it in place with a new distance is exactly what made translation invisible: it is marched.
+            if (params.beamGuard != 0)
+                return false;
             if (params.beamRefValid == 0 || !beamLatticeValid(position))
                 return false;
             depthCache = 0.f; // Already in place: the persistent lattice is not rewritten for a carry.
@@ -6581,6 +6748,18 @@ void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
     gHSTRCloud.testBeamTile(dispatchThreadId.xy);
 }
 
+[numthreads(8, 8, 1)]
+void listBeamRefreshBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.listBeamRefreshBlock(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void testBeamDirtyTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.testBeamDirtyTile(foldedDirtyThread(groupId, groupThreadId.x));
+}
+
 [numthreads(64, 1, 1)]
 void testBeamTilesTemporal(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
@@ -6620,6 +6799,21 @@ void updateBeamCoarse(uint3 dispatchThreadId: SV_DispatchThreadID)
     gHSTRCloud.updateBeamCoarseCell(dispatchThreadId.x);
 }
 
+/// The dirty passes' 64-thread groups in rows of kDirtyRow, because a dispatch dimension stops at 65,535 groups. A walking
+/// camera near cloud lists ~100k blocks, and at 8 rays x 64 slices each the query alone wanted ~800k groups in x: the dispatch
+/// was out of range, the blocks were never re-marched, and walk scored ~5% of pixels over 0.02 whatever the parallax budget.
+static const uint kDirtyRow = 32768;
+
+void writeFoldedDirtyArgs(uint at, uint threads)
+{
+    const uint groups = (threads + 63u) / 64u;
+    gHSTRCloud.hstrBeamDirtyArgs[at] = min(groups, kDirtyRow);
+    gHSTRCloud.hstrBeamDirtyArgs[at + 1] = (groups + kDirtyRow - 1u) / kDirtyRow;
+    gHSTRCloud.hstrBeamDirtyArgs[at + 2] = 1u;
+}
+
+uint foldedDirtyThread(uint3 groupId, uint groupThread) { return (groupId.y * kDirtyRow + groupId.x) * 64u + groupThread; }
+
 /// Dispatch arguments for the blocks the coarse level could not answer for.
 [numthreads(1, 1, 1)]
 void writeBeamDescendArgs()
@@ -6640,17 +6834,17 @@ void writeBeamDirtyArgs()
     // Corners and centres of every block, times the threads each ray is split across: one dispatch, see buildBeamDirtyQueries.
     const uint passes = gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u;
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
-    gHSTRCloud.hstrBeamDirtyArgs[0] = (blocks * rb * rb * passes * segments + 63u) / 64u;
-    gHSTRCloud.hstrBeamDirtyArgs[1] = 1u;
-    gHSTRCloud.hstrBeamDirtyArgs[2] = 1u;
-    gHSTRCloud.hstrBeamDirtyArgs[3] = (blocks * edge * edge + 63u) / 64u;
-    gHSTRCloud.hstrBeamDirtyArgs[4] = 1u;
-    gHSTRCloud.hstrBeamDirtyArgs[5] = 1u;
+    writeFoldedDirtyArgs(0, blocks * rb * rb * passes * segments);
+    const uint unitSide = edge + 2u * kBeamDirtyApron * max(gHSTRCloud.params.beamTileSize, 1u);
+    writeFoldedDirtyArgs(3, blocks * unitSide * unitSide);
     // The coarse cells to rebuild are only all known once the blocks have been classified, which is now.
     const uint cells = min(gHSTRCloud.hstrBeamDescendCount[1], gHSTRCloud.params.beamCoarseCapacity);
     gHSTRCloud.hstrBeamDirtyArgs[9] = (cells + 63u) / 64u;
     gHSTRCloud.hstrBeamDirtyArgs[10] = 1u;
     gHSTRCloud.hstrBeamDirtyArgs[11] = 1u;
+    // The root tiles of the listed blocks (testBeamDirtyTile).
+    const uint side = max(edge / max(gHSTRCloud.params.beamTileSize, 1u), 1u) + 2u * kBeamDirtyApron;
+    writeFoldedDirtyArgs(12, blocks * side * side);
 }
 
 groupshared uint gDirtyRay[64];      ///< Slice 0's answer for the ray: its position packed, or ~0 when nothing is marched.
@@ -6669,17 +6863,18 @@ groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance t
 /// the step cap or goes opaque can end differently. Measured, 720p sea: the error statistics matched to every printed digit
 /// across 1 to 64 slices; that is not a pixel diff, and a dense or long volume could still separate them.
 [numthreads(64, 1, 1)]
-void buildBeamDirtyQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupThreadId: SV_GroupThreadID)
+void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
+    const uint thread = foldedDirtyThread(groupId, groupThreadId.x);
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
-    const uint slice = dispatchThreadId.x % segments;
+    const uint slice = thread % segments;
     const uint lead = groupThreadId.x - slice;
     if (slice == 0)
     {
         uint2 point;
         bool centre;
         uint2 position;
-        bool march = gHSTRCloud.beamDirtyRay(dispatchThreadId.x / segments, point, centre) &&
+        bool march = gHSTRCloud.beamDirtyRay(thread / segments, point, centre) &&
                      gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position);
         gDirtyRay[groupThreadId.x] = march ? (position.x | (position.y << 16)) : 0xFFFFFFFFu;
     }
@@ -6715,9 +6910,9 @@ void buildBeamDirtyQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 gr
 }
 
 [numthreads(64, 1, 1)]
-void marchBeamDirtyUnits(uint3 dispatchThreadId: SV_DispatchThreadID)
+void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
-    gHSTRCloud.marchBeamDirtyUnit(dispatchThreadId.x);
+    gHSTRCloud.marchBeamDirtyUnit(foldedDirtyThread(groupId, groupThreadId.x));
 }
 
 groupshared uint gResidualMask[2]; ///< Which of the group's 64 pixels the residual resolve has to write.

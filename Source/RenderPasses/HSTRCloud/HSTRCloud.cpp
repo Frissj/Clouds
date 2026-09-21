@@ -302,6 +302,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamGuard = bool(value);
             continue;
         }
+        if (key == "beamPrebuild")
+        {
+            mBeamPrebuild = bool(value);
+            continue;
+        }
+        if (key == "beamGuardParallax")
+        {
+            mBeamGuardParallax = value;
+            continue;
+        }
         if (key == "beamAssumeCarry")
         {
             mParams.beamAssumeCarry = uint32_t(bool(value));
@@ -399,16 +409,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamSparseCut = value;
             continue;
         }
+        // Re-anchoring discards the persistent image, so only a CHANGE does it. Setting the same value used to re-anchor too, and
+        // sea_motion.py re-applies an arm's properties before each scored step - so every quality figure it produced was of a
+        // freshly built image, never of the one the flight had arrived at. It is how a flick that showed empty sky scored 0.125%.
         if (key == kBeamRefFrame)
         {
+            if (mBeamRefFrame != bool(value))
+                mBeamRefAnchored = false;
             mBeamRefFrame = value;
-            mBeamRefAnchored = false;
             continue;
         }
         if (key == kBeamRefMargin)
         {
+            if (mBeamRefMargin != float(value))
+                mBeamRefAnchored = false;
             mBeamRefMargin = value;
-            mBeamRefAnchored = false;
             continue;
         }
         if (key == kBeamSparseMinLevel)
@@ -913,6 +928,8 @@ Properties HSTRCloud::getProperties() const
     props["beamScreenResidual"] = mBeamScreenResidual;
     props["beamAssumeCarry"] = mParams.beamAssumeCarry != 0;
     props["beamGuard"] = mBeamGuard;
+    props["beamPrebuild"] = mBeamPrebuild;
+    props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
@@ -1243,6 +1260,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
+    mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
     mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
@@ -3235,6 +3254,7 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamOctFull = mBeamOctFull ? 1u : 0u;
     mParams.beamOctAxis = mBeamOctAxis;
     mParams.beamGuard = mBeamGuard && mBeamRefFrame && mpScene ? 1u : 0u;
+    mParams.beamBuildAll = 0; // Set again by updateBeamOctFrame for the build that anchors a prebuilt image.
     mParams.beamScreenResidual = mBeamOct && mBeamScreenResidual && mBeamRefFrame && mpScene ? 1u : 0u;
     if (!mBeamRefFrame || !mpScene)
     {
@@ -3339,6 +3359,8 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     // value is the largest one a perspective frame has.
     mParams.beamGuardAngle = beamGuardReach(frameDim, camera) * (2.f * length(camera.cameraU)) /
                              (std::max(length(camera.cameraW), 1e-6f) * float(frameDim.x));
+    mParams.beamGuardParallaxAngle =
+        mBeamGuardParallax * (2.f * length(camera.cameraU)) / (std::max(length(camera.cameraW), 1e-6f) * float(frameDim.x));
     // Two tiles of guard each way: at level 0 a tile test reads the corners and centres of all eight neighbours.
     const float slack = 2.f * float(guard);
     mParams.beamScreenBounds = float4(
@@ -3438,6 +3460,11 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
     // An octahedral texel is anisotropic - at the diamond mid-edge the map's singular values are 2.36 and 1.20 - so the reach has
     // to be taken along the worst axis, not on average, or the guard would certify blocks it has no right to.
     mParams.beamGuardAngle = beamGuardReach(frameDim, camera) * 2.36f * 2.f / float(dim);
+    // The parallax budget in texels at the map's SMALLEST singular value (1.20, the diamond's centre), where a radian is the
+    // most texels, so no texel of a certified block has moved further than beamGuardParallax.
+    // Held under one guard block, because a certificate only looks one ring of blocks out for what can shift in.
+    const float blockTexels = float(std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u));
+    mParams.beamGuardParallaxAngle = std::min(mBeamGuardParallax, blockTexels) * 1.20f * 2.f / float(dim);
     // The on-screen test projects a direction through the camera basis instead of comparing against a padded bounding box, so it
     // needs that basis inverted, and a conversion from a box's radius in texels to the normalised device units it can span. Both
     // are taken at their largest: the map's worst-axis texel angle, and the steeper of the two screen axes, where a radian buys
@@ -3471,6 +3498,13 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
         std::max(0.f, low.x - pad), std::max(0.f, low.y - pad), std::min(imageDim.x, high.x + pad),
         std::min(imageDim.y, high.y + pad)
     );
+    // beamPrebuild: the anchoring build covers the whole sphere, not the screen. The image is indexed by world direction, so
+    // everything a turn can bring on screen can be built before it does, and a direction built once stays built until the
+    // camera translates far enough for the guard to expire it. Built only on screen, a turn paid for every direction it
+    // uncovered: 4K from a reset, 0.05 rad/frame cost 3-51 ms a frame where the same turn over built directions cost 0.8-0.95.
+    mParams.beamBuildAll = fresh && mBeamPrebuild ? 1u : 0u;
+    if (mParams.beamBuildAll != 0)
+        mParams.beamScreenBounds = float4(0.f, 0.f, imageDim.x, imageDim.y);
 }
 
 void HSTRCloud::ensureCameraResources()
@@ -4017,7 +4051,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
                 mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1);
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 12, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                    sizeof(uint32_t), 15, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                               ResourceBindFlags::IndirectArg
                 );
                 const uint2 coarseDims = (guardDims + 3u) / 4u;
@@ -4347,6 +4381,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         pRenderContext->clearUAV(mpBeamPixels[0]->getUAV().get(), float4(0.f, 0.f, 0.f, -1.f));
                 }
                 const bool gridDispatch = (mBeamGridDispatch || history) && mParams.beamSegments == 1;
+                mBeamGuardDriven = false;
                 for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                 {
                     FALCOR_PROFILE(pRenderContext, "beamLevel" + std::to_string(level));
@@ -4370,8 +4405,16 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // margin, and 4x at beamRefMargin 0.5, which is why enlarging the frame kept costing more than it saved.
                             const float tile = float(std::max(1u, mParams.beamTileSize));
                             const float4 box = mParams.beamScreenBounds;
-                            const int2 first = int2(std::floor(box.x / tile), std::floor(box.y / tile)) - 2;
-                            const int2 last = int2(std::ceil(box.z / tile), std::ceil(box.w / tile)) + 2;
+                            // With the guard a point is kept per block (beamGuardBlockOnScreen): its block, dilated by the
+                            // blocks whose tiles read it, has to touch the screen - which reaches one block plus that dilation
+                            // past the box, rounded up to whole tiles.
+                            const uint32_t blockEdge = std::max(mParams.beamDirtyBlockEdge, 1u);
+                            const int reach = (mParams.beamGuard != 0 && mBeamRefFrame)
+                                                  ? int((((2u * mParams.beamTileSize + blockEdge - 1u) / blockEdge + 1u) * blockEdge +
+                                                         mParams.beamTileSize - 1u) / std::max(mParams.beamTileSize, 1u))
+                                                  : 2;
+                            const int2 first = int2(std::floor(box.x / tile), std::floor(box.y / tile)) - reach;
+                            const int2 last = int2(std::ceil(box.z / tile), std::ceil(box.w / tile)) + reach;
                             const uint2 origin = uint2(std::max(0, first.x), std::max(0, first.y));
                             // Nothing in the image can need work except the blocks this build's refresh phase selects, WHEN the
                             // camera has not translated (so no parallax can have failed), the frame is not re-anchoring, the
@@ -4397,7 +4440,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             const uint2 firstBlock(cell % phases, cell / phases);
                             mParams.beamGridBlocks = generated ? 1u : 0u;
                             mParams.beamGridBlockStride = phases;
-                            for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
+                            // Guard-driven: every block this build touches comes from the guard's dirty list - what the camera
+                            // invalidated, what it turned onto, and the refresh phase (listBeamRefreshBlock) - so there is no
+                            // grid dispatch and no region list. Tiles and units then follow the same list.
+                            const bool guardDriven = generated && guarded && mpBeamDirty && mBeamRefFrame;
+                            mBeamGuardDriven = guardDriven;
+                            mBeamGridRegions.clear();
+                            mBeamGridRegionMode.clear();
+                            for (uint32_t centres = 0; centres < (guardDriven ? 0u : (mParams.beamCentreless != 0 ? 1u : 2u)); ++centres)
                             {
                                 const uint2 dims = mParams.beamTileDims + (centres ? 0u : 1u);
                                 uint2 threads;
@@ -4453,7 +4503,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     continue;
                                 }
                                 dispatch(firstBlock, threads, 1u); // The refresh phase, wherever the camera is looking.
-                                if (sameBox)
+                                // With the guard there are no strips: the dirty list below finds the entering blocks exactly,
+                                // by the on-screen test the build itself uses. Box subtraction was never exact on the
+                                // octahedral map, and it was expensive: where a yaw carries the footprint from not wrapping to
+                                // wrapping, the box jumps from the screen's to the whole image's, and "new box minus old box" is
+                                // nearly the whole sphere. 4K, prebuilt sphere: 2.3 ms frames every ~31 at any yaw rate, 1.44 ms
+                                // of it a 64M-thread unit march that found nothing to do.
+                                if (sameBox || guarded)
                                 {
                                     if (centres == 0)
                                         ++mBeamGridGenerated;
@@ -4461,8 +4517,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 }
                                 // The strips the screen newly covers, as current box minus previous box. Clamped to the grid,
                                 // and taken with the same two-tile reach beamPointOnScreen uses so a strip carries its guard.
-                                const int2 pf = int2(std::floor(mParams.beamPrevScreenBounds.x / tile), std::floor(mParams.beamPrevScreenBounds.y / tile)) - 2;
-                                const int2 pl = int2(std::ceil(mParams.beamPrevScreenBounds.z / tile), std::ceil(mParams.beamPrevScreenBounds.w / tile)) + 3;
+                                const int2 pf = int2(std::floor(mParams.beamPrevScreenBounds.x / tile), std::floor(mParams.beamPrevScreenBounds.y / tile)) - reach;
+                                const int2 pl = int2(std::ceil(mParams.beamPrevScreenBounds.z / tile), std::ceil(mParams.beamPrevScreenBounds.w / tile)) + reach + 1;
                                 const int2 cf(std::max(0, first.x), std::max(0, first.y));
                                 const int2 cl(std::min(int32_t(dims.x), last.x + 1), std::min(int32_t(dims.y), last.y + 1));
                                 const int2 pfc(std::max(cf.x, pf.x), std::max(cf.y, pf.y));
@@ -4483,11 +4539,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             }
                             // The blocks translation actually invalidated. Classified once per block rather than once per point,
                             // compacted, and dispatched indirectly, so the cost follows what moved instead of what exists.
+                            //
+                            // A turn runs it too. A block no build has reached has no certificate, so the guard lists exactly
+                            // the never-built blocks a turn brings on screen - by the same on-screen test the build uses. The
+                            // strips above cannot: they subtract BOXES, and where the footprint wraps the octahedral map the box
+                            // is the whole image, so the box never changes and nothing ever "entered". Measured 4K, 0.05
+                            // rad/frame from a reset: the frame after 40 turns was empty sky but for a few refresh blocks,
+                            // every never-built tile holding the level map's clear value ("failed"), and the residual resolve
+                            // took 1.25-1.38 ms reconstructing them from a lattice nobody had queried. The benchmark missed it
+                            // because its scored steps re-applied beamRefFrame, which re-anchored and rebuilt the image.
+                            const bool turned = any(cameraTarget != mBeamCameraTarget);
                             mBeamDirtyActive = false;
-                            if (generated && mParams.beamStationary == 0 && guarded && mpBeamDirty)
+                            if (guardDriven)
                             {
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
+                                pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
+                                // A camera that neither moved nor turned cannot have invalidated or uncovered anything, so only the
+                                // refresh phase is listed and the classification is skipped.
+                                const bool classify = mParams.beamStationary == 0 || turned;
                                 // MEASURED TWICE and REVERTED: bounding this domain. First to the screen's block box, then to that
                                 // box unioned with the regions the query dispatch had just covered. Both take the rectangle's walk
                                 // from 0.33 ms to 2.4 and above, with the level-0 query pass at 1.35. A block left out is never
@@ -4515,14 +4585,32 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 // real information, but 560 long marches cannot fill the GPU, so they cost latency, not work.
                                 {
                                     FALCOR_PROFILE(pRenderContext, "classify");
-                                    pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
-                                    bindRenderer(pRenderContext, mpBeamCoarsePass);
-                                    mpBeamCoarsePass->execute(pRenderContext, uint3(mParams.beamCoarseDims, 1));
-                                    bindRenderer(pRenderContext, mpBeamDescendArgsPass);
-                                    mpBeamDescendArgsPass->execute(pRenderContext, uint3(1));
-                                    bindRenderer(pRenderContext, mpBeamLeafPass);
-                                    mpBeamLeafPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 24);
-                                    mBeamClassifyCells = mParams.beamCoarseDims.x * mParams.beamCoarseDims.y;
+                                    if (classify)
+                                    {
+                                        bindRenderer(pRenderContext, mpBeamCoarsePass);
+                                        mpBeamCoarsePass->execute(pRenderContext, uint3(mParams.beamCoarseDims, 1));
+                                        bindRenderer(pRenderContext, mpBeamDescendArgsPass);
+                                        mpBeamDescendArgsPass->execute(pRenderContext, uint3(1));
+                                        bindRenderer(pRenderContext, mpBeamLeafPass);
+                                        mpBeamLeafPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 24);
+                                        mBeamClassifyCells = mParams.beamCoarseDims.x * mParams.beamCoarseDims.y;
+                                    }
+                                    // The refresh phase: blocks firstBlock + k * phases (in refresh blocks) still inside the grid,
+                                    // each as its guard blocks.
+                                    const uint32_t g = std::max(refreshBlock * mParams.beamTileSize / std::max(mParams.beamDirtyBlockEdge, 1u), 1u);
+                                    const uint2 refreshBlocks = (mParams.beamTileDims + 1u + refreshBlock - 1u) / refreshBlock;
+                                    const uint2 count(
+                                        firstBlock.x < refreshBlocks.x ? (refreshBlocks.x - firstBlock.x + phases - 1u) / phases : 0u,
+                                        firstBlock.y < refreshBlocks.y ? (refreshBlocks.y - firstBlock.y + phases - 1u) / phases : 0u
+                                    );
+                                    if (count.x != 0 && count.y != 0)
+                                    {
+                                        mParams.beamGridOrigin = firstBlock;
+                                        mParams.beamGridBlockStride = phases;
+                                        bindRenderer(pRenderContext, mpBeamRefreshListPass);
+                                        mpBeamRefreshListPass->execute(pRenderContext, uint3(count * g, 1));
+                                        mBeamGridThreads += count.x * count.y * g * g;
+                                    }
                                     bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
                                     mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
                                 }
@@ -4581,7 +4669,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     bindRenderer(pRenderContext, mpBeamTilePass);
                     bindOutput(mpBeamTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
                     mpBeamTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
-                    if (level == 0 && !mBeamGridRegions.empty())
+                    if (level == 0 && (!mBeamGridRegions.empty() || mBeamGuardDriven))
                     {
                         // Only the tiles whose basis points this build touched can have changed classification.
                         mParams.beamTileGenerated = 1;
@@ -4598,6 +4686,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         mParams.beamTileGenerated = 0;
                         mParams.beamGridBlocks = 0;
                         mParams.beamGridOrigin = uint2(0);
+                        // And the tiles of the blocks the guard listed, whose basis the dirty query just re-marched.
+                        if (mBeamDirtyActive)
+                        {
+                            bindRenderer(pRenderContext, mpBeamDirtyTilePass);
+                            bindOutput(mpBeamDirtyTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                            mpBeamDirtyTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                            mpBeamDirtyTilePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 48); // Bytes: twelve uints in.
+                        }
                     }
                     else if (level == 0)
                         mpBeamTilePass->execute(pRenderContext, uint3(tileCount, 1, 1));
@@ -4649,11 +4745,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 }
                 pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             }
-            bindRenderer(pRenderContext, pResolve);
-            pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
-            pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+            {
+                FALCOR_PROFILE(pRenderContext, "pixels");
+                bindRenderer(pRenderContext, pResolve);
+                pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+            }
             if (residual)
             {
+                FALCOR_PROFILE(pRenderContext, "residual");
                 bindRenderer(pRenderContext, mpBeamResidualArgsPass);
                 mpBeamResidualArgsPass->execute(pRenderContext, uint3(1));
                 bindRenderer(pRenderContext, mpBeamResidualResolvePass);
@@ -4709,7 +4809,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         else
         {
             bindMarch();
-            if (unitMarch && !mBeamGridRegions.empty())
+            if (unitMarch && (!mBeamGridRegions.empty() || mBeamGuardDriven))
             {
                 // Only the units whose tile this build could have reclassified, or whose own carry could have expired: the same
                 // regions the query and tile passes covered. Everything else already holds a residual for its own direction.

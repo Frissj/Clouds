@@ -30,7 +30,7 @@ BEAM = {
     # over 0.02 against the exact march - better than beamScreenResidual's 0.156% at 3.4-7.6 ms. Before it this was the anchored
     # screen-space rectangle at beamTolerance 0.05 and no refresh; sweeps that want that set beamOct / beamRefFrame off.
     "beamRefFrame": True, "beamOct": True, "beamOctFull": False, "beamOctScale": 1.0, "beamGuard": True,
-    "beamScreenResidual": False, "beamSparse": False, "beamSparseCut": False, "beamQueue": False,
+    "beamPrebuild": True, "beamScreenResidual": False, "beamSparse": False, "beamSparseCut": False, "beamQueue": False,
 }
 
 

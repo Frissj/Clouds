@@ -1197,6 +1197,14 @@ struct HSTRCloudParams
     /// buildBeamDirtyQueries). 64 is the ceiling the clamp allows and scaling had still not flattened there - at ~560 rays, i.e.
     /// ~36k threads. With thousands of dirty rays the query turns throughput-bound again, where slices are duplicated work.
     uint beamDirtySegments = 64;
+    /// Nonzero for the build that anchors the octahedral image when beamPrebuild is on: every block is built, not just the ones
+    /// the screen touches (beamBoxOnScreen answers yes everywhere). See beamPrebuild on the host.
+    uint beamBuildAll = 0;
+    /// The parallax a guard block may accumulate since the camera it was marched from, in radians: beamGuardParallax texels of
+    /// the beam image at its SMALLEST texel angle, so the bound holds along the axis where a radian is the most texels. A block
+    /// stays valid while |P - capturedFrom| <= beamGuardParallaxAngle * blockMinDistance, because no point of it can have shifted
+    /// by more than |dP| / distance. See beamCellCertified.
+    float beamGuardParallaxAngle = 0.f;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

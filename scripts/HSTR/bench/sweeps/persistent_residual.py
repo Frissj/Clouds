@@ -29,6 +29,7 @@ COMMON = dict(
     beamRefFrame=True,
     beamRefresh=256,
     beamGuard=True,
+    beamPrebuild=True,
     beamOct=True,
     beamOctFull=False,
     beamOctScale=1.0,
