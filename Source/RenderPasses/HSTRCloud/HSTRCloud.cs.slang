@@ -1505,6 +1505,27 @@ struct HSTRCloudRenderer
         return interval.x < interval.y;
     }
 
+    /// Octahedral map, +z at the zenith. Continuous across z = 0, no transcendentals, and its inverse is exact, so a world
+    /// direction has one texel and keeps it: this is what removes re-anchoring. World up is y, so the frame swaps y and z.
+    float2 octEncode(float3 direction)
+    {
+        const float3 d = float3(direction.x, direction.z, direction.y);
+        const float3 n = d / (abs(d.x) + abs(d.y) + abs(d.z));
+        float2 p = n.xy;
+        if (n.z < 0.f)
+            p = float2((1.f - abs(n.y)) * (n.x >= 0.f ? 1.f : -1.f), (1.f - abs(n.x)) * (n.y >= 0.f ? 1.f : -1.f));
+        return p * 0.5f + 0.5f;
+    }
+
+    float3 octDecode(float2 uv)
+    {
+        const float2 p = uv * 2.f - 1.f;
+        float3 n = float3(p.x, p.y, 1.f - abs(p.x) - abs(p.y));
+        if (n.z < 0.f)
+            n.xy = float2((1.f - abs(n.y)) * (n.x >= 0.f ? 1.f : -1.f), (1.f - abs(n.x)) * (n.y >= 0.f ? 1.f : -1.f));
+        return normalize(float3(n.x, n.z, n.y));
+    }
+
     float3 cameraRayDirection(float2 pixelPosition)
     {
         const float2 p = pixelPosition / float2(params.frameDim);
@@ -1518,6 +1539,8 @@ struct HSTRCloudRenderer
     {
         if (params.beamRefFrame == 0)
             return cameraRayDirection(beamPosition);
+        if (params.beamOct != 0)
+            return octDecode(beamPosition / float2(params.beamFrameDim));
         if (params.beamRefAligned != 0)
         {
             const float2 screenPosition =
@@ -1539,6 +1562,12 @@ struct HSTRCloudRenderer
         beamPosition = 0.f;
         if (params.beamRefFrame == 0)
             return false;
+        if (params.beamOct != 0)
+        {
+            // Every direction lands, which is exactly why the image never needs re-anchoring.
+            beamPosition = octEncode(w) * float2(params.beamFrameDim);
+            return true;
+        }
         const float3 c = float3(dot(params.beamRefInverse0, w), dot(params.beamRefInverse1, w), dot(params.beamRefInverse2, w));
         if (c.z <= 1e-6f)
             return false;
@@ -1555,7 +1584,7 @@ struct HSTRCloudRenderer
             beamPosition = pixelPosition;
             return true;
         }
-        if (params.beamRefAligned != 0)
+        if (params.beamRefAligned != 0 && params.beamOct == 0)
         {
             beamPosition = pixelPosition + 0.5f * (float2(params.beamFrameDim) - float2(params.frameDim));
             return true;

@@ -197,6 +197,10 @@ private:
     /// direction that has never been marched. This is the gate on a persistent world-direction cache: if yaw then costs what
     /// parked costs, the yaw penalty really is newly exposed directions and the cache is worth building.
     bool mBeamRefPrebuild = false;
+    bool mBeamOct = false;      ///< The beam image is the octahedral sphere: no anchor, so no re-anchoring.
+    bool mBeamOctFull = false;  ///< Build the whole sphere rather than the screen's footprint.
+    float mBeamOctScale = 1.f;  ///< Texel angular size against a screen pixel at the view centre.
+    uint2 mBeamOctDim = { 0, 0 };
     /// How the query dispatch was generated, counted since the view settled: swept over the region, generated from the refresh
     /// phase alone, or that plus the strips a rotation exposed. Reported so an arm that should be generating and is not says so.
     uint32_t mBeamGridSweeps = 0;
@@ -218,6 +222,7 @@ private:
     uint32_t mBeamRefAnchors = 0;  ///< Re-anchors since the view settled, which is what a turn amortises a full rebuild over.
     float4 mBeamBuiltScreenBounds = float4(0.f); ///< beamScreenBounds of the build that most recently wrote the beam image.
     void updateBeamReferenceFrame(const uint2& frameDim);
+    void updateBeamOctFrame(const uint2& frameDim, const CameraData& camera);
     // beamRefresh: the previous build's lattice and level map (swapped with the current ones every build), its marched pixels
     // (the two alternate), and its camera.
     ref<Texture> mpBeamLatticePrev;

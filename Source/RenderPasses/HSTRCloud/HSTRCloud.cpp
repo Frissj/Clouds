@@ -283,6 +283,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamRefPrebuild = bool(value);
             continue;
         }
+        if (key == "beamOct")
+        {
+            mBeamOct = bool(value);
+            continue;
+        }
+        if (key == "beamOctFull")
+        {
+            mBeamOctFull = bool(value);
+            continue;
+        }
+        if (key == "beamOctScale")
+        {
+            mBeamOctScale = float(value);
+            continue;
+        }
         if (key == "beamPageIndirect")
         {
             mParams.beamPageIndirect = uint32_t(value);
@@ -841,6 +856,10 @@ Properties HSTRCloud::getProperties() const
     props[kBeamAdaptiveRoot] = mParams.beamAdaptiveRoot != 0;
     props[kCompareBlock] = mParams.compareBlock;
     props["beamRefPrebuild"] = mBeamRefPrebuild;
+    props["beamOct"] = mBeamOct;
+    props["beamOctFull"] = mBeamOctFull;
+    props["beamOctScale"] = mBeamOctScale;
+    props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
     props["beamPageShift"] = mParams.beamPageShift;
     props[kCompareColumnLow] = mParams.compareColumnLow;
@@ -3127,6 +3146,8 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
 void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
 {
     mParams.beamRefFrame = mBeamRefFrame ? 1u : 0u;
+    mParams.beamOct = mBeamOct && mBeamRefFrame && mpScene ? 1u : 0u;
+    mParams.beamOctFull = mBeamOctFull ? 1u : 0u;
     if (!mBeamRefFrame || !mpScene)
     {
         mParams.beamFrameDim = frameDim;
@@ -3137,6 +3158,11 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
         return;
     }
     const auto& camera = mpScene->getCamera()->getData();
+    if (mBeamOct)
+    {
+        updateBeamOctFrame(frameDim, camera);
+        return;
+    }
     const float widen = 1.f + 2.f * mBeamRefMargin;
     const uint2 beamDim = uint2(float2(frameDim) * widen + 0.5f);
     const uint32_t guard = std::max(1u, mParams.beamTileSize);
@@ -3225,6 +3251,91 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamScreenBounds = float4(
         std::max(0.f, low.x - slack), std::max(0.f, low.y - slack), std::min(float(beamDim.x), high.x + slack),
         std::min(float(beamDim.y), high.y + slack)
+    );
+}
+
+/// Places the octahedral beam image. There is no anchor and so no re-anchor: the image is the sphere, a direction's texel is
+/// fixed for the life of the renderer, and a turn only moves which part of it the screen resolves.
+///
+/// The image is sized so a texel spans the angle a screen pixel does at the view centre: the sphere is 4 pi sr, so (2 sqrt(pi) f)^2
+/// texels cover it at f pixels per radian. At 4K that is about 114 M texels, 13.7x the screen - which is why the residual has to
+/// be paged before this ships at 4K, and why the first measurements of it are taken at lower resolutions where it fits outright.
+///
+/// beamScreenBounds is the screen's footprint in octahedral space. The footprint is curved, so it is bounded by sampling a grid of
+/// screen directions and padding by the largest gap between neighbouring samples: near the square's border - the two half great
+/// circles x = 0 and y = 0 below the horizon, where the map wraps - that gap is large and the bound grows to stay conservative,
+/// which costs dispatch breadth but never correctness. Everywhere else it is tight.
+void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& camera)
+{
+    const float focal = 0.5f * float(frameDim.x) * length(camera.cameraW) / std::max(length(camera.cameraU), 1e-6f);
+    const uint32_t guard = std::max(1u, mParams.beamTileSize);
+    uint32_t dim = uint32_t(2.f * std::sqrt(3.14159265f) * focal * std::max(mBeamOctScale, 0.01f) + 0.5f);
+    dim = std::max(((dim + guard - 1u) / guard) * guard, 4u * guard);
+    const float2 imageDim = float2(float(dim), float(dim));
+    auto octOf = [&](const float3& direction)
+    {
+        const float3 d(direction.x, direction.z, direction.y); // +z at the zenith, matching the shader.
+        const float3 n = d / (std::abs(d.x) + std::abs(d.y) + std::abs(d.z));
+        float2 p(n.x, n.y);
+        if (n.z < 0.f)
+            p = float2((1.f - std::abs(n.y)) * (n.x >= 0.f ? 1.f : -1.f), (1.f - std::abs(n.x)) * (n.y >= 0.f ? 1.f : -1.f));
+        return (p * 0.5f + 0.5f) * imageDim;
+    };
+    const uint32_t samples = 33;
+    std::vector<float2> grid(samples * samples);
+    float2 low(std::numeric_limits<float>::max());
+    float2 high(std::numeric_limits<float>::lowest());
+    for (uint32_t j = 0; j < samples; ++j)
+        for (uint32_t i = 0; i < samples; ++i)
+        {
+            const float2 ndc(2.f * float(i) / float(samples - 1u) - 1.f, 1.f - 2.f * float(j) / float(samples - 1u));
+            const float2 position = octOf(normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW));
+            grid[j * samples + i] = position;
+            low = min(low, position);
+            high = max(high, position);
+        }
+    float pad = 2.f * float(guard);
+    for (uint32_t j = 0; j < samples; ++j)
+        for (uint32_t i = 0; i < samples; ++i)
+        {
+            const float2 a = grid[j * samples + i];
+            if (i + 1 < samples)
+            {
+                const float2 d = abs(grid[j * samples + i + 1] - a);
+                pad = std::max(pad, std::max(d.x, d.y));
+            }
+            if (j + 1 < samples)
+            {
+                const float2 d = abs(grid[(j + 1) * samples + i] - a);
+                pad = std::max(pad, std::max(d.x, d.y));
+            }
+        }
+    if (mBeamOctFull)
+    {
+        low = float2(0.f);
+        high = imageDim;
+        pad = 0.f;
+    }
+    mParams.beamFrameDim = uint2(dim, dim);
+    mParams.beamRefU = camera.cameraU;
+    mParams.beamRefV = camera.cameraV;
+    mParams.beamRefW = camera.cameraW;
+    mParams.beamRefAligned = 0;
+    // The image cannot go stale, so the only build that starts from nothing is the one that allocates it.
+    const bool fresh = !mBeamRefAnchored || any(mParams.beamFrameDim != mBeamOctDim);
+    if (fresh)
+    {
+        mBeamRefAnchored = true;
+        mBeamOctDim = mParams.beamFrameDim;
+        ++mBeamRefAnchors;
+        mBeamHistoryValid = false;
+        mParams.beamHistoryValid = 0;
+        mBeamReusable = false;
+    }
+    mParams.beamRefValid = fresh ? 0u : 1u;
+    mParams.beamScreenBounds = float4(
+        std::max(0.f, low.x - pad), std::max(0.f, low.y - pad), std::min(imageDim.x, high.x + pad),
+        std::min(imageDim.y, high.y + pad)
     );
 }
 

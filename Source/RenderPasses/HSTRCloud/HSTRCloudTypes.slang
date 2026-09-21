@@ -1092,6 +1092,22 @@ struct HSTRCloudParams
     uint beamPageIndirect = 0;
     uint beamPageShift = 4;            ///< Lattice points per page edge, as a shift.
     uint2 beamPageDims = { 0, 0 };     ///< Pages covering the lattice.
+    /// 1 when the beam image IS the octahedral sphere instead of a perspective rectangle anchored to a camera pose.
+    ///
+    /// Every world direction then has one fixed texel for as long as the renderer runs, so there is nothing to re-anchor: a turn
+    /// changes which already-built directions are resolved and nothing else. That is the whole point. A re-anchor today discards
+    /// a cache that is entirely correct - at 0.05 rad/frame a 65 degree view exposes 4.4% new directions per frame and the frame
+    /// re-anchors every third one, re-marching 100% of the image - and the level-0 query pass it rebuilds is 4.16 ms of a 6.84 ms
+    /// fast turn.
+    ///
+    /// The image stays a rectangle, so the lattice, the tiles, the level map, the residual, the carry and the generated dispatch
+    /// are untouched: only beamRayDirection, beamImagePosition and beamPixelPosition change, because those are the only places
+    /// the beam pipeline talks about the world. The octahedral map is continuous across z = 0 and costs no transcendentals (abs,
+    /// divide, select); its only discontinuity is the square's border, which is the two half great circles x = 0 and y = 0 of the
+    /// -z hemisphere. The frame is oriented with +z at the zenith, so that seam lies below the horizon.
+    uint beamOct = 0;
+    uint beamOctFull = 0;              ///< Build the whole sphere rather than the screen's footprint (isolates bounding bugs).
+    uint2 beamOctReserved = { 0, 0 };
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
