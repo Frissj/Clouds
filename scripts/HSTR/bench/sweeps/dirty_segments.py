@@ -11,8 +11,9 @@ from sea_config import mk
 # from unit transmittance, composed front to back by the first. It was rejected once as beamSegments on the million-ray lattice,
 # where slices losing early termination is pure extra work; here latency is the whole cost, so it should be the opposite.
 #
-# Read beamDirty/query, not the frame total: the rest of the frame is the same in every arm. And quality must not move at all -
-# the composition is exact, so any change is a bug.
+# Read beamDirty/query, not the frame total: the rest of the frame is the same in every arm. Quality should not move - the
+# composition is exact given the slices - but the slices are not the unbroken march cut up (each restarts marchBeam's state, and
+# the step cap and opacity cutoff apply per slice), so a change is a finding to explain rather than automatically a bug.
 COMMON = dict(
     beamTileSize=4,
     beamLevels=1,

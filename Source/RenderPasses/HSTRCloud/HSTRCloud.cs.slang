@@ -6602,8 +6602,12 @@ groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance t
 /// decide for itself would race with neighbouring points' carry writes, and two slices of one ray disagreeing would compose a
 /// ray from pieces of two different answers. Every thread reaches both barriers; the early-outs only choose what is marched.
 ///
-/// Slices compose front to back exactly: radiance as C += T C_k, optical depth as a sum, and the opacity-weighted distance as
-/// sum(T_before d_k (1 - T_k)) / (1 - T_total), which is what one unbroken march would have accumulated.
+/// Slices compose front to back: radiance as C += T C_k, optical depth as a sum, and the opacity-weighted distance as
+/// sum(T_before d_k (1 - T_k)) / (1 - T_total). The COMPOSITION is exact given the slices; the slices themselves are not the
+/// unbroken march cut into pieces. Each marchBeam starts fresh - held step and sigma, cached lighting, empty-cell traversal state -
+/// a step boundary is forced at every slice edge, and maxMarchSteps and cloudMinTransmittance apply per slice, so a ray that hits
+/// the step cap or goes opaque can end differently. Measured, 720p sea: the error statistics matched to every printed digit
+/// across 1 to 64 slices; that is not a pixel diff, and a dense or long volume could still separate them.
 [numthreads(64, 1, 1)]
 void buildBeamDirtyQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupThreadId: SV_GroupThreadID)
 {

@@ -1192,8 +1192,10 @@ struct HSTRCloudParams
     /// longest ray, and duplicated work is nearly free where latency is the whole cost. Must divide 64.
     ///
     /// MEASURED, 720p oct, bracketed (seg 1 run twice, warm-up arm first), query ms: walk 1 -> 0.34/0.28, 16 -> 0.15, 32 -> 0.090,
-    /// 64 -> 0.055, frame 0.45 -> 0.19; sprint 1 -> 0.045, 64 -> 0.022 with the frame flat (0.55 / 0.52). Error bit-identical in
-    /// every arm. 64 is the ceiling the clamp allows and scaling had still not flattened there.
+    /// 64 -> 0.055, frame 0.45 -> 0.19; sprint 1 -> 0.045, 64 -> 0.022 with the frame flat (0.55 / 0.52). Error statistics equal to
+    /// every printed digit in every arm (not a pixel diff: slices restart marchBeam's state and its step and opacity caps, see
+    /// buildBeamDirtyQueries). 64 is the ceiling the clamp allows and scaling had still not flattened there - at ~560 rays, i.e.
+    /// ~36k threads. With thousands of dirty rays the query turns throughput-bound again, where slices are duplicated work.
     uint beamDirtySegments = 64;
 };
 
