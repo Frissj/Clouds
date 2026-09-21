@@ -1169,11 +1169,32 @@ struct HSTRCloudParams
     /// and assuming 4 put every dirty point outside the tile grid: 77,895 threads dispatched, none of them in range, the blocks
     /// never verified, and so re-listed as invalidated on every frame for ever.
     uint beamDirtyPointStride = 1;
-    /// First block the classification covers. It only has to look at blocks the screen can reach: the octahedral guard grid is
-    /// 373 x 373 blocks of the whole sphere and the screen touches a few thousand of them, so walking all 139,129 to find them
-    /// just moves the sweep from the query pass into the classifier.
+    /// The coarse level over the guard blocks: one cell per 1 << beamCoarseShift blocks on a side.
+    ///
+    /// A leaf certificate says the block is safe while |P - C| <= R. A coarse cell holds the same pair, chosen so that its
+    /// sphere lies inside every one of its children's: anchored at the camera that last rebuilt it, with
+    /// R = min over children of (R_child - |C_child - A|), which is the triangle inequality and so is exactly conservative.
+    /// One test then answers for all its children, and - just as importantly - the octahedral on-screen test, which costs a
+    /// decode and a projection, is paid once per cell instead of once per block.
+    /// beamCoarseShift sits here, immediately after beamDirtyPointStride, so that the uint2 below starts eight-byte aligned. A
+    /// uint2 placed mid-row is padded in the shader and not on the host, which the layout check reports as a four-byte difference.
+    /// Two, so a cell is 4 x 4 blocks and its uncovered children fit a sixteen-bit mask (kBeamCoarseChildren). At three (8 x 8)
+    /// one unverified child zeroed a cell of sixty-four: 720p oct walk, beamDirty 0.61 ms of a 0.62 ms query.
+    uint beamCoarseShift = 2;
+    /// First block the classification covers, when a caller bounds it. Kept at zero: see the note beside the classify dispatch.
     uint2 beamGuardOrigin = { 0, 0 };
-    uint2 beamDirtyReserved = { 0, 0 };
+    uint2 beamCoarseDims = { 0, 0 };
+    uint beamCoarseCapacity = 0;
+    /// Threads per ray in the dirty query: each marches an equal slice of the ray's volume interval from unit transmittance and
+    /// the first composes them front to back. Rejected once as beamSegments on the full lattice (4 -> 1 took that pass 11.0 ->
+    /// 5.4 ms) because slices lose early termination and so duplicate work - but that pass was a million rays and throughput-
+    /// bound. The dirty query is a few hundred rays, a few waves on a GPU of thousands of lanes, so it costs the latency of its
+    /// longest ray, and duplicated work is nearly free where latency is the whole cost. Must divide 64.
+    ///
+    /// MEASURED, 720p oct, bracketed (seg 1 run twice, warm-up arm first), query ms: walk 1 -> 0.34/0.28, 16 -> 0.15, 32 -> 0.090,
+    /// 64 -> 0.055, frame 0.45 -> 0.19; sprint 1 -> 0.045, 64 -> 0.022 with the frame flat (0.55 / 0.52). Error bit-identical in
+    /// every arm. 64 is the ceiling the clamp allows and scaling had still not flattened there.
+    uint beamDirtySegments = 64;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

@@ -268,10 +268,20 @@ private:
     ref<Buffer> mpBeamDirtyCount;
     ref<Buffer> mpBeamDirtyArgs;    ///< Two indirect dispatches: the query over those blocks, then the residual over them.
     ref<ComputePass> mpBeamClassifyGuardPass;
+    ref<Texture> mpBeamCoarse;        ///< Coarse certificate: anchor camera and safe radius per cell of blocks.
+    ref<Texture> mpBeamCoarseState;   ///< Per coarse cell: children its certificate does not cover, and a queued-for-rebuild bit.
+    ref<Buffer> mpBeamDescend;        ///< Blocks the coarse level could not answer for, to classify one by one.
+    ref<Buffer> mpBeamDescendCount;   ///< [0] blocks in mpBeamDescend, [1] cells in mpBeamRebuild.
+    ref<Buffer> mpBeamRebuild;        ///< Coarse cells to rebuild after this build's query: expired, or a child re-verified.
+    ref<ComputePass> mpBeamCoarsePass;
+    ref<ComputePass> mpBeamLeafPass;
+    ref<ComputePass> mpBeamCoarseUpdatePass;
+    ref<ComputePass> mpBeamDescendArgsPass;
     ref<ComputePass> mpBeamDirtyArgsPass;
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
     bool mBeamDirtyActive = false; ///< This build listed invalidated blocks, so the residual has to cover them too.
+    uint32_t mBeamClassifyCells = 0; ///< Guard blocks the classification examined, against the whole grid it used to walk.
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
     ref<Texture> mpBeamQueryMap; ///< Sparse query ID per possible lattice coordinate.
     ref<Texture> mpBeamTileMap;  ///< Final sparse tile ID per finest cell.

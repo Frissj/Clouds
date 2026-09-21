@@ -87,7 +87,7 @@ for label, props in ARMS:
         before = stats()
         priorThreads = int(before.get("beamGridThreads", 0))
         priorUnits = int(before.get("beamUnitThreads", 0))
-        threads, units, dirty, unver, carried, ran, rng, called, sweeps = [], [], [], [], [], [], [], [], 0
+        threads, units, dirty, unver, cls, sweeps = [], [], [], [], [], 0
         priorSweeps = int(before.get("beamGridSweeps", 0))
         for i in range(FRAMES):
             pose(i, forward, yaw)
@@ -101,18 +101,10 @@ for label, props in ARMS:
             priorUnits = nowUnits
             dirty.append(int(s.get("beamDirtyBlocks", 0)))
             unver.append(int(s.get("beamDirtyUnverified", 0)))
-            carried.append(int(s.get("beamGuardVerified", 0)))
-            ran.append(int(s.get("beamDirtyThreads", 0)))
-            rng.append(int(s.get("beamDirtyInRange", 0)))
-            called.append(int(s.get("beamGuardCalled", 0)))
+            cls.append(int(s.get("beamClassifyCells", 0)))
         sweeps = int(stats().get("beamGridSweeps", 0)) - priorSweeps
         mean = lambda v: sum(v) / float(len(v))
         dim = int(hstr.properties.get("beamOctDim", 0))
-        c = stats()
-        if motion == "walk":
-            log(f"      cfg guardDimsX {int(c.get('cfgGuardDimsX',0))} dirtyEdge {int(c.get('cfgDirtyEdge',0))} "
-                f"capacity {int(c.get('cfgDirtyCapacity',0))} tileDimsX {int(c.get('cfgTileDimsX',0))} "
-                f"refreshBlock {int(c.get('cfgRefreshBlock',0))} latticeStep {int(c.get('cfgLatticeStep',0))}")
         log(f"{label:5s} {motion:6s} query {mean(threads):10.0f}  residual {mean(units):10.0f}  dirty blocks {mean(dirty):8.0f}"
-            f" unverified {mean(unver):8.0f}  verified {mean(carried):9.0f}  ran {mean(ran):8.0f}  inRange {mean(rng):8.0f}  guardCalled {mean(called):9.0f}  sweeps {sweeps:3d}/{FRAMES}")
+            f" unverified {mean(unver):8.0f}  classified {mean(cls):8.0f}  sweeps {sweeps:3d}/{FRAMES}")
 exit()

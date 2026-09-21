@@ -34,10 +34,13 @@ COMMON = dict(
     beamGuard=True,
 )
 
-RECT = dict(COMMON, beamOct=False, beamRefMargin=0.15)
+# Every arm sets beamScreenResidual: nothing is put back between tests, and before this the "oct" arm of every motion after the
+# first inherited True from the previous motion's "oct screen" arm - that was the 0.62 ms walk and 1.27 ms sprint "march" it
+# reported, which a plain oct arm does not pay (dirty_seg_anchor: march 0.02 ms at walk).
+RECT = dict(COMMON, beamOct=False, beamRefMargin=0.15, beamScreenResidual=False)
 OCT = dict(COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0)
 TESTS = [
     ("rect", mk(**RECT, beamTolerance=0.05)),
-    ("oct", mk(**OCT, beamTolerance=0.05)),
+    ("oct", mk(**OCT, beamTolerance=0.05, beamScreenResidual=False)),
     ("oct screen", mk(**OCT, beamTolerance=0.02, beamScreenResidual=True)),
 ]

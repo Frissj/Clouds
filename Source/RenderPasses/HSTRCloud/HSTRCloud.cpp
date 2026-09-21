@@ -288,6 +288,15 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamDirtySegments")
+        {
+            // Threads per ray must divide the 64-thread group, or a ray's slices would straddle two groups' shared memory.
+            uint32_t segments = std::clamp(uint32_t(value), 1u, 64u);
+            while (64u % segments != 0u)
+                --segments;
+            mParams.beamDirtySegments = segments;
+            continue;
+        }
         if (key == "beamGuard")
         {
             mBeamGuard = bool(value);
@@ -904,6 +913,7 @@ Properties HSTRCloud::getProperties() const
     props["beamScreenResidual"] = mBeamScreenResidual;
     props["beamAssumeCarry"] = mParams.beamAssumeCarry != 0;
     props["beamGuard"] = mBeamGuard;
+    props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
@@ -1041,6 +1051,7 @@ Properties HSTRCloud::getProperties() const
         cloud["beamUnitThreads"] = mBeamUnitThreads;
         cloud["beamDirtyBlocks"] = mBeamLevelCounts[kBeamDirtyBlocks];
         cloud["beamDirtyUnverified"] = mBeamLevelCounts[kBeamDirtyUnverified];
+        cloud["beamClassifyCells"] = mBeamClassifyCells;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -1221,6 +1232,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamUnitMarchPass = createPass("marchBeamUnits");
     mpBeamQueueMarchPass = createPass("marchBeamQueue");
     mpBeamClassifyGuardPass = createPass("classifyBeamGuard");
+    mpBeamCoarsePass = createPass("classifyBeamCoarse");
+    mpBeamLeafPass = createPass("classifyBeamLeaves");
+    mpBeamCoarseUpdatePass = createPass("updateBeamCoarse");
+    mpBeamDescendArgsPass = createPass("writeBeamDescendArgs");
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
@@ -3090,6 +3105,11 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
+    var["hstrBeamCoarse"] = mpBeamCoarse;
+    var["hstrBeamCoarseState"] = mpBeamCoarseState;
+    var["hstrBeamDescend"] = mpBeamDescend;
+    var["hstrBeamDescendCount"] = mpBeamDescendCount;
+    var["hstrBeamRebuild"] = mpBeamRebuild;
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
@@ -3991,12 +4011,24 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
                 mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1);
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 6, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
-                                             ResourceBindFlags::IndirectArg
+                    sizeof(uint32_t), 12, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                              ResourceBindFlags::IndirectArg
                 );
+                const uint2 coarseDims = (guardDims + 3u) / 4u;
+                mpBeamCoarse =
+                    mpDevice->createTexture2D(coarseDims.x, coarseDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+                mpBeamCoarseState =
+                    mpDevice->createTexture2D(coarseDims.x, coarseDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                // The coarse level lists individual blocks, each at most once, so this too holds every block and cannot overflow.
+                mpBeamDescend = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
+                mpBeamDescendCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2);
+                mpBeamRebuild = mpDevice->createStructuredBuffer(sizeof(uint32_t), coarseDims.x * coarseDims.y);
                 mBeamGuardCleared = false;
             }
             mParams.beamGuardDims = guardDims;
+            mParams.beamCoarseShift = 2; // 4 x 4: the texture sizes above, and the sixteen-bit child mask, both assume it.
+            mParams.beamCoarseDims = (guardDims + 3u) / 4u;
+            mParams.beamCoarseCapacity = mParams.beamCoarseDims.x * mParams.beamCoarseDims.y;
             mParams.beamDirtyCapacity = guardDims.x * guardDims.y;
             // A guard block is beamRefreshBlock points of the LATTICE. In beam units that is beamRefreshBlock * beamLatticeStep
             // wide, and in QUERY points - which are one per beamTileSize units - it is that divided by the tile. Those are three
@@ -4296,6 +4328,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 {
                     pRenderContext->clearUAV(mpBeamGuardDepth->getUAV().get(), uint4(0xFFFFFFFFu));
                     pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
+                    pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
+                    pRenderContext->clearUAV(mpBeamCoarseState->getUAV().get(), uint4(0));
                     mBeamGuardCleared = true;
                 }
                 // A re-anchored frame shares no index with the one before it, so every mark in the persistent lattice goes.
@@ -4448,21 +4482,56 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             {
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
-                                // MEASURED and REVERTED: bounding this to the screen's block box. A block outside the box is not
-                                // classified, so it is never certified either, and the points the generated strips still visit
-                                // there fall back to the thirteen-sample test the certificate exists to avoid - the rectangle's
-                                // walk went 0.33 ms to 2.62 with the level-0 query pass at 1.42. Every block the query can touch
-                                // has to be offered a certificate, so the classification covers the grid.
-                                bindRenderer(pRenderContext, mpBeamClassifyGuardPass);
-                                mpBeamClassifyGuardPass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
-                                bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
-                                mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
-                                for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
+                                // MEASURED TWICE and REVERTED: bounding this domain. First to the screen's block box, then to that
+                                // box unioned with the regions the query dispatch had just covered. Both take the rectangle's walk
+                                // from 0.33 ms to 2.4 and above, with the level-0 query pass at 1.35. A block left out is never
+                                // RE-verified - the classifier does not grant certificates, a point reads the guard itself - so
+                                // once its radius expires every point in it pays the thirteen-sample test on every frame for ever,
+                                // and one such block costs far more than the thousands of cheap classifications it saved.
+                                // The answer is not a tighter domain but a hierarchy over it, so covering the domain is cheap.
+                                //
+                                // One thread per COARSE cell (4 x 4 blocks) decides for its blocks. A held certificate answers
+                                // for every child it covers, and only the children in its uncovered mask are listed for the leaf
+                                // test - so one never-verified child costs one block, not the cell. Measured with a binary 8 x 8
+                                // cell first: classifier threads 139,129 -> 2,209 for the same 74 dirty blocks, yet beamDirty
+                                // stayed 0.61 of a 0.62 ms walk, as edge cells whose off-screen children are never verified
+                                // could never certify and descended into all sixty-four children on every frame.
+                                //
+                                // Rebuilds are event-driven: a cell is rebuilt only if its certificate expired or a child the
+                                // leaf test listed is about to be re-verified, never because it was merely looked at. They come
+                                // after the query, since they read the verifications it writes.
+                                //
+                                // MEASURED, 720p oct walk (2 units + 0.01 rad a frame): beamDirty 0.59 ms = classify 0.033 +
+                                // query 0.552 + rebuild under 0.01. Masks and sparse rebuilds did not move the total (4 x 4 binary
+                                // cells, same run conditions: 0.60), because hierarchy upkeep was never the cost. The query is:
+                                // its ~70 blocks a frame are a NEW set each frame - never-visited directions the turn brings on
+                                // screen, depth still at the clear value - and all 560 of their threads march and verify. That is
+                                // real information, but 560 long marches cannot fill the GPU, so they cost latency, not work.
                                 {
-                                    mParams.beamGridCentres = centres;
+                                    FALCOR_PROFILE(pRenderContext, "classify");
+                                    pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
+                                    bindRenderer(pRenderContext, mpBeamCoarsePass);
+                                    mpBeamCoarsePass->execute(pRenderContext, uint3(mParams.beamCoarseDims, 1));
+                                    bindRenderer(pRenderContext, mpBeamDescendArgsPass);
+                                    mpBeamDescendArgsPass->execute(pRenderContext, uint3(1));
+                                    bindRenderer(pRenderContext, mpBeamLeafPass);
+                                    mpBeamLeafPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 24);
+                                    mBeamClassifyCells = mParams.beamCoarseDims.x * mParams.beamCoarseDims.y;
+                                    bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
+                                    mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
+                                }
+                                {
+                                    FALCOR_PROFILE(pRenderContext, "query");
+                                    // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
+                                    // longest ray, so the two it used to be cost two of those back to back.
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                                }
+                                {
+                                    FALCOR_PROFILE(pRenderContext, "rebuild");
+                                    bindRenderer(pRenderContext, mpBeamCoarseUpdatePass);
+                                    mpBeamCoarseUpdatePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 36);
                                 }
                                 mBeamDirtyActive = true;
                             }
