@@ -20,7 +20,9 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 28;
+static const uint kBeamCountSlots = 30;
+static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
+static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;
@@ -1155,7 +1157,23 @@ struct HSTRCloudParams
     /// frame and the residual was marching about ten times that. Projecting the direction itself costs three dot products and has
     /// no such slack.
     float beamOctNdcPerTexel = 0.f;
-    uint beamGuardReserved = 0;
+    /// The guard's block grid, and the block's edge in beam units, for the dispatch that covers only the blocks that failed.
+    /// beamGuardDims starts a row deliberately: a uint2 is eight-byte aligned in the shader and placing it mid-row inserts
+    /// padding the host struct does not have, which the layout check catches as a four-byte difference.
+    uint2 beamGuardDims = { 0, 0 };
+    uint beamDirtyBlockEdge = 0;
+    uint beamDirtyCapacity = 0;
+    /// Lattice points per axis in a guard block, which is NOT beamRefreshBlock. A block is beamRefreshBlock points of the LATTICE,
+    /// the lattice is one point per beamLatticeStep beam pixels, and a query point is one per beamTileSize pixels - so the points
+    /// per block are beamRefreshBlock * beamLatticeStep / beamTileSize. With a lattice step of 2 and a tile of 4 that is 2, not 4,
+    /// and assuming 4 put every dirty point outside the tile grid: 77,895 threads dispatched, none of them in range, the blocks
+    /// never verified, and so re-listed as invalidated on every frame for ever.
+    uint beamDirtyPointStride = 1;
+    /// First block the classification covers. It only has to look at blocks the screen can reach: the octahedral guard grid is
+    /// 373 x 373 blocks of the whole sphere and the screen touches a few thousand of them, so walking all 139,129 to find them
+    /// just moves the sweep from the query pass into the classifier.
+    uint2 beamGuardOrigin = { 0, 0 };
+    uint2 beamDirtyReserved = { 0, 0 };
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

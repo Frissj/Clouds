@@ -264,6 +264,14 @@ private:
     ref<Texture> mpBeamGuardCamera; ///< Per block: the camera position its points were last tested against.
     bool mBeamGuard = false;        ///< Certify translation survival per block instead of per point.
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
+    ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
+    ref<Buffer> mpBeamDirtyCount;
+    ref<Buffer> mpBeamDirtyArgs;    ///< Two indirect dispatches: the query over those blocks, then the residual over them.
+    ref<ComputePass> mpBeamClassifyGuardPass;
+    ref<ComputePass> mpBeamDirtyArgsPass;
+    ref<ComputePass> mpBeamDirtyQueryPass;
+    ref<ComputePass> mpBeamDirtyMarchPass;
+    bool mBeamDirtyActive = false; ///< This build listed invalidated blocks, so the residual has to cover them too.
     ref<Texture> mpBeamLevel;   ///< Level that finalised every finest beam tile.
     ref<Texture> mpBeamQueryMap; ///< Sparse query ID per possible lattice coordinate.
     ref<Texture> mpBeamTileMap;  ///< Final sparse tile ID per finest cell.

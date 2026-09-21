@@ -1039,6 +1039,8 @@ Properties HSTRCloud::getProperties() const
         cloud["beamGridStrips"] = mBeamGridStrips;
         cloud["beamGridThreads"] = mBeamGridThreads;
         cloud["beamUnitThreads"] = mBeamUnitThreads;
+        cloud["beamDirtyBlocks"] = mBeamLevelCounts[kBeamDirtyBlocks];
+        cloud["beamDirtyUnverified"] = mBeamLevelCounts[kBeamDirtyUnverified];
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -1218,6 +1220,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamGridMarchPass = createPass("marchBeamGrid");
     mpBeamUnitMarchPass = createPass("marchBeamUnits");
     mpBeamQueueMarchPass = createPass("marchBeamQueue");
+    mpBeamClassifyGuardPass = createPass("classifyBeamGuard");
+    mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
+    mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
+    mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
     mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
@@ -3081,6 +3087,9 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
     var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
+    var["hstrBeamDirty"] = mpBeamDirty;
+    var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
+    var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
@@ -3976,8 +3985,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 mpBeamGuardCamera =
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+                // One entry per block, so the work list can hold every block at once and can never overflow. That is the whole
+                // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
+                const uint32_t cells = guardDims.x * guardDims.y;
+                mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1);
+                mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 6, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                             ResourceBindFlags::IndirectArg
+                );
                 mBeamGuardCleared = false;
             }
+            mParams.beamGuardDims = guardDims;
+            mParams.beamDirtyCapacity = guardDims.x * guardDims.y;
+            // A guard block is beamRefreshBlock points of the LATTICE. In beam units that is beamRefreshBlock * beamLatticeStep
+            // wide, and in QUERY points - which are one per beamTileSize units - it is that divided by the tile. Those are three
+            // different numbers whenever the lattice step is not the tile size, and here the step is 2 against a tile of 4.
+            const uint32_t block = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
+            mParams.beamDirtyBlockEdge = block;
+            mParams.beamDirtyPointStride = std::max(block / std::max(mParams.beamTileSize, 1u), 1u);
         }
         if (!mpBeamLevel || mpBeamLevel->getWidth() != levelDims.x || mpBeamLevel->getHeight() != levelDims.y)
             mpBeamLevel = mpDevice->createTexture2D(levelDims.x, levelDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
@@ -4317,8 +4343,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // that can need work are the refresh phase's blocks plus whatever the screen box newly covers. The
                             // second part is exact rectangle subtraction: current tile box minus the box the last build wrote,
                             // which for a rotation is one or two thin strips. Nothing else in the image can have changed.
+                            // A translated camera used to force the sweep, because anything could have failed parallax. With the
+                            // guard it no longer has to: the blocks that could have failed are exactly the ones whose certificate
+                            // does not hold, and those are listed and dispatched below. So translation joins rotation in
+                            // generating its work instead of searching for it.
+                            const bool guarded = mParams.beamGuard != 0 && mBeamGuardCleared;
                             const bool carrying = mBeamRefFrame && mParams.beamRefValid != 0 && mParams.beamHistoryValid != 0 &&
-                                                  mParams.beamStationary != 0 && phases > 2;
+                                                  (mParams.beamStationary != 0 || guarded) && phases > 2;
                             const bool sameBox = all(mParams.beamScreenBounds == mParams.beamPrevScreenBounds);
                             const bool generated = carrying;
                             const uint32_t refreshBlock = std::max(mParams.beamRefreshBlock, 1u);
@@ -4409,6 +4440,31 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 strip(int2(midLow.x, std::max(cf.y, plc.y)), midHigh);        // below it
                                 if (centres == 0)
                                     ++mBeamGridStrips;
+                            }
+                            // The blocks translation actually invalidated. Classified once per block rather than once per point,
+                            // compacted, and dispatched indirectly, so the cost follows what moved instead of what exists.
+                            mBeamDirtyActive = false;
+                            if (generated && mParams.beamStationary == 0 && guarded && mpBeamDirty)
+                            {
+                                FALCOR_PROFILE(pRenderContext, "beamDirty");
+                                pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
+                                // MEASURED and REVERTED: bounding this to the screen's block box. A block outside the box is not
+                                // classified, so it is never certified either, and the points the generated strips still visit
+                                // there fall back to the thirteen-sample test the certificate exists to avoid - the rectangle's
+                                // walk went 0.33 ms to 2.62 with the level-0 query pass at 1.42. Every block the query can touch
+                                // has to be offered a certificate, so the classification covers the grid.
+                                bindRenderer(pRenderContext, mpBeamClassifyGuardPass);
+                                mpBeamClassifyGuardPass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
+                                bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
+                                mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
+                                for (uint32_t centres = 0; centres < (mParams.beamCentreless != 0 ? 1u : 2u); ++centres)
+                                {
+                                    mParams.beamGridCentres = centres;
+                                    bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
+                                    bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                    mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                                }
+                                mBeamDirtyActive = true;
                             }
                             mParams.beamGridCentres = 0;
                             mParams.beamGridOrigin = uint2(0);
@@ -4569,6 +4625,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mParams.beamUnitGenerated = 0;
                 mParams.beamGridBlocks = 0;
                 mParams.beamGridOrigin = uint2(0);
+                // And the residual for the blocks translation invalidated, over the same list the query pass just used.
+                if (mBeamDirtyActive)
+                {
+                    bindRenderer(pRenderContext, mpBeamDirtyMarchPass);
+                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] = mpBeamPixels[0];
+                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixels"] = ref<Texture>();
+                    mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 12); // Bytes: three uints in.
+                }
             }
             else if (unitMarch)
             {

@@ -65,6 +65,12 @@ for i in range(int(os.environ.get("HSTR_SETTLE", "900"))):
 while int(hstr.properties["worldCacheSampleCount"]) < 64:
     m.renderFrame()
 hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": True})
+# The beam counters only leave the GPU while a reference comparison is active, so one stored frame is captured to open that path.
+# Its error numbers are meaningless here and nothing below reads them.
+m.renderFrame()
+hstr.set_properties({"storeExact": True})
+m.renderFrame()
+hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 0})
 log(f"sea: settled, mapped {stats().get('mapped', 0)}")
 
 ARMS = [("rect", mk(**COMMON, beamOct=False, beamRefMargin=0.15)),
@@ -81,7 +87,7 @@ for label, props in ARMS:
         before = stats()
         priorThreads = int(before.get("beamGridThreads", 0))
         priorUnits = int(before.get("beamUnitThreads", 0))
-        threads, units, sweeps = [], [], 0
+        threads, units, dirty, unver, carried, ran, rng, called, sweeps = [], [], [], [], [], [], [], [], 0
         priorSweeps = int(before.get("beamGridSweeps", 0))
         for i in range(FRAMES):
             pose(i, forward, yaw)
@@ -93,9 +99,20 @@ for label, props in ARMS:
             nowUnits = int(s.get("beamUnitThreads", 0))
             units.append(nowUnits - priorUnits)
             priorUnits = nowUnits
+            dirty.append(int(s.get("beamDirtyBlocks", 0)))
+            unver.append(int(s.get("beamDirtyUnverified", 0)))
+            carried.append(int(s.get("beamGuardVerified", 0)))
+            ran.append(int(s.get("beamDirtyThreads", 0)))
+            rng.append(int(s.get("beamDirtyInRange", 0)))
+            called.append(int(s.get("beamGuardCalled", 0)))
         sweeps = int(stats().get("beamGridSweeps", 0)) - priorSweeps
         mean = lambda v: sum(v) / float(len(v))
         dim = int(hstr.properties.get("beamOctDim", 0))
-        log(f"{label:5s} {motion:6s} query threads/frame {mean(threads):11.0f}  residual threads/frame {mean(units):11.0f}  "
-            f"sweeps {sweeps:3d}/{FRAMES}  image {dim if dim else 'rect'}")
+        c = stats()
+        if motion == "walk":
+            log(f"      cfg guardDimsX {int(c.get('cfgGuardDimsX',0))} dirtyEdge {int(c.get('cfgDirtyEdge',0))} "
+                f"capacity {int(c.get('cfgDirtyCapacity',0))} tileDimsX {int(c.get('cfgTileDimsX',0))} "
+                f"refreshBlock {int(c.get('cfgRefreshBlock',0))} latticeStep {int(c.get('cfgLatticeStep',0))}")
+        log(f"{label:5s} {motion:6s} query {mean(threads):10.0f}  residual {mean(units):10.0f}  dirty blocks {mean(dirty):8.0f}"
+            f" unverified {mean(unver):8.0f}  verified {mean(carried):9.0f}  ran {mean(ran):8.0f}  inRange {mean(rng):8.0f}  guardCalled {mean(called):9.0f}  sweeps {sweeps:3d}/{FRAMES}")
 exit()
