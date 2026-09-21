@@ -4630,23 +4630,29 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         {
             FALCOR_PROFILE(pRenderContext, "resolve");
             const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : mpBeamResolvePass;
-            const uint32_t pixels = mParams.frameDim.x * mParams.frameDim.y;
-            if (!mpBeamResidualList || mpBeamResidualList->getElementCount() < pixels)
+            // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
+            // common resolve is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel). The
+            // resolve queues its 8 x 8 groups that hold such pixels, with a mask, so the second pass runs over them alone.
+            const bool residual = mParams.beamRefFrame != 0 && mParams.beamScreenResidual == 0 && !mBeamSparseBuilt;
+            // Only this configuration's resolve ever queues a group (the screen residual returns before it can), so only it
+            // allocates the queue: 1.5 MiB at 4K.
+            if (residual)
             {
-                mpBeamResidualList = mpDevice->createStructuredBuffer(sizeof(uint32_t), pixels);
-                mpBeamResidualArgs = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 4, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
-                                             ResourceBindFlags::IndirectArg
-                );
+                const uint32_t groups = ((mParams.frameDim.x + 7u) / 8u) * ((mParams.frameDim.y + 7u) / 8u);
+                if (!mpBeamResidualList || mpBeamResidualList->getElementCount() < 3u * groups)
+                {
+                    mpBeamResidualList = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3u * groups);
+                    mpBeamResidualArgs = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 4, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                                 ResourceBindFlags::IndirectArg
+                    );
+                }
+                pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             }
-            pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             bindRenderer(pRenderContext, pResolve);
             pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
             pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
-            // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
-            // common resolve above is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel).
-            // The resolve lists those pixels as it meets them, so the second pass runs over them alone.
-            if (mParams.beamRefFrame != 0 && mParams.beamScreenResidual == 0 && !mBeamSparseBuilt)
+            if (residual)
             {
                 bindRenderer(pRenderContext, mpBeamResidualArgsPass);
                 mpBeamResidualArgsPass->execute(pRenderContext, uint3(1));

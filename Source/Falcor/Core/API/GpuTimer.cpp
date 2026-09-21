@@ -126,6 +126,15 @@ void GpuTimer::resolve()
     // This should be batched across all active timers and results copied into a single staging buffer once per frame instead.
 
     // Resolve timestamps into buffer.
+    //
+    // The resolve writes mpResolveBuffer through the raw gfx encoder, which Falcor's state tracking does not see, so the buffer
+    // is moved to CopyDest through the tracker first. Without it the tracker still believed the buffer to be in CopySource from
+    // the previous copy, copyResource below issued no barrier between the resolve's write and its own read, and the copy read
+    // the PREVIOUS resolve: every reading after a timer's first was that timer's use before last, two frames old for a profiler
+    // event that runs every frame. Measured by the timers' own GPU ticks - a timer's second reading was byte-identical to its
+    // first - and it put two frames of the previous benchmark arm into every arm's mean (+0.17 ms of "march" after a
+    // screen-residual arm, where the march took 0.007 ms). ResolveQueryData also requires its destination in COPY_DEST.
+    mpDevice->getRenderContext()->resourceBarrier(mpResolveBuffer.get(), Resource::State::CopyDest);
     auto encoder = mpDevice->getRenderContext()->getLowLevelData()->getResourceCommandEncoder();
 
     encoder->resolveQuery(mpDevice->getTimestampQueryHeap()->getGfxQueryPool(), mStart, 2, mpResolveBuffer->getGfxBufferResource(), 0);

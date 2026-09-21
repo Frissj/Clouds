@@ -352,8 +352,9 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamDescend;      ///< Guard blocks this build has to classify one by one.
     RWStructuredBuffer<uint> hstrBeamDescendCount; ///< [0] blocks in hstrBeamDescend, [1] cells in hstrBeamRebuild.
     RWStructuredBuffer<uint> hstrBeamRebuild;      ///< Coarse cells whose certificate this build has to rebuild.
-    RWStructuredBuffer<uint> hstrBeamResidualList; ///< Reference frame: pixels of failed tiles, packed, for the residual resolve.
-    RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] pixels listed, [1..3] the residual resolve's dispatch.
+    /// Reference frame: per 8 x 8 resolve group holding failed-tile pixels, its packed group position and a 64-bit pixel mask.
+    RWStructuredBuffer<uint> hstrBeamResidualList;
+    RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch.
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
@@ -5376,7 +5377,9 @@ struct HSTRCloudRenderer
     /// whatever the texel last held. Measured at 4K parked: resolving from the stored units scored 0.431% of pixels over 0.02
     /// (p99.9 0.086, max 0.61); marching those very same unit directions afresh in the resolve scored 0.244% (p99.9 0.030, max
     /// 0.18). Same sample positions, so the gap was never resampling - it was reading units nobody had written. An accepted
-    /// tile's unit is instead taken from its own basis, within tolerance by construction and costing no march.
+    /// tile's unit is instead taken from its own basis: the estimate that tile was accepted with, at no march. (Acceptance tests
+    /// the centre surplus and the edge contrast, so this is the basis the resolve would use there anyway, not a bound on every
+    /// unit of the tile.)
     float3 beamUnitRadiance(uint2 unit)
     {
         const uint finest = beamTileEdge(params.beamLevels - 1);
@@ -5398,44 +5401,39 @@ struct HSTRCloudRenderer
     }
 
     /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel
-    /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel.
-    void resolveBeamPixel(uint2 pixel)
+    /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel. Returns whether the pixel is left to
+    /// the reference frame's residual resolve instead.
+    bool resolveBeamPixel(uint2 pixel)
     {
         if (any(pixel >= params.frameDim))
-            return;
+            return false;
         const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
-            return;
+            return false;
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
         if (level == params.beamLevels + 1u)
         {
             color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
-            return;
+            return false;
         }
         if (level >= params.beamLevels)
         {
             // A tile the basis could not carry. In the reference frame its residual lives in the beam image beside the basis, so
             // the resolve reads it here instead of a separate screen-space march pass writing colour directly.
             if (params.beamScreenResidual != 0)
-                return; // The screen-space march already wrote this pixel, exactly, with no resampling.
+                return false; // The screen-space march already wrote this pixel, exactly, with no resampling.
             // In the reference frame the residual is resolved by resolveBeamResidualPixel, in its own dispatch: see there. This
-            // pass has already found the pixel, so it hands it over rather than making that one test all 8.3M pixels again -
-            // one atomic per wave.
-            if (params.beamRefFrame != 0)
-            {
-                const uint lanes = WaveActiveCountBits(true);
-                uint first = 0;
-                if (WaveIsFirstLane())
-                    InterlockedAdd(hstrBeamResidualArgs[0], lanes, first);                const uint slot = WaveReadLaneFirst(first) + WavePrefixCountBits(true);
-                if (slot < params.frameDim.x * params.frameDim.y) // The list holds a whole frame; cleared every build.
-                    hstrBeamResidualList[slot] = pixel.x | (pixel.y << 16);
-            }
-            return;
+            // pass has already found the pixel, so it says so, and the resolveBeam entry queues its 8 x 8 group with a mask.
+            return params.beamRefFrame != 0;
         }
         color[pixel] = float4(beamReconstruct(level, beamPosition, w, false), 1.f);
+        return false;
     }
+
+    /// 8 x 8 resolve groups in the frame: the capacity of the residual queue.
+    uint beamResidualGroups() { return ((params.frameDim.x + 7u) / 8u) * ((params.frameDim.y + 7u) / 8u); }
 
     /// A failed tile's pixel in the reference frame: the bilinear over the four units around it, each the best value known for
     /// its direction (beamUnitRadiance).
@@ -5444,13 +5442,17 @@ struct HSTRCloudRenderer
     /// resolve heavier for EVERY pixel, not just the ~6% it serves: 4K resolve 0.37 -> 0.81-0.96 ms in every arm, including the
     /// screen-residual arm that never takes the branch. That is register pressure and occupancy, not work.
     ///
-    /// One thread per pixel resolveBeamPixel listed, rather than per pixel of the frame.
-    void resolveBeamResidualPixel(uint index)
+    /// One 64-thread group per 8 x 8 resolve group that had a residual pixel, one thread per pixel, and only the pixels its mask
+    /// names go on - so the pass costs the failed pixels, and its queue is three uints per screen group rather than one per pixel.
+    /// A per-pixel list cost 31.6 MiB at 4K; this is 1.5 MiB. A full-frame dispatch testing every pixel cost 0.13-0.20 ms.
+    void resolveBeamResidualPixel(uint entry, uint lane)
     {
-        if (index >= min(hstrBeamResidualArgs[0], params.frameDim.x * params.frameDim.y))
+        if (entry >= min(hstrBeamResidualArgs[0], beamResidualGroups()))
             return;
-        const uint packed = hstrBeamResidualList[index];
-        const uint2 pixel = uint2(packed & 0xFFFFu, packed >> 16);
+        const uint packed = hstrBeamResidualList[3 * entry];
+        if ((hstrBeamResidualList[3 * entry + 1 + (lane >> 5)] & (1u << (lane & 31u))) == 0)
+            return;
+        const uint2 pixel = uint2(packed & 0xFFFFu, packed >> 16) * 8u + uint2(lane & 7u, lane >> 3);
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
@@ -6718,24 +6720,49 @@ void marchBeamDirtyUnits(uint3 dispatchThreadId: SV_DispatchThreadID)
     gHSTRCloud.marchBeamDirtyUnit(dispatchThreadId.x);
 }
 
+groupshared uint gResidualMask[2]; ///< Which of the group's 64 pixels the residual resolve has to write.
+
+/// The resolve, and the queue of 8 x 8 groups holding pixels the residual resolve has to write: one entry per such group, with
+/// the mask of which pixels, appended once by the group's first thread.
 [numthreads(8, 8, 1)]
-void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID)
+void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
 {
-    gHSTRCloud.resolveBeamPixel(dispatchThreadId.xy);
+    if (groupIndex < 2)
+        gResidualMask[groupIndex] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (gHSTRCloud.resolveBeamPixel(dispatchThreadId.xy))
+        InterlockedOr(gResidualMask[groupIndex >> 5], 1u << (groupIndex & 31u));
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex == 0 && (gResidualMask[0] | gResidualMask[1]) != 0)
+    {
+        uint entry;
+        InterlockedAdd(gHSTRCloud.hstrBeamResidualArgs[0], 1u, entry);
+        if (entry < gHSTRCloud.beamResidualGroups())
+        {
+            gHSTRCloud.hstrBeamResidualList[3 * entry] = groupId.x | (groupId.y << 16);
+            gHSTRCloud.hstrBeamResidualList[3 * entry + 1] = gResidualMask[0];
+            gHSTRCloud.hstrBeamResidualList[3 * entry + 2] = gResidualMask[1];
+        }
+    }
 }
+
+/// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
+/// a 4K frame has 129,600 resolve groups.
+static const uint kResidualRow = 32768;
 
 [numthreads(64, 1, 1)]
-void resolveBeamResidual(uint3 dispatchThreadId: SV_DispatchThreadID)
+void resolveBeamResidual(uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
 {
-    gHSTRCloud.resolveBeamResidualPixel(dispatchThreadId.x);
+    gHSTRCloud.resolveBeamResidualPixel(groupId.y * kResidualRow + groupId.x, groupIndex);
 }
 
-/// Dispatch arguments for the pixels the resolve listed, after the count in element 0.
+/// Dispatch arguments for the groups the resolve queued, after the count in element 0.
 [numthreads(1, 1, 1)]
 void writeBeamResidualArgs()
 {
-    gHSTRCloud.hstrBeamResidualArgs[1] = (gHSTRCloud.hstrBeamResidualArgs[0] + 63u) / 64u;
-    gHSTRCloud.hstrBeamResidualArgs[2] = 1u;
+    const uint groups = min(gHSTRCloud.hstrBeamResidualArgs[0], gHSTRCloud.beamResidualGroups());
+    gHSTRCloud.hstrBeamResidualArgs[1] = min(groups, kResidualRow);
+    gHSTRCloud.hstrBeamResidualArgs[2] = (groups + kResidualRow - 1u) / kResidualRow;
     gHSTRCloud.hstrBeamResidualArgs[3] = 1u;
 }
 

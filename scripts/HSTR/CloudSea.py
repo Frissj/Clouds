@@ -43,8 +43,22 @@ g.addPass(createPass("HSTRCloud", {
     # Whole query rays: split segments each start at unit transmittance, so those behind opaque cloud march on to the view
     # distance. Near view at 4K, 4x1: queries 201 -> 85 ms, total 293 -> 175 ms, display error 0.21 -> 0.16.
     "beamSegments": 1,
-    "beamTolerance": 0.05,
-    "beamTemporal": True,
+    # The persistent octahedral beam image: the beam basis and its residual live on a world-fixed sphere of directions, so turning
+    # re-marches nothing already seen, and a per-block parallax guard over a 4 x 4 hierarchy lists only what translation broke.
+    # 4K GPU ms park / look / flick / walk / sprint 0.49 / 0.51 / 0.72 / 0.92 / 0.56, 0.137% of pixels over 0.02 against the
+    # per-pixel march (a3d4d427). It replaces the screen-space temporal beam at tolerance 0.05.
+    "beamTolerance": 0.01,
+    "beamTemporal": False,
+    "beamRefFrame": True,
+    "beamOct": True,
+    "beamOctFull": False,
+    "beamOctScale": 1.0,
+    "beamGuard": True,
+    "beamRefresh": 256,
+    "beamRefreshBlock": 4,
+    "beamDepthTolerance": 0.05,
+    "beamCarryTolerance": 0.0,
+    "beamScreenResidual": False,
 }), "HSTRCloud")
 g.addPass(createPass("ToneMapper", {"autoExposure": False, "exposureCompensation": 0.0}), "ToneMapper")
 g.addEdge("HSTRCloud.color", "ToneMapper.src")
