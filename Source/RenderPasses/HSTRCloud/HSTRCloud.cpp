@@ -1038,6 +1038,7 @@ Properties HSTRCloud::getProperties() const
         cloud["beamGridGenerated"] = mBeamGridGenerated;
         cloud["beamGridStrips"] = mBeamGridStrips;
         cloud["beamGridThreads"] = mBeamGridThreads;
+        cloud["beamUnitThreads"] = mBeamUnitThreads;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -3361,7 +3362,14 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
             low = min(low, position);
             high = max(high, position);
         }
+    // The footprint can bulge between samples, so the box is padded by the largest gap between neighbouring ones. Where the map
+    // WRAPS, that gap is a large fraction of the image and the padding stops describing a bulge: the footprint is in two pieces
+    // and only the whole image contains it. Those two cases are separated here, because conflating them padded every frame by a
+    // wrap-sized amount - and a slowly turning camera whose pad fluctuated frame to frame then generated entering strips far
+    // larger than its motion, which cost 0.81 ms of residual march at 0.01 rad/frame against 0.44 at 0.05.
+    const float wrapping = 0.25f * std::max(imageDim.x, imageDim.y);
     float pad = 2.f * float(guard);
+    bool wrapped = false;
     for (uint32_t j = 0; j < samples; ++j)
         for (uint32_t i = 0; i < samples; ++i)
         {
@@ -3369,14 +3377,22 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
             if (i + 1 < samples)
             {
                 const float2 d = abs(grid[j * samples + i + 1] - a);
-                pad = std::max(pad, std::max(d.x, d.y));
+                const float gap = std::max(d.x, d.y);
+                gap >= wrapping ? wrapped = true : pad = std::max(pad, gap);
             }
             if (j + 1 < samples)
             {
                 const float2 d = abs(grid[(j + 1) * samples + i] - a);
-                pad = std::max(pad, std::max(d.x, d.y));
+                const float gap = std::max(d.x, d.y);
+                gap >= wrapping ? wrapped = true : pad = std::max(pad, gap);
             }
         }
+    if (wrapped)
+    {
+        low = float2(0.f);
+        high = imageDim;
+        pad = 0.f;
+    }
     if (mBeamOctFull)
     {
         low = float2(0.f);
@@ -4547,6 +4563,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mParams.beamGridOrigin = uint2(region.x, region.y);
                     mParams.beamGridBlocks = mBeamGridRegionMode[r];
                     bindMarch();
+                    mBeamUnitThreads += region.z * ts * region.w * ts;
                     pMarch->execute(pRenderContext, uint3(region.z * ts, region.w * ts, 1));
                 }
                 mParams.beamUnitGenerated = 0;
@@ -4554,7 +4571,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mParams.beamGridOrigin = uint2(0);
             }
             else if (unitMarch)
+            {
+                mBeamUnitThreads += mParams.beamFrameDim.x * mParams.beamFrameDim.y;
                 pMarch->execute(pRenderContext, uint3(mParams.beamFrameDim, 1));
+            }
             else if (gridMarch)
                 pMarch->execute(pRenderContext, uint3(mParams.frameDim, 1));
             else

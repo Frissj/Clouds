@@ -209,6 +209,7 @@ private:
     uint32_t mBeamGridGenerated = 0;
     uint32_t mBeamGridStrips = 0;
     uint32_t mBeamGridThreads = 0;
+    uint32_t mBeamUnitThreads = 0; ///< Residual-march threads dispatched, cumulative: the query counter says nothing about them.
     /// The regions this build's query dispatch covered, replayed by the level-0 tile pass: a tile can only change its
     /// classification where one of its basis points was re-marched. Empty means the tile pass sweeps, as it always did.
     std::vector<uint4> mBeamGridRegions;   ///< origin.xy, size.xy

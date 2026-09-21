@@ -80,7 +80,8 @@ for label, props in ARMS:
             m.renderFrame()
         before = stats()
         priorThreads = int(before.get("beamGridThreads", 0))
-        threads, tiles, sweeps = [], [], 0
+        priorUnits = int(before.get("beamUnitThreads", 0))
+        threads, units, sweeps = [], [], 0
         priorSweeps = int(before.get("beamGridSweeps", 0))
         for i in range(FRAMES):
             pose(i, forward, yaw)
@@ -89,10 +90,12 @@ for label, props in ARMS:
             now = int(s.get("beamGridThreads", 0))
             threads.append(now - priorThreads)
             priorThreads = now
-            tiles.append(int(s.get("beamMarchTiles", 0)))
+            nowUnits = int(s.get("beamUnitThreads", 0))
+            units.append(nowUnits - priorUnits)
+            priorUnits = nowUnits
         sweeps = int(stats().get("beamGridSweeps", 0)) - priorSweeps
         mean = lambda v: sum(v) / float(len(v))
         dim = int(hstr.properties.get("beamOctDim", 0))
-        log(f"{label:5s} {motion:6s} query threads/frame {mean(threads):11.0f}  failed tiles {mean(tiles):9.0f}  "
+        log(f"{label:5s} {motion:6s} query threads/frame {mean(threads):11.0f}  residual threads/frame {mean(units):11.0f}  "
             f"sweeps {sweeps:3d}/{FRAMES}  image {dim if dim else 'rect'}")
 exit()

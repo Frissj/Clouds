@@ -13,7 +13,20 @@ os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/User
 BASE = json.loads(os.environ["HSTR_BASE"])
 TESTS = json.loads(os.environ["HSTR_TESTS"])
 MOTIONS = json.loads(os.environ.get("HSTR_MOTIONS", '[["fly 2", 2.0, 0.0], ["fly 20", 20.0, 0.0], ["yaw", 0.0, 0.004]]'))
-WARM, TIMED, STEPS = 16, 48, int(os.environ.get("HSTR_STEPS", "12"))
+# READ THIS BEFORE COMPARING A WORLD-PERSISTENT CACHE ACROSS ARMS. WARM is how many frames an arm runs before its timed window,
+# and for the anchored rectangle it barely matters: the rectangle re-anchors and forgets, so it reaches the same state from any
+# history, and its numbers here are stable to 0.03 ms across every run of this session. The octahedral image does not forget. Its
+# cost depends on how much of the sphere is already resident, so it depends on everything the camera did first, and WARM decides
+# that. Measured at 720p: the same octahedral arm at 0.01 rad/frame reported 0.64, 0.54, 0.08, 0.08 ms as it was simply repeated
+# within one run at WARM 16 - the first arms were still paying the fresh build that beamReset forces, which for the sphere clears
+# roughly 300 MB of texture and marches a whole first footprint. Raising WARM to 96 moved 0.01 rad/frame from 0.92 to 0.70 and
+# 0.05 rad/frame from 0.61 to 1.43, in opposite directions, because 96 frames of turning at 0.05 fills most of the sphere.
+#
+# So a single number for a persistent directional cache under a fixed-length synthetic motion is not well defined, and none of the
+# octahedral timings taken this way should be quoted as ITS cost. What they support is the comparison of one mechanism against
+# another inside one arm - query threads, residual threads, which pass moved - and the rectangle's own numbers. Characterising the
+# octahedral image needs a protocol that states the residency it starts from, which this harness does not yet express.
+WARM, TIMED, STEPS = int(os.environ.get("HSTR_WARM", "16")), 48, int(os.environ.get("HSTR_STEPS", "12"))
 TRACE_SUN = os.environ.get("HSTR_TRACE_SUN", "0") != "0"  # Sums the sun scheduler's per-frame counts over the timed flight.
 m.script("scripts/HSTR/CloudSea.py")
 # HSTR_RES=1920x1080 settles in a fraction of the time, for residency diagnostics (the cut and the timings are not the 4K ones).
