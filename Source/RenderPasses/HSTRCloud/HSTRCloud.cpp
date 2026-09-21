@@ -288,6 +288,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamReset")
+        {
+            // Drops the persistent beam image so the next build starts from nothing. The octahedral image is fixed to the WORLD
+            // and survives until its dimensions change, so without this a benchmark arm inherits every direction the arms before
+            // it marched - including ones marched from other camera positions, which then fail parallax in bulk. That made one
+            // configuration measure 0.36 ms and then 2.41 ms in consecutive runs. An arm that resets first measures itself.
+            if (bool(value))
+            {
+                mBeamRefAnchored = false;
+                mBeamHistoryValid = false;
+                mBeamReusable = false;
+                mParams.beamHistoryValid = 0;
+            }
+            continue;
+        }
         if (key == "beamScreenResidual")
         {
             mBeamScreenResidual = bool(value);

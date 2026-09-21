@@ -134,6 +134,11 @@ for motion, forward, yaw, *rest in MOTIONS:
     sun = float(rest[0]) if rest else SUN_RATE
     for test, properties in TESTS:
         hstr.set_properties(dict(BASE, **properties))
+        # Every arm starts from an empty beam image. The reference frame re-anchors on its own so it hardly noticed, but the
+        # octahedral image is fixed to the world and persists until its dimensions change: without this an arm inherits the
+        # directions its predecessors marched, and one configuration measured 0.36 ms and then 2.41 ms in consecutive runs while
+        # the rectangle control reproduced to 0.07. The warm-up below then fills it from this arm's own motion.
+        hstr.set_properties({"beamReset": True})
         for i in range(WARM):
             pose(i - WARM - TIMED, forward, yaw, sun)
             m.renderFrame()
