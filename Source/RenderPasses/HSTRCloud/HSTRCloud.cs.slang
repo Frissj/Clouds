@@ -352,6 +352,8 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamDescend;      ///< Guard blocks this build has to classify one by one.
     RWStructuredBuffer<uint> hstrBeamDescendCount; ///< [0] blocks in hstrBeamDescend, [1] cells in hstrBeamRebuild.
     RWStructuredBuffer<uint> hstrBeamRebuild;      ///< Coarse cells whose certificate this build has to rebuild.
+    RWStructuredBuffer<uint> hstrBeamResidualList; ///< Reference frame: pixels of failed tiles, packed, for the residual resolve.
+    RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] pixels listed, [1..3] the residual resolve's dispatch.
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
@@ -5367,6 +5369,34 @@ struct HSTRCloudRenderer
         hstrBeamArgs[6 * level + 5] = 1;
     }
 
+    /// The best value known for one beam unit's direction, which is what a failed tile's pixel interpolates between.
+    ///
+    /// The residual image only holds what the residual marched: units of FAILED tiles. A pixel near a failed tile's edge
+    /// interpolates across into the next tile, whose units the residual never touched if that tile was accepted - so it read
+    /// whatever the texel last held. Measured at 4K parked: resolving from the stored units scored 0.431% of pixels over 0.02
+    /// (p99.9 0.086, max 0.61); marching those very same unit directions afresh in the resolve scored 0.244% (p99.9 0.030, max
+    /// 0.18). Same sample positions, so the gap was never resampling - it was reading units nobody had written. An accepted
+    /// tile's unit is instead taken from its own basis, within tolerance by construction and costing no march.
+    float3 beamUnitRadiance(uint2 unit)
+    {
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        const uint level = hstrBeamLevel[unit / finest];
+        const float2 p = float2(unit) + 0.5f;
+        const float3 w = beamRayDirection(p);
+        if (level == params.beamLevels + 1u)
+            return beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo);
+        if (level >= params.beamLevels)
+        {
+            const float4 held = hstrBeamPixels[unit];
+            if (held.a >= 0.f)
+                return held.rgb;
+            // A failed tile's unit the residual has not reached - outside the on-screen box it marches. Its finest basis
+            // failed the surplus test, but it is still an estimate of this direction; the texel is not.
+            return beamReconstruct(params.beamLevels - 1u, p, w, false);
+        }
+        return beamReconstruct(level, p, w, false);
+    }
+
     /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel
     /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel.
     void resolveBeamPixel(uint2 pixel)
@@ -5390,20 +5420,48 @@ struct HSTRCloudRenderer
             // the resolve reads it here instead of a separate screen-space march pass writing colour directly.
             if (params.beamScreenResidual != 0)
                 return; // The screen-space march already wrote this pixel, exactly, with no resampling.
+            // In the reference frame the residual is resolved by resolveBeamResidualPixel, in its own dispatch: see there. This
+            // pass has already found the pixel, so it hands it over rather than making that one test all 8.3M pixels again -
+            // one atomic per wave.
             if (params.beamRefFrame != 0)
             {
-                const float2 texel = beamPosition - 0.5f;
-                const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
-                const float2 g = saturate(texel - float2(base));
-                const float4 v = bilinear(
-                    hstrBeamPixels[uint2(base)], hstrBeamPixels[uint2(base + int2(1, 0))], hstrBeamPixels[uint2(base + int2(0, 1))],
-                    hstrBeamPixels[uint2(base + int2(1, 1))], g
-                );
-                color[pixel] = float4(v.rgb, 1.f);
+                const uint lanes = WaveActiveCountBits(true);
+                uint first = 0;
+                if (WaveIsFirstLane())
+                    InterlockedAdd(hstrBeamResidualArgs[0], lanes, first);                const uint slot = WaveReadLaneFirst(first) + WavePrefixCountBits(true);
+                if (slot < params.frameDim.x * params.frameDim.y) // The list holds a whole frame; cleared every build.
+                    hstrBeamResidualList[slot] = pixel.x | (pixel.y << 16);
             }
             return;
         }
         color[pixel] = float4(beamReconstruct(level, beamPosition, w, false), 1.f);
+    }
+
+    /// A failed tile's pixel in the reference frame: the bilinear over the four units around it, each the best value known for
+    /// its direction (beamUnitRadiance).
+    ///
+    /// A separate dispatch from resolveBeamPixel on purpose. Inlined there, the four basis reconstructions this may need made the
+    /// resolve heavier for EVERY pixel, not just the ~6% it serves: 4K resolve 0.37 -> 0.81-0.96 ms in every arm, including the
+    /// screen-residual arm that never takes the branch. That is register pressure and occupancy, not work.
+    ///
+    /// One thread per pixel resolveBeamPixel listed, rather than per pixel of the frame.
+    void resolveBeamResidualPixel(uint index)
+    {
+        if (index >= min(hstrBeamResidualArgs[0], params.frameDim.x * params.frameDim.y))
+            return;
+        const uint packed = hstrBeamResidualList[index];
+        const uint2 pixel = uint2(packed & 0xFFFFu, packed >> 16);
+        float2 beamPosition;
+        if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
+            return;
+        const float2 texel = beamPosition - 0.5f;
+        const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
+        const float2 g = saturate(texel - float2(base));
+        const float3 v = lerp(
+            lerp(beamUnitRadiance(uint2(base)), beamUnitRadiance(uint2(base + int2(1, 0))), g.x),
+            lerp(beamUnitRadiance(uint2(base + int2(0, 1))), beamUnitRadiance(uint2(base + int2(1, 1))), g.x), g.y
+        );
+        color[pixel] = float4(v, 1.f);
     }
 
     /// One pixel of a finest tile that failed its surplus test, marched exactly.
@@ -6664,6 +6722,21 @@ void marchBeamDirtyUnits(uint3 dispatchThreadId: SV_DispatchThreadID)
 void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.resolveBeamPixel(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void resolveBeamResidual(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.resolveBeamResidualPixel(dispatchThreadId.x);
+}
+
+/// Dispatch arguments for the pixels the resolve listed, after the count in element 0.
+[numthreads(1, 1, 1)]
+void writeBeamResidualArgs()
+{
+    gHSTRCloud.hstrBeamResidualArgs[1] = (gHSTRCloud.hstrBeamResidualArgs[0] + 63u) / 64u;
+    gHSTRCloud.hstrBeamResidualArgs[2] = 1u;
+    gHSTRCloud.hstrBeamResidualArgs[3] = 1u;
 }
 
 [numthreads(8, 8, 1)]

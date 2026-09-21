@@ -158,6 +158,10 @@ private:
     ref<ComputePass> mpBeamTilePass;
     ref<ComputePass> mpBeamArgsPass;
     ref<ComputePass> mpBeamResolvePass;
+    ref<ComputePass> mpBeamResidualResolvePass; ///< Reference frame: failed tiles' pixels, from the residual image.
+    ref<ComputePass> mpBeamResidualArgsPass;
+    ref<Buffer> mpBeamResidualList;             ///< Pixels the resolve found in failed tiles, one frame's worth.
+    ref<Buffer> mpBeamResidualArgs;             ///< [0] their count, [1..3] the residual resolve's indirect dispatch.
     ref<ComputePass> mpBeamSparseResolvePass;
     ref<ComputePass> mpBeamMarchPass;
     ref<ComputePass> mpBeamClassifyPass;

@@ -1160,6 +1160,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamArgsPass = nullptr;
     mpBeamResolvePass = nullptr;
     mpBeamSparseResolvePass = nullptr;
+    mpBeamResidualResolvePass = nullptr;
+    mpBeamResidualArgsPass = nullptr;
     mpBeamMarchPass = nullptr;
     mpBeamClassifyPass = nullptr;
     mpBeamSparseEmitPass = nullptr;
@@ -1222,6 +1224,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamSparseResolvePass = createPass("resolveBeamSparse");
+    mpBeamResidualResolvePass = createPass("resolveBeamResidual");
+    mpBeamResidualArgsPass = createPass("writeBeamResidualArgs");
     mpBeamMarchPass = createPass("marchBeamPixels");
     mpBeamClassifyPass = createPass("classifyBeamRoots");
     mpBeamSparseEmitPass = createPass("emitBeamSparseQueries");
@@ -3110,6 +3114,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamDescend"] = mpBeamDescend;
     var["hstrBeamDescendCount"] = mpBeamDescendCount;
     var["hstrBeamRebuild"] = mpBeamRebuild;
+    var["hstrBeamResidualList"] = mpBeamResidualList;
+    var["hstrBeamResidualArgs"] = mpBeamResidualArgs;
     var["hstrBeamLevel"] = mpBeamLevel;
     var["hstrBeamLatticePrev"] = mpBeamLatticePrev;
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
@@ -4624,9 +4630,30 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         {
             FALCOR_PROFILE(pRenderContext, "resolve");
             const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : mpBeamResolvePass;
+            const uint32_t pixels = mParams.frameDim.x * mParams.frameDim.y;
+            if (!mpBeamResidualList || mpBeamResidualList->getElementCount() < pixels)
+            {
+                mpBeamResidualList = mpDevice->createStructuredBuffer(sizeof(uint32_t), pixels);
+                mpBeamResidualArgs = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 4, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                             ResourceBindFlags::IndirectArg
+                );
+            }
+            pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             bindRenderer(pRenderContext, pResolve);
             pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
             pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+            // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
+            // common resolve above is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel).
+            // The resolve lists those pixels as it meets them, so the second pass runs over them alone.
+            if (mParams.beamRefFrame != 0 && mParams.beamScreenResidual == 0 && !mBeamSparseBuilt)
+            {
+                bindRenderer(pRenderContext, mpBeamResidualArgsPass);
+                mpBeamResidualArgsPass->execute(pRenderContext, uint3(1));
+                bindRenderer(pRenderContext, mpBeamResidualResolvePass);
+                mpBeamResidualResolvePass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                mpBeamResidualResolvePass->executeIndirect(pRenderContext, mpBeamResidualArgs.get(), 4); // Bytes: after the count.
+            }
         };
         if (mParams.beamRefFrame == 0)
             resolve();
