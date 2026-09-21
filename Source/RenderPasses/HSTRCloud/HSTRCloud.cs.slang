@@ -1507,9 +1507,28 @@ struct HSTRCloudRenderer
 
     /// Octahedral map, +z at the zenith. Continuous across z = 0, no transcendentals, and its inverse is exact, so a world
     /// direction has one texel and keeps it: this is what removes re-anchoring. World up is y, so the frame swaps y and z.
+    /// The direction in the octahedral frame: its z is the axis beamOctAxis names, and the kink circle is perpendicular to it.
+    float3 octFrame(float3 w)
+    {
+        if (params.beamOctAxis == 1)
+            return float3(w.y, w.z, w.x);
+        if (params.beamOctAxis == 2)
+            return float3(w.x, w.y, w.z);
+        return float3(w.x, w.z, w.y);
+    }
+
+    float3 octWorld(float3 n)
+    {
+        if (params.beamOctAxis == 1)
+            return float3(n.z, n.x, n.y);
+        if (params.beamOctAxis == 2)
+            return float3(n.x, n.y, n.z);
+        return float3(n.x, n.z, n.y);
+    }
+
     float2 octEncode(float3 direction)
     {
-        const float3 d = float3(direction.x, direction.z, direction.y);
+        const float3 d = octFrame(direction);
         const float3 n = d / (abs(d.x) + abs(d.y) + abs(d.z));
         float2 p = n.xy;
         if (n.z < 0.f)
@@ -1523,7 +1542,7 @@ struct HSTRCloudRenderer
         float3 n = float3(p.x, p.y, 1.f - abs(p.x) - abs(p.y));
         if (n.z < 0.f)
             n.xy = float2((1.f - abs(n.y)) * (n.x >= 0.f ? 1.f : -1.f), (1.f - abs(n.x)) * (n.y >= 0.f ? 1.f : -1.f));
-        return normalize(float3(n.x, n.z, n.y));
+        return normalize(octWorld(n));
     }
 
     float3 cameraRayDirection(float2 pixelPosition)
@@ -5336,6 +5355,8 @@ struct HSTRCloudRenderer
         {
             // A tile the basis could not carry. In the reference frame its residual lives in the beam image beside the basis, so
             // the resolve reads it here instead of a separate screen-space march pass writing colour directly.
+            if (params.beamScreenResidual != 0)
+                return; // The screen-space march already wrote this pixel, exactly, with no resampling.
             if (params.beamRefFrame != 0)
             {
                 const float2 texel = beamPosition - 0.5f;
@@ -5527,7 +5548,8 @@ struct HSTRCloudRenderer
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         const float3 radiance = beamRadiance(exact.cache, exact.single, exact.depth, w, albedo);
         color[pixel] = float4(radiance, 1.f);
-        if (params.beamRefresh != 0)
+        // With beamScreenResidual the beam image is not the screen, so a screen-indexed write would land on unrelated directions.
+        if (params.beamRefresh != 0 && params.beamScreenResidual == 0)
             hstrBeamPixelOutput[pixel] = float4(radiance, exact.distance);
     }
 

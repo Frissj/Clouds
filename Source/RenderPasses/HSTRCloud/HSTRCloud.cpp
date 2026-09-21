@@ -288,6 +288,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamScreenResidual")
+        {
+            mBeamScreenResidual = bool(value);
+            continue;
+        }
+        if (key == "beamOctAxis")
+        {
+            mBeamOctAxis = uint32_t(value);
+            continue;
+        }
         if (key == "beamOctFull")
         {
             mBeamOctFull = bool(value);
@@ -858,6 +868,8 @@ Properties HSTRCloud::getProperties() const
     props["beamRefPrebuild"] = mBeamRefPrebuild;
     props["beamOct"] = mBeamOct;
     props["beamOctFull"] = mBeamOctFull;
+    props["beamOctAxis"] = mBeamOctAxis;
+    props["beamScreenResidual"] = mBeamScreenResidual;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
@@ -3148,6 +3160,8 @@ void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
     mParams.beamRefFrame = mBeamRefFrame ? 1u : 0u;
     mParams.beamOct = mBeamOct && mBeamRefFrame && mpScene ? 1u : 0u;
     mParams.beamOctFull = mBeamOctFull ? 1u : 0u;
+    mParams.beamOctAxis = mBeamOctAxis;
+    mParams.beamScreenResidual = mBeamOct && mBeamScreenResidual && mBeamRefFrame && mpScene ? 1u : 0u;
     if (!mBeamRefFrame || !mpScene)
     {
         mParams.beamFrameDim = frameDim;
@@ -3274,7 +3288,9 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
     const float2 imageDim = float2(float(dim), float(dim));
     auto octOf = [&](const float3& direction)
     {
-        const float3 d(direction.x, direction.z, direction.y); // +z at the zenith, matching the shader.
+        const float3 d = mBeamOctAxis == 1 ? float3(direction.y, direction.z, direction.x)
+                         : mBeamOctAxis == 2 ? direction
+                                             : float3(direction.x, direction.z, direction.y); // Matches octFrame in the shader.
         const float3 n = d / (std::abs(d.x) + std::abs(d.y) + std::abs(d.z));
         float2 p(n.x, n.y);
         if (n.z < 0.f)
@@ -4394,8 +4410,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // The compacted fallback list enumerates BEAM tiles and marches their own units as if they were pixels, which is only true
         // while the beam image is the screen. In the reference frame the fallback runs over the beam image instead, where it is a
         // function of world direction and carries exactly through a turn; the resolve samples it.
-        const bool unitMarch = mParams.beamRefFrame != 0;
-        const bool gridMarch = mBeamGridDispatch && !unitMarch;
+        // beamScreenResidual sends the failed-tile march back to screen space, where a pixel marches its own ray and the resolve
+        // never resamples. It costs the residual's carry, so it is a quality-for-marching trade rather than a free win.
+        const bool screenResidual = mBeamOct && mBeamScreenResidual && mParams.beamRefFrame != 0;
+        const bool unitMarch = mParams.beamRefFrame != 0 && !screenResidual;
+        const bool gridMarch = (mBeamGridDispatch && !unitMarch) || screenResidual;
         const bool queued = mParams.beamQueue != 0 && !gridMarch && !unitMarch;
         const ref<ComputePass>& pMarch =
             unitMarch ? mpBeamUnitMarchPass : (queued ? mpBeamQueuePixelPass : (gridMarch ? mpBeamGridMarchPass : mpBeamMarchPass));

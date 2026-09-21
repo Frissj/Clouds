@@ -14,11 +14,12 @@ from sea_config import mk
 COMMON = dict(
     beamTileSize=4, beamLevels=1, beamSegments=1, beamTemporal=False, beamSparse=False, beamSparseCut=False,
     beamQueue=False, beamGridDispatch=False, beamRefreshBlock=4, beamCarryTolerance=0.0, beamDepthTolerance=0.05,
-    beamRefreshDebug=0, beamRefFrame=True, beamRefMargin=0.15,
+    beamRefreshDebug=0,
 )
 
 TESTS = [
-    ("r16 (insurance)", mk(**COMMON, beamRefresh=16)),
-    ("r256", mk(**COMMON, beamRefresh=256)),
-    ("r256 screen", mk(**COMMON, beamRefresh=256, beamRefFrame=False)),
+    ("r16 (insurance)", mk(**COMMON, beamRefFrame=True, beamRefMargin=0.15, beamRefresh=16)),
+    ("r256", mk(**COMMON, beamRefFrame=True, beamRefMargin=0.15, beamRefresh=256)),
+    ("r256 m50 prebuilt", mk(**COMMON, beamRefFrame=True, beamRefresh=256, beamRefMargin=0.5, beamRefPrebuild=True)),
+    ("r256 screen", mk(**COMMON, beamRefFrame=False, beamRefMargin=0.15, beamRefresh=256)),
 ]

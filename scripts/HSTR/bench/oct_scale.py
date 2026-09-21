@@ -89,9 +89,21 @@ def measure(label, props, yaw, pitch=0.0):
 # every pixel resamples four marched neighbours, and that resampling alone scored 0.511% where the aligned rectangle scored 0.000%.
 # If it is sampling, beamOctScale buys it back at the square of the memory; if it plateaus, it is the map's derivative kink at the
 # diamond edge - which is the horizon in this frame - and no amount of resolution will fix it.
-for pitch in (0.0, 0.5):
-    measure("rect default", dict(beamTolerance=0.05, beamRefMargin=0.15, beamOct=False), 0.0, pitch)
-    for scale in (1.0, 1.4, 2.0):
-        measure(f"oct x{scale} exact", dict(beamTolerance=0.0, beamOct=True, beamOctFull=True, beamOctScale=scale), 0.0, pitch)
-        measure(f"oct x{scale} default", dict(beamTolerance=0.05, beamOct=True, beamOctFull=True, beamOctScale=scale), 0.0, pitch)
+# Is the octahedral deficit the HORIZON? The map's derivative kinks on the great circle perpendicular to its z axis, and the frame
+# puts +z at the zenith, so that circle is the horizon - where a tile straddling it has a ray field the bilinear-plus-bubble basis
+# cannot fit. Pitching up walks the horizon out of frame: vfov is about 46 degrees, so pitch 1.0 rad (57 degrees) clears it
+# entirely. If the octahedral image reaches the rectangle there and only there, the kink is the cause and the fix is to orient the
+# map rather than to spend resolution on it.
+# Can MARCHING buy what RESOLUTION was buying? The octahedral deficit is the basis fitting a sheared texel (singular values 2.36
+# and 1.20 at 55 degrees, so a texel is about 2:1) plus the resolve resampling four marched units. beamScreenResidual removes the
+# resampling outright by marching each failed pixel's own ray; tightening beamTolerance then fails more tiles, moving pixels off the
+# basis and onto that exact path. If x1.0 with a tight tolerance reaches what x2.0 reaches, the sphere needs a quarter of the memory
+# and pays marching time instead - which is the trade worth knowing before a page pool is sized.
+for yaw in (0.0, 0.8):
+    measure("rect default", dict(beamTolerance=0.05, beamRefMargin=0.15, beamOct=False), yaw, 0.0)
+    measure("oct x1.0", dict(beamTolerance=0.05, beamOct=True, beamOctFull=True, beamOctScale=1.0), yaw, 0.0)
+    measure("oct x2.0", dict(beamTolerance=0.05, beamOct=True, beamOctFull=True, beamOctScale=2.0), yaw, 0.0)
+    for tol in (0.05, 0.02, 0.005):
+        measure(f"oct x1.0 scr t{tol}",
+                dict(beamTolerance=tol, beamOct=True, beamOctFull=True, beamOctScale=1.0, beamScreenResidual=True), yaw, 0.0)
 exit()

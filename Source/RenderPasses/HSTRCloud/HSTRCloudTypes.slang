@@ -1107,7 +1107,22 @@ struct HSTRCloudParams
     /// -z hemisphere. The frame is oriented with +z at the zenith, so that seam lies below the horizon.
     uint beamOct = 0;
     uint beamOctFull = 0;              ///< Build the whole sphere rather than the screen's footprint (isolates bounding bugs).
-    uint2 beamOctReserved = { 0, 0 };
+    /// Which world axis the octahedral map's +z points along: 0 the zenith, 1 world +x, 2 world +z.
+    ///
+    /// The map is continuous but its DERIVATIVE kinks on the great circle perpendicular to this axis, where a tile straddling it
+    /// has a ray field the bilinear-plus-bubble basis cannot fit. With +z at the zenith that circle is the horizon, which is
+    /// where a cloud camera spends all of its time; pointing the axis along the horizon instead trades it for a vertical circle
+    /// that the view crosses at two azimuths. This exists to measure whether that kink is the octahedral image's remaining
+    /// quality deficit before resolution is spent on it.
+    uint beamOctAxis = 0;
+    /// 1 when a failed tile's pixels are marched in SCREEN space rather than read out of the beam-image residual.
+    ///
+    /// A screen pixel never lands on an octahedral texel, so the resolve's bilinear over four marched units is a resampling the
+    /// anchored rectangle never paid: measured, it alone scores 0.511% of pixels over 0.02 where the aligned rectangle scores
+    /// 0.000%. Marching the pixel's own ray removes it outright instead of buying it back with resolution, at the cost of losing
+    /// the residual's carry - every failed pixel marches every build. That is the trade this exposes: marching time against the
+    /// memory a higher-resolution sphere would need.
+    uint beamScreenResidual = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

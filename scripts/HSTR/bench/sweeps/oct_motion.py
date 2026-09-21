@@ -31,9 +31,14 @@ COMMON = dict(
     beamRefresh=256,
 )
 
+# beamScreenResidual marches a failed tile's pixels in screen space instead of resampling the beam-image residual, which removed
+# the octahedral quality deficit outright at x1.0 resolution: with beamTolerance 0.005 it scores 0.063% of pixels over 0.02 against
+# the rectangle's 0.527%, with max error BELOW the rectangle's and no pixels at all over 0.1. It costs the residual's carry, so
+# every failed pixel marches every build - and tightening the tolerance fails more of them. This prices that.
 TESTS = [
-    ("rect m15", mk(**COMMON, beamOct=False, beamRefMargin=0.15)),
-    ("rect m50", mk(**COMMON, beamOct=False, beamRefMargin=0.5)),
-    ("oct x1.4", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.4)),
-    ("oct x1.0", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0)),
+    ("rect m15", mk(**COMMON, beamOct=False, beamRefMargin=0.15, beamTolerance=0.05)),
+    ("oct x1.0", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0, beamTolerance=0.05)),
+    ("oct scr t.05", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0, beamScreenResidual=True, beamTolerance=0.05)),
+    ("oct scr t.02", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0, beamScreenResidual=True, beamTolerance=0.02)),
+    ("oct scr t.005", mk(**COMMON, beamOct=True, beamOctFull=False, beamOctScale=1.0, beamScreenResidual=True, beamTolerance=0.005)),
 ]

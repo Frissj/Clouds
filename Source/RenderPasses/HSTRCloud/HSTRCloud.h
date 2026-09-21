@@ -201,6 +201,8 @@ private:
     bool mBeamOctFull = false;  ///< Build the whole sphere rather than the screen's footprint.
     float mBeamOctScale = 1.f;  ///< Texel angular size against a screen pixel at the view centre.
     uint2 mBeamOctDim = { 0, 0 };
+    uint32_t mBeamOctAxis = 0;  ///< World axis the octahedral map's +z points along, and so where its derivative kinks.
+    bool mBeamScreenResidual = false; ///< March failed tiles in screen space instead of resampling the beam-image residual.
     /// How the query dispatch was generated, counted since the view settled: swept over the region, generated from the refresh
     /// phase alone, or that plus the strips a rotation exposed. Reported so an arm that should be generating and is not says so.
     uint32_t mBeamGridSweeps = 0;
