@@ -1147,7 +1147,15 @@ struct HSTRCloudParams
     /// image a texel is anisotropic, so this uses the LARGEST singular value of the map - 2.36 at the diamond mid-edge - because
     /// the bound has to hold along the worst axis rather than on average.
     float beamGuardAngle = 0.f;
-    uint2 beamGuardReserved = { 0, 0 };
+    /// Normalised-device units a single beam texel can span on screen, used to widen the octahedral on-screen test by the angular
+    /// radius of whatever box is being tested. Zero disables the exact test and falls back to the bounding box.
+    ///
+    /// The octahedral footprint of the screen is CURVED, so bounding it with an axis-aligned box and padding that box by the
+    /// largest gap between sampled directions over-covers badly - measured, a 0.05 rad/frame turn exposes 4.4% of the screen per
+    /// frame and the residual was marching about ten times that. Projecting the direction itself costs three dot products and has
+    /// no such slack.
+    float beamOctNdcPerTexel = 0.f;
+    uint beamGuardReserved = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

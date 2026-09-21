@@ -309,7 +309,14 @@ void HSTRCloud::parseProperties(const Properties& props)
                 mBeamRefAnchored = false;
                 mBeamHistoryValid = false;
                 mBeamReusable = false;
+                mBeamRefreshValid = false;
                 mParams.beamHistoryValid = 0;
+                // Entering-strip work is the new screen box minus the box the last build wrote, and the refresh phase is a
+                // function of the frame counter. An arm that inherits either of those does not start where its neighbours did.
+                mParams.beamFrame = 0;
+                mBeamBuiltScreenBounds = float4(0.f);
+                mParams.beamPrevScreenBounds = float4(0.f);
+                mBeamGuardCleared = false;
             }
             continue;
         }
@@ -3187,6 +3194,7 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
 void HSTRCloud::updateBeamReferenceFrame(const uint2& frameDim)
 {
     mParams.beamRefFrame = mBeamRefFrame ? 1u : 0u;
+    mParams.beamOctNdcPerTexel = 0.f;
     mParams.beamOct = mBeamOct && mBeamRefFrame && mpScene ? 1u : 0u;
     mParams.beamOctFull = mBeamOctFull ? 1u : 0u;
     mParams.beamOctAxis = mBeamOctAxis;
@@ -3379,6 +3387,19 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
     // An octahedral texel is anisotropic - at the diamond mid-edge the map's singular values are 2.36 and 1.20 - so the reach has
     // to be taken along the worst axis, not on average, or the guard would certify blocks it has no right to.
     mParams.beamGuardAngle = beamGuardReach(frameDim, camera) * 2.36f * 2.f / float(dim);
+    // The on-screen test projects a direction through the camera basis instead of comparing against a padded bounding box, so it
+    // needs that basis inverted, and a conversion from a box's radius in texels to the normalised device units it can span. Both
+    // are taken at their largest: the map's worst-axis texel angle, and the steeper of the two screen axes, where a radian buys
+    // the most normalised device units.
+    const float3 u = camera.cameraU, v = camera.cameraV, w = camera.cameraW;
+    const float3 r0 = cross(v, w), r1 = cross(w, u), r2 = cross(u, v);
+    const float determinant = dot(u, r0);
+    const float inverseScale = std::abs(determinant) > 1e-20f ? 1.f / determinant : 0.f;
+    mParams.beamRefInverse0 = r0 * inverseScale;
+    mParams.beamRefInverse1 = r1 * inverseScale;
+    mParams.beamRefInverse2 = r2 * inverseScale;
+    const float tanHalf = std::max(length(v) / std::max(length(w), 1e-6f), 1e-6f);
+    mParams.beamOctNdcPerTexel = (2.36f * 2.f / float(dim)) * (1.f + tanHalf * tanHalf) / tanHalf;
     mParams.beamRefU = camera.cameraU;
     mParams.beamRefV = camera.cameraV;
     mParams.beamRefW = camera.cameraW;

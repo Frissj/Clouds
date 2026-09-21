@@ -4186,6 +4186,21 @@ struct HSTRCloudRenderer
     {
         if (params.beamRefFrame == 0)
             return true;
+        if (params.beamOct != 0 && params.beamOctNdcPerTexel > 0.f)
+        {
+            // The octahedral footprint of the screen is curved, so a bounding box around it has to be padded and over-covers. The
+            // direction itself does not: project the box's centre through the camera basis and widen the screen rectangle by the
+            // box's own angular radius, which is what beamOctNdcPerTexel converts from texels into normalised device units.
+            const float3 w = beamRayDirection(0.5f * (low + high));
+            const float3 c =
+                float3(dot(params.beamRefInverse0, w), dot(params.beamRefInverse1, w), dot(params.beamRefInverse2, w));
+            if (c.z <= 1e-6f)
+                return false; // Behind the camera, and a box of a few texels cannot reach around to the front of it.
+            const float2 ndc = c.xy / c.z;
+            const float radius = 0.5f * max(high.x - low.x, high.y - low.y) + 1.f;
+            const float margin = 1.f + radius * params.beamOctNdcPerTexel;
+            return all(abs(ndc) <= margin);
+        }
         return all(high >= params.beamScreenBounds.xy) && all(low <= params.beamScreenBounds.zw);
     }
 
@@ -5416,6 +5431,11 @@ struct HSTRCloudRenderer
                 return;
             unit = tile * ts + (gridUnit % ts);
         }
+        // MEASURED and REVERTED: bounding a SWEPT residual to the box the screen covers, on the theory that dispatching a thread
+        // per texel of the octahedral sphere to have almost all of them fail the test below was the 1.28 ms of a 1.79 ms sprint
+        // frame. It was not - sprint went 1.79 to 1.85 - and it cost coverage: the resolve reads a 2x2 neighbourhood, so units
+        // just outside the box are read after all, and a parked octahedral frame went from 1.663% of pixels over 0.02 to 7.790%.
+        // The residual's cost under translation is units genuinely re-marching, not threads arriving to be rejected.
         if (any(unit >= params.beamFrameDim) || !beamBoxOnScreen(float2(unit), float2(unit) + 1.f))
             return;
         // MEASURED and REMOVED: marching a one-unit apron around every failed tile, so the resolve's bilinear never reaches into
