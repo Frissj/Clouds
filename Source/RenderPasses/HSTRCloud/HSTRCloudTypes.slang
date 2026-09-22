@@ -20,9 +20,11 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 30;
+static const uint kBeamCountSlots = 32;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
+static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
+static const uint kBeamDirtyApronMarched = 31; ///< Apron units (around listed blocks) it marched.
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;

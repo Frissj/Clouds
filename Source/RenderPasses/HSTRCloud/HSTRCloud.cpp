@@ -1068,6 +1068,8 @@ Properties HSTRCloud::getProperties() const
         cloud["beamUnitThreads"] = mBeamUnitThreads;
         cloud["beamDirtyBlocks"] = mBeamLevelCounts[kBeamDirtyBlocks];
         cloud["beamDirtyUnverified"] = mBeamLevelCounts[kBeamDirtyUnverified];
+        cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
+        cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
@@ -1260,6 +1262,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpBeamDirtyListUnitsPass = createPass("listBeamDirtyUnits");
+    mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramids");
@@ -3130,6 +3134,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
+    var["hstrBeamDirtyMark"] = mpBeamDirtyMark;
+    var["hstrBeamDirtyUnits"] = mpBeamDirtyUnits;
     var["hstrBeamCoarse"] = mpBeamCoarse;
     var["hstrBeamCoarseState"] = mpBeamCoarseState;
     var["hstrBeamDescend"] = mpBeamDescend;
@@ -4051,9 +4057,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1);
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2); // Blocks listed, units to march.
+                mpBeamDirtyMark = mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                // Every unit of every block: the compacted list decides each unit once (beamDirtyUnitOwner), so it cannot overflow.
+                const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
+                mpBeamDirtyUnits = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells * blockEdge * blockEdge);
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 15, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                    sizeof(uint32_t), 18, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                               ResourceBindFlags::IndirectArg
                 );
                 const uint2 coarseDims = (guardDims + 3u) / 4u;
@@ -4568,6 +4578,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             {
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
+                                pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
                                 // A camera that neither moved nor turned cannot have invalidated or uncovered anything, so only the
                                 // refresh phase is listed and the classification is skipped.
@@ -4864,11 +4875,21 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // And the residual for the blocks translation invalidated, over the same list the query pass just used.
                 if (mBeamDirtyActive)
                 {
-                    bindRenderer(pRenderContext, mpBeamDirtyMarchPass);
-                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
-                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] = mpBeamPixels[0];
-                    mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixels"] = ref<Texture>();
-                    mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 12); // Bytes: three uints in.
+                    // Decide and compact, then march the list: see listBeamDirtyUnit for why not in place.
+                    auto bindDirty = [&](const ref<ComputePass>& pPass)
+                    {
+                        bindRenderer(pRenderContext, pPass);
+                        ShaderVar dirtyVar = pPass->getRootVar()["CB"]["gHSTRCloud"];
+                        dirtyVar["color"] = color;
+                        dirtyVar["hstrBeamPixelOutput"] = mpBeamPixels[0];
+                        dirtyVar["hstrBeamPixels"] = ref<Texture>();
+                    };
+                    bindDirty(mpBeamDirtyListUnitsPass);
+                    mpBeamDirtyListUnitsPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 12); // Bytes: three uints in.
+                    bindDirty(mpBeamDirtyUnitArgsPass);
+                    mpBeamDirtyUnitArgsPass->execute(pRenderContext, uint3(1));
+                    bindDirty(mpBeamDirtyMarchPass);
+                    mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                 }
             }
             else if (unitMarch)

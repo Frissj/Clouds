@@ -286,6 +286,10 @@ private:
     ref<ComputePass> mpBeamDirtyArgsPass;
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
+    ref<ComputePass> mpBeamDirtyListUnitsPass;
+    ref<ComputePass> mpBeamDirtyUnitArgsPass;
+    ref<Texture> mpBeamDirtyMark;  ///< Per guard block: its first dirty-list slot this build (hstrBeamDirtyMark).
+    ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     ref<ComputePass> mpBeamDirtyTilePass;
     ref<ComputePass> mpBeamRefreshListPass;
     ref<ComputePass> mpBeamGuardPyramidPass;

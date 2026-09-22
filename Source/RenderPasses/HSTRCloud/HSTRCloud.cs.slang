@@ -350,6 +350,11 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamDirty;
     RWStructuredBuffer<uint> hstrBeamDirtyCount;
     RWStructuredBuffer<uint> hstrBeamDirtyArgs;
+    /// Per guard block: the first dirty-list slot it was listed in this build, ~0 when not listed (cleared every build). Lets
+    /// each unit the dirty march covers be decided by exactly one block (beamDirtyUnitOwner).
+    RWTexture2D<uint> hstrBeamDirtyMark;
+    /// The units the dirty march has to march, compacted (count in hstrBeamDirtyCount[1]), packed x | y << 16.
+    RWStructuredBuffer<uint> hstrBeamDirtyUnits;
     /// The coarse certificate level: xyz is the camera the cell was last rebuilt from, w the radius it is safe within.
     RWTexture2D<float4> hstrBeamCoarse;
     /// Per coarse cell: the children its certificate does NOT cover (low 16 bits) and whether it is queued for a rebuild (bit 16).
@@ -5583,7 +5588,17 @@ struct HSTRCloudRenderer
     }
 
     /// The residual for one beam unit, once a dispatch has decided which unit this thread owns.
-    void marchBeamUnitAt(uint2 unit, bool force = false)
+    /// Returns whether it marched, rather than carried, deferred to the basis or skipped.
+    bool marchBeamUnitAt(uint2 unit, bool force = false)
+    {
+        if (!beamUnitNeedsMarch(unit, force))
+            return false;
+        marchBeamUnitExact(unit);
+        return true;
+    }
+
+    /// Everything marchBeamUnitAt decides before it marches, including the carry it writes when it does not.
+    bool beamUnitNeedsMarch(uint2 unit, bool force)
     {
         // MEASURED and REVERTED: bounding a SWEPT residual to the box the screen covers, on the theory that dispatching a thread
         // per texel of the octahedral sphere to have almost all of them fail the test below was the 1.28 ms of a 1.79 ms sprint
@@ -5591,16 +5606,15 @@ struct HSTRCloudRenderer
         // just outside the box are read after all, and a parked octahedral frame went from 1.663% of pixels over 0.02 to 7.790%.
         // The residual's cost under translation is units genuinely re-marching, not threads arriving to be rejected.
         if (any(unit >= params.beamFrameDim) || !beamUnitOnScreen(unit))
-            return;
+            return false;
         // MEASURED and REMOVED: marching a one-unit apron around every failed tile, so the resolve's bilinear never reaches into
         // an accepted neighbour's unwritten units. Failed tiles are 4 units square and scattered, so a one-unit border is 2.25x
         // their area and the march went 0.59 -> 1.71 ms parked and 0.75 -> 3.39 under yaw - and it did not move the seam it was
         // aimed at (720p max log error 7.88e-2, bit-identical before and after), so the seam is something else.
         const uint finest = beamTileEdge(params.beamLevels - 1);
         if (hstrBeamLevel[unit / finest] < params.beamLevels)
-            return; // The basis carries this tile; the resolve reconstructs it.
+            return false; // The basis carries this tile; the resolve reconstructs it.
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
-        const float3 albedo = gScene.getGridVolume(0).data.albedo;
         // Carried where THIS unit already holds a value marched for this direction, and the camera has not moved past its
         // parallax. The residual image is persistent, so the question is about the unit itself rather than about what the
         // previous build happened to cover: alpha < 0 means never marched since the frame was anchored, and that is the only
@@ -5615,7 +5629,7 @@ struct HSTRCloudRenderer
         {
             if (!force && params.beamRefValid != 0 && !beamRefreshes(unit / finest) && hstrBeamPixelOutput[unit].a >= 0.f &&
                 beamCellCertified(unit / max(params.beamDirtyBlockEdge, 1u)))
-                return;
+                return false;
         }
         else if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest))
         {
@@ -5630,10 +5644,18 @@ struct HSTRCloudRenderer
                         hstrBeamPixelOutput[unit] = float4(previous.rgb, d);
                     uint unused;
                     InterlockedAdd(hstrBeamCounts[kBeamMaxLevels], 1u, unused);
-                    return;
+                    return false;
                 }
             }
         }
+        return true;
+    }
+
+    /// The residual march itself, for a unit beamUnitNeedsMarch has passed.
+    void marchBeamUnitExact(uint2 unit)
+    {
+        const float3 w = beamRayDirection(float2(unit) + 0.5f);
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
         // A failed tile's unit can see nearer cloud than any basis point of its block, and the block is only as safe as its
@@ -6121,7 +6143,11 @@ struct HSTRCloudRenderer
         uint slot;
         InterlockedAdd(hstrBeamDirtyCount[0], 1u, slot);
         if (slot < params.beamDirtyCapacity)
+        {
             hstrBeamDirty[slot] = (cell.y << 16) | (cell.x & 0xFFFFu);
+            uint first;
+            InterlockedMin(hstrBeamDirtyMark[cell], slot, first);
+        }
         uint counted;
         InterlockedAdd(hstrBeamCounts[kBeamDirtyBlocks], 1u, counted);
         return true;
@@ -6144,31 +6170,92 @@ struct HSTRCloudRenderer
         uint slot;
         InterlockedAdd(hstrBeamDirtyCount[0], 1u, slot);
         if (slot < params.beamDirtyCapacity)
+        {
             hstrBeamDirty[slot] = (cell.y << 16) | (cell.x & 0xFFFFu);
+            uint first;
+            InterlockedMin(hstrBeamDirtyMark[cell], slot, first);
+        }
         // Its points are about to be verified again, which zeroes the coarse certificate over it (beamGuardVerified).
         if (params.beamCoarseShift != 0)
             beamQueueRebuild(cell >> params.beamCoarseShift);
     }
 
-    /// One thread per beam unit of a listed block: the residual, over the same blocks.
-    /// Over the same apron as testBeamDirtyTile, since a tile there can have just started failing and then needs its units.
-    void marchBeamDirtyUnit(uint thread)
+    /// Which listed block decides this unit: its own block if that is listed (and then the unit is forced), otherwise the
+    /// covering listed block with the lowest slot; ~0 if none covers it. Before, a block listed twice (classified and refreshed)
+    /// and every overlapping apron - up to eight around an unlisted block - each tested, and marched, the same unit.
+    uint beamDirtyUnitOwner(int2 unit, uint edge, uint apron, out bool own)
+    {
+        const int e = int(edge);
+        const int2 block = unit / e;
+        own = all(block < int2(params.beamGuardDims)) && hstrBeamDirtyMark[uint2(block)] != 0xFFFFFFFFu;
+        if (own)
+            return hstrBeamDirtyMark[uint2(block)];
+        // The blocks b whose padded box [b e - apron, b e + e + apron) holds the unit: floor((u - apron) / e) to
+        // floor((u + apron) / e). The offset keeps the division of a negative numerator rounding down.
+        const int2 lo = max((unit - int(apron) + 64 * e) / e - 64, 0);
+        const int2 hi = min((unit + int(apron)) / e, int2(params.beamGuardDims) - 1);
+        uint owner = 0xFFFFFFFFu;
+        for (int y = lo.y; y <= hi.y; ++y)
+            for (int x = lo.x; x <= hi.x; ++x)
+                owner = min(owner, hstrBeamDirtyMark[uint2(x, y)]);
+        return owner;
+    }
+
+    /// Pass A of the dirty march: one thread per unit of every listed block and its apron (testBeamDirtyTile's, since a tile there
+    /// can have just started failing and then needs its units) decides cheaply whether the unit marches, and appends it to
+    /// hstrBeamDirtyUnits. The block's own units are forced whatever its just-renewed certificate says; the apron's are asked as
+    /// usual. Each unit is decided once (beamDirtyUnitOwner).
+    ///
+    /// Marching in place instead, 4K walk: 30.0M threads for 413k marches (1.4%) scattered through them, so nearly every wave
+    /// paid a full march for one or two lanes - 20.8 ms of a 28 ms frame. Sprint: 67.3M threads, 0.8% marching.
+    void listBeamDirtyUnit(uint thread)
     {
         const uint edge = max(params.beamDirtyBlockEdge, 1u);
         const uint apron = kBeamDirtyApron * max(params.beamTileSize, 1u);
         const uint padded = edge + 2u * apron;
         const uint per = padded * padded;
         const uint index = thread / per;
-        if (index >= min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
+        bool march = false;
+        bool own = false;
+        uint2 unit = 0;
+        if (index < min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
+        {
+            const uint packed = hstrBeamDirty[index];
+            const uint local = thread % per;
+            const int2 at = int2(uint2(packed & 0xFFFFu, packed >> 16) * edge + uint2(local % padded, local / padded)) - int(apron);
+            if (all(at >= 0) && beamDirtyUnitOwner(at, edge, apron, own) == index)
+            {
+                unit = uint2(at);
+                march = beamUnitNeedsMarch(unit, own);
+            }
+        }
+        // One atomic per wave for the list, and for the probe counters (dirty_march_probe.py).
+        const uint marching = WaveActiveCountBits(march);
+        if (marching == 0)
             return;
-        const uint packed = hstrBeamDirty[index];
-        const uint local = thread % per;
-        const int2 unit = int2(uint2(packed & 0xFFFFu, packed >> 16) * edge + uint2(local % padded, local / padded)) - int(apron);
-        if (any(unit < 0))
+        const uint ownMarching = WaveActiveCountBits(march && own);
+        uint base = 0;
+        if (WaveIsFirstLane())
+        {
+            InterlockedAdd(hstrBeamDirtyCount[1], marching, base);
+            uint unused;
+            if (ownMarching != 0)
+                InterlockedAdd(hstrBeamCounts[kBeamDirtyOwnMarched], ownMarching, unused);
+            if (marching != ownMarching)
+                InterlockedAdd(hstrBeamCounts[kBeamDirtyApronMarched], marching - ownMarching, unused);
+        }
+        base = WaveReadLaneFirst(base);
+        if (march)
+            hstrBeamDirtyUnits[base + WavePrefixCountBits(march)] = unit.x | (unit.y << 16);
+    }
+
+    /// Pass B: one thread per unit pass A listed, every one of which marches.
+    void marchBeamDirtyListedUnit(uint thread)
+    {
+        if (thread >= hstrBeamDirtyCount[1])
             return;
-        // The block's own units are re-marched whatever its (just renewed) certificate says; the apron's are asked as usual.
-        const uint2 inner = uint2(local % padded, local / padded);
-        marchBeamUnitAt(uint2(unit), all(inner >= apron) && all(inner < apron + edge));
+        const uint packed = hstrBeamDirtyUnits[thread];
+        marchBeamUnitExact(uint2(packed & 0xFFFFu, packed >> 16));
     }
 
     /// Records what a point that took the full test this build proves about its block: the camera it was verified from, and a
@@ -6977,9 +7064,22 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 }
 
 [numthreads(64, 1, 1)]
+void listBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.listBeamDirtyUnit(foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// Dispatch arguments for the compacted units, hstrBeamDirtyArgs[15..17].
+[numthreads(1, 1, 1)]
+void writeBeamDirtyUnitArgs()
+{
+    writeFoldedDirtyArgs(15, gHSTRCloud.hstrBeamDirtyCount[1]);
+}
+
+[numthreads(64, 1, 1)]
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
-    gHSTRCloud.marchBeamDirtyUnit(foldedDirtyThread(groupId, groupThreadId.x));
+    gHSTRCloud.marchBeamDirtyListedUnit(foldedDirtyThread(groupId, groupThreadId.x));
 }
 
 groupshared uint gResidualMask[2]; ///< Which of the group's 64 pixels the residual resolve has to write.
