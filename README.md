@@ -10,6 +10,8 @@ HST is derived from NVIDIA Falcor. HST-specific original work authored by Sam Fr
 
 This project is pursuing a **radical camera-rendering architecture**. It is **not** trying to make conventional volumetric ray marching incrementally faster.
 
+For bounded, headless GPU/CPU timeline captures, see [Profiling HSTR with NVIDIA Nsight Systems](docs/HSTR-nsight-systems.md).
+
 ---
 
 # Read This Before Changing the Renderer

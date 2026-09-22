@@ -31,6 +31,8 @@
 *.pyc
 *slang-dump-*
 *.mp4
+*.nsys-rep
+*.qdstrm
 *.tlog
 *.bak
 *.swp
