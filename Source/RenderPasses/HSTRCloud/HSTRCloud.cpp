@@ -302,6 +302,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamInvalidate = bool(value);
             continue;
         }
+        if (key == "beamRepairProbe")
+        {
+            mBeamRepairProbe = bool(value);
+            continue;
+        }
         if (key == "beamGuard")
         {
             mBeamGuard = bool(value);
@@ -937,6 +942,7 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
+    props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
@@ -1041,6 +1047,12 @@ Properties HSTRCloud::getProperties() const
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         cloud["seaTilesChanged"] = mSeaTilesChanged;
         cloud["beamInvalidatedBuilds"] = mBeamInvalidatedBuilds;
+        const char* probeNames[] = {"Scored", "InPlace", "Reprojected", "Either"};
+        for (uint32_t k = 0; k < 4; ++k)
+        {
+            cloud[std::string("beamProbeUnits") + probeNames[k]] = mBeamLevelCounts[kBeamProbeUnits + k];
+            cloud[std::string("beamProbeRays") + probeNames[k]] = mBeamLevelCounts[kBeamProbeRays + k];
+        }
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
         cloud["transferEntries"] = mTransferEntries;
@@ -3177,6 +3189,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
     var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
     var["hstrBeamInvalidations"] = mpBeamInvalidations;
+    var["hstrBeamPixelsSnapshot"] = mpBeamPixelsSnapshot;
+    var["hstrBeamLatticeSnapshot"] = mpBeamLatticeSnapshot;
     var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
@@ -4753,6 +4767,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     mpBeamDirtyQueryPass->getProgram()->addDefine(
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
+                                    if (mBeamRepairProbe)
+                                    {
+                                        if (!mpBeamLatticeSnapshot || mpBeamLatticeSnapshot->getWidth() != mpBeamLattice->getWidth() ||
+                                            mpBeamLatticeSnapshot->getHeight() != mpBeamLattice->getHeight())
+                                        {
+                                            mpBeamLatticeSnapshot = mpDevice->createTexture2D(
+                                                mpBeamLattice->getWidth(), mpBeamLattice->getHeight(), ResourceFormat::RGBA16Float, 3, 1,
+                                                nullptr, ResourceBindFlags::ShaderResource
+                                            );
+                                        }
+                                        pRenderContext->copyResource(mpBeamLatticeSnapshot.get(), mpBeamLattice.get());
+                                    }
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
@@ -4974,6 +5001,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         dirtyVar["hstrBeamPixelOutput"] = mpBeamPixels[0];
                         dirtyVar["hstrBeamPixels"] = ref<Texture>();
                     };
+                    mpBeamDirtyMarchPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
+                    if (mBeamRepairProbe)
+                    {
+                        const ref<Texture>& pPixels = mpBeamPixels[0];
+                        if (!mpBeamPixelsSnapshot || mpBeamPixelsSnapshot->getWidth() != pPixels->getWidth() ||
+                            mpBeamPixelsSnapshot->getHeight() != pPixels->getHeight())
+                        {
+                            mpBeamPixelsSnapshot = mpDevice->createTexture2D(
+                                pPixels->getWidth(), pPixels->getHeight(), ResourceFormat::RGBA16Float, 1, 1, nullptr,
+                                ResourceBindFlags::ShaderResource
+                            );
+                        }
+                        pRenderContext->copyResource(mpBeamPixelsSnapshot.get(), pPixels.get());
+                    }
                     bindDirty(mpBeamDirtyListUnitsPass);
                     mpBeamDirtyListUnitsPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 12); // Bytes: three uints in.
                     bindDirty(mpBeamDirtyUnitArgsPass);

@@ -26,6 +26,11 @@ import HSTRCloudTypes;
 #ifndef HSTR_BEAM_SPARSE_CUT
 #define HSTR_BEAM_SPARSE_CUT 1
 #endif
+/// beamRepairProbe: scores what a repair could predict for each re-marched sample. Set by the host on the dirty query and the
+/// dirty unit march only, so no shipping program carries it.
+#ifndef HSTR_BEAM_REPAIR_PROBE
+#define HSTR_BEAM_REPAIR_PROBE 0
+#endif
 #define SHIP_BIT_cloudTransferClasses 1
 #define SHIP_BIT_cloudCostProbe 2
 #define SHIP_BIT_cloudEmptySkip 4
@@ -358,6 +363,9 @@ struct HSTRCloudRenderer
     /// World regions whose content (density or lighting) changed since the last build, as bounding spheres (xyz centre, w radius),
     /// params.beamInvalidateCount of them. See invalidateBeamGuardBlock.
     StructuredBuffer<float4> hstrBeamInvalidations;
+    /// beamRepairProbe: the residual units and the lattice as they stood before this build re-marched them.
+    Texture2D<float4> hstrBeamPixelsSnapshot;
+    Texture2DArray<float4> hstrBeamLatticeSnapshot;
     /// The coarse certificate level: xyz is the camera the cell was last rebuilt from, w the radius it is safe within.
     RWTexture2D<float4> hstrBeamCoarse;
     /// Per coarse cell: the children its certificate does NOT cover (low 16 bits) and whether it is queued for a rebuild (bit 16).
@@ -5654,6 +5662,91 @@ struct HSTRCloudRenderer
         return true;
     }
 
+#if HSTR_BEAM_REPAIR_PROBE
+    /// Largest per-channel difference in log(1 + radiance): the image gate's metric.
+    float beamProbeError(float3 a, float3 b) { const float3 e = abs(log(1.f + max(a, 0.f)) - log(1.f + max(b, 0.f))); return max(e.x, max(e.y, e.z)); }
+
+    /// Where the previous build saw what this camera sees along w, if it lies at the distance d0 the previous build stored for w:
+    /// single-depth reprojection. False for a direction that stored no opacity (nothing there to move).
+    bool beamProbeReproject(float3 w, float d0, out float2 position)
+    {
+        position = 0.f;
+        if (!(d0 > 0.f))
+            return false;
+        const float3 camera = gScene.camera.data.posW;
+        const float3 x = camera + beamCurrentDistance(d0, w) * w;
+        return beamImagePosition(normalize(x - params.beamPrevCamera), position);
+    }
+
+    /// Scores what a repair could have predicted for a sample this build re-marched: the old value kept in place, and the old image
+    /// reprojected by the old distance. Four counters from base: marched, in place within 0.02, reprojected within 0.02, either.
+    void beamProbeCount(uint base, bool scored, bool inPlace, bool reprojected)
+    {
+        const uint n = WaveActiveCountBits(scored);
+        const uint a = WaveActiveCountBits(scored && inPlace);
+        const uint b = WaveActiveCountBits(scored && reprojected);
+        const uint c = WaveActiveCountBits(scored && (inPlace || reprojected));
+        if (WaveIsFirstLane() && n != 0)
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[base], n, unused);
+            InterlockedAdd(hstrBeamCounts[base + 1], a, unused);
+            InterlockedAdd(hstrBeamCounts[base + 2], b, unused);
+            InterlockedAdd(hstrBeamCounts[base + 3], c, unused);
+        }
+    }
+
+    void beamProbeUnit(uint2 unit, float3 w, float3 exact)
+    {
+        const float4 old = hstrBeamPixelsSnapshot[unit];
+        const bool scored = old.a >= 0.f; // Never marched before has nothing to predict from.
+        const bool inPlace = scored && beamProbeError(old.rgb, exact) <= 0.02f;
+        bool reprojected = inPlace && !(old.a > 0.f); // Empty: nothing moves.
+        float2 position;
+        if (scored && beamProbeReproject(w, old.a, position))
+        {
+            const float4 moved = hstrBeamPixelsSnapshot.SampleLevel(hstrLinearClampSampler, position / float2(params.beamFrameDim), 0.f);
+            reprojected = beamProbeError(moved.rgb, exact) <= 0.02f;
+        }
+        beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected);
+    }
+
+    /// The lattice's radiance at a beam position, bilinear over its cache, single and depth (then composed, as the basis does).
+    float3 beamProbeLatticeRadiance(float2 position, float3 w, float3 albedo)
+    {
+        const float2 t = position / float(max(params.beamLatticeStep, 1u)); // Lattice texel k holds beam position k * step.
+        const int2 base = int2(floor(t));
+        const float2 f = t - float2(base);
+        float4 depthCache = 0.f;
+        float4 single = 0.f;
+        for (uint k = 0; k < 4; ++k)
+        {
+            const int2 texel = max(base + int2(k & 1u, k >> 1), 0);
+            const float weight = ((k & 1u) != 0 ? f.x : 1.f - f.x) * ((k >> 1) != 0 ? f.y : 1.f - f.y);
+            const uint2 at = uint2(texel) * max(params.beamLatticeStep, 1u);
+            depthCache += weight * hstrBeamLatticeSnapshot[beamLatticeTexel(at, 0)];
+            single += weight * hstrBeamLatticeSnapshot[beamLatticeTexel(at, 1)];
+        }
+        return beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo);
+    }
+
+    void beamProbeQuery(uint2 position, BeamSample fresh)
+    {
+        const float3 w = beamRayDirection(float2(position));
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        const float3 exact = beamRadiance(fresh.cache, fresh.single, fresh.depth, w, albedo);
+        const bool scored = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 2)].y > 0.5f;
+        const float4 depthCache = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 0)];
+        const float4 single = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 1)];
+        const bool inPlace = scored && beamProbeError(beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo), exact) <= 0.02f;
+        bool reprojected = inPlace && !(single.a > 0.f);
+        float2 moved;
+        if (scored && beamProbeReproject(w, single.a, moved))
+            reprojected = beamProbeError(beamProbeLatticeRadiance(moved, w, albedo), exact) <= 0.02f;
+        beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected);
+    }
+#endif
+
     /// The residual march itself, for a unit beamUnitNeedsMarch has passed.
     void marchBeamUnitExact(uint2 unit)
     {
@@ -5661,6 +5754,9 @@ struct HSTRCloudRenderer
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
+#if HSTR_BEAM_REPAIR_PROBE
+        beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb);
+#endif
         // A failed tile's unit can see nearer cloud than any basis point of its block, and the block is only as safe as its
         // nearest sample.
         if (params.beamGuard != 0 && params.beamRefFrame != 0)
@@ -7072,6 +7168,9 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
+#if HSTR_BEAM_REPAIR_PROBE
+    gHSTRCloud.beamProbeQuery(position, ray);
+#endif
     gHSTRCloud.beamQueryMarched(position, ray);
 #else
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);

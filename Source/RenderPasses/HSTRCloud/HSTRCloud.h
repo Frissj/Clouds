@@ -254,6 +254,9 @@ private:
     std::vector<float4> mBeamInvalidations;
     bool mBeamInvalidateAll = false;    ///< Everything changed: every guard block is unverified at the next build.
     bool mBeamInvalidate = true;        ///< beamInvalidate: off only to A/B the stale image it prevents.
+    bool mBeamRepairProbe = false;      ///< beamRepairProbe: score in-place and reprojected predictions of re-marched samples.
+    ref<Texture> mpBeamPixelsSnapshot;  ///< beamRepairProbe: the residual units before the dirty march.
+    ref<Texture> mpBeamLatticeSnapshot; ///< beamRepairProbe: the lattice before the dirty query.
     uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
     ref<ComputePass> mpBeamInvalidatePass;
     ref<Buffer> mpBeamInvalidations;

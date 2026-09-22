@@ -17,7 +17,7 @@ os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/User
 FRAMES = int(os.environ.get("HSTR_FRAMES", "16"))
 WARM = int(os.environ.get("HSTR_WARM", "16"))
 ARM = dict(runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweeps", "persistent_residual.py"))["OCT_T001"],
-           beamGuardParallax=1.0)
+           beamGuardParallax=1.0, beamRepairProbe=True)
 
 m.script("scripts/HSTR/CloudSea.py")
 W, H = [int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")]
@@ -76,12 +76,20 @@ for motion, forward, yaw in MOTIONS:
         pose(i, forward, yaw)
         m.renderFrame()
         s = stats()
-        rows.append((int(s.get("beamDirtyBlocks", 0)), int(s.get("beamDirtyOwnMarched", 0)), int(s.get("beamDirtyApronMarched", 0)),
-                     float(hstr.properties.get("beamMarchedFraction", 0.0))))
+        rows.append([int(s.get("beamDirtyBlocks", 0)), int(s.get("beamDirtyOwnMarched", 0)), int(s.get("beamDirtyApronMarched", 0)),
+                     float(hstr.properties.get("beamMarchedFraction", 0.0))] +
+                    [int(s.get(f"beamProbe{kind}{k}", 0)) for kind in ("Units", "Rays")
+                     for k in ("Scored", "InPlace", "Reprojected", "Either")])
     mean = lambda k: sum(r[k] for r in rows) / float(len(rows))
     blocks, own, apron, fraction = mean(0), mean(1), mean(2), mean(3)
     threads = blocks * 576
     log(f"{motion:6s} dirty blocks {blocks:9.0f}  threads {threads:11.0f}  own slots {blocks * 64:10.0f}  own marched {own:10.0f}"
         f" ({100 * own / max(blocks * 64, 1):5.1f}%)  apron marched {apron:9.0f}  marched/threads {100 * (own + apron) / max(threads, 1):5.1f}%"
         f"  pixels in marched tiles {100 * fraction:5.1f}%  frame units {W * H}")
+    # beamRepairProbe: of the samples this build re-marched, how many a repair could have predicted within 0.02 (log(1 + x)).
+    for i, kind in enumerate(("units", "rays")):
+        scored, inPlace, reprojected, either = (mean(4 + 4 * i + k) for k in range(4))
+        pct = lambda v: 100 * v / max(scored, 1)
+        log(f"{motion:6s}   {kind:5s} re-marched {scored:9.0f}: kept in place ok {pct(inPlace):5.1f}%, reprojected ok {pct(reprojected):5.1f}%,"
+            f" either {pct(either):5.1f}%, neither (true repair) {100 - pct(either):5.1f}%")
 exit()
