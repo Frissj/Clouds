@@ -297,6 +297,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamDirtySegments = segments;
             continue;
         }
+        if (key == "beamInvalidate")
+        {
+            mBeamInvalidate = bool(value);
+            continue;
+        }
         if (key == "beamGuard")
         {
             mBeamGuard = bool(value);
@@ -931,6 +936,7 @@ Properties HSTRCloud::getProperties() const
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
+    props["beamInvalidate"] = mBeamInvalidate;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
     props["beamPageIndirect"] = mParams.beamPageIndirect;
@@ -1033,6 +1039,8 @@ Properties HSTRCloud::getProperties() const
         cloud["cutMargin"] = stats.cutMargin;
         cloud["cuts"] = stats.cuts;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
+        cloud["seaTilesChanged"] = mSeaTilesChanged;
+        cloud["beamInvalidatedBuilds"] = mBeamInvalidatedBuilds;
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
         cloud["transferEntries"] = mTransferEntries;
@@ -1267,6 +1275,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramids");
+    mpBeamInvalidatePass = createPass("invalidateBeamGuardBlocks");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
     mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
@@ -1929,6 +1938,20 @@ void HSTRCloud::buildCloudDomain()
     logInfo("HSTRCloud: cloud sea domain {} voxels of {:.2f} world units ({} fine density).", dims, voxel, mpCloudResidency ? "virtual" : "proxy");
 }
 
+void HSTRCloud::invalidateBeamColumn(int2 worldTile)
+{
+    // The tile's column of the cloud layer, widened by how far its change reaches: the sun octaves' Gaussian (blurSunOctaves),
+    // one world cache cell and the domain's trilinear footprint.
+    const auto& desc = mpCloudSea->getDesc();
+    const float voxel = mpCloudSea->getVoxelWorld();
+    const float octaveCell = mParams.hstrOctaveDims.x > 0 ? float(desc.tiles) * desc.tileWorld / float(mParams.hstrOctaveDims.x) : 0.f;
+    const float margin = std::ceil(2.5f * mParams.octaveBlurSigma) * octaveCell +
+                         float(std::max(mParams.worldCacheCellVoxels, 1u)) * voxel + 2.f * voxel;
+    const float3 lo = desc.origin + float3(float(worldTile.x), 0.f, float(worldTile.y)) * float3(desc.tileWorld, 0.f, desc.tileWorld);
+    const float3 hi = lo + float3(desc.tileWorld, desc.layerHeight, desc.tileWorld);
+    mBeamInvalidations.push_back(float4(0.5f * (lo + hi), 0.5f * length(hi - lo) + margin));
+}
+
 void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
 {
     // The domain proxy of the changed slots: their float16 volumes (converted on the sea's workers, straight into staging buffers)
@@ -2105,8 +2128,31 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     std::vector<uint32_t> changed;
     {
         FALCOR_PROFILE(pRenderContext, "seaTiles");
-        // A residency cut running on its worker reads the tiles: finished tiles wait until it is back.
-        changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && mpCloudResidency->cutInFlight()));
+        // A residency cut running on its worker reads the tiles: finished tiles wait until it is back. With residency frozen
+        // (benchmarks) the sea takes its tiles on synchronously instead, in the frame that requests them: when a worker happened
+        // to deliver decided what the scored frames saw, and the same code measured sprint at 0.025% or 0.127% over 0.02.
+        if (mCloudResidencyFrozen)
+            changed = mpCloudSea->fill(camera->getPosition());
+        else
+            changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && mpCloudResidency->cutInFlight()));
+    }
+    mSeaTilesChanged += uint32_t(changed.size()); // Tiles whose cloud the sea replaced, cumulative (cloudStats seaTilesChanged).
+    // The persistent beam image holds radiance marched through the old cloud: both the world column a slot held and the one it now
+    // holds changed (invalidateBeamGuardBlock).
+    const auto& seaTiles = mpCloudSea->getTiles();
+    if (mSeaSlotWorld.size() != seaTiles.size())
+    {
+        mSeaSlotWorld.resize(seaTiles.size());
+        for (size_t slot = 0; slot < seaTiles.size(); ++slot)
+            mSeaSlotWorld[slot] = seaTiles[slot].world;
+    }
+    for (uint32_t slot : changed)
+    {
+        if (slot >= seaTiles.size())
+            continue;
+        invalidateBeamColumn(mSeaSlotWorld[slot]);
+        invalidateBeamColumn(seaTiles[slot].world);
+        mSeaSlotWorld[slot] = seaTiles[slot].world;
     }
     if (!mCloudInstancesUploaded)
     {
@@ -3130,6 +3176,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
     var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
+    var["hstrBeamInvalidations"] = mpBeamInvalidations;
     var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
@@ -3196,6 +3243,9 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
         const uint32_t r = mParams.cloudTileVoxels;
         for (uint32_t slot : mSunPageSlots)
         {
+            // Its light changes, and so does the radiance the beam image holds for every direction through it.
+            if (mpCloudSea && slot < mpCloudSea->getTiles().size())
+                invalidateBeamColumn(mpCloudSea->getTiles()[slot].world);
             mParams.fineSunOffset = uint3(slot % mParams.cloudTiles.x * r, 0, slot / mParams.cloudTiles.x * r);
             mParams.fineSunSize = uint3(r, fineDims.y, r);
             bindRenderer(pRenderContext, mpFineSunPass);
@@ -3208,6 +3258,7 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     else
     {
         // Ballistic sun transmittance per residual cell, with per-leaf activation, then non-resident pages are cleared.
+        mBeamInvalidateAll = true; // Every sun page changes.
         pRenderContext->clearUAV(mpLeafResidual->getUAV().get(), uint4(0));
         bindRenderer(pRenderContext, mpFineSunPass);
         bindOutput(mpFineSunPass, "hstrFineSunOutput", mpFineSun, "hstrFineSun");
@@ -4580,9 +4631,48 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
                                 pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
-                                // A camera that neither moved nor turned cannot have invalidated or uncovered anything, so only the
-                                // refresh phase is listed and the classification is skipped.
-                                const bool classify = mParams.beamStationary == 0 || turned;
+                                // Content that changed since the last build unverifies the blocks whose directions cross it, before
+                                // the classification lists what is not certified. A few regions a tile crossing; past the buffer, or
+                                // when every sun page changed, every block.
+                                if (!mBeamInvalidate)
+                                {
+                                    mBeamInvalidations.clear(); // A/B only: the image keeps what it marched through old content.
+                                    mBeamInvalidateAll = false;
+                                }
+                                const bool invalidated = !mBeamInvalidations.empty() || mBeamInvalidateAll;
+                                if (invalidated)
+                                {
+                                    FALCOR_PROFILE(pRenderContext, "invalidate");
+                                    constexpr uint32_t kCapacity = 256;
+                                    if (mBeamInvalidateAll || mBeamInvalidations.size() > kCapacity)
+                                    {
+                                        pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
+                                        pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
+                                    }
+                                    else
+                                    {
+                                        if (!mpBeamInvalidations)
+                                        {
+                                            mpBeamInvalidations = mpDevice->createStructuredBuffer(
+                                                sizeof(float4), kCapacity, ResourceBindFlags::ShaderResource
+                                            );
+                                        }
+                                        mpBeamInvalidations->setBlob(
+                                            mBeamInvalidations.data(), 0, mBeamInvalidations.size() * sizeof(float4)
+                                        );
+                                        mParams.beamInvalidateCount = uint32_t(mBeamInvalidations.size());
+                                        bindRenderer(pRenderContext, mpBeamInvalidatePass);
+                                        mpBeamInvalidatePass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
+                                        mParams.beamInvalidateCount = 0;
+                                    }
+                                    mBeamInvalidations.clear();
+                                    mBeamInvalidateAll = false;
+                                    ++mBeamInvalidatedBuilds;
+                                }
+                                // A camera that neither moved nor turned, over content that did not change, cannot have
+                                // invalidated or uncovered anything, so only the refresh phase is listed and the classification
+                                // is skipped.
+                                const bool classify = mParams.beamStationary == 0 || turned || invalidated;
                                 // MEASURED TWICE and REVERTED: bounding this domain. First to the screen's block box, then to that
                                 // box unioned with the regions the query dispatch had just covered. Both take the rectangle's walk
                                 // from 0.33 ms to 2.4 and above, with the level-0 query pass at 1.35. A block left out is never

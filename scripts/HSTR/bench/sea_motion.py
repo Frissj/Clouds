@@ -53,10 +53,16 @@ def settle():
     for i in range(1500):
         m.renderFrame()
         s = stats()
-        busy = int(s.get("pendingTiles", 0)) + int(s.get("pending", 0)) + int(s.get("sunBakesFrame", 0))
+        # Idle means the residency has nothing left to change, not only nothing left to load: freezing it (below) also stops fades
+        # and map/unmap work mid-way. Checked on the sea (2026-09-22): nothing was mid-fade where the streaming-only test ended, so
+        # this is hygiene, not the cause of the sprint flakiness - that was sea tiles landing between a step's stored exact frame
+        # and its scored frame, fixed by the sea taking tiles on synchronously while residency is frozen (updateCloudDomain).
+        busy = sum(int(s.get(k, 0)) for k in ("pendingTiles", "pending", "sunBakesFrame", "activeFades", "mapBacklog",
+                                                "undesiredFadingOut"))
         quiet = quiet + 1 if busy == 0 else 0
         if i > 32 and quiet > 20:
-            return i
+            return i + 1
+    print("sea_motion: the residency never went idle in 1500 frames; runs are not comparable")
     return 1500
 
 
@@ -142,7 +148,9 @@ while int(hstr.properties["worldCacheSampleCount"]) < 64:
 hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": os.environ.get("HSTR_FREEZE", "1") != "0"})
 settled = stats()
 log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun baked {settled.get('sunBaked', 0)}, waiting "
-    f"{settled.get('sunWaiting', 0)}, slots free {settled.get('sunSlotsFree', 0)})")
+    f"{settled.get('sunWaiting', 0)}, slots free {settled.get('sunSlotsFree', 0)}, world cache samples "
+    f"{hstr.properties.get('worldCacheSampleCount', 0)}, fades {settled.get('activeFades', 0)}, map backlog "
+    f"{settled.get('mapBacklog', 0)}, fading out {settled.get('undesiredFadingOut', 0)})")
 for motion, forward, yaw, *rest in MOTIONS:
     sun = float(rest[0]) if rest else SUN_RATE
     for test, properties in TESTS:
@@ -152,10 +160,16 @@ for motion, forward, yaw, *rest in MOTIONS:
         # directions its predecessors marched, and one configuration measured 0.36 ms and then 2.41 ms in consecutive runs while
         # the rectangle control reproduced to 0.07. The warm-up below then fills it from this arm's own motion.
         hstr.set_properties({"beamReset": True})
+        # Sea tiles replaced during the arm: the sea streams even with residency frozen, and a tile landing between a direction's
+        # march and a scored step changes the cloud under the persistent beam image.
+        tilesAtStart = int(stats().get("seaTilesChanged", 0))
+        invalidatedAtStart = int(stats().get("beamInvalidatedBuilds", 0))
         for i in range(WARM):
             pose(i - WARM - TIMED, forward, yaw, sun)
             m.renderFrame()
         t = timed(TIMED, -TIMED, forward, yaw, sun)
+        tilesBeforeSteps = int(stats().get("seaTilesChanged", 0)) - tilesAtStart
+        tilesPerStep = []
         errors = []
         for step in range(STEPS):
             pose(step, forward, yaw, sun)
@@ -168,6 +182,7 @@ for motion, forward, yaw, *rest in MOTIONS:
             p = hstr.properties
             hstr.set_properties({"compareReference": False, "compareExact": False})
             s = p.get("cloudStats", {})
+            tilesPerStep.append(int(s.get("seaTilesChanged", 0)) - tilesAtStart)
             errors.append({"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]),
                            "max": float(p["referenceLogMax"]), "marched": float(p["beamMarchedFraction"]),
                            "carriedPoints": int(s.get("beamCarriedPoints", 0)), "carriedPixels": int(s.get("beamCarriedPixels", 0)),
@@ -185,5 +200,8 @@ for motion, forward, yaw, *rest in MOTIONS:
         parts += " cpu max " + json.dumps({k: v for k, v in t["cpuMax"].items() if v >= 1.0})
         log(f"{motion:7s} {test:16s} {t.get('HSTRCloud', 0):6.2f} ms ({parts}); marched {100 * mean['marched']:4.1f}%; "
             f"carried {mean['carriedPoints']:.0f} points {mean['carriedPixels']:.0f} pixels (debug {mean['debug']:.0f}, steps marched {mean['marchedSteps']:.0f} carried {mean['carriedSteps']:.0f}); "
-            f">0.02 mean {100 * mean['over02']:.3f}% worst {100 * worst:.3f}%, p99.9 {mean['p999']:.2e}, max {max(e['max'] for e in errors):.2e}")
+            f">0.02 mean {100 * mean['over02']:.3f}% worst {100 * worst:.3f}%, p99.9 {mean['p999']:.2e}, max {max(e['max'] for e in errors):.2e}"
+            f"; sea tiles changed before steps {tilesBeforeSteps}, by step {tilesPerStep}"
+            f", invalidating builds {int(stats().get('beamInvalidatedBuilds', 0)) - invalidatedAtStart}"
+            f", per-step >0.02 {[round(100 * e['over02'], 3) for e in errors]}")
 exit()

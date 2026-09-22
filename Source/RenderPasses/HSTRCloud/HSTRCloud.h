@@ -248,6 +248,17 @@ private:
     /// Fills the queue's dispatch arguments for entries of threadsPerEntry threads.
     void writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry);
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
+    uint32_t mSeaTilesChanged = 0;      ///< Sea tiles whose cloud was replaced, cumulative (cloudStats).
+    std::vector<int2> mSeaSlotWorld;    ///< Per sea slot: the world tile the beam image last saw it hold.
+    /// World regions whose density or lighting changed since the last guard build, as spheres (invalidateBeamGuardBlock).
+    std::vector<float4> mBeamInvalidations;
+    bool mBeamInvalidateAll = false;    ///< Everything changed: every guard block is unverified at the next build.
+    bool mBeamInvalidate = true;        ///< beamInvalidate: off only to A/B the stale image it prevents.
+    uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
+    ref<ComputePass> mpBeamInvalidatePass;
+    ref<Buffer> mpBeamInvalidations;
+    /// Queues the column of the cloud layer over a world tile, and what its change reaches, for invalidateBeamGuardBlock.
+    void invalidateBeamColumn(int2 worldTile);
     float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).
     float mCloudCutTurn = 3.f;          ///< CloudView::cutTurn (degrees).
     bool mCloudCutAsync = true;         ///< CloudView::cutAsync: the frame only takes on cuts the worker finished.

@@ -356,13 +356,16 @@ std::vector<uint32_t> CloudSea::update(float3 cameraPosition, bool applyResults)
     return changed;
 }
 
-void CloudSea::fill(float3 cameraPosition)
+std::vector<uint32_t> CloudSea::fill(float3 cameraPosition)
 {
-    update(cameraPosition);
+    std::vector<uint32_t> changed = update(cameraPosition);
     {
         std::unique_lock lock(mMutex);
         mWake.wait(lock, [&] { return mJobs.empty() && mBusy == 0; });
     }
-    update(cameraPosition);
+    for (uint32_t slot : update(cameraPosition))
+        if (std::find(changed.begin(), changed.end(), slot) == changed.end())
+            changed.push_back(slot);
+    return changed;
 }
 } // namespace hstrcloud

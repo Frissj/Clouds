@@ -75,8 +75,8 @@ public:
     /// Recentres the window on the camera and applies finished rasterizations (unless applyResults is false: they wait for a later
     /// update, while something is reading the tiles). Returns the slots whose content changed.
     std::vector<uint32_t> update(float3 cameraPosition, bool applyResults = true);
-    /// Rasterizes every tile of the window around the camera before returning.
-    void fill(float3 cameraPosition);
+    /// Rasterizes every tile of the window around the camera before returning, and returns the slots whose content changed.
+    std::vector<uint32_t> fill(float3 cameraPosition);
 
     const std::vector<CloudAsset>& getAssets() const { return mAssets; }
     const CloudSeaDesc& getDesc() const { return mDesc; }

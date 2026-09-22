@@ -1217,6 +1217,8 @@ struct HSTRCloudParams
     /// Levels of the guard's min-depth pyramid (hstrBeamGuardPyramid), and the one a build pass is writing.
     uint beamGuardPyramidLevels = 0;
     uint beamGuardPyramidLevel = 0;
+    /// Changed-content regions in hstrBeamInvalidations for this build's invalidateBeamGuardBlocks.
+    uint beamInvalidateCount = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

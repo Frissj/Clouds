@@ -11,6 +11,14 @@ HSTR is a quality-constrained real-time renderer. The target is below 2 ms at 4K
 - Build immediately after C++ or shader edits with the documented HSTRCloud build command. Do not hunt for another command.
 - Preserve unrelated working-tree changes and benchmark artifacts.
 
+## Benchmark runs: a few minutes each, one per question
+
+- Every run must finish in a few minutes. Each Mogwai launch pays a ~1,200-frame sea settle before it measures anything, so the settle, not the measurement, is the cost. Never loop a harness over several processes (one per settle count, one per repeat): put every arm and variant in ONE run's TESTS or property sweep, so they share one settle.
+- One run per question. Before launching, state what the run answers and roughly how long it takes. If it cannot answer the question, add the logging it needs first; do not launch repeats hoping a pattern appears.
+- Run only the motions the question needs (e.g. `--motions "sprint 20 0"` alone), with the fewest arms and steps that answer it.
+- Log the state needed to explain the result (counters, settle state) in the same run, so a surprising number never needs a second run just to find out what happened.
+- Compare A/B arms within one run. Numbers from different runs are not comparable until the harness is shown to be deterministic.
+
 ## Optimization philosophy
 
 - Pursue both sides of the budget: fewer expensive queries and cheaper queries. Micro-optimizing one million queries is not a credible route to the target by itself.
