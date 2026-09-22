@@ -5863,6 +5863,63 @@ struct HSTRCloudRenderer
             reprojected = beamProbeError(beamProbeLatticeRadiance(moved, w, albedo), exact) <= 0.02f;
         beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected, fresh.steps);
         beamProbeDivergence(kBeamProbeDivergence + 2, fresh.steps);
+        // Block-coherent: would carrying the WHOLE block have been right, and would a geometry signature of this view have said so?
+        // The signature is taken from this exact march, so it prices the classifier, not a validator march.
+        const float opacityOld = 1.f - exp(-depthCache.a);
+        const float opacityNew = 1.f - exp(-fresh.depth);
+        const float dOpacity = abs(opacityNew - opacityOld);
+        const float dDistance = (opacityOld > 0.01f || opacityNew > 0.01f)
+                                    ? abs(fresh.distance - single.a) / max(max(fresh.distance, single.a), 1e-3f)
+                                    : 0.f;
+        const bool tight = scored && dOpacity <= 0.02f && dDistance <= 0.02f;
+        const bool loose = scored && dOpacity <= 0.05f && dDistance <= 0.10f;
+        beamProbeBlock(!scored || inPlace, tight || !scored, loose || !scored, scored, fresh.steps);
+    }
+
+    /// Groups the dirty query's lanes by block (beamDirtyRay: rb * rb * passes consecutive rays) and counts whole blocks.
+    /// MEASURED (4K, OCT_T001, parallax 1, 16 frames, dirty_march_probe.py): blocks whose every re-marched ray was within 0.02 in
+    /// place hold 71.1% of the query's steps at walk and 67.6% at sprint, the ceiling of a coherent block carry. A signature at
+    /// opacity 0.02 / distance 2% accepts 75.3% of walk steps, 11.8% of them in blocks with a bad ray, and 59.5% of sprint's, 2.9%
+    /// bad; at 0.05 / 10% it accepts 82.0% / 80.2% with 16.2% / 16.5% bad. So the signal separates, but a validator that marches
+    /// every ray for it pays the extinction half of a step (march_components.py) to save at most ~60%: it must be sparse or coarse.
+    void beamProbeBlock(bool ok, bool tight, bool loose, bool scored, float steps)
+    {
+        const uint rb = max(params.beamDirtyPointStride, 1u);
+        const uint g = rb * rb * (params.beamCentreless != 0 ? 1u : 2u);
+        if (g > 32u || (32u % g) != 0u)
+            return;
+        const uint lane = WaveGetLaneIndex();
+        const uint start = lane - lane % g;
+        const uint word = start / 32u;
+        const uint shift = start % 32u;
+        const uint groupMask = (g == 32u ? ~0u : ((1u << g) - 1u)) << shift;
+        const uint active = WaveActiveBallot(true)[word] & groupMask;
+        const bool blockOk = (WaveActiveBallot(!ok)[word] & groupMask) == 0;
+        const bool blockTight = (WaveActiveBallot(!tight)[word] & groupMask) == 0;
+        const bool blockLoose = (WaveActiveBallot(!loose)[word] & groupMask) == 0;
+        const bool blockScored = (WaveActiveBallot(scored)[word] & groupMask) != 0;
+        const bool lead = lane == firstbitlow(active);
+        const uint s = blockScored ? uint(steps) : 0u;
+        const uint blocks = WaveActiveCountBits(lead && blockScored);
+        const uint okBlocks = WaveActiveCountBits(lead && blockScored && blockOk);
+        const uint okSteps = WaveActiveSum(blockOk ? s : 0u);
+        const uint allSteps = WaveActiveSum(s);
+        const uint tightSteps = WaveActiveSum(blockTight ? s : 0u);
+        const uint tightBad = WaveActiveSum(blockTight && !blockOk ? s : 0u);
+        const uint looseSteps = WaveActiveSum(blockLoose ? s : 0u);
+        const uint looseBad = WaveActiveSum(blockLoose && !blockOk ? s : 0u);
+        if (WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks], blocks, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 1], okBlocks, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 2], okSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 3], allSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 4], tightSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 5], tightBad, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 6], looseSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamProbeBlocks + 7], looseBad, unused);
+        }
     }
 #endif
 

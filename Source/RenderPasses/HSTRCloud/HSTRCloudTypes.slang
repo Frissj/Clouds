@@ -20,7 +20,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 52;
+static const uint kBeamCountSlots = 60;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -32,6 +32,11 @@ static const uint kBeamProbeRays = 36;
 static const uint kBeamProbeSteps = 40;
 /// beamRepairProbe, per build: units' march steps taken and paid (wave longest x lanes), then the same for the dirty query's rays.
 static const uint kBeamProbeDivergence = 48;
+/// beamRepairProbe, per dirty query build, over whole dirty blocks rather than rays (a block's rays are consecutive lanes):
+/// blocks scored, blocks whose every re-marched ray was within 0.02 kept in place, the march steps of those blocks, all steps of
+/// scored blocks; then for a tight and a loose current-view geometry signature (every ray's opacity and opacity-weighted
+/// distance unchanged within a bound), the steps of the blocks it would accept and of those it would accept wrongly.
+static const uint kBeamProbeBlocks = 52;
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;
@@ -465,7 +470,13 @@ struct HSTRCloudParams
     uint worldCacheBands = 2; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
     uint worldCacheWindow = 1; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
     uint worldCacheTextured = 1; ///< 1: the camera reads the cache from baked, hardware-filtered 3D textures.
-    uint lightingStride = 1;     ///< The camera march re-evaluates the cache every lightingStride steps and holds it between.
+    /// The camera march re-evaluates the cache every lightingStride steps and holds it between.
+    /// MEASURED on the dirty passes and LEFT AT 1 (4K, OCT_T001, parallax 1, one settle, dirty_lighting_rate.py): walk 7.48 ms
+    /// (anchor 7.44) -> stride 2 7.41 at 0.136% -> 0.154% over 0.02, stride 4 7.46 at 1.097%; sprint 9.20 -> 9.17 / 9.13, error
+    /// unchanged. The cache read is not where the lighting half of a step goes. Holding the sun depth instead (cloudSunReuse 2 / 4
+    /// voxels, shipping defines kept) is worth 0.75-0.9 ms walk and 0.5-0.7 sprint but puts 4.0-4.8% / 6.7-7.1% of pixels over
+    /// 0.02 (p99.9 0.026 -> 0.072, sprint 0.015 -> 0.15): the sun depth is not smooth at one-voxel steps through cloud edges.
+    uint lightingStride = 1;
 
     uint2 beamTileDims = { 0, 0 };    ///< Coarsest beam tiles.
     uint2 beamLatticeDims = { 0, 0 }; ///< Query lattice, one texel per beamLatticeStep pixels; every tile corner and centre is a texel.

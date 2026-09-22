@@ -82,7 +82,9 @@ for motion, forward, yaw in MOTIONS:
                      for k in ("Scored", "InPlace", "Reprojected", "Either")] +
                     [int(s.get(f"beamProbe{kind}Steps{k}", 0)) for kind in ("Unit", "Ray")
                      for k in ("Scored", "InPlace", "Reprojected", "Either")] +
-                    [int(s.get(f"beamProbe{k}", 0)) for k in ("UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid")])
+                    [int(s.get(f"beamProbe{k}", 0)) for k in ("UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid")] +
+                    [int(s.get(f"beamProbe{k}", 0)) for k in ("Blocks", "BlocksOk", "BlockOkSteps", "BlockSteps", "TightSteps",
+                                                              "TightBadSteps", "LooseSteps", "LooseBadSteps")])
     mean = lambda k: sum(r[k] for r in rows) / float(len(rows))
     blocks, own, apron, fraction = mean(0), mean(1), mean(2), mean(3)
     log(f"{motion:6s} dirty blocks {blocks:9.0f}  own units {blocks * 64:10.0f}  own marched {own:10.0f} ({100 * own / max(blocks * 64, 1):5.1f}%)"
@@ -101,4 +103,10 @@ for motion, forward, yaw in MOTIONS:
         # Wave efficiency of the march: steps the lanes took over what their waves paid (the longest lane, times the lanes).
         taken, paid = mean(20 + 2 * i), mean(21 + 2 * i)
         log(f"{motion:6s}   {kind:5s} wave efficiency {100 * taken / max(paid, 1):5.1f}% ({taken:11.0f} steps taken, {paid:11.0f} paid)")
+    # Whole blocks: the ceiling of a coherent block carry, and what a current-view geometry signature would have accepted of it.
+    nb, nok, okSteps, allSteps, tight, tightBad, loose, looseBad = (mean(24 + k) for k in range(8))
+    sp = lambda v: 100 * v / max(allSteps, 1)
+    log(f"{motion:6s}   blocks {nb:9.0f}: every ray ok in place {100 * nok / max(nb, 1):5.1f}% of blocks, {sp(okSteps):5.1f}% of their steps")
+    log(f"{motion:6s}   geometry tight (opacity 0.02, distance 2%): accepts {sp(tight):5.1f}% of steps, wrongly {sp(tightBad):5.1f}%")
+    log(f"{motion:6s}   geometry loose (opacity 0.05, distance 10%): accepts {sp(loose):5.1f}% of steps, wrongly {sp(looseBad):5.1f}%")
 exit()

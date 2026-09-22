@@ -800,8 +800,17 @@ bool HSTRCloud::beamShipping() const
 {
     const HSTRCloudParams& p = mParams;
     return mBeamShip && p.cloudQuadrature <= 1 && p.cloudSourceLinear == 0 && p.cloudCostProbe == 0 && p.cloudLongitudinalOracle <= 1 &&
-           p.cloudSunReuse <= 0.f && p.cloudTransferClasses == 0 && p.cloudTightReject == 0 && p.cloudStepFootprint <= 0.f &&
+           p.cloudTransferClasses == 0 && p.cloudTightReject == 0 && p.cloudStepFootprint <= 0.f &&
            p.cloudLocalStep == 0 && p.cloudTrapezoid == 0 && p.adaptiveMarch == 0 && p.cloudEmptySkip == 1 && p.cloudSunCache == 1;
+}
+
+/// The HSTR_SHIP mask the beam programs compile with. cloudSunReuse is a distance rather than a switch, so a nonzero one keeps its
+/// group live (bit 256) instead of dropping every other folded switch with it.
+uint32_t HSTRCloud::beamShipDefine() const
+{
+    if (!beamShipping())
+        return 0u;
+    return mParams.cloudSunReuse > 0.f ? (mBeamShipMask & ~256u) : mBeamShipMask;
 }
 
 void HSTRCloud::setProperties(const Properties& props)
@@ -1064,6 +1073,9 @@ Properties HSTRCloud::getProperties() const
         const char* divergenceNames[] = {"UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid"};
         for (uint32_t k = 0; k < 4; ++k)
             cloud[std::string("beamProbe") + divergenceNames[k]] = mBeamLevelCounts[kBeamProbeDivergence + k];
+        const char* blockNames[] = {"Blocks", "BlocksOk", "BlockOkSteps", "BlockSteps", "TightSteps", "TightBadSteps", "LooseSteps", "LooseBadSteps"};
+        for (uint32_t k = 0; k < 8; ++k)
+            cloud[std::string("beamProbe") + blockNames[k]] = mBeamLevelCounts[kBeamProbeBlocks + k];
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
         cloud["transferEntries"] = mTransferEntries;
@@ -3595,7 +3607,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // The same march program as every other beam march. Without HSTR_SHIP the dirty passes compiled every switch as a live branch:
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-    pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+    pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
 }
 
 void HSTRCloud::ensureCameraResources()
@@ -4341,7 +4353,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // dispatched: setting it with the march pass below left a frame's queries compiled against the previous value of
         // cloudSunLiveMarch whenever it changed.
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -4400,7 +4412,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     }
 
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
                     for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                     {
@@ -4502,7 +4514,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // The corner grid, then the centre grid, each as a 2D dispatch at the lattice spacing. With the queue these
                             // only carry and queue; the queued points are marched below, one list of similar cost per dispatch.
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                             // Launch over the screen box, not the whole beam image. beamPointOnScreen keeps a point while any
@@ -4817,7 +4829,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             {
                                 writeBeamQueueArgs(pRenderContext, 1);
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
@@ -4963,7 +4975,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const ref<ComputePass>& pMarch =
             unitMarch ? mpBeamUnitMarchPass : (queued ? mpBeamQueuePixelPass : (gridMarch ? mpBeamGridMarchPass : mpBeamMarchPass));
         pMarch->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
-        pMarch->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+        pMarch->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
         auto bindMarch = [&]()
         {
             bindRenderer(pRenderContext, pMarch);

@@ -12,6 +12,8 @@ REFERENCE = {
     "beamEdgeContrast": 0.05, "beamGuide": 0, "beamOracle": 0, "beamOracleBar": 0.02, "beamCentreless": False,
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 0,
     "beamShip": False,
+    # Sweeps vary the lighting rate; the exact frame must not inherit an arm's.
+    "lightingStride": 1,
 }
 
 BEAM = {

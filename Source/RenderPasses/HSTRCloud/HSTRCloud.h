@@ -273,6 +273,7 @@ private:
     uint32_t mBeamShipMask = 509;
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
+    uint32_t beamShipDefine() const;
     bool mBeamRefreshValid = false;
     float4x4 mBeamPrevViewProj;
     float3 mBeamPrevCamera = float3(0.f);
