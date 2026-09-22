@@ -288,6 +288,9 @@ private:
     ref<ComputePass> mpBeamDirtyMarchPass;
     ref<ComputePass> mpBeamDirtyTilePass;
     ref<ComputePass> mpBeamRefreshListPass;
+    ref<ComputePass> mpBeamGuardPyramidPass;
+    ref<Buffer> mpBeamGuardPyramid;     ///< Min-depth pyramid over the guard blocks (beamCellRadius).
+    uint32_t mBeamGuardPyramidLevels = 0;
     bool mBeamGuardDriven = false; ///< This build's blocks all came from the guard's dirty list: no grid regions, no sweeps.
     bool mBeamDirtyActive = false; ///< This build listed invalidated blocks, so the residual has to cover them too.
     uint32_t mBeamClassifyCells = 0; ///< Guard blocks the classification examined, against the whole grid it used to walk.

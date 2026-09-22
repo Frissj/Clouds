@@ -342,6 +342,9 @@ struct HSTRCloudRenderer
     /// Per block of lattice points: the smallest distance any of its points holds, and the camera it was last verified from.
     /// Together they certify that translation cannot have invalidated the block (params.beamGuard).
     RWTexture2D<uint> hstrBeamGuardDepth;
+    /// Min-depth pyramid over the guard blocks, levels packed one after another (level 0 is hstrBeamGuardDepth as a float, never
+    /// verified as unbounded). See beamCellRadius.
+    RWStructuredBuffer<float> hstrBeamGuardPyramid;
     RWTexture2D<float4> hstrBeamGuardCamera;
     /// The blocks whose certificate failed this build, compacted, with the count and the indirect arguments that dispatch them.
     RWStructuredBuffer<uint> hstrBeamDirty;
@@ -5875,44 +5878,54 @@ struct HSTRCloudRenderer
     /// frame. Conservative as before: an unverified block is never certified, and a stale minimum is only ever too small.
     bool beamBlockCertified(uint2 position) { return beamCellCertified(beamGuardCell(position)); }
 
-    /// The nearest distance any sample of the block OR of the eight around it holds: what can shift into the block.
-    ///
-    /// A block's own depths bound how far its own content moves, but not what moves in. A block of empty sky holds no distance at
-    /// all, and bounded by itself it was certified for ever - so under translation cloud slid into sky that was never re-marched:
-    /// 4K walk, cloud edges cut into a sawtooth along block boundaries and a whole small cloud missing, 4.8% of pixels over 0.02
-    /// with every other block re-marched each frame. Content can only arrive from within the parallax budget, which is held under
-    /// one block (beamGuardParallax is clamped to the block edge on the host), so the ring of neighbours is enough.
-    float beamCellReachDepth(uint2 cell)
-    {
-        float nearest = 3.4e38f;
-        for (int y = -1; y <= 1; ++y)
-            for (int x = -1; x <= 1; ++x)
-            {
-                const int2 n = int2(cell) + int2(x, y);
-                if (any(n < 0) || any(n >= int2(params.beamGuardDims)))
-                    continue;
-                const uint stored = hstrBeamGuardDepth[uint2(n)];
-                if (stored == 0xFFFFFFFFu)
-                    continue; // Never built: it can hold nothing that moves in, and is listed on its own when it is needed.
-                nearest = min(nearest, asfloat(stored));
-            }
-        return nearest;
-    }
-
     bool beamCellCertified(uint2 cell)
     {
         if (params.beamGuard == 0 || params.beamRefFrame == 0 || params.beamHistoryValid == 0)
             return false;
-        if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu)
-            return false; // Never verified, so nothing is known about it.
-        const float minimum = beamCellReachDepth(cell);
-        if (!(minimum > 0.f))
-            return false;
-        const float4 verified = hstrBeamGuardCamera[cell];
-        if (verified.w < 0.5f)
-            return false;
-        const float moved = length(gScene.camera.data.posW - verified.xyz);
-        return moved <= params.beamGuardParallaxAngle * minimum;
+        const float radius = beamCellRadius(cell);
+        return radius > 0.f && length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) <= radius;
+    }
+
+    /// Level L of the guard's min-depth pyramid: its offset in hstrBeamGuardPyramid and its dimensions.
+    void beamGuardPyramidLevel(uint level, out uint offset, out uint2 dims)
+    {
+        offset = 0;
+        dims = params.beamGuardDims;
+        for (uint l = 0; l < level; ++l)
+        {
+            offset += dims.x * dims.y;
+            dims = (dims + 1u) / 2u;
+        }
+    }
+
+    /// One entry of the pyramid: level 0 from the guard depths (never verified: unbounded), each level above the 2 x 2 minimum.
+    void buildBeamGuardPyramid(uint2 thread)
+    {
+        const uint level = params.beamGuardPyramidLevel;
+        uint offset;
+        uint2 dims;
+        beamGuardPyramidLevel(level, offset, dims);
+        if (any(thread >= dims))
+            return;
+        float nearest = 3.4e38f;
+        if (level == 0)
+        {
+            const uint stored = hstrBeamGuardDepth[thread];
+            nearest = stored == 0xFFFFFFFFu ? 3.4e38f : asfloat(stored);
+        }
+        else
+        {
+            uint below;
+            uint2 belowDims;
+            beamGuardPyramidLevel(level - 1u, below, belowDims);
+            for (uint y = 0; y < 2; ++y)
+                for (uint x = 0; x < 2; ++x)
+                {
+                    const uint2 c = min(thread * 2u + uint2(x, y), belowDims - 1u);
+                    nearest = min(nearest, hstrBeamGuardPyramid[below + c.y * belowDims.x + c.x]);
+                }
+        }
+        hstrBeamGuardPyramid[offset + thread.y * dims.x + thread.x] = nearest;
     }
 
     /// Appends the block to this build's work list if translation could have invalidated anything in it.
@@ -5925,12 +5938,43 @@ struct HSTRCloudRenderer
     /// The list is sized to hold every block, so it cannot overflow and there is no fallback path to get wrong.
     /// The radius a leaf is safe within: the tolerance on its nearest sample, over the block's angular reach. An unverified block
     /// has none, and an empty one - no sample hit anything - has an unbounded one, which is what lets empty sky collapse.
+    ///
+    /// Everything that can shift into a block has to be counted, not just the block's own content. Bounded by its own depths, a
+    /// block of empty sky was certified for ever and cloud slid into it unseen (4K walk: edges cut into a sawtooth). Bounded by
+    /// its ring of neighbours it still missed content that crosses more than a block between checks: a walk anchored 128 units
+    /// back lost a whole small cloud, 1.05% of pixels over 0.02. So the bound is taken at every scale of a min-depth pyramid:
+    /// the 3 x 3 neighbourhood at level L holds everything within 2^L blocks, and content from beyond level L - 1's reach has to
+    /// travel at least 2^(L-1) blocks to arrive, which from distance d takes a camera move of that angle times d. The ring is
+    /// held to beamGuardParallaxAngle instead, the error a certified block may carry. A move m also brings content nearer, to
+    /// no less than d - m, so each level allows m <= a d / (1 + a).
     float beamCellRadius(uint2 cell)
     {
         if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
             return -1.f;
-        const float minimum = beamCellReachDepth(cell);
-        return minimum > 0.f ? params.beamGuardParallaxAngle * minimum : -1.f;
+        const float blockAngle = float(params.beamDirtyBlockEdge) * 1.20f * 2.f / float(max(params.beamFrameDim.x, 1u));
+        float radius = 3.4e38f;
+        uint offset = 0;
+        uint2 dims = params.beamGuardDims;
+        for (uint level = 0; level < max(params.beamGuardPyramidLevels, 1u); ++level)
+        {
+            const int2 at = int2(cell >> level);
+            float nearest = 3.4e38f;
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x)
+                {
+                    const int2 n = at + int2(x, y);
+                    if (all(n >= 0) && all(n < int2(dims)))
+                        nearest = min(nearest, hstrBeamGuardPyramid[offset + uint(n.y) * dims.x + uint(n.x)]);
+                }
+            if (!(nearest > 0.f))
+                return -1.f;
+            const float budget = level == 0 ? params.beamGuardParallaxAngle : float(1u << (level - 1u)) * blockAngle;
+            if (nearest < 3.4e38f)
+                radius = min(radius, budget * nearest / (1.f + budget));
+            offset += dims.x * dims.y;
+            dims = (dims + 1u) / 2u;
+        }
+        return radius;
     }
 
     /// The beam-image box a coarse cell covers, so its on-screen test is the same test its children would have run.
@@ -6749,6 +6793,12 @@ void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 }
 
 [numthreads(8, 8, 1)]
+void buildBeamGuardPyramids(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.buildBeamGuardPyramid(dispatchThreadId.xy);
+}
+
+[numthreads(8, 8, 1)]
 void listBeamRefreshBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.listBeamRefreshBlock(dispatchThreadId.xy);
@@ -6847,10 +6897,15 @@ void writeBeamDirtyArgs()
     writeFoldedDirtyArgs(12, blocks * side * side);
 }
 
+#ifndef HSTR_BEAM_DIRTY_SLICES
+#define HSTR_BEAM_DIRTY_SLICES 0 // Nonzero: beamDirtySegments > 1 (set by the host), the sliced query below.
+#endif
+
 groupshared uint gDirtyRay[64];      ///< Slice 0's answer for the ray: its position packed, or ~0 when nothing is marched.
 groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance times opacity, and steps.
 
-/// The dirty query: every corner and centre of every listed block, in one dispatch, with beamDirtySegments threads per ray.
+/// The dirty query: every corner and centre of every listed block, in one dispatch, with beamDirtySegments threads per ray. At one
+/// thread per ray (the default, HSTR_BEAM_DIRTY_SLICES 0) it is a plain march: no groupshared, barriers or composition.
 ///
 /// Slice 0 alone runs the tests and any carry, and shares whether the ray needs marching through groupshared. Letting each slice
 /// decide for itself would race with neighbouring points' carry writes, and two slices of one ray disagreeing would compose a
@@ -6866,6 +6921,17 @@ groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance t
 void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
     const uint thread = foldedDirtyThread(groupId, groupThreadId.x);
+#if HSTR_BEAM_DIRTY_SLICES == 0
+    uint2 point;
+    bool centre;
+    uint2 position;
+    if (!gHSTRCloud.beamDirtyRay(thread, point, centre) || !gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position))
+        return;
+    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    if (!(1.f - exp(-ray.depth) > 1e-4f))
+        ray.distance = 0.f; // As the sliced composition leaves it.
+    gHSTRCloud.beamQueryMarched(position, ray);
+#else
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
     const uint slice = thread % segments;
     const uint lead = groupThreadId.x - slice;
@@ -6907,6 +6973,7 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     const float opacity = 1.f - exp(-ray.depth);
     ray.distance = opacity > 1e-4f ? weighted / opacity : 0.f;
     gHSTRCloud.beamQueryMarched(position, ray);
+#endif
 }
 
 [numthreads(64, 1, 1)]

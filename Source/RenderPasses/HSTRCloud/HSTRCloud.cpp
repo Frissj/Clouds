@@ -1262,6 +1262,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
+    mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramids");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
     mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
@@ -3124,6 +3125,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
+    var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
     var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
@@ -4063,9 +4065,21 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamDescend = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
                 mpBeamDescendCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2);
                 mpBeamRebuild = mpDevice->createStructuredBuffer(sizeof(uint32_t), coarseDims.x * coarseDims.y);
+                // The min-depth pyramid over the blocks (beamCellRadius): every level down to 1 x 1, packed.
+                uint32_t entries = 0;
+                mBeamGuardPyramidLevels = 0;
+                for (uint2 dims = guardDims;; dims = (dims + 1u) / 2u)
+                {
+                    entries += dims.x * dims.y;
+                    ++mBeamGuardPyramidLevels;
+                    if (dims.x == 1 && dims.y == 1)
+                        break;
+                }
+                mpBeamGuardPyramid = mpDevice->createStructuredBuffer(sizeof(float), entries);
                 mBeamGuardCleared = false;
             }
             mParams.beamGuardDims = guardDims;
+            mParams.beamGuardPyramidLevels = mBeamGuardPyramidLevels;
             mParams.beamCoarseShift = 2; // 4 x 4: the texture sizes above, and the sixteen-bit child mask, both assume it.
             mParams.beamCoarseDims = (guardDims + 3u) / 4u;
             mParams.beamCoarseCapacity = mParams.beamCoarseDims.x * mParams.beamCoarseDims.y;
@@ -4587,6 +4601,22 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     FALCOR_PROFILE(pRenderContext, "classify");
                                     if (classify)
                                     {
+                                        // Certificates read the min-depth pyramid (beamCellRadius), so it is rebuilt from the
+                                        // depths as they now stand: level 0 from the blocks, each level above from the one below.
+                                        for (uint32_t pyramidLevel = 0; pyramidLevel < mBeamGuardPyramidLevels; ++pyramidLevel)
+                                        {
+                                            mParams.beamGuardPyramidLevel = pyramidLevel;
+                                            uint2 dims = mParams.beamGuardDims;
+                                            for (uint32_t l = 0; l < pyramidLevel; ++l)
+                                                dims = (dims + 1u) / 2u;
+                                            bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
+                                            mpBeamGuardPyramidPass->execute(pRenderContext, uint3(dims, 1));
+                                        }
+                                        // A stored coarse certificate was derived from the pyramid as it was then, and a block's
+                                        // radius depends on depths well outside its own cell; once the camera translates, none
+                                        // of them is trusted, and every on-screen block answers for itself.
+                                        if (mParams.beamStationary == 0)
+                                            pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
                                         bindRenderer(pRenderContext, mpBeamCoarsePass);
                                         mpBeamCoarsePass->execute(pRenderContext, uint3(mParams.beamCoarseDims, 1));
                                         bindRenderer(pRenderContext, mpBeamDescendArgsPass);
@@ -4618,6 +4648,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     FALCOR_PROFILE(pRenderContext, "query");
                                     // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
                                     // longest ray, so the two it used to be cost two of those back to back.
+                                    // One thread per ray compiles without the slice composition (beamDirtySegments).
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine(
+                                        "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
+                                    );
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);

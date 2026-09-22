@@ -1196,7 +1196,14 @@ struct HSTRCloudParams
     /// every printed digit in every arm (not a pixel diff: slices restart marchBeam's state and its step and opacity caps, see
     /// buildBeamDirtyQueries). 64 is the ceiling the clamp allows and scaling had still not flattened there - at ~560 rays, i.e.
     /// ~36k threads. With thousands of dirty rays the query turns throughput-bound again, where slices are duplicated work.
-    uint beamDirtySegments = 64;
+    ///
+    /// DEFAULT 1, and above 1 only a compiled variant (HSTR_BEAM_DIRTY_SLICES) so the shipped query carries no slice composition.
+    /// MEASURED 4K, OCT_T001, beamGuardParallax 1 (dirty_segment_budget.py), HSTRCloud ms / query ms / >0.02 against the exact march:
+    /// walk 1 slice 28.2 / 6.4 / 0.136%, 64 slices 62.0 / 38.2 / 0.554% (p99.9 0.026 -> 0.036); sprint 31.4 / 6.1 / 0.025% against
+    /// 81.7 / 53.1 / 0.156%. Park and look never run the query (the sphere is prebuilt). So at 4K the query is always throughput-
+    /// bound, and slicing also costs quality: the per-slice restarts are not negligible there. A per-build adaptive count (the most
+    /// slices keeping rays x slices within a thread budget of 32k-256k) chose 1 in every one of those cases and was removed.
+    uint beamDirtySegments = 1;
     /// Nonzero for the build that anchors the octahedral image when beamPrebuild is on: every block is built, not just the ones
     /// the screen touches (beamBoxOnScreen answers yes everywhere). See beamPrebuild on the host.
     uint beamBuildAll = 0;
@@ -1205,6 +1212,9 @@ struct HSTRCloudParams
     /// stays valid while |P - capturedFrom| <= beamGuardParallaxAngle * blockMinDistance, because no point of it can have shifted
     /// by more than |dP| / distance. See beamCellCertified.
     float beamGuardParallaxAngle = 0.f;
+    /// Levels of the guard's min-depth pyramid (hstrBeamGuardPyramid), and the one a build pass is writing.
+    uint beamGuardPyramidLevels = 0;
+    uint beamGuardPyramidLevel = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
