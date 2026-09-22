@@ -2,10 +2,9 @@ import os
 import sys
 from falcor import *
 
-# Under translation, what does the dirty unit march actually march? It dispatches (edge + 2 apron)^2 threads per listed block - 24^2
-# = 576 for 8 x 8 own units at tile 4 - forcing the block's own units and asking the apron's as usual. If most threads march, the
-# work is real and only fewer invalidations can cut it (reprojection); if most return early, a dense one-thread-per-unit pass or a
-# deduplicated unit list can. beamDirtyOwnMarched / beamDirtyApronMarched count the marched units, per build.
+# Under translation, what does the dirty march actually march? beamDirtyOwnMarched / beamDirtyApronMarched count the units the dirty
+# tile pass listed, per build (a listed block's own, and those of the tiles around it); beamRepairProbe scores what a prediction
+# could have kept of every re-marched sample, by count and by march steps, and how much of each wave's march its lanes spent idle.
 #
 # Headless: HSTR_TAG=probe Mogwai.exe --headless --script=scripts/HSTR/bench/dirty_march_probe.py (HSTR_RES defaults to 4K).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -62,7 +61,8 @@ m.renderFrame()
 hstr.set_properties({"storeExact": True})
 m.renderFrame()
 hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 0})
-log(f"sea: settled, mapped {stats().get('mapped', 0)}, {W}x{H}")
+log(f"sea: settled, mapped {stats().get('mapped', 0)}, {W}x{H}; sun baked {stats().get('sunBaked', 0)} waiting "
+    f"{stats().get('sunWaiting', 0)} stale {stats().get('sunStale', 0)} slots free {stats().get('sunSlotsFree', 0)}")
 
 MOTIONS = [("walk", 2.0, 0.004), ("sprint", 20.0, 0.0)]
 for motion, forward, yaw in MOTIONS:
@@ -79,17 +79,26 @@ for motion, forward, yaw in MOTIONS:
         rows.append([int(s.get("beamDirtyBlocks", 0)), int(s.get("beamDirtyOwnMarched", 0)), int(s.get("beamDirtyApronMarched", 0)),
                      float(hstr.properties.get("beamMarchedFraction", 0.0))] +
                     [int(s.get(f"beamProbe{kind}{k}", 0)) for kind in ("Units", "Rays")
-                     for k in ("Scored", "InPlace", "Reprojected", "Either")])
+                     for k in ("Scored", "InPlace", "Reprojected", "Either")] +
+                    [int(s.get(f"beamProbe{kind}Steps{k}", 0)) for kind in ("Unit", "Ray")
+                     for k in ("Scored", "InPlace", "Reprojected", "Either")] +
+                    [int(s.get(f"beamProbe{k}", 0)) for k in ("UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid")])
     mean = lambda k: sum(r[k] for r in rows) / float(len(rows))
     blocks, own, apron, fraction = mean(0), mean(1), mean(2), mean(3)
-    threads = blocks * 576
-    log(f"{motion:6s} dirty blocks {blocks:9.0f}  threads {threads:11.0f}  own slots {blocks * 64:10.0f}  own marched {own:10.0f}"
-        f" ({100 * own / max(blocks * 64, 1):5.1f}%)  apron marched {apron:9.0f}  marched/threads {100 * (own + apron) / max(threads, 1):5.1f}%"
-        f"  pixels in marched tiles {100 * fraction:5.1f}%  frame units {W * H}")
+    log(f"{motion:6s} dirty blocks {blocks:9.0f}  own units {blocks * 64:10.0f}  own marched {own:10.0f} ({100 * own / max(blocks * 64, 1):5.1f}%)"
+        f"  apron marched {apron:9.0f}  pixels in marched tiles {100 * fraction:5.1f}%  frame units {W * H}")
     # beamRepairProbe: of the samples this build re-marched, how many a repair could have predicted within 0.02 (log(1 + x)).
     for i, kind in enumerate(("units", "rays")):
         scored, inPlace, reprojected, either = (mean(4 + 4 * i + k) for k in range(4))
         pct = lambda v: 100 * v / max(scored, 1)
         log(f"{motion:6s}   {kind:5s} re-marched {scored:9.0f}: kept in place ok {pct(inPlace):5.1f}%, reprojected ok {pct(reprojected):5.1f}%,"
             f" either {pct(either):5.1f}%, neither (true repair) {100 - pct(either):5.1f}%")
+        # The same, weighted by the march steps each sample cost.
+        steps, sIn, sRe, sEither = (mean(12 + 4 * i + k) for k in range(4))
+        sp = lambda v: 100 * v / max(steps, 1)
+        log(f"{motion:6s}   {kind:5s} by steps {steps:11.0f} ({steps / max(scored, 1):6.1f}/sample): in place ok {sp(sIn):5.1f}%, reprojected ok"
+            f" {sp(sRe):5.1f}%, either {sp(sEither):5.1f}%")
+        # Wave efficiency of the march: steps the lanes took over what their waves paid (the longest lane, times the lanes).
+        taken, paid = mean(20 + 2 * i), mean(21 + 2 * i)
+        log(f"{motion:6s}   {kind:5s} wave efficiency {100 * taken / max(paid, 1):5.1f}% ({taken:11.0f} steps taken, {paid:11.0f} paid)")
 exit()

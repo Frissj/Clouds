@@ -300,10 +300,11 @@ private:
     ref<ComputePass> mpBeamDirtyArgsPass;
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
-    ref<ComputePass> mpBeamDirtyListUnitsPass;
     ref<ComputePass> mpBeamDirtyUnitArgsPass;
     ref<Texture> mpBeamDirtyMark;  ///< Per guard block: its first dirty-list slot this build (hstrBeamDirtyMark).
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
+    /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.
+    void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
     ref<ComputePass> mpBeamDirtyTilePass;
     ref<ComputePass> mpBeamRefreshListPass;
     ref<ComputePass> mpBeamGuardPyramidPass;

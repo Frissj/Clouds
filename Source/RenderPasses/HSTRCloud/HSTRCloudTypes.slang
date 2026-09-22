@@ -20,7 +20,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 40;
+static const uint kBeamCountSlots = 52;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -28,6 +28,10 @@ static const uint kBeamDirtyApronMarched = 31; ///< Apron units (around listed b
 /// beamRepairProbe, four each: re-marched samples scored, kept in place within 0.02, reprojected within 0.02, either.
 static const uint kBeamProbeUnits = 32;
 static const uint kBeamProbeRays = 36;
+/// beamRepairProbe: the kBeamProbeUnits and kBeamProbeRays counts again, weighted by march steps (units at +0, rays at +4).
+static const uint kBeamProbeSteps = 40;
+/// beamRepairProbe, per build: units' march steps taken and paid (wave longest x lanes), then the same for the dirty query's rays.
+static const uint kBeamProbeDivergence = 48;
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;
@@ -140,7 +144,11 @@ struct HSTRCloudFadeFrame
 /// hstrCloudOccupancy words per brick: a 4-bit density bound per 2-voxel cell (cloudCellCode) in words 0-7, then the bound of each of
 /// the brick's eight 4-voxel octants in word 8 (the brick's own bound is the maximum of those eight).
 static const uint kCloudCellWords = 9;
-static const uint kCloudSunAncestors = 2;    ///< Levels a sample of an unbaked brick climbs for a baked ancestor before the live march.
+/// Levels a sample of an unbaked brick climbs for a baked ancestor before the live march: to the root. The sun slot pool holds one
+/// bake per density slot, and the sea's bricks need about three (orientation classes), so it settles full with ~126k bakes that never
+/// run; climbing two levels, 1-7% of the samples a 4K walk re-marched still took the live march at every step, 4.5-4.9 ms of the
+/// frame. To the root the live passes cost 0.005 ms at identical error (0.136% over 0.02, p99.9 0.0256).
+static const uint kCloudSunAncestors = 15;
 static const uint kCloudSunBakesPerBrick = 8; ///< Orientation classes one brick keeps baked sun depth for (hstrCloudSunSlots).
 
 /// One brick's sun bake (bakeCloudSun): per atlas texel, the optical depth over reach source voxels towards the sun.
@@ -1222,6 +1230,8 @@ struct HSTRCloudParams
     uint beamGuardPyramidLevel = 0;
     /// Changed-content regions in hstrBeamInvalidations for this build's invalidateBeamGuardBlocks.
     uint beamInvalidateCount = 0;
+    /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
+    uint cloudSunAncestors = kCloudSunAncestors;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.

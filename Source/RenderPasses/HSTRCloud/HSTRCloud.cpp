@@ -307,6 +307,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamRepairProbe = bool(value);
             continue;
         }
+        if (key == "cloudSunAncestors")
+        {
+            mParams.cloudSunAncestors = uint32_t(value);
+            continue;
+        }
         if (key == "beamGuard")
         {
             mBeamGuard = bool(value);
@@ -985,6 +990,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSunCache] = mParams.cloudSunCache != 0;
     props[kMarchProbe] = mParams.marchProbe;
     props[kCloudThinDepth] = mParams.cloudThinDepth;
+    props["cloudSunAncestors"] = mParams.cloudSunAncestors;
     props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
@@ -1052,7 +1058,12 @@ Properties HSTRCloud::getProperties() const
         {
             cloud[std::string("beamProbeUnits") + probeNames[k]] = mBeamLevelCounts[kBeamProbeUnits + k];
             cloud[std::string("beamProbeRays") + probeNames[k]] = mBeamLevelCounts[kBeamProbeRays + k];
+            cloud[std::string("beamProbeUnitSteps") + probeNames[k]] = mBeamLevelCounts[kBeamProbeSteps + k];
+            cloud[std::string("beamProbeRaySteps") + probeNames[k]] = mBeamLevelCounts[kBeamProbeSteps + 4 + k];
         }
+        const char* divergenceNames[] = {"UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid"};
+        for (uint32_t k = 0; k < 4; ++k)
+            cloud[std::string("beamProbe") + divergenceNames[k]] = mBeamLevelCounts[kBeamProbeDivergence + k];
         // What a transfer cache would have had to produce against what it could have served (cloudTransferClasses).
         cloud["transferCrossings"] = mTransferCrossings;
         cloud["transferEntries"] = mTransferEntries;
@@ -1282,7 +1293,6 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
-    mpBeamDirtyListUnitsPass = createPass("listBeamDirtyUnits");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
@@ -3580,6 +3590,14 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
         mParams.beamScreenBounds = float4(0.f, 0.f, imageDim.x, imageDim.y);
 }
 
+void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
+{
+    // The same march program as every other beam march. Without HSTR_SHIP the dirty passes compiled every switch as a live branch:
+    // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
+    pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipping() ? mBeamShipMask : 0u));
+}
+
 void HSTRCloud::ensureCameraResources()
 {
     const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
@@ -4124,7 +4142,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
                 mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2); // Blocks listed, units to march.
                 mpBeamDirtyMark = mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
-                // Every unit of every block: the compacted list decides each unit once (beamDirtyUnitOwner), so it cannot overflow.
+                // Every unit of every block: each tile is tested once (beamDirtyTileOwner) and lists its own units, so it cannot overflow.
                 const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
                 mpBeamDirtyUnits = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells * blockEdge * blockEdge);
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
@@ -4764,10 +4782,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
                                     // longest ray, so the two it used to be cost two of those back to back.
                                     // One thread per ray compiles without the slice composition (beamDirtySegments).
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
                                     mpBeamDirtyQueryPass->getProgram()->addDefine(
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
-                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
+                                    setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
                                     if (mBeamRepairProbe)
                                     {
                                         if (!mpBeamLatticeSnapshot || mpBeamLatticeSnapshot->getWidth() != mpBeamLattice->getWidth() ||
@@ -4854,6 +4873,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             bindRenderer(pRenderContext, mpBeamDirtyTilePass);
                             bindOutput(mpBeamDirtyTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
                             mpBeamDirtyTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                            // A failing tile lists its units that need marching, which reads what each unit holds.
+                            mpBeamDirtyTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] = mpBeamPixels[0];
                             mpBeamDirtyTilePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 48); // Bytes: twelve uints in.
                         }
                     }
@@ -4992,7 +5013,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // And the residual for the blocks translation invalidated, over the same list the query pass just used.
                 if (mBeamDirtyActive)
                 {
-                    // Decide and compact, then march the list: see listBeamDirtyUnit for why not in place.
+                    // March the list the dirty tile pass compacted: see marchBeamDirtyListedUnit for why not in place.
                     auto bindDirty = [&](const ref<ComputePass>& pPass)
                     {
                         bindRenderer(pRenderContext, pPass);
@@ -5002,6 +5023,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         dirtyVar["hstrBeamPixels"] = ref<Texture>();
                     };
                     mpBeamDirtyMarchPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
+                    setBeamDirtyMarchDefines(mpBeamDirtyMarchPass);
                     if (mBeamRepairProbe)
                     {
                         const ref<Texture>& pPixels = mpBeamPixels[0];
@@ -5015,12 +5037,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         }
                         pRenderContext->copyResource(mpBeamPixelsSnapshot.get(), pPixels.get());
                     }
-                    bindDirty(mpBeamDirtyListUnitsPass);
-                    mpBeamDirtyListUnitsPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 12); // Bytes: three uints in.
+                    // The units to march were listed by the dirty tile pass (listBeamFailedTileUnits).
                     bindDirty(mpBeamDirtyUnitArgsPass);
                     mpBeamDirtyUnitArgsPass->execute(pRenderContext, uint3(1));
-                    bindDirty(mpBeamDirtyMarchPass);
-                    mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                    {
+                        FALCOR_PROFILE(pRenderContext, "units");
+                        bindDirty(mpBeamDirtyMarchPass);
+                        mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                    }
                 }
             }
             else if (unitMarch)

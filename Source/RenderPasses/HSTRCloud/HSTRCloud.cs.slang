@@ -10,6 +10,11 @@ import HSTRCloudTypes;
 /// register its fallback path needs costs the march occupancy. MEASURED (4K c15, settled): near 46.2 -> 38.8 ms, sea 31.3 -> 33.4 ms,
 /// with identical frames - in a settled view every sun query is answered by a bake, so the march below never runs and only its
 /// registers are felt.
+///
+/// MEASURED and REMOVED (4K beam dirty passes, 2026-09-22): deferring the fallback out of the dirty marches to a second pass that
+/// marched only the samples reaching it. It looked worth 4.6 ms at walk, but that was the live marches themselves, not their
+/// registers: the sun slot pool left 1-7% of re-marched samples without a bake two levels up (kCloudSunAncestors), and once they
+/// climb to the root the deferred and inline programs time the same (walk 12.57 / 12.75 ms, sprint 16.14 / 16.29).
 #ifndef HSTR_SUN_LIVE
 #define HSTR_SUN_LIVE 1
 #endif
@@ -356,7 +361,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamDirtyCount;
     RWStructuredBuffer<uint> hstrBeamDirtyArgs;
     /// Per guard block: the first dirty-list slot it was listed in this build, ~0 when not listed (cleared every build). Lets
-    /// each unit the dirty march covers be decided by exactly one block (beamDirtyUnitOwner).
+    /// each tile the dirty tile pass covers be tested by exactly one block (beamDirtyTileOwner).
     RWTexture2D<uint> hstrBeamDirtyMark;
     /// The units the dirty march has to march, compacted (count in hstrBeamDirtyCount[1]), packed x | y << 16.
     RWStructuredBuffer<uint> hstrBeamDirtyUnits;
@@ -961,7 +966,7 @@ struct HSTRCloudRenderer
     uint cloudSunSlotUp(inout uint entry, uint sunClass)
     {
         uint sunSlot = cloudSunSlotOf(entry, sunClass);
-        for (uint k = 0; k < kCloudSunAncestors && sunSlot == kCloudRefNone && hstrCloudBricks[entry].parent != kCloudRefNone; ++k)
+        for (uint k = 0; k < params.cloudSunAncestors && sunSlot == kCloudRefNone && hstrCloudBricks[entry].parent != kCloudRefNone; ++k)
         {
             entry = hstrCloudBricks[entry].parent;
             sunSlot = cloudSunSlotOf(entry, sunClass);
@@ -5362,11 +5367,21 @@ struct HSTRCloudRenderer
     /// their basis. Without it a listed block got new lattice and a new residual but kept whatever classification it had - and
     /// a block no build had reached kept the level map's clear value, "failed", so every pixel of it went to the residual.
     ///
-    /// Over the block AND the two tiles around it (kBeamDirtyApron). A tile's test reads the corners and centres of its eight
-    /// neighbours, so new basis in a block changes the answer of tiles up to two away that the block does not contain. Tested
+    /// Over the block AND the tiles around it whose test reads its points. A tile's test reads the corners of the tiles from one
+    /// before it to two after it and the centres from one before to one after (beamTransmittanceRange), so new basis in a block
+    /// changes the answer of tiles the block does not contain: from two before its first tile to one after its last. Tested
     /// over the block alone, the edge tiles of whatever had been built beside a never-built region kept a classification made
     /// against lattice nobody had written yet: after a flick from a reset, the outline of every earlier sliver stayed on screen
     /// as a dashed seam through the clouds.
+    ///
+    /// Each such tile is tested ONCE, by the listed block with the lowest slot among those whose points it reads
+    /// (beamDirtyTileOwner). Listed blocks come in contiguous regions, and each tested every tile of its own two-tile apron, so a
+    /// tile inside a region was tested by up to nine of them: 4K sprint, 0.73 ms of tile tests for ~118k blocks.
+    ///
+    /// A tile that fails lists its units that need marching (beamFailedUnitNeedsMarch) for the dirty unit march: those are the only
+    /// units the build can have to march, since the rest belong to accepted tiles or to blocks whose certificate held. That replaced
+    /// a pass of one thread per unit of every listed block and its apron - 576 per block for its 64, almost none of the apron ever
+    /// marching - which cost 0.75 ms at 4K walk and 1.3 ms at sprint.
     void testBeamDirtyTile(uint thread)
     {
         const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
@@ -5383,6 +5398,8 @@ struct HSTRCloudRenderer
         const uint2 tile = uint2(signedTile);
         if (any(tile >= params.beamTileDims) || any(tile * beamTileEdge(0) >= params.beamFrameDim) || !beamTileOnScreen(0, tile))
             return;
+        if (beamDirtyTileOwner(tile, side) != index)
+            return;
         if (!beamTileRefines(0, tile, false))
         {
             writeBeamLevel(0, tile, 0);
@@ -5391,6 +5408,62 @@ struct HSTRCloudRenderer
         recordBeamRefinement(0, tile);
         if (params.beamLevels <= 1)
             writeBeamLevel(0, tile, params.beamLevels);
+        listBeamFailedTileUnits(tile);
+    }
+
+    /// The listed block that tests this tile: the one with the lowest dirty-list slot among the blocks whose re-marched points the
+    /// tile's test reads - per axis, a block b of side tiles marches the corners and centres side * b to side * b + side - 1, which
+    /// tiles side * b - 2 to side * b + side read. ~0 when none of them is listed, and then the tile cannot have changed.
+    uint beamDirtyTileOwner(uint2 tile, uint side)
+    {
+        const int2 t = int2(tile);
+        const int2 lo = max((t + int(side) - 1) / int(side) - 1, 0);
+        const int2 hi = min((t + 2) / int(side), int2(params.beamGuardDims) - 1);
+        uint owner = 0xFFFFFFFFu;
+        for (int y = lo.y; y <= hi.y; ++y)
+            for (int x = lo.x; x <= hi.x; ++x)
+                owner = min(owner, hstrBeamDirtyMark[uint2(x, y)]);
+        return owner;
+    }
+
+    /// Appends the units of a tile that has just failed that need marching to hstrBeamDirtyUnits (count hstrBeamDirtyCount[1]): all
+    /// of them where the tile's block is listed (its certificate now names this camera, which its units were not marched from),
+    /// otherwise only those its certificate does not keep. A tile's units go in together, and a wave's tiles are neighbours, so a
+    /// wave of the unit march marches neighbouring directions: appended a unit at a time across the wave instead - unit k of 64
+    /// tiles, then unit k + 1 - the same 295k units took the 4K walk's unit march from ~4 to ~12 ms.
+    void listBeamFailedTileUnits(uint2 tile)
+    {
+        const uint ts = max(params.beamTileSize, 1u);
+        const uint2 block = tile * ts / max(params.beamDirtyBlockEdge, 1u); // A tile lies in one block.
+        const bool own = all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] != 0xFFFFFFFFu;
+        // The block's certificate, once for the tile rather than once per unit: it walks the depth pyramid.
+        const bool certified = !own && beamCellCertified(block);
+        uint mask = 0;
+        for (uint k = 0; k < ts * ts; ++k)
+            if (beamFailedUnitNeedsMarch(tile * ts + uint2(k % ts, k / ts), own, true, certified))
+                mask |= 1u << k;
+        const uint count = countbits(mask);
+        const uint total = WaveActiveSum(count);
+        if (total == 0)
+            return;
+        const uint owned = WaveActiveSum(own ? count : 0u);
+        uint base = 0;
+        if (WaveIsFirstLane())
+        {
+            InterlockedAdd(hstrBeamDirtyCount[1], total, base);
+            uint unused;
+            if (owned != 0)
+                InterlockedAdd(hstrBeamCounts[kBeamDirtyOwnMarched], owned, unused);
+            if (total != owned)
+                InterlockedAdd(hstrBeamCounts[kBeamDirtyApronMarched], total - owned, unused);
+        }
+        uint at = WaveReadLaneFirst(base) + WavePrefixSum(count);
+        for (uint bits = mask; bits != 0; bits &= bits - 1u)
+        {
+            const uint k = firstbitlow(bits);
+            const uint2 unit = tile * ts + uint2(k % ts, k / ts);
+            hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
+        }
     }
 
     /// Temporal tile tests: one thread walks one coarsest tile down through the levels whose queries exist this frame (children
@@ -5625,6 +5698,16 @@ struct HSTRCloudRenderer
         const uint finest = beamTileEdge(params.beamLevels - 1);
         if (hstrBeamLevel[unit / finest] < params.beamLevels)
             return false; // The basis carries this tile; the resolve reconstructs it.
+        return beamFailedUnitNeedsMarch(unit, force);
+    }
+
+    /// beamUnitNeedsMarch for a unit of a tile known to have failed (the dirty tile pass, which has just tested it). certifiedKnown:
+    /// the caller has already evaluated the unit's block certificate (certified), once for all the units of a tile.
+    bool beamFailedUnitNeedsMarch(uint2 unit, bool force, bool certifiedKnown = false, bool certified = false)
+    {
+        if (any(unit >= params.beamFrameDim) || !beamUnitOnScreen(unit))
+            return false;
+        const uint finest = beamTileEdge(params.beamLevels - 1);
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         // Carried where THIS unit already holds a value marched for this direction, and the camera has not moved past its
         // parallax. The residual image is persistent, so the question is about the unit itself rather than about what the
@@ -5638,8 +5721,9 @@ struct HSTRCloudRenderer
         // units were marched from the old one.
         if (params.beamGuard != 0 && params.beamRefFrame != 0)
         {
-            if (!force && params.beamRefValid != 0 && !beamRefreshes(unit / finest) && hstrBeamPixelOutput[unit].a >= 0.f &&
-                beamCellCertified(unit / max(params.beamDirtyBlockEdge, 1u)))
+            const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);
+            const bool held = params.beamRefValid != 0 && !beamRefreshes(unit / finest) && hstrBeamPixelOutput[unit].a >= 0.f;
+            if (!force && held && (certifiedKnown ? certified : beamCellCertified(cell)))
                 return false;
         }
         else if (params.beamRefValid != 0 && params.beamRefresh != 0 && !beamRefreshes(unit / finest))
@@ -5680,12 +5764,19 @@ struct HSTRCloudRenderer
 
     /// Scores what a repair could have predicted for a sample this build re-marched: the old value kept in place, and the old image
     /// reprojected by the old distance. Four counters from base: marched, in place within 0.02, reprojected within 0.02, either.
-    void beamProbeCount(uint base, bool scored, bool inPlace, bool reprojected)
+    /// The same four again from kBeamProbeSteps (units, then rays), weighted by the march steps the sample cost: what a prediction
+    /// would save is the steps it avoids, not the samples.
+    void beamProbeCount(uint base, bool scored, bool inPlace, bool reprojected, float steps)
     {
         const uint n = WaveActiveCountBits(scored);
         const uint a = WaveActiveCountBits(scored && inPlace);
         const uint b = WaveActiveCountBits(scored && reprojected);
         const uint c = WaveActiveCountBits(scored && (inPlace || reprojected));
+        const uint s = scored ? uint(steps) : 0u;
+        const uint sn = WaveActiveSum(s);
+        const uint sa = WaveActiveSum(inPlace ? s : 0u);
+        const uint sb = WaveActiveSum(reprojected ? s : 0u);
+        const uint sc = WaveActiveSum(inPlace || reprojected ? s : 0u);
         if (WaveIsFirstLane() && n != 0)
         {
             uint unused;
@@ -5693,10 +5784,15 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrBeamCounts[base + 1], a, unused);
             InterlockedAdd(hstrBeamCounts[base + 2], b, unused);
             InterlockedAdd(hstrBeamCounts[base + 3], c, unused);
+            const uint weighted = kBeamProbeSteps + (base == kBeamProbeUnits ? 0u : 4u);
+            InterlockedAdd(hstrBeamCounts[weighted], sn, unused);
+            InterlockedAdd(hstrBeamCounts[weighted + 1], sa, unused);
+            InterlockedAdd(hstrBeamCounts[weighted + 2], sb, unused);
+            InterlockedAdd(hstrBeamCounts[weighted + 3], sc, unused);
         }
     }
 
-    void beamProbeUnit(uint2 unit, float3 w, float3 exact)
+    void beamProbeUnit(uint2 unit, float3 w, float3 exact, float steps)
     {
         const float4 old = hstrBeamPixelsSnapshot[unit];
         const bool scored = old.a >= 0.f; // Never marched before has nothing to predict from.
@@ -5708,7 +5804,29 @@ struct HSTRCloudRenderer
             const float4 moved = hstrBeamPixelsSnapshot.SampleLevel(hstrLinearClampSampler, position / float2(params.beamFrameDim), 0.f);
             reprojected = beamProbeError(moved.rgb, exact) <= 0.02f;
         }
-        beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected);
+        beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected, steps);
+        // MEASURED and REMOVED: what a runtime check would accept of that reprojection. The content's depth found in two steps (the
+        // unit's own old depth, then the source's), the previous image read bilinearly there, accepted only if every unit the read
+        // weighs was marched, belongs to a failed tile and agrees with the depth to 5%: 4K walk accepted 62.5% of the re-marched units
+        // and 19% of those were over 0.02 (12% of all of them); sprint 21.9%, 42.5% bad. Requiring the sources to agree within 0.02
+        // too: walk 27.7% accepted, 14.5% of those bad; sprint 9.0%, 29.6%. What changes is what the new viewpoint sees, not the
+        // resampling, and no check on the old image can see that.
+        beamProbeDivergence(kBeamProbeDivergence, steps);
+    }
+
+    /// How much of a wave's march the lanes spent waiting: the steps its lanes took, and 64 times its longest (two counters from
+    /// base). Their ratio is the wave's efficiency - what sorting marches by cost could at most recover.
+    void beamProbeDivergence(uint base, float steps)
+    {
+        const uint s = uint(steps);
+        const uint taken = WaveActiveSum(s);
+        const uint paid = WaveActiveMax(s) * WaveGetLaneCount();
+        if (WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[base], taken, unused);
+            InterlockedAdd(hstrBeamCounts[base + 1], paid, unused);
+        }
     }
 
     /// The lattice's radiance at a beam position, bilinear over its cache, single and depth (then composed, as the basis does).
@@ -5743,7 +5861,8 @@ struct HSTRCloudRenderer
         float2 moved;
         if (scored && beamProbeReproject(w, single.a, moved))
             reprojected = beamProbeError(beamProbeLatticeRadiance(moved, w, albedo), exact) <= 0.02f;
-        beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected);
+        beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected, fresh.steps);
+        beamProbeDivergence(kBeamProbeDivergence + 2, fresh.steps);
     }
 #endif
 
@@ -5755,7 +5874,7 @@ struct HSTRCloudRenderer
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
-        beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb);
+        beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
 #endif
         // A failed tile's unit can see nearer cloud than any basis point of its block, and the block is only as safe as its
         // nearest sample.
@@ -6281,76 +6400,9 @@ struct HSTRCloudRenderer
             beamQueueRebuild(cell >> params.beamCoarseShift);
     }
 
-    /// Which listed block decides this unit: its own block if that is listed (and then the unit is forced), otherwise the
-    /// covering listed block with the lowest slot; ~0 if none covers it. Before, a block listed twice (classified and refreshed)
-    /// and every overlapping apron - up to eight around an unlisted block - each tested, and marched, the same unit.
-    uint beamDirtyUnitOwner(int2 unit, uint edge, uint apron, out bool own)
-    {
-        const int e = int(edge);
-        const int2 block = unit / e;
-        own = all(block < int2(params.beamGuardDims)) && hstrBeamDirtyMark[uint2(block)] != 0xFFFFFFFFu;
-        if (own)
-            return hstrBeamDirtyMark[uint2(block)];
-        // The blocks b whose padded box [b e - apron, b e + e + apron) holds the unit: floor((u - apron) / e) to
-        // floor((u + apron) / e). The offset keeps the division of a negative numerator rounding down.
-        const int2 lo = max((unit - int(apron) + 64 * e) / e - 64, 0);
-        const int2 hi = min((unit + int(apron)) / e, int2(params.beamGuardDims) - 1);
-        uint owner = 0xFFFFFFFFu;
-        for (int y = lo.y; y <= hi.y; ++y)
-            for (int x = lo.x; x <= hi.x; ++x)
-                owner = min(owner, hstrBeamDirtyMark[uint2(x, y)]);
-        return owner;
-    }
-
-    /// Pass A of the dirty march: one thread per unit of every listed block and its apron (testBeamDirtyTile's, since a tile there
-    /// can have just started failing and then needs its units) decides cheaply whether the unit marches, and appends it to
-    /// hstrBeamDirtyUnits. The block's own units are forced whatever its just-renewed certificate says; the apron's are asked as
-    /// usual. Each unit is decided once (beamDirtyUnitOwner).
-    ///
-    /// Marching in place instead, 4K walk: 30.0M threads for 413k marches (1.4%) scattered through them, so nearly every wave
-    /// paid a full march for one or two lanes - 20.8 ms of a 28 ms frame. Sprint: 67.3M threads, 0.8% marching.
-    void listBeamDirtyUnit(uint thread)
-    {
-        const uint edge = max(params.beamDirtyBlockEdge, 1u);
-        const uint apron = kBeamDirtyApron * max(params.beamTileSize, 1u);
-        const uint padded = edge + 2u * apron;
-        const uint per = padded * padded;
-        const uint index = thread / per;
-        bool march = false;
-        bool own = false;
-        uint2 unit = 0;
-        if (index < min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
-        {
-            const uint packed = hstrBeamDirty[index];
-            const uint local = thread % per;
-            const int2 at = int2(uint2(packed & 0xFFFFu, packed >> 16) * edge + uint2(local % padded, local / padded)) - int(apron);
-            if (all(at >= 0) && beamDirtyUnitOwner(at, edge, apron, own) == index)
-            {
-                unit = uint2(at);
-                march = beamUnitNeedsMarch(unit, own);
-            }
-        }
-        // One atomic per wave for the list, and for the probe counters (dirty_march_probe.py).
-        const uint marching = WaveActiveCountBits(march);
-        if (marching == 0)
-            return;
-        const uint ownMarching = WaveActiveCountBits(march && own);
-        uint base = 0;
-        if (WaveIsFirstLane())
-        {
-            InterlockedAdd(hstrBeamDirtyCount[1], marching, base);
-            uint unused;
-            if (ownMarching != 0)
-                InterlockedAdd(hstrBeamCounts[kBeamDirtyOwnMarched], ownMarching, unused);
-            if (marching != ownMarching)
-                InterlockedAdd(hstrBeamCounts[kBeamDirtyApronMarched], marching - ownMarching, unused);
-        }
-        base = WaveReadLaneFirst(base);
-        if (march)
-            hstrBeamDirtyUnits[base + WavePrefixCountBits(march)] = unit.x | (unit.y << 16);
-    }
-
-    /// Pass B: one thread per unit pass A listed, every one of which marches.
+    /// The dirty unit march: one thread per unit the dirty tile pass listed (listBeamFailedTileUnits), every one of which marches.
+    /// Marching in place instead, 4K walk: 30.0M threads for 413k marches (1.4%) scattered through them, so nearly every wave paid
+    /// a full march for one or two lanes - 20.8 ms of a 28 ms frame.
     void marchBeamDirtyListedUnit(uint thread)
     {
         if (thread >= hstrBeamDirtyCount[1])
@@ -6358,6 +6410,16 @@ struct HSTRCloudRenderer
         const uint packed = hstrBeamDirtyUnits[thread];
         marchBeamUnitExact(uint2(packed & 0xFFFFu, packed >> 16));
     }
+
+    // MEASURED and REMOVED (2026-09-22): letting each sample the guard lists decide for itself whether to march, from its own history.
+    // Near cloud shifts by more than a block every frame at walk (90% of the listed blocks with content, all of them at sprint), so
+    // no per-block budget can hold it - one learned per block up to the pyramid's next level changed nothing, 0.136% / 15.9 ms either
+    // way - yet 91.5% of the rays it re-marched were within 0.02 of their old value. Each lattice point and unit kept the build it
+    // was marched at and a camera distance learned from how much it had changed over the distance before (tolerance * d / change,
+    // at most twice the distance it had held over), and was kept while the camera stayed within it: 75% of the rays were kept, but
+    // 4K walk scored 2.890% of pixels over 0.02 (p99.9 0.474) against 0.136%, sprint 5.486% against 0.025%, for 16.1 -> 14.2 ms and
+    // 15.9 -> 15.8. The rays it kept were the cheap ones - the query only went 6.3 -> 4.6 ms - and a carried corner beside a fresh
+    // centre trips the surplus test, so the tiles failing it rose by half. A change is not linear in the camera distance.
 
     /// Records what a point that took the full test this build proves about its block: the camera it was verified from, and a
     /// running minimum of the distances its points hold. The minimum is never raised - a block that has drifted nearer keeps the
@@ -7123,14 +7185,12 @@ void writeBeamDirtyArgs()
     const uint passes = gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u;
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
     writeFoldedDirtyArgs(0, blocks * rb * rb * passes * segments);
-    const uint unitSide = edge + 2u * kBeamDirtyApron * max(gHSTRCloud.params.beamTileSize, 1u);
-    writeFoldedDirtyArgs(3, blocks * unitSide * unitSide);
     // The coarse cells to rebuild are only all known once the blocks have been classified, which is now.
     const uint cells = min(gHSTRCloud.hstrBeamDescendCount[1], gHSTRCloud.params.beamCoarseCapacity);
     gHSTRCloud.hstrBeamDirtyArgs[9] = (cells + 63u) / 64u;
     gHSTRCloud.hstrBeamDirtyArgs[10] = 1u;
     gHSTRCloud.hstrBeamDirtyArgs[11] = 1u;
-    // The root tiles of the listed blocks (testBeamDirtyTile).
+    // The root tiles of the listed blocks and their aprons (testBeamDirtyTile, which also lists the units to march).
     const uint side = max(edge / max(gHSTRCloud.params.beamTileSize, 1u), 1u) + 2u * kBeamDirtyApron;
     writeFoldedDirtyArgs(12, blocks * side * side);
 }
@@ -7215,12 +7275,6 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     ray.distance = opacity > 1e-4f ? weighted / opacity : 0.f;
     gHSTRCloud.beamQueryMarched(position, ray);
 #endif
-}
-
-[numthreads(64, 1, 1)]
-void listBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
-{
-    gHSTRCloud.listBeamDirtyUnit(foldedDirtyThread(groupId, groupThreadId.x));
 }
 
 /// Dispatch arguments for the compacted units, hstrBeamDirtyArgs[15..17].
