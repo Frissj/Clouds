@@ -257,6 +257,8 @@ private:
     bool mBeamRepairProbe = false;      ///< beamRepairProbe: score in-place and reprojected predictions of re-marched samples.
     ref<Texture> mpBeamPixelsSnapshot;  ///< beamRepairProbe: the residual units before the dirty march.
     ref<Texture> mpBeamLatticeSnapshot; ///< beamRepairProbe: the lattice before the dirty query.
+    ref<Texture> mpBeamGuardCameraSnapshot; ///< beamRepairProbe: the guard cameras before the dirty query.
+    ref<Texture> mpBeamProbeAccept;         ///< beamRepairProbe: per block, the witness policies that would have carried it.
     uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
     ref<ComputePass> mpBeamInvalidatePass;
     ref<Buffer> mpBeamInvalidations;
@@ -302,6 +304,27 @@ private:
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
     ref<ComputePass> mpBeamDirtyUnitArgsPass;
+    // Cell views (cellViews): the dirty passes compose rays from cached per-cell views of the transfer (composeBeam).
+    bool mCellViews = false;
+    bool mCellViewsClear = true;           ///< The map and the views must be emptied before the next use.
+    uint32_t mCellViewFrame = 0;
+    ref<Texture> mpCellMap;                ///< Per domain cell: view slot + 1 (R32Uint, hstrCellMap).
+    ref<Texture> mpCellRequest;            ///< Per domain cell: the frame + 1 it was last queued in.
+    ref<Texture> mpCellOccupancy;          ///< Per domain cell: whether any sample in it can read density (R8Uint).
+    bool mCellOccupancyDirty = true;       ///< The domain changed since the occupancy was built.
+    ref<ComputePass> mpCellOccupancyPass;
+    ref<Buffer> mpCellViews;               ///< CellView per slot.
+    ref<Texture> mpCellTexels;             ///< Atlas: cache rgb, transmittance.
+    ref<Texture> mpCellTexelsSingle;       ///< Atlas: single rgb, opacity centroid.
+    ref<Buffer> mpCellBuild;               ///< Cells queued for a build this frame.
+    ref<Buffer> mpCellCounters;            ///< [0] cells queued this frame.
+    ref<Buffer> mpCellCursor;              ///< [0] the slot ring's cursor.
+    ref<Buffer> mpCellArgs;                ///< The build dispatch's arguments.
+    ref<ComputePass> mpCellArgsPass;
+    ref<ComputePass> mpCellBuildPass;
+    ref<ComputePass> mpCellInvalidatePass;
+    /// Creates (or re-creates, on a size change) the cell view resources, empties them when asked, and sets their parameters.
+    void ensureCellViews(RenderContext* pRenderContext);
     ref<Texture> mpBeamDirtyMark;  ///< Per guard block: its first dirty-list slot this build (hstrBeamDirtyMark).
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.

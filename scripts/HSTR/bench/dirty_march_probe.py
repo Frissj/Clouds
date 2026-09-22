@@ -16,7 +16,7 @@ os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/User
 FRAMES = int(os.environ.get("HSTR_FRAMES", "16"))
 WARM = int(os.environ.get("HSTR_WARM", "16"))
 ARM = dict(runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweeps", "persistent_residual.py"))["OCT_T001"],
-           beamGuardParallax=1.0, beamRepairProbe=True)
+           beamGuardParallax=1.0, beamRepairProbe=True, beamShadowCarry=int(os.environ.get("HSTR_SHADOW", "0")))
 
 m.script("scripts/HSTR/CloudSea.py")
 W, H = [int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")]
@@ -50,11 +50,17 @@ def pose(frame, forward, yaw):
 
 pose(0, 0.0, 0.0)
 hstr.set_properties(dict(ARM, worldCacheUpdates=1))
+# The same idle test as sea_motion.py: a single frame without bakes is not a settled sea (it once stopped with 350k bakes waiting).
+quiet = 0
 for i in range(int(os.environ.get("HSTR_SETTLE", "1500"))):
     m.renderFrame()
     s = stats()
-    if i > 64 and int(s.get("pending", 0)) == 0 and int(s.get("sunBakesFrame", 0)) == 0 and int(s.get("pendingTiles", 0)) == 0:
+    busy = sum(int(s.get(k, 0)) for k in ("pendingTiles", "pending", "sunBakesFrame", "activeFades", "mapBacklog", "undesiredFadingOut"))
+    quiet = quiet + 1 if busy == 0 else 0
+    if i > 32 and quiet > 20:
         break
+while int(hstr.properties["worldCacheSampleCount"]) < 64:
+    m.renderFrame()
 hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": True})
 # The beam counters only leave the GPU while a comparison is active; its error numbers are not read here.
 m.renderFrame()
@@ -65,7 +71,11 @@ log(f"sea: settled, mapped {stats().get('mapped', 0)}, {W}x{H}; sun baked {stats
     f"{stats().get('sunWaiting', 0)} stale {stats().get('sunStale', 0)} slots free {stats().get('sunSlotsFree', 0)}")
 
 MOTIONS = [("walk", 2.0, 0.004), ("sprint", 20.0, 0.0)]
-for motion, forward, yaw in MOTIONS:
+# HSTR_SHADOWS: beamShadowCarry values to run the motions under, one settle for all (0: the plain probe).
+SHADOWS = [int(v) for v in os.environ.get("HSTR_SHADOWS", str(ARM["beamShadowCarry"])).split(",")]
+for shadow, (motion, forward, yaw) in [(sh, mo) for sh in SHADOWS for mo in MOTIONS]:
+    ARM["beamShadowCarry"] = shadow
+    log(f"--- beamShadowCarry {shadow}")
     hstr.set_properties(dict(ARM))
     hstr.set_properties({"beamReset": True})
     for i in range(WARM):
@@ -84,7 +94,8 @@ for motion, forward, yaw in MOTIONS:
                      for k in ("Scored", "InPlace", "Reprojected", "Either")] +
                     [int(s.get(f"beamProbe{k}", 0)) for k in ("UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid")] +
                     [int(s.get(f"beamProbe{k}", 0)) for k in ("Blocks", "BlocksOk", "BlockOkSteps", "BlockSteps", "TightSteps",
-                                                              "TightBadSteps", "LooseSteps", "LooseBadSteps")])
+                                                              "TightBadSteps", "LooseSteps", "LooseBadSteps")] +
+                    [int(s.get(f"beamProbeSlot{k}", 0)) for k in range(60, 240)])
     mean = lambda k: sum(r[k] for r in rows) / float(len(rows))
     blocks, own, apron, fraction = mean(0), mean(1), mean(2), mean(3)
     log(f"{motion:6s} dirty blocks {blocks:9.0f}  own units {blocks * 64:10.0f}  own marched {own:10.0f} ({100 * own / max(blocks * 64, 1):5.1f}%)"
@@ -109,4 +120,31 @@ for motion, forward, yaw in MOTIONS:
     log(f"{motion:6s}   blocks {nb:9.0f}: every ray ok in place {100 * nok / max(nb, 1):5.1f}% of blocks, {sp(okSteps):5.1f}% of their steps")
     log(f"{motion:6s}   geometry tight (opacity 0.02, distance 2%): accepts {sp(tight):5.1f}% of steps, wrongly {sp(tightBad):5.1f}%")
     log(f"{motion:6s}   geometry loose (opacity 0.05, distance 10%): accepts {sp(loose):5.1f}% of steps, wrongly {sp(looseBad):5.1f}%")
+    # Witness matrix (beamProbeWitnesses): per signature and policy, query steps a carry would save (accepted and right, as a share
+    # of the scored blocks' steps), steps accepted wrongly, and the witnesses' own extinction steps against the same total.
+    slot = lambda k: mean(32 + k - 60)
+    signatures = ["opacity", "+centroid", "+quantiles", "+sun d50", "+sun+cache", "quant 5%", "sun+c 5%", "radiance",
+                  "radiance.01", "rad+sun+c"]
+    policies = ["centre", "2 centres", "4 centres", "all 8", "nearest", "nearest 2"]
+    cost = [slot(180 + p) for p in range(6)]
+    log(f"{motion:6s}   witness cost (extinction steps / query steps): " +
+        ", ".join(f"{policies[p]} {100 * cost[p] / max(allSteps, 1):4.1f}%" for p in range(6)))
+    log(f"{motion:6s}   {'signature':11s} " + " ".join(f"{p:>17s}" for p in policies) + "   (right% / wrong% of query steps)")
+    for sig in range(10):
+        cells = []
+        for p in range(6):
+            accepted, bad = slot(60 + 2 * (sig * 6 + p)), slot(61 + 2 * (sig * 6 + p))
+            cells.append(f"{sp(accepted - bad):7.1f} /{sp(bad):5.1f}   ")
+        log(f"{motion:6s}   {signatures[sig]:11s} " + " ".join(f"{c:>17s}" for c in cells))
+    # The residual of accepted blocks: share of ALL re-marched unit steps that lie in accepted blocks, and of those, the share within
+    # 0.02 in place and kept-or-reprojected.
+    unitSteps = mean(12)
+    log(f"{motion:6s}   raw unit steps {unitSteps:.0f}, first accepted cell {slot(186):.0f} / {slot(187):.0f} / {slot(188):.0f}")
+    for j, sig in enumerate((4, 7, 9)):
+        cells = []
+        for p in range(6):
+            b = j * 6 + p
+            total, kept, either = slot(186 + 3 * b), slot(187 + 3 * b), slot(188 + 3 * b)
+            cells.append(f"{100 * total / max(unitSteps, 1):4.1f}: {100 * kept / max(total, 1):4.1f}/{100 * either / max(total, 1):4.1f}")
+        log(f"{motion:6s}   units {signatures[sig]:11s} " + " ".join(f"{c:>17s}" for c in cells) + "   (% of unit steps: kept/either ok)")
 exit()

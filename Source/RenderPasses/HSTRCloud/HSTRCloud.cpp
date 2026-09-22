@@ -312,6 +312,54 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunAncestors = uint32_t(value);
             continue;
         }
+        if (key == "beamShadowCarry")
+        {
+            mParams.beamShadowCarry = uint32_t(value);
+            continue;
+        }
+        if (key == "cellViews")
+        {
+            const bool on = bool(value);
+            if (on != mCellViews)
+                mCellViewsClear = true;
+            mCellViews = on;
+            continue;
+        }
+        if (key == "cellViewEdge")
+        {
+            mParams.cellViewEdge = std::clamp(uint32_t(value), 2u, 64u);
+            continue;
+        }
+        if (key == "cellViewCapacity")
+        {
+            mParams.cellViewCapacity = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == "cellViewBuilds")
+        {
+            mParams.cellViewBuildCapacity = std::clamp(uint32_t(value), 1u, 65535u);
+            continue;
+        }
+        if (key == "cellViewDrift")
+        {
+            mParams.cellViewDrift = std::max(0.f, float(value));
+            continue;
+        }
+        if (key == "cellViewMaxAge")
+        {
+            mParams.cellViewMaxAge = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == "cellViewRefine")
+        {
+            mParams.cellViewRefine = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "cellViewDebug")
+        {
+            mParams.cellViewDebug = uint32_t(value);
+            continue;
+        }
         if (key == "beamGuard")
         {
             mBeamGuard = bool(value);
@@ -340,6 +388,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             // configuration measure 0.36 ms and then 2.41 ms in consecutive runs. An arm that resets first measures itself.
             if (bool(value))
             {
+                mCellViewsClear = true;
                 mBeamRefAnchored = false;
                 mBeamHistoryValid = false;
                 mBeamReusable = false;
@@ -1000,6 +1049,14 @@ Properties HSTRCloud::getProperties() const
     props[kMarchProbe] = mParams.marchProbe;
     props[kCloudThinDepth] = mParams.cloudThinDepth;
     props["cloudSunAncestors"] = mParams.cloudSunAncestors;
+    props["beamShadowCarry"] = mParams.beamShadowCarry;
+    props["cellViews"] = mCellViews;
+    props["cellViewEdge"] = mParams.cellViewEdge;
+    props["cellViewCapacity"] = mParams.cellViewCapacity;
+    props["cellViewBuilds"] = mParams.cellViewBuildCapacity;
+    props["cellViewDrift"] = mParams.cellViewDrift;
+    props["cellViewMaxAge"] = mParams.cellViewMaxAge;
+    props["cellViewRefine"] = mParams.cellViewRefine != 0;
     props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
@@ -1073,6 +1130,11 @@ Properties HSTRCloud::getProperties() const
         const char* divergenceNames[] = {"UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid"};
         for (uint32_t k = 0; k < 4; ++k)
             cloud[std::string("beamProbe") + divergenceNames[k]] = mBeamLevelCounts[kBeamProbeDivergence + k];
+        for (uint32_t k = kBeamProbeMatrix; k < kCellViewRays; ++k)
+            cloud["beamProbeSlot" + std::to_string(k)] = mBeamLevelCounts[k];
+        const char* cellNames[] = {"Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests", "Built", "Steps"};
+        for (uint32_t k = 0; k < 8; ++k)
+            cloud[std::string("cellView") + cellNames[k]] = mBeamLevelCounts[kCellViewRays + k];
         const char* blockNames[] = {"Blocks", "BlocksOk", "BlockOkSteps", "BlockSteps", "TightSteps", "TightBadSteps", "LooseSteps", "LooseBadSteps"};
         for (uint32_t k = 0; k < 8; ++k)
             cloud[std::string("beamProbe") + blockNames[k]] = mBeamLevelCounts[kBeamProbeBlocks + k];
@@ -1305,6 +1367,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpCellArgsPass = createPass("writeCellViewArgs");
+    mpCellBuildPass = createPass("buildCellViews");
+    mpCellInvalidatePass = createPass("invalidateCellViews");
+    mpCellOccupancyPass = createPass("buildCellOccupancy");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
@@ -3214,6 +3280,18 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamPixelsSnapshot"] = mpBeamPixelsSnapshot;
     var["hstrBeamLatticeSnapshot"] = mpBeamLatticeSnapshot;
     var["hstrBeamGuardCamera"] = mpBeamGuardCamera;
+    var["hstrCellMap"] = mpCellMap;
+    var["hstrCellRequest"] = mpCellRequest;
+    var["hstrCellOccupancy"] = mpCellOccupancy;
+    var["hstrCellViews"] = mpCellViews;
+    var["hstrCellTexels"] = mpCellTexels;
+    var["hstrCellTexelsSingle"] = mpCellTexelsSingle;
+    var["hstrCellBuild"] = mpCellBuild;
+    var["hstrCellCounters"] = mpCellCounters;
+    var["hstrCellCursor"] = mpCellCursor;
+    var["hstrCellArgs"] = mpCellArgs;
+    var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
+    var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
@@ -3608,6 +3686,66 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+    pPass->getProgram()->addDefine("HSTR_CELL_VIEWS", mCellViews && mParams.seaMode != 0 ? "1" : "0");
+}
+
+void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
+{
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const uint3 dims = mParams.hstrExtinctionDims;
+    if (!mpCellMap || mpCellMap->getWidth() != dims.x || mpCellMap->getHeight() != dims.y || mpCellMap->getDepth() != dims.z)
+    {
+        mpCellMap = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R32Uint, 1, nullptr, flags);
+        mpCellRequest = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R32Uint, 1, nullptr, flags);
+        mpCellOccupancy = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R8Uint, 1, nullptr, flags);
+        mCellViewsClear = true;
+    }
+    const uint32_t capacity = mParams.cellViewCapacity;
+    const uint32_t edge = mParams.cellViewEdge;
+    const uint32_t perRow = std::max(1u, std::min(capacity, 8192u / edge));
+    const uint32_t rows = (capacity + perRow - 1) / perRow;
+    if (!mpCellViews || mpCellViews->getElementCount() != capacity || mpCellTexels->getWidth() != perRow * edge ||
+        mpCellTexels->getHeight() != rows * edge)
+    {
+        mpCellViews = mpDevice->createStructuredBuffer(sizeof(CellView), capacity, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpCellTexels = mpDevice->createTexture2D(perRow * edge, rows * edge, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
+        mpCellTexelsSingle = mpDevice->createTexture2D(perRow * edge, rows * edge, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
+        mCellViewsClear = true;
+    }
+    if (!mpCellBuild || mpCellBuild->getElementCount() != mParams.cellViewBuildCapacity)
+        mpCellBuild = mpDevice->createStructuredBuffer(
+            sizeof(int4), mParams.cellViewBuildCapacity, flags, MemoryType::DeviceLocal, nullptr, false
+        );
+    if (!mpCellCounters)
+    {
+        mpCellCounters = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpCellCursor = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpCellArgs = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), 3, flags | ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, nullptr, false
+        );
+        mCellViewsClear = true;
+    }
+    if (mCellViewsClear)
+    {
+        pRenderContext->clearUAV(mpCellMap->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mpCellRequest->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mpCellViews->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mpCellCursor->getUAV().get(), uint4(0));
+        mCellViewsClear = false;
+        mCellOccupancyDirty = true;
+    }
+    if (mCellOccupancyDirty)
+    {
+        bindRenderer(pRenderContext, mpCellOccupancyPass);
+        bindOutput(mpCellOccupancyPass, "hstrCellOccupancyOutput", mpCellOccupancy, "hstrCellOccupancy");
+        mpCellOccupancyPass->getRootVar()["CB"]["gHSTRCloud"]["hstrDomainVolume"] = mpDomainVolume;
+        mpCellOccupancyPass->execute(pRenderContext, dims);
+        mCellOccupancyDirty = false;
+    }
+    mParams.cellViews = 1;
+    mParams.cellViewSlotsPerRow = perRow;
+    mParams.cellViewAtlasInvWidth = 1.f / float(perRow * edge);
+    mParams.cellViewAtlasInvHeight = 1.f / float(rows * edge);
 }
 
 void HSTRCloud::ensureCameraResources()
@@ -4675,6 +4813,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
                                 pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
+                                const bool cellViews = mCellViews && mParams.seaMode != 0;
+                                if (cellViews)
+                                {
+                                    ensureCellViews(pRenderContext);
+                                    mParams.cellViewFrame = ++mCellViewFrame;
+                                    pRenderContext->clearUAV(mpCellCounters->getUAV().get(), uint4(0));
+                                }
                                 // Content that changed since the last build unverifies the blocks whose directions cross it, before
                                 // the classification lists what is not certified. A few regions a tile crossing; past the buffer, or
                                 // when every sun page changed, every block.
@@ -4687,11 +4832,22 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 if (invalidated)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "invalidate");
+                                    // The domain may hold new density: the cell occupancy is rebuilt before anything reads it.
+                                    if (cellViews)
+                                    {
+                                        mCellOccupancyDirty = true;
+                                        ensureCellViews(pRenderContext);
+                                    }
                                     constexpr uint32_t kCapacity = 256;
                                     if (mBeamInvalidateAll || mBeamInvalidations.size() > kCapacity)
                                     {
                                         pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
                                         pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
+                                        if (cellViews)
+                                        {
+                                            mCellViewsClear = true;
+                                            ensureCellViews(pRenderContext);
+                                        }
                                     }
                                     else
                                     {
@@ -4707,6 +4863,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         mParams.beamInvalidateCount = uint32_t(mBeamInvalidations.size());
                                         bindRenderer(pRenderContext, mpBeamInvalidatePass);
                                         mpBeamInvalidatePass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
+                                        // The same regions unmap the cell views of the content that changed.
+                                        if (cellViews)
+                                        {
+                                            bindRenderer(pRenderContext, mpCellInvalidatePass);
+                                            mpCellInvalidatePass->execute(pRenderContext, uint3(mParams.cellViewCapacity, 1, 1));
+                                        }
                                         mParams.beamInvalidateCount = 0;
                                     }
                                     mBeamInvalidations.clear();
@@ -4810,6 +4972,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                             );
                                         }
                                         pRenderContext->copyResource(mpBeamLatticeSnapshot.get(), mpBeamLattice.get());
+                                        if (!mpBeamGuardCameraSnapshot || mpBeamGuardCameraSnapshot->getWidth() != mpBeamGuardCamera->getWidth() ||
+                                            mpBeamGuardCameraSnapshot->getHeight() != mpBeamGuardCamera->getHeight())
+                                        {
+                                            mpBeamGuardCameraSnapshot = mpDevice->createTexture2D(
+                                                mpBeamGuardCamera->getWidth(), mpBeamGuardCamera->getHeight(), ResourceFormat::RGBA32Float, 1, 1,
+                                                nullptr, ResourceBindFlags::ShaderResource
+                                            );
+                                            mpBeamProbeAccept = mpDevice->createTexture2D(
+                                                mpBeamGuardCamera->getWidth(), mpBeamGuardCamera->getHeight(), ResourceFormat::R32Uint, 1, 1,
+                                                nullptr, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                                            );
+                                        }
+                                        pRenderContext->copyResource(mpBeamGuardCameraSnapshot.get(), mpBeamGuardCamera.get());
+                                        pRenderContext->clearUAV(mpBeamProbeAccept->getUAV().get(), uint4(0));
                                     }
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
@@ -5056,6 +5232,18 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         FALCOR_PROFILE(pRenderContext, "units");
                         bindDirty(mpBeamDirtyMarchPass);
                         mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                    }
+                    // Cell views: build the views this frame's dirty rays queued, from this camera, for the next frame to read.
+                    if (mCellViews && mParams.seaMode != 0 && mpCellArgs)
+                    {
+                        FALCOR_PROFILE(pRenderContext, "cellViews");
+                        bindRenderer(pRenderContext, mpCellArgsPass);
+                        mpCellArgsPass->execute(pRenderContext, uint3(1));
+                        setBeamDirtyMarchDefines(mpCellBuildPass);
+                        bindRenderer(pRenderContext, mpCellBuildPass);
+                        bindOutput(mpCellBuildPass, "hstrCellTexelsOutput", mpCellTexels, "hstrCellTexels");
+                        bindOutput(mpCellBuildPass, "hstrCellTexelsSingleOutput", mpCellTexelsSingle, "hstrCellTexelsSingle");
+                        mpCellBuildPass->executeIndirect(pRenderContext, mpCellArgs.get(), 0);
                     }
                 }
             }

@@ -2,6 +2,27 @@
 
 HSTR is a quality-constrained real-time renderer. The target is below 2 ms at 4K without surrendering opportunities for performance, while preserving at least the required 99th-percentile quality against the original path-traced result.
 
+## STOP: architecture gate before writing any renderer code
+
+README.md defines the final architecture. It is not background reading. Before designing or writing ANY new evaluator, pass, cache or
+optimization, write down in chat, explicitly:
+
+1. Which README "Final Architecture" component this builds.
+2. The unit of work it runs per: if the answer is "per camera ray", "per lattice point", "per basis ray" or "per pixel", and the
+   work walks the volume (steps, cells, bricks, nodes along the ray), STOP. That is a ray marcher by another name, whatever it reads.
+   The README's final work unit is projected transport node x BeamTile.
+3. Whether it still exists once `marchBeam()` is only the residual path. If not, do not build it without explicit instruction.
+4. Which README "Automatic Red Flags" it resembles. Replacing the density a ray reads with a cached representation, while still
+   traversing per ray, is the red flag "improve the density lookup for every Beam query".
+
+If you cannot answer these in a way that matches the README, do not write the code. Ask. This rule exists because an agent spent
+an hour building a per-ray cell traversal (`composeBeam`) that the README explicitly rules out.
+
+Also:
+- The build copies shaders into `build/windows-ninja-msvc/bin/Release/shaders`. A shader edit is NOT live until the build command
+  has run. Rebuild after every shader edit, before every benchmark run, or the run measures the old shader.
+- Edit files with the Edit tool. Do not rewrite source through python/sed/heredoc scripts.
+
 ## Non-negotiable workflow
 
 - Run Falcor/Mogwai headless only. The benchmark wrappers already pass `--headless`; do not open an interactive renderer.

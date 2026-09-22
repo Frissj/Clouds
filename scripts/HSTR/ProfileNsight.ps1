@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(60, 1000000)]
+    # 0: no frame limit - the Mogwai script decides when to exit (a benchmark that settles first).
+    [ValidateRange(0, 1000000)]
     [int]$Frames = 300,
 
     [ValidateSet("d3d12", "vulkan")]
@@ -13,6 +14,10 @@ param(
     [string]$Name = ("hstr-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss")),
 
     [string[]]$MogwaiArgs = @(),
+
+    # Samples SM activity, warp occupancy and DRAM throughput over time, to tell a kernel with low occupancy from one waiting on
+    # its longest waves.
+    [switch]$GpuMetrics,
 
     [switch]$Open,
 
@@ -54,8 +59,14 @@ $profileArgs = @(
     "profile"
     "--trace=$trace"
     "--sample=none"
-    "--duration-frames=$Frames"
-    "--kill=true"
+)
+if ($Frames -gt 0) {
+    $profileArgs += @("--duration-frames=$Frames", "--kill=true")
+}
+if ($GpuMetrics) {
+    $profileArgs += @("--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000")
+}
+$profileArgs += @(
     "--wait=all"
     "--stats=true"
     "--show-output=true"

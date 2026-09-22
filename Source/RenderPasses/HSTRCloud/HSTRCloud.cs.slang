@@ -36,6 +36,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_BEAM_REPAIR_PROBE
 #define HSTR_BEAM_REPAIR_PROBE 0
 #endif
+#ifndef HSTR_CELL_VIEWS
+#define HSTR_CELL_VIEWS 0 // Nonzero (cellViews, set by the host on the dirty passes): dirty rays compose from cell views (composeBeam).
+#endif
 #define SHIP_BIT_cloudTransferClasses 1
 #define SHIP_BIT_cloudCostProbe 2
 #define SHIP_BIT_cloudEmptySkip 4
@@ -371,6 +374,28 @@ struct HSTRCloudRenderer
     /// beamRepairProbe: the residual units and the lattice as they stood before this build re-marched them.
     Texture2D<float4> hstrBeamPixelsSnapshot;
     Texture2DArray<float4> hstrBeamLatticeSnapshot;
+    /// beamRepairProbe: each block's guard camera before this build, i.e. where its old values were marched from, and the witness
+    /// policies that would have carried it (kBeamProbeAcceptSignatures), for the unit march to score its residual against.
+    Texture2D<float4> hstrBeamGuardCameraSnapshot;
+    RWTexture2D<uint> hstrBeamProbeAccept;
+    /// Cell views (cellViews, see composeBeam): per domain cell (wrapped into the domain), its view's slot plus one (0: none); per
+    /// cell, the cellViewFrame + 1 it was last queued for a build in; the views; their texels in an atlas of cellViewEdge^2 tiles,
+    /// (cache rgb, transmittance) and (single rgb, opacity centroid as a fraction of the chord); the cells queued this frame, how
+    /// many, the ring cursor that hands out slots, and the build dispatch's arguments.
+    RWTexture3D<uint> hstrCellMap;
+    RWTexture3D<uint> hstrCellRequest;
+    /// Per domain cell: 1 where a sample inside it can read density (any of its 27 voxels has a nonzero conservative maximum).
+    Texture3D<uint> hstrCellOccupancy;
+    RWTexture3D<uint> hstrCellOccupancyOutput;
+    RWStructuredBuffer<CellView> hstrCellViews;
+    Texture2D<float4> hstrCellTexels;
+    Texture2D<float4> hstrCellTexelsSingle;
+    RWTexture2D<float4> hstrCellTexelsOutput;
+    RWTexture2D<float4> hstrCellTexelsSingleOutput;
+    RWStructuredBuffer<int4> hstrCellBuild;
+    RWStructuredBuffer<uint> hstrCellCounters;
+    RWStructuredBuffer<uint> hstrCellCursor;
+    RWStructuredBuffer<uint> hstrCellArgs;
     /// The coarse certificate level: xyz is the camera the cell was last rebuilt from, w the radius it is safe within.
     RWTexture2D<float4> hstrBeamCoarse;
     /// Per coarse cell: the children its certificate does NOT cover (low 16 bits) and whether it is queued for a rebuild (bit 16).
@@ -1945,6 +1970,26 @@ struct HSTRCloudRenderer
         inout float opacityDistance
     )
     {
+        float fineVoxels = 1.f;
+        marchSegmentMoment(ray, segment, withSource, residual, radiance, residualRadiance, transmittance, steps, opacityDistance, fineVoxels);
+    }
+
+    /// marchSegmentMoment continuing from fineVoxels: the sampled voxel edge the march last read, which bounds its next step. A
+    /// march resumed mid-ray (composeBeam's cells) passes the one it stopped with; starting at 1 makes the first step cross a whole
+    /// domain voxel on one sample.
+    void marchSegmentMoment(
+        CutRay ray,
+        float2 segment,
+        bool withSource,
+        bool residual,
+        inout float3 radiance,
+        inout float3 residualRadiance,
+        inout float transmittance,
+        inout uint steps,
+        inout float opacityDistance,
+        inout float fineVoxels
+    )
+    {
         const float cellWidth = float(params.hstrCellWidth);
         const float voxelsPerUnit = length(ray.direction) * cellWidth;
         if (voxelsPerUnit <= 1e-6f)
@@ -1968,8 +2013,7 @@ struct HSTRCloudRenderer
         float heldStep = -1.f;  ///< Step the previous sample's density bounds allow (cloudLocalStep), or negative for the majorant rule.
         uint sinceLighting = ~0u;
         float t = segment.x;
-        // Voxel edge (domain voxels) of the density the last sample read: fine bricks shorten the minimum step to their voxels.
-        float fineVoxels = 1.f;
+        // fineVoxels: voxel edge (domain voxels) of the density the last sample read: fine bricks shorten the minimum step to theirs.
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
         {
@@ -4136,6 +4180,445 @@ struct HSTRCloudRenderer
         return result;
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Cell views: a world-space transport cache for the rays translation invalidates.
+    //
+    // A camera ray's split-frame terms compose exactly over any partition of the ray into disjoint intervals: C = sum T_<k C_k,
+    // T = prod T_k. The partition used here is the domain's voxel cells (cell i spans [i - 0.5, i + 0.5)^3, voxel i centred at i),
+    // and each cell with content caches a VIEW of its own transfer: the cell's (cache, single, transmittance, opacity centroid) for
+    // every ray of a cellViewEdge^2 grid over its projection, marched from the camera that built it. A ray from another camera
+    // position crosses the cell along a chord through some point m; the build ray through m's projection crosses it along a chord
+    // through the same point, whose ends are displaced sideways by (camera shift across the ray) / (distance) * (half chord). That
+    // misregistration is what cellViewDrift bounds. It grows with the camera's movement over the cell's distance, so a cell survives
+    // far more movement than the lattice guard allows, which is a texel of the IMAGE rather than a fraction of a voxel. A cell with
+    // no usable view is marched exactly along its chord, in place, and queued for a build that the next frame reads. The phase is
+    // applied per pixel (single carries none), so a view holds for every direction through the cell.
+
+    /// The plane a view is laid out on: through the cell centre, facing the build camera, with axes u and v.
+    void cellViewAxes(float3 centre, float3 camera, out float3 n, out float3 u, out float3 v)
+    {
+        n = normalize(centre - camera);
+        const float3 up = abs(n.y) < 0.99f ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
+        u = normalize(cross(up, n));
+        v = cross(n, u);
+    }
+
+    /// Half-extent of a view on that plane: the cell's circumradius, widened for perspective (its near corners project outward).
+    float cellViewRadius(float distance)
+    {
+        const float r = 0.8660254f;
+        return r * distance / max(distance - r, 1e-3f);
+    }
+
+    /// Texel coordinates (0 to cellViewEdge) of voxel position p in the view of cell centre, built from camera.
+    float2 cellViewTexel(float3 p, float3 centre, float3 camera)
+    {
+        float3 n, u, v;
+        cellViewAxes(centre, camera, n, u, v);
+        const float along = length(centre - camera);
+        const float3 q = p - camera;
+        const float3 onPlane = camera + q * (along / max(dot(q, n), 1e-6f));
+        const float2 xy = float2(dot(onPlane - centre, u), dot(onPlane - centre, v)) / cellViewRadius(along);
+        return (xy * 0.5f + 0.5f) * float(params.cellViewEdge);
+    }
+
+    /// Atlas texture coordinate of a texel position in slot's view, kept half a texel inside it so the filter never reads a neighbour.
+    float2 cellViewAtlasUv(uint slot, float2 texel)
+    {
+        const float edge = float(params.cellViewEdge);
+        const float2 origin = float2(uint2(slot % params.cellViewSlotsPerRow, slot / params.cellViewSlotsPerRow)) * edge;
+        return (origin + clamp(texel, 0.5f, edge - 0.5f)) * float2(params.cellViewAtlasInvWidth, params.cellViewAtlasInvHeight);
+    }
+
+    /// The domain cell of an unwrapped cell, as the map indexes it (x and z wrap, y does not).
+    uint3 cellViewKey(float3 cell)
+    {
+        const float3 dims = float3(params.hstrExtinctionDims);
+        return uint3(uint(cell.x - floor(cell.x / dims.x) * dims.x), uint(max(cell.y, 0.f)), uint(cell.z - floor(cell.z / dims.z) * dims.z));
+    }
+
+    /// The sea's distance fade (cameraExtinctionAtVoxel) at a camera distance in voxels.
+    float cellViewFade(float distance)
+    {
+        if (params.seaMode == 0 || params.cloudPixelAngle <= 0.f)
+            return 1.f;
+        return saturate((1.f - distance * params.seaVoxelSize.x / params.seaViewDistance) / 0.3f);
+    }
+
+    /// Camera distances (voxels, to the cell centre) over which the density a cell's samples read stays at the level they read
+    /// from distance: the footprint level of the instance at the centre, and the proxy past it. Narrowed by the circumradius so that
+    /// every sample of the cell stays inside it; a cell straddling a level boundary gets a quarter of a voxel either way.
+    float2 cellViewBand(float3 centre, float distance)
+    {
+        float2 band = float2(0.f, 1e30f);
+        const float k = params.seaVoxelSize.x * params.cloudPixelAngle; // Footprint (world) per voxel of distance.
+        if (params.cloudVirtual != 0 && k > 0.f)
+        {
+            uint instanceIndex;
+            float3 x;
+            float unused;
+            HSTRCloudInstance instance;
+            cloudInstanceAt(seaVoxel(centre), distance * k, instanceIndex, x, unused, instance);
+            if (instance.occupied != 0)
+            {
+                const float sv = instance.sourceVoxelWorld;
+                const float level = log2(max(distance * k / sv, 1.f)) + params.cloudLodBias;
+                const float low = level >= instance.proxyLevel ? instance.proxyLevel : floor(max(level, 0.f));
+                const float high = level >= instance.proxyLevel ? 1e30f : min(low + 1.f, instance.proxyLevel);
+                band.x = low <= params.cloudLodBias ? 0.f : sv * exp2(low - params.cloudLodBias) / k;
+                band.y = high >= 1e29f ? 1e30f : sv * exp2(high - params.cloudLodBias) / k;
+            }
+        }
+        band += float2(0.8660254f, -0.8660254f);
+        if (band.x > distance || band.y < distance)
+            band = float2(distance - 0.25f, distance + 0.25f);
+        return band;
+    }
+
+    /// The finest voxel edge (domain voxels) a sample in cell can read: its instance's source voxel, else the proxy's. A march that
+    /// starts inside cloud begins at that step, as a continuous march reaching it from cloud would.
+    float cellViewFineVoxels(float3 centre)
+    {
+        if (params.cloudVirtual == 0)
+            return 1.f;
+        uint instanceIndex;
+        float3 x;
+        float unused;
+        HSTRCloudInstance instance;
+        cloudInstanceAt(seaVoxel(centre), 0.f, instanceIndex, x, unused, instance);
+        return instance.occupied != 0 ? min(instance.sourceVoxelWorld / params.seaVoxelSize.x, 1.f) : 1.f;
+    }
+
+    /// Ray parameters where the ray origin + t dv enters and leaves the box [lo, lo + 1].
+    float2 cellViewSlab(float3 origin, float3 dv, float3 lo)
+    {
+        float enter = -1e30f;
+        float exit = 1e30f;
+        [unroll]
+        for (uint a = 0; a < 3; ++a)
+        {
+            if (abs(dv[a]) > 1e-12f)
+            {
+                const float t0 = (lo[a] - origin[a]) / dv[a];
+                const float t1 = (lo[a] + 1.f - origin[a]) / dv[a];
+                enter = max(enter, min(t0, t1));
+                exit = min(exit, max(t0, t1));
+            }
+            else if (origin[a] < lo[a] || origin[a] >= lo[a] + 1.f)
+                exit = -1e30f;
+        }
+        return float2(enter, exit);
+    }
+
+    /// Adds per-thread counts to hstrBeamCounts once per wave.
+    void cellViewCount(uint slot, uint value)
+    {
+        const uint total = WaveActiveSum(value);
+        if (WaveIsFirstLane() && total != 0u)
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[slot], total, unused);
+        }
+    }
+
+    /// marchBeam over the whole ray, composed from cell views where they hold (see above) and marched exactly per cell elsewhere.
+    BeamSample composeBeam(float3 direction)
+    {
+        BeamSample result = {};
+        CutRay ray;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float3 cameraWorld = gScene.camera.data.posW;
+        const bool made = makeCutRay(cameraWorld, direction, volume, ray);
+        uint hits = 0;
+        uint emptyHits = 0;
+        uint exact = 0;
+        uint cells = 0;
+        uint exactSteps = 0;
+        if (made)
+        {
+            ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+            const float cellWidth = float(params.hstrCellWidth);
+            const float3 origin = ray.position * cellWidth;
+            const float3 dv = ray.direction * cellWidth;
+            const float voxelsPerUnit = length(dv);
+            const float3 camera = worldToVoxel(cameraWorld, volume) - float3(params.hstrGridMin);
+            const bool withCache = beamWithCache();
+            const bool withSingle = beamWithSingle();
+            const float3 dims = float3(params.hstrExtinctionDims);
+            const uint frameStamp = params.cellViewFrame + 1u;
+            float3 cache = 0.f;
+            float3 single = 0.f;
+            float transmittance = 1.f;
+            float opacityDistance = 0.f;
+            uint steps = 0;
+            float fineVoxels = 1.f; // The exact chords resume the march's step state from cell to cell.
+            const float nudge = 1e-3f / max(voxelsPerUnit, 1e-6f);
+            float t = 0.f;
+            if (params.cellViewDebug == 1)
+            {
+                marchSegmentMoment(ray, float2(0.f, 1.f), withCache, withSingle, cache, single, transmittance, steps, opacityDistance, fineVoxels);
+                t = 1.f;
+            }
+            [loop]
+            for (uint k = 0; k < 2048u && t < 1.f && transmittance > params.cloudMinTransmittance && voxelsPerUnit > 1e-6f; ++k)
+            {
+                const float3 p = origin + (t + nudge) * dv;
+                // A zero majorant block holds nothing any sample could read: cross it, and the zero 16-voxel blocks after it, at once.
+                if (params.cellViewDebug != 2 && majorantAt(p) <= 0.f)
+                {
+                    const float3 block = floor(p * 0.25f) * 4.f;
+                    float exitBlock = 1e30f;
+                    [unroll]
+                    for (uint a = 0; a < 3; ++a)
+                        if (abs(dv[a]) > 1e-12f)
+                            exitBlock = min(exitBlock, (block[a] + (dv[a] > 0.f ? 4.f : 0.f) - origin[a]) / dv[a]);
+                    t = max(max(exitBlock, majorantZeroExit(ray, t)), t + nudge);
+                    continue;
+                }
+                const float3 cell = floor(p + 0.5f);
+                const float2 slab = cellViewSlab(origin, dv, cell - 0.5f);
+                const float exit = max(min(slab.y, 1.f), t + nudge);
+                const float2 chord = float2(max(slab.x, 0.f), exit);
+                ++cells;
+                const uint3 key = cellViewKey(cell);
+                const bool inside = cell.y >= 0.f && cell.y < dims.y;
+                // No sample in the cell can read density: nothing to march, view or request.
+                if (params.cellViewDebug != 2 && inside && hstrCellOccupancy.Load(int4(int3(key), 0)) == 0u)
+                {
+                    t = exit;
+                    continue;
+                }
+                const float distance = length(cell - camera);
+                const bool keyed = inside && distance >= 4.f;
+                bool usable = false;
+                bool request = keyed;
+                if (keyed)
+                {
+                    const uint entry = hstrCellMap[key];
+                    if (entry != 0u)
+                    {
+                        const uint slot = entry - 1u;
+                        const CellView view = hstrCellViews[slot];
+                        // How far the build ray through the chord's midpoint strays from this chord at the chord's ends.
+                        const float3 m = origin + 0.5f * (chord.x + chord.y) * dv;
+                        const float3 toMid = normalize(m - camera);
+                        const float3 moved = camera - view.camera;
+                        const float3 across = moved - dot(moved, toMid) * toMid;
+                        const float drift = length(across) / max(length(m - view.camera), 1e-3f) * 0.5f * (chord.y - chord.x) * voxelsPerUnit;
+                        const uint age = frameStamp - view.frame;
+                        const float fadeNow = cellViewFade(distance);
+                        const float fadeRatio = view.fade > 1e-4f ? fadeNow / view.fade : (fadeNow <= 1e-4f ? 1.f : 1e30f);
+                        const bool same = view.frame != 0u && all(view.cell == int3(cell));
+                        usable = same && distance >= view.bandLow && distance <= view.bandHigh && drift <= params.cellViewDrift &&
+                                 age <= 2u * params.cellViewMaxAge && fadeRatio >= 0.9f && fadeRatio <= 1.1f;
+                        request = !usable || drift > 0.5f * params.cellViewDrift || age > params.cellViewMaxAge ||
+                                  fadeRatio < 0.95f || fadeRatio > 1.05f;
+                        if (usable && (view.flags & kCellViewEmpty) != 0u)
+                            ++emptyHits;
+                        else if (usable)
+                        {
+                            const float3 centre = cell;
+                            float2 uv = cellViewAtlasUv(slot, cellViewTexel(m, centre, view.camera));
+                            float4 a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            float4 b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            // Where the chord's light comes from: an opaque skin sits at its centroid, and the build ray through THAT
+                            // point is the one that saw the same skin.
+                            if (params.cellViewRefine != 0 && a.a < 0.98f)
+                            {
+                                const float3 c = origin + (chord.x + saturate(b.a) * (chord.y - chord.x)) * dv;
+                                uv = cellViewAtlasUv(slot, cellViewTexel(c, centre, view.camera));
+                                a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                                b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            }
+                            // The fade scales the cell's extinction: exact for the transmittance, and for the light where the source is
+                            // constant along the chord.
+                            float T = saturate(a.a);
+                            float scale = 1.f;
+                            if (abs(fadeRatio - 1.f) > 1e-4f)
+                            {
+                                const float faded = pow(max(T, 1e-12f), fadeRatio);
+                                scale = T < 0.9999f ? (1.f - faded) / (1.f - T) : fadeRatio;
+                                T = faded;
+                            }
+                            cache += transmittance * scale * a.rgb;
+                            single += transmittance * scale * b.rgb;
+                            const float d0 = ray.entryDistance + chord.x * ray.worldLength;
+                            const float d1 = ray.entryDistance + chord.y * ray.worldLength;
+                            opacityDistance += transmittance * (1.f - T) * (d0 + saturate(b.a) * (d1 - d0));
+                            transmittance *= T;
+                            fineVoxels = cellViewFineVoxels(cell);
+                            ++hits;
+                        }
+                    }
+                }
+                if (!usable)
+                {
+                    const uint before = steps;
+                    marchSegmentMoment(ray, float2(t, exit), withCache, withSingle, cache, single, transmittance, steps, opacityDistance, fineVoxels);
+                    exactSteps += steps - before;
+                    ++exact;
+                }
+                if (request && hstrCellRequest[key] != frameStamp)
+                {
+                    uint previous;
+                    InterlockedExchange(hstrCellRequest[key], frameStamp, previous);
+                    if (previous != frameStamp)
+                    {
+                        uint index;
+                        InterlockedAdd(hstrCellCounters[0], 1u, index);
+                        if (index < params.cellViewBuildCapacity)
+                            hstrCellBuild[index] = int4(int3(cell), 0);
+                    }
+                }
+                t = exit;
+            }
+            result.cache = cache;
+            result.single = single;
+            result.depth = -log(max(transmittance, 1e-12f));
+            result.steps = float(steps + hits);
+            result.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
+        }
+        cellViewCount(kCellViewRays, made ? 1u : 0u);
+        cellViewCount(kCellViewHits, hits);
+        cellViewCount(kCellViewEmptyHits, emptyHits);
+        cellViewCount(kCellViewExact, exact);
+        cellViewCount(kCellViewCells, cells);
+        cellViewCount(kCellViewSteps, exactSteps);
+        return result;
+    }
+
+    /// The march a dirty ray takes: composed from cell views (HSTR_CELL_VIEWS), or marched.
+    BeamSample marchBeamDirty(float3 direction)
+    {
+#if HSTR_CELL_VIEWS
+        return composeBeam(direction);
+#else
+        return marchBeam(direction, float2(0.f, 1.f));
+#endif
+    }
+
+    /// Starts the build of cell's view: takes the ring's next slot, unmaps the cell that held it, and writes the header. ~0 when the
+    /// camera is too close to the cell for a view (it is then marched every time).
+    uint beginCellView(int3 cell)
+    {
+        const float3 camera = worldToVoxel(gScene.camera.data.posW, gScene.getGridVolume(0)) - float3(params.hstrGridMin);
+        const float3 centre = float3(cell);
+        const float distance = length(centre - camera);
+        if (distance < 4.f || params.cellViewCapacity == 0u)
+            return ~0u;
+        uint cursor;
+        InterlockedAdd(hstrCellCursor[0], 1u, cursor);
+        const uint slot = cursor % params.cellViewCapacity;
+        const CellView old = hstrCellViews[slot];
+        if (old.frame != 0u)
+        {
+            uint previous;
+            InterlockedCompareExchange(hstrCellMap[cellViewKey(float3(old.cell))], slot + 1u, 0u, previous);
+        }
+        CellView view;
+        view.camera = camera;
+        const float2 band = cellViewBand(centre, distance);
+        view.bandLow = band.x;
+        view.bandHigh = band.y;
+        view.cell = cell;
+        view.flags = 0u;
+        view.frame = params.cellViewFrame + 1u;
+        view.fade = cellViewFade(distance);
+        view.pad = 0u;
+        hstrCellViews[slot] = view;
+        return slot;
+    }
+
+    /// Whether domain voxel neighbour (of the 27 around cell) can hold density a sample inside the cell reads (its conservative maximum).
+    bool cellViewOccupied(int3 cell, uint neighbour)
+    {
+        const int3 offset = int3(neighbour % 3u, (neighbour / 3u) % 3u, neighbour / 9u) - 1;
+        const float3 at = float3(cell + offset);
+        if (at.y < 0.f || at.y >= float(params.hstrExtinctionDims.y))
+            return false;
+        return hstrDomainVolume.Load(int4(int3(cellViewKey(at)), 0)).y > 0.f;
+    }
+
+    /// One texel of cell's view in slot: the build camera's ray through it, marched along its chord of the cell.
+    bool buildCellViewTexel(int3 cell, uint slot, uint2 texel)
+    {
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float3 cameraWorld = gScene.camera.data.posW;
+        const float3 camera = worldToVoxel(cameraWorld, volume) - float3(params.hstrGridMin);
+        const float3 centre = float3(cell);
+        float3 n, u, v;
+        cellViewAxes(centre, camera, n, u, v);
+        const float2 xy = ((float2(texel) + 0.5f) / float(params.cellViewEdge) * 2.f - 1.f) * cellViewRadius(length(centre - camera));
+        const float3 target = centre + xy.x * u + xy.y * v;
+        float4 a = float4(0.f, 0.f, 0.f, 1.f);
+        float4 b = float4(0.f, 0.f, 0.f, 0.5f);
+        bool content = false;
+        CutRay ray;
+        if (makeCutRay(cameraWorld, (target - camera) * params.seaVoxelSize, volume, ray))
+        {
+            ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+            const float cellWidth = float(params.hstrCellWidth);
+            const float2 slab = cellViewSlab(ray.position * cellWidth, ray.direction * cellWidth, centre - 0.5f);
+            const float2 chord = float2(max(slab.x, 0.f), min(slab.y, 1.f));
+            if (chord.y > chord.x)
+            {
+                float3 cache = 0.f;
+                float3 single = 0.f;
+                float transmittance = 1.f;
+                uint steps = 0;
+                float opacityDistance = 0.f;
+                float fineVoxels = cellViewFineVoxels(centre);
+                marchSegmentMoment(ray, chord, beamWithCache(), beamWithSingle(), cache, single, transmittance, steps, opacityDistance, fineVoxels);
+                const float d0 = ray.entryDistance + chord.x * ray.worldLength;
+                const float d1 = ray.entryDistance + chord.y * ray.worldLength;
+                const float centroid = transmittance < 1.f - 1e-4f
+                                           ? saturate((opacityDistance / (1.f - transmittance) - d0) / max(d1 - d0, 1e-6f))
+                                           : 0.5f;
+                a = float4(cache, transmittance);
+                b = float4(single, centroid);
+                content = transmittance < 1.f - 1e-5f || any(cache > 0.f) || any(single > 0.f);
+            }
+        }
+        const uint2 at = uint2(slot % params.cellViewSlotsPerRow, slot / params.cellViewSlotsPerRow) * params.cellViewEdge + texel;
+        hstrCellTexelsOutput[at] = a;
+        hstrCellTexelsSingleOutput[at] = b;
+        return content;
+    }
+
+    /// Finishes a build: an empty view is flagged so that lookups skip its texels, and the cell maps to the slot.
+    void endCellView(int3 cell, uint slot, bool content)
+    {
+        if (!content)
+            hstrCellViews[slot].flags = kCellViewEmpty;
+        uint previous;
+        InterlockedExchange(hstrCellMap[cellViewKey(float3(cell))], slot + 1u, previous);
+        uint unused;
+        InterlockedAdd(hstrBeamCounts[kCellViewBuilt], 1u, unused);
+    }
+
+    /// Unmaps a view whose cell lies in a changed region (hstrBeamInvalidations, beamInvalidateCount of them).
+    void invalidateCellView(uint slot)
+    {
+        if (slot >= params.cellViewCapacity)
+            return;
+        const CellView view = hstrCellViews[slot];
+        if (view.frame == 0u)
+            return;
+        const float3 world = params.seaOrigin + (float3(view.cell) + float3(params.hstrGridMin) + 0.5f) * params.seaVoxelSize;
+        const float reach = 0.8660254f * params.seaVoxelSize.x;
+        bool hit = false;
+        for (uint k = 0; k < params.beamInvalidateCount; ++k)
+        {
+            const float4 sphere = hstrBeamInvalidations[k];
+            hit = hit || length(world - sphere.xyz) <= sphere.w + reach;
+        }
+        if (!hit)
+            return;
+        uint previous;
+        InterlockedCompareExchange(hstrCellMap[cellViewKey(float3(view.cell))], slot + 1u, 0u, previous);
+        hstrCellViews[slot].frame = 0u;
+    }
+
     /// marchSegmentMoment in the beam view with every HSTR_SHIP switch at its shipping value (HSTR_SHIP bit 512): a midpoint march
     /// with the empty-cell skip, the held cache and the sun depth per contributing sample, and none of the experiments' state. The
     /// same frame, from a loop DXC sees without the dead branches.
@@ -5805,6 +6288,27 @@ struct HSTRCloudRenderer
             reprojected = beamProbeError(moved.rgb, exact) <= 0.02f;
         }
         beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected, steps);
+        // The residual of the blocks a witness policy would have carried: of their units' steps, how many were within 0.02 in place,
+        // and how many kept or reprojected. Units of blocks the query did not list read no acceptance (cleared each build).
+        {
+            const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);
+            const uint accepted = all(cell < params.beamGuardDims) ? hstrBeamProbeAccept[cell] : 0u;
+            const uint unitSteps = scored ? uint(steps) : 0u;
+            if (accepted != 0u && unitSteps != 0u)
+            {
+                for (uint b = 0; b < 3u * kBeamProbePolicies; ++b)
+                {
+                    if ((accepted & (1u << b)) == 0u)
+                        continue;
+                    uint unused;
+                    InterlockedAdd(hstrBeamCounts[kBeamProbeUnitAccept + 3u * b], unitSteps, unused);
+                    if (inPlace)
+                        InterlockedAdd(hstrBeamCounts[kBeamProbeUnitAccept + 3u * b + 1u], unitSteps, unused);
+                    if (inPlace || reprojected)
+                        InterlockedAdd(hstrBeamCounts[kBeamProbeUnitAccept + 3u * b + 2u], unitSteps, unused);
+                }
+            }
+        }
         // MEASURED and REMOVED: what a runtime check would accept of that reprojection. The content's depth found in two steps (the
         // unit's own old depth, then the source's), the previous image read bilinearly there, accepted only if every unit the read
         // weighs was marched, belongs to a failed tile and agrees with the depth to 5%: 4K walk accepted 62.5% of the re-marched units
@@ -5848,15 +6352,164 @@ struct HSTRCloudRenderer
         return beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo);
     }
 
-    void beamProbeQuery(uint2 position, BeamSample fresh)
+    /// What a current-view witness would see along one ray, from one camera: an extinction march (the same stepping as the camera
+    /// march, no lighting) giving the opacity, its centroid and the distances at which 25/50/75% of it has accumulated, then a
+    /// transport fingerprint at those three places - the sun transmittance from the bakes and one world-cache luminance at d50.
+    struct ProbeSignature
+    {
+        float opacity;
+        float centroid;
+        float3 d;
+        float3 sun;
+        float cache;
+        float steps; ///< Steps of one extinction march: what the witness would cost.
+    };
+
+    float beamProbeExtinction(CutRay ray, float3 targets, out float3 tAt, out float centroid, out float steps)
+    {
+        tAt = -1.f;
+        centroid = 0.f;
+        steps = 0.f;
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return 0.f;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        float transmittance = 1.f;
+        float weighted = 0.f;
+        float fineVoxels = 1.f;
+        float t = 0.f;
+        [loop]
+        while (t < 1.f && transmittance > params.cloudMinTransmittance && steps < float(params.maxMarchSteps))
+        {
+            const float3 v = (ray.position + t * ray.direction) * cellWidth;
+            const float majorant = majorantAt(v);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+            const float dt = min(stepVoxels / voxelsPerUnit, 1.f - t);
+            steps += 1.f;
+            if (majorant <= 0.f)
+            {
+                t = min(max(t + dt, majorantZeroExit(ray, t)), 1.f);
+                continue;
+            }
+            const float tSample = t + 0.5f * dt;
+            const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+            CloudSample sample = {};
+            const float sigma = cameraExtinctionAtVoxel(midpoint, rayFootprint(ray, tSample), fineVoxels, sample);
+            const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+            const float before = 1.f - transmittance;
+            weighted += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
+            transmittance *= 1.f - alpha;
+            const float after = 1.f - transmittance;
+            for (uint q = 0; q < 3; ++q)
+                if (tAt[q] < 0.f && after >= targets[q])
+                    tAt[q] = t + dt * saturate((targets[q] - before) / max(after - before, 1e-6f));
+            t = sample.empty ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), 1.f) : t + dt;
+        }
+        const float opacity = 1.f - transmittance;
+        centroid = opacity > 1e-4f ? weighted / opacity : 0.f;
+        return opacity;
+    }
+
+    ProbeSignature beamProbeSignature(float3 origin, float3 w)
+    {
+        ProbeSignature g = {};
+        CutRay ray;
+        if (!makeCutRay(origin, w, gScene.getGridVolume(0), ray))
+            return g;
+        float3 tAt;
+        g.opacity = beamProbeExtinction(ray, float3(2.f), tAt, g.centroid, g.steps);
+        if (g.opacity <= 0.01f)
+            return g;
+        float centroid, steps;
+        beamProbeExtinction(ray, g.opacity * float3(0.25f, 0.5f, 0.75f), tAt, centroid, steps);
+        const float cellWidth = float(params.hstrCellWidth);
+        for (uint q = 0; q < 3; ++q)
+        {
+            const float tq = max(tAt[q], 0.f);
+            g.d[q] = ray.entryDistance + tq * ray.worldLength;
+            const float3 v = (ray.position + tq * ray.direction) * cellWidth;
+            const float footprint = rayFootprint(ray, tq);
+            CloudSample sample = {};
+            float fineVoxels = 1.f;
+            cameraExtinctionAtVoxel(v, footprint, fineVoxels, sample);
+            g.sun[q] = exp(-sunDepthAt(v, footprint, sample));
+            if (q == 1)
+                g.cache = dot(worldCacheRadiance(v, ray.viewDirection), float3(0.2126f, 0.7152f, 0.0722f));
+        }
+        return g;
+    }
+
+    float beamProbeRelative(float a, float b) { return abs(a - b) / max(max(abs(a), abs(b)), 1e-3f); }
+
+    /// Which signatures (bits, kBeamProbeSignatures) say the ray's transport is unchanged. Distances seen from the new camera are
+    /// moved by its displacement along w, which is where the old ray's plane through the same content lies.
+    uint beamProbeMatches(ProbeSignature o, ProbeSignature n, float shift)
+    {
+        const bool emptyBoth = o.opacity <= 0.01f && n.opacity <= 0.01f;
+        const float dOpacity = abs(o.opacity - n.opacity);
+        float centroid = 0.f;
+        float3 d = 0.f;
+        float3 sun = 0.f;
+        float cache = 0.f;
+        if (!emptyBoth)
+        {
+            centroid = beamProbeRelative(o.centroid, n.centroid + shift);
+            for (uint q = 0; q < 3; ++q)
+            {
+                d[q] = beamProbeRelative(o.d[q], n.d[q] + shift);
+                sun[q] = abs(o.sun[q] - n.sun[q]);
+            }
+            cache = beamProbeRelative(o.cache, n.cache);
+        }
+        const float dMax = max(d.x, max(d.y, d.z));
+        const float sunMax = max(sun.x, max(sun.y, sun.z));
+        const bool a = dOpacity <= 0.02f;
+        const bool c = a && dMax <= 0.02f;
+        const bool e = c && sunMax <= 0.02f && cache <= 0.02f;
+        const bool cLoose = dOpacity <= 0.05f && dMax <= 0.05f;
+        uint bits = 0;
+        bits |= a ? 1u : 0u;
+        bits |= (a && centroid <= 0.02f) ? 2u : 0u;
+        bits |= c ? 4u : 0u;
+        bits |= (c && sun.y <= 0.02f) ? 8u : 0u;
+        bits |= e ? 16u : 0u;
+        bits |= cLoose ? 32u : 0u;
+        bits |= (cLoose && sunMax <= 0.05f && cache <= 0.05f) ? 64u : 0u;
+        return bits;
+    }
+
+    /// The witness policies, as masks over a block's g lanes (per corners, then per centres): one centre, two opposite centres,
+    /// every centre, every ray, and the one or two rays whose OLD values were nearest (the most parallax per unit of motion) -
+    /// all of which a runtime knows before marching anything.
+    uint beamProbePolicyMask(uint policy, uint per, uint g, uint nearest, uint second)
+    {
+        const uint centres = ((1u << per) - 1u) << per;
+        if (policy == 0)
+            return 1u << per;
+        if (policy == 1)
+            return (1u << per) | (1u << (2u * per - 1u));
+        if (policy == 2)
+            return centres;
+        if (policy == 3)
+            return (1u << g) - 1u;
+        if (policy == 4)
+            return nearest < g ? 1u << nearest : 0u;
+        return (nearest < g ? 1u << nearest : 0u) | (second < g ? 1u << second : 0u);
+    }
+
+    /// Returns whether beamShadowCarry keeps this ray's old value (its block's policy accepted it).
+    bool beamProbeQuery(uint2 position, BeamSample fresh, bool march)
     {
         const float3 w = beamRayDirection(float2(position));
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
         const float3 exact = beamRadiance(fresh.cache, fresh.single, fresh.depth, w, albedo);
-        const bool scored = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 2)].y > 0.5f;
+        const bool scored = march && hstrBeamLatticeSnapshot[beamLatticeTexel(position, 2)].y > 0.5f;
         const float4 depthCache = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 0)];
         const float4 single = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 1)];
-        const bool inPlace = scored && beamProbeError(beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo), exact) <= 0.02f;
+        const float inPlaceError = beamProbeError(beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo), exact);
+        const bool inPlace = scored && inPlaceError <= 0.02f;
         bool reprojected = inPlace && !(single.a > 0.f);
         float2 moved;
         if (scored && beamProbeReproject(w, single.a, moved))
@@ -5874,6 +6527,122 @@ struct HSTRCloudRenderer
         const bool tight = scored && dOpacity <= 0.02f && dDistance <= 0.02f;
         const bool loose = scored && dOpacity <= 0.05f && dDistance <= 0.10f;
         beamProbeBlock(!scored || inPlace, tight || !scored, loose || !scored, scored, fresh.steps);
+        return beamProbeWitnesses(position, w, march, scored, inPlace, scored && inPlaceError <= 0.01f, fresh.steps, single.a);
+    }
+
+    /// MEASURED and REMOVED: the runtime witnessed carry this matrix priced (beamWitness; 4K OCT_T001 parallax 1, one settle,
+    /// witness6 / witness_split). A dirty block marched its witnesses first and kept every old value when all agreed within the
+    /// tolerance, otherwise a compacted dependent dispatch marched its other rays. Walk base 7.46 ms, four centres at 0.01 8.82
+    /// (query 2.92 -> 4.16 with the repair 1.67 of it), deferred repair 10.14 at 0.333% > 0.02 (base 0.136%): the rejected blocks'
+    /// stale rays failed their tiles and the unit march grew 3.42 -> 4.94. Sprint 9.27 -> 10.88 / 16.05. Even carrying EVERY block
+    /// (tolerance 1e9, a wrong image) only reached 6.10 ms: the witness pass alone cost 2.71 ms, so the query it attacks cannot fall
+    /// much below 2 ms this way and the 3.4 ms of units are untouched. The ceiling, not the implementation, rejected it: predicting
+    /// which old camera-ray results survive translation cannot reach the target; translation needs world-space transport.
+    /// The witness matrix: for every signature and policy, would observing only the policy's rays have carried the block, and was
+    /// the whole block within 0.02 in place (the exact oracle)? Counted in query steps the carry would have saved, with the steps
+    /// the witnesses' extinction marches would have cost. Every lane of the wave is active here (buildBeamDirtyQueries).
+    bool beamProbeWitnesses(uint2 position, float3 w, bool march, bool scored, bool inPlace, bool inPlaceTight, float steps, float oldDistance)
+    {
+        const uint rb = max(params.beamDirtyPointStride, 1u);
+        const uint per = rb * rb;
+        const uint g = per * 2u;
+        if (g > 32u || (32u % g) != 0u || params.beamCentreless != 0)
+            return false;
+        bool shadow = false;
+        uint matches = (1u << kBeamProbeSignatures) - 1u;
+        float witnessSteps = 0.f;
+        if (scored)
+        {
+            const uint2 cell = beamGuardCell(position);
+            const float3 oldCamera = hstrBeamGuardCameraSnapshot[cell].xyz;
+            const float3 camera = gScene.camera.data.posW;
+            const ProbeSignature o = beamProbeSignature(oldCamera, w);
+            const ProbeSignature n = beamProbeSignature(camera, w);
+            matches = beamProbeMatches(o, n, dot(camera - oldCamera, w));
+            // The witness marched in full and compared with its own old radiance, which the lattice already holds: the
+            // signature a runtime gets for no storage, since a block it rejects needs that march anyway.
+            matches |= inPlace ? (1u << 7) : 0u;
+            matches |= inPlaceTight ? (1u << 8) : 0u;
+            matches |= (inPlace && (matches & 16u) != 0) ? (1u << 9) : 0u;
+            witnessSteps = n.steps;
+        }
+        // A ray this build marches for the first time has no old value: its block cannot be carried under any policy.
+        const bool firstMarch = march && !scored;
+        const uint lane = WaveGetLaneIndex();
+        const uint start = lane - lane % g;
+        const uint local = lane % g;
+        const uint word = start / 32u;
+        const uint shift = start % 32u;
+        const uint groupMask = (g == 32u ? ~0u : ((1u << g) - 1u)) << shift;
+        const bool blockOk = (WaveActiveBallot(scored && !inPlace)[word] & groupMask) == 0;
+        const bool blockFresh = (WaveActiveBallot(firstMarch)[word] & groupMask) != 0;
+        const bool blockScored = (WaveActiveBallot(scored)[word] & groupMask) != 0;
+        // Nearest old values first; a ray that stored nothing (empty) goes after every ray that stored a distance, and a ray that
+        // was not scored is never a witness.
+        const float key = scored ? (oldDistance > 0.f ? oldDistance : 1e30f) : 3e38f;
+        uint nearest = g;
+        uint second = g;
+        float best = 3e38f;
+        float next = 3e38f;
+        for (uint k = 0; k < g; ++k)
+        {
+            const float other = WaveReadLaneAt(key, start + k);
+            if (other < best)
+            {
+                second = nearest;
+                next = best;
+                nearest = k;
+                best = other;
+            }
+            else if (other < next)
+            {
+                second = k;
+                next = other;
+            }
+        }
+        const uint s = blockScored ? uint(steps) : 0u;
+        uint acceptBits = 0;
+        for (uint sig = 0; sig < kBeamProbeSignatures; ++sig)
+        {
+            const uint failing = (WaveActiveBallot(scored && (matches & (1u << sig)) == 0)[word] & groupMask) >> shift;
+            for (uint policy = 0; policy < kBeamProbePolicies; ++policy)
+            {
+                const uint witnesses = beamProbePolicyMask(policy, per, g, nearest, second);
+                const bool accept = blockScored && !blockFresh && witnesses != 0 && (failing & witnesses) == 0;
+                const uint acceptSteps = WaveActiveSum(accept ? s : 0u);
+                const uint badSteps = WaveActiveSum(accept && !blockOk ? s : 0u);
+                if (WaveIsFirstLane())
+                {
+                    uint unused;
+                    const uint slot = kBeamProbeMatrix + 2u * (sig * kBeamProbePolicies + policy);
+                    InterlockedAdd(hstrBeamCounts[slot], acceptSteps, unused);
+                    InterlockedAdd(hstrBeamCounts[slot + 1], badSteps, unused);
+                }
+                for (uint j = 0; j < 3; ++j)
+                    if (sig == kBeamProbeAcceptSignatures[j] && accept)
+                        acceptBits |= 1u << (j * kBeamProbePolicies + policy);
+                // An accepted block keeps EVERY old value, its witnesses' too, even where they were marched in full: the next build
+                // must compare a witness with the value from the camera the carried rays came from, or a slow drift passes every
+                // per-frame check.
+                if (params.beamShadowCarry == 1u + sig * kBeamProbePolicies + policy)
+                    shadow = accept && scored;
+            }
+        }
+        // What the witnesses themselves would have marched: the extinction steps of each policy's rays, from this camera.
+        for (uint policy = 0; policy < kBeamProbePolicies; ++policy)
+        {
+            const bool witness = blockScored && (beamProbePolicyMask(policy, per, g, nearest, second) & (1u << local)) != 0;
+            const uint cost = WaveActiveSum(witness ? uint(witnessSteps) : 0u);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamProbeWitnessSteps + policy], cost, unused);
+            }
+        }
+        const uint marching = (WaveActiveBallot(march)[word] & groupMask) >> shift;
+        if (march && local == firstbitlow(marching))
+            hstrBeamProbeAccept[beamGuardCell(position)] = acceptBits;
+        return shadow;
     }
 
     /// Groups the dirty query's lanes by block (beamDirtyRay: rb * rb * passes consecutive rays) and counts whole blocks.
@@ -5928,7 +6697,7 @@ struct HSTRCloudRenderer
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        const BeamSample exact = marchBeamDirty(w);
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
@@ -6087,6 +6856,16 @@ struct HSTRCloudRenderer
         const uint packed = hstrBeamDirty[index];
         point = uint2(packed & 0xFFFFu, packed >> 16) * rb + uint2(local % rb, local / rb);
         return true;
+    }
+
+    /// beamShadowCarry: a block the probe carries is certified again from HERE, with its values left as they are. Leaving its guard
+    /// camera where the values came from instead kept it listed on every later build - it can never re-certify - so the dirty set
+    /// only grew (4K walk, shadow carry: 52k -> 117k blocks a build). Drift still cannot pass unseen: the lattice keeps the anchor's
+    /// values, so when this certificate expires the block is compared with those, not with anything written since.
+    void beamShadowCertify(uint2 cell)
+    {
+        hstrBeamGuardCamera[cell] = float4(gScene.camera.data.posW, 1.f);
+        beamGuardDropCoarse(cell);
     }
 
     void marchBeamAt(uint2 pixel)
@@ -7279,16 +8058,31 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #if HSTR_BEAM_DIRTY_SLICES == 0
     uint2 point;
     bool centre;
-    uint2 position;
-    if (!gHSTRCloud.beamDirtyRay(thread, point, centre) || !gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position))
+    uint2 position = 0;
+    const bool march = gHSTRCloud.beamDirtyRay(thread, point, centre) && gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position);
+#if HSTR_BEAM_REPAIR_PROBE
+    // The probe reads its block's other lanes, so every lane has to reach it.
+    BeamSample ray = {};
+    if (march)
+    {
+        ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+        if (!(1.f - exp(-ray.depth) > 1e-4f))
+            ray.distance = 0.f;
+    }
+    const bool shadowCarried = gHSTRCloud.beamProbeQuery(position, ray, march);
+    // beamShadowCarry: an accepted block keeps its old values and is certified from here, as a real carry would be.
+    if (march && !shadowCarried)
+        gHSTRCloud.beamQueryMarched(position, ray);
+    else if (shadowCarried)
+        gHSTRCloud.beamShadowCertify(gHSTRCloud.beamGuardCell(position));
+#else
+    if (!march)
         return;
-    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    BeamSample ray = gHSTRCloud.marchBeamDirty(gHSTRCloud.beamRayDirection(float2(position)));
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
-#if HSTR_BEAM_REPAIR_PROBE
-    gHSTRCloud.beamProbeQuery(position, ray);
-#endif
     gHSTRCloud.beamQueryMarched(position, ray);
+#endif
 #else
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
     const uint slice = thread % segments;
@@ -7345,6 +8139,72 @@ void writeBeamDirtyUnitArgs()
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
     gHSTRCloud.marchBeamDirtyListedUnit(foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// Cell views: the build dispatch's arguments, one group per queued cell.
+[numthreads(1, 1, 1)]
+void writeCellViewArgs()
+{
+    const uint queued = gHSTRCloud.hstrCellCounters[0];
+    gHSTRCloud.hstrCellArgs[0] = min(queued, gHSTRCloud.params.cellViewBuildCapacity);
+    gHSTRCloud.hstrCellArgs[1] = 1u;
+    gHSTRCloud.hstrCellArgs[2] = 1u;
+    gHSTRCloud.hstrBeamCounts[kCellViewRequests] += queued;
+}
+
+groupshared uint gCellViewSlot;
+groupshared uint gCellViewContent;
+
+/// Cell views: one group per queued cell builds its view, each thread a share of the texels. An unoccupied cell is flagged empty
+/// without marching (lookups skip those before they ask, so this only happens after the content changed).
+[numthreads(8, 8, 1)]
+void buildCellViews(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID, uint groupIndex: SV_GroupIndex)
+{
+    const uint index = groupId.x;
+    if (index >= min(gHSTRCloud.hstrCellCounters[0], gHSTRCloud.params.cellViewBuildCapacity))
+        return;
+    const int3 cell = gHSTRCloud.hstrCellBuild[index].xyz;
+    if (groupIndex == 0)
+    {
+        gCellViewSlot = gHSTRCloud.beginCellView(cell);
+        gCellViewContent = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint slot = gCellViewSlot;
+    if (slot == ~0u)
+        return;
+    const uint edge = gHSTRCloud.params.cellViewEdge;
+    bool content = false;
+    if (gHSTRCloud.hstrCellOccupancy.Load(int4(int3(gHSTRCloud.cellViewKey(float3(cell))), 0)) != 0u)
+    {
+        for (uint y = groupThreadId.y; y < edge; y += 8u)
+            for (uint x = groupThreadId.x; x < edge; x += 8u)
+                content = gHSTRCloud.buildCellViewTexel(cell, slot, uint2(x, y)) || content;
+    }
+    if (content)
+        InterlockedOr(gCellViewContent, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex == 0)
+        gHSTRCloud.endCellView(cell, slot, gCellViewContent != 0u);
+}
+
+/// Cell views: the occupancy of every domain cell, from the conservative maxima of its 27 voxels (rebuilt when content changes).
+[numthreads(4, 4, 4)]
+void buildCellOccupancy(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId >= gHSTRCloud.params.hstrExtinctionDims))
+        return;
+    bool occupied = false;
+    for (uint k = 0; k < 27u && !occupied; ++k)
+        occupied = gHSTRCloud.cellViewOccupied(int3(dispatchThreadId), k);
+    gHSTRCloud.hstrCellOccupancyOutput[dispatchThreadId] = occupied ? 1u : 0u;
+}
+
+/// Cell views: one thread per slot, unmapping the views of changed content.
+[numthreads(64, 1, 1)]
+void invalidateCellViews(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.invalidateCellView(dispatchThreadId.x);
 }
 
 groupshared uint gResidualMask[2]; ///< Which of the group's 64 pixels the residual resolve has to write.

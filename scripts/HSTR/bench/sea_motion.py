@@ -187,11 +187,15 @@ for motion, forward, yaw, *rest in MOTIONS:
                            "max": float(p["referenceLogMax"]), "marched": float(p["beamMarchedFraction"]),
                            "carriedPoints": int(s.get("beamCarriedPoints", 0)), "carriedPixels": int(s.get("beamCarriedPixels", 0)),
                            "marchTiles": int(s.get("beamMarchTiles", 0)), "debug": int(s.get("beamRefreshDebugCount", 0)),
-                           "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0))})
+                           "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0)),
+                           # cellViews: the scored frame's composition (0 with it off).
+                           "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
+                                                                                 "Built", "Steps")}})
         if not errors:  # HSTR_STEPS=0: timings and residency only.
             errors = [{"over02": 0.0, "p999": 0.0, "max": 0.0, "marched": 0.0, "carriedPoints": 0, "carriedPixels": 0, "marchTiles": 0,
                        "debug": 0, "marchedSteps": 0, "carriedSteps": 0}]
-        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0]}
+        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k != "cell"}
+        cell = errors[-1].get("cell", {})
         worst = max(e["over02"] for e in errors)
         with open(f"{OUT}/{TAG}_test.jsonl", "a") as f:
             f.write(json.dumps({"motion": motion, "test": test, "gpu": t, "errors": errors}) + "\n")
@@ -203,5 +207,5 @@ for motion, forward, yaw, *rest in MOTIONS:
             f">0.02 mean {100 * mean['over02']:.3f}% worst {100 * worst:.3f}%, p99.9 {mean['p999']:.2e}, max {max(e['max'] for e in errors):.2e}"
             f"; sea tiles changed before steps {tilesBeforeSteps}, by step {tilesPerStep}"
             f", invalidating builds {int(stats().get('beamInvalidatedBuilds', 0)) - invalidatedAtStart}"
-            f", per-step >0.02 {[round(100 * e['over02'], 3) for e in errors]}")
+            f", per-step >0.02 {[round(100 * e['over02'], 3) for e in errors]}" + (f"; cell views (last step) {cell}" if cell.get("Rays") else ""))
 exit()

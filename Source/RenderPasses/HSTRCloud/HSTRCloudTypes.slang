@@ -20,7 +20,17 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 60;
+static const uint kBeamCountSlots = 248;
+/// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
+/// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
+static const uint kCellViewRays = 240;
+static const uint kCellViewHits = 241;
+static const uint kCellViewEmptyHits = 242;
+static const uint kCellViewExact = 243;
+static const uint kCellViewCells = 244;
+static const uint kCellViewRequests = 245;
+static const uint kCellViewBuilt = 246;
+static const uint kCellViewSteps = 247;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -37,6 +47,18 @@ static const uint kBeamProbeDivergence = 48;
 /// scored blocks; then for a tight and a loose current-view geometry signature (every ray's opacity and opacity-weighted
 /// distance unchanged within a bound), the steps of the blocks it would accept and of those it would accept wrongly.
 static const uint kBeamProbeBlocks = 52;
+/// beamRepairProbe witness matrix (beamProbeWitnesses): per signature (kBeamProbeSignatures: opacity; + centroid; + d25/d50/d75;
+/// + sun at d50; + sun at all three and cache at d50; the third and fifth again at 0.05 / 5%; the witness's own full march within
+/// 0.02 of its old radiance, within 0.01, and within 0.02 with the fifth) and policy (kBeamProbePolicies: one centre, two, four, all
+/// eight, nearest old value, nearest two), query steps accepted and accepted wrongly; then each policy's witness steps; then, for
+/// the signatures in kBeamProbeAcceptSignatures, the units' steps in accepted blocks and of those the ones within 0.02 kept in
+/// place, and kept or reprojected.
+static const uint kBeamProbeSignatures = 10;
+static const uint kBeamProbePolicies = 6;
+static const uint kBeamProbeMatrix = 60;
+static const uint kBeamProbeWitnessSteps = 180; // kBeamProbeMatrix + 2 * signatures * policies
+static const uint kBeamProbeUnitAccept = 186;   // kBeamProbeWitnessSteps + policies; 3 signatures x 6 policies x 3
+static const uint kBeamProbeAcceptSignatures[3] = { 4, 7, 9 };
 static const uint kBeamSparseRoots = 7;
 static const uint kBeamSparseEmpty = 8;
 static const uint kBeamSparseCandidates = 9;
@@ -293,6 +315,21 @@ struct HSTRCloudStaging
     uint transform; ///< CloudFormat.h kTransform*.
     uint brick;     ///< GPU brick index (its occupancy in hstrCloudOccupancy).
 };
+
+/// One cached cell view (cellViews): the transfer of a domain cell [cell, cell + 1)^3 (voxel coordinates, voxel i centred at i) as
+/// seen from camera, on a cellViewEdge^2 texel grid over the cell's projection. See composeBeam.
+struct CellView
+{
+    float3 camera; ///< Build camera, voxel coordinates.
+    float bandLow; ///< Camera distances (voxels, to the cell centre) over which the cell's density level and fade still hold.
+    int3 cell;     ///< The cell, unwrapped (the map is indexed by its wrap into the domain).
+    float bandHigh;
+    uint flags;    ///< kCellViewEmpty.
+    uint frame;    ///< cellViewFrame it was built in, plus one (0: never built).
+    float fade;    ///< The sea's distance fade at the build distance.
+    uint pad;
+};
+static const uint kCellViewEmpty = 1; ///< Nothing in the cell reaches the camera: no transmittance lost, no light.
 
 struct HSTRCloudParams
 {
@@ -1243,6 +1280,29 @@ struct HSTRCloudParams
     uint beamInvalidateCount = 0;
     /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
     uint cloudSunAncestors = kCloudSunAncestors;
+    /// PROBE (beamRepairProbe only): 1 + signature * kBeamProbePolicies + policy makes the dirty query keep the OLD lattice values of
+    /// every block that witness policy would have carried, while still marching them all, so the image shows what the carry would
+    /// cost before anything is skipped. A carried block keeps its old values and is certified from the current camera
+    /// (beamShadowCertify). 0: off.
+    uint beamShadowCarry = 0;
+    /// Cell views: the dirty query and the dirty unit march compose each ray from cached per-cell views of its transfer (a world-
+    /// space transport cache, keyed by domain cell, each view seen from the camera that built it) instead of marching it; a cell
+    /// without a usable view is marched exactly along its chord and queued for a build. 0: off. See composeBeam.
+    uint cellViews = 0;
+    uint cellViewEdge = 16;          ///< Texels along each side of a view.
+    uint cellViewCapacity = 16384;   ///< Views the atlas holds (a ring: a build takes the oldest slot).
+    uint cellViewBuildCapacity = 4096; ///< Builds one frame may queue.
+    /// Lateral misregistration a view may accumulate before it is marched instead, in voxels: the camera's movement across the
+    /// ray, over the distance to the build camera, times half the chord. Past half of it a view is still used and rebuilt.
+    float cellViewDrift = 0.05f;
+    uint cellViewMaxAge = 256;       ///< Frames after which a view is rebuilt (cache and lighting changes it does not see).
+    uint cellViewFrame = 0;          ///< Advances every frame that composes.
+    uint cellViewSlotsPerRow = 1;    ///< Views per atlas row.
+    float cellViewAtlasInvWidth = 0.f; ///< Scalars, not a float2: see beamCoarseShift on mid-row vectors.
+    float cellViewAtlasInvHeight = 0.f;
+    uint cellViewRefine = 1;         ///< Second lookup at the chord's opacity centroid (1) or only at its midpoint (0).
+    /// DEBUG: 1 marches the whole ray in one call (composeBeam's own march), 2 splits it at cells but marches the zero blocks too.
+    uint cellViewDebug = 0;
 };
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
