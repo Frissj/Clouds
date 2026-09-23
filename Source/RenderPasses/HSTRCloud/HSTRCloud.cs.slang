@@ -4868,6 +4868,15 @@ struct HSTRCloudRenderer
     /// (exact emission behind a wrong transmittance), constant source 10.2%, linear 7.0%, trilinear emission 6.3%; views 2.7%;
     /// the gate is 0.137%. Evaluating is also 2.5-6.8 ms against 1.09 for the exact march of the same directions. A node at domain-
     /// voxel resolution is too coarse for the density this renderer shows; a node fine enough is the bricks themselves.
+    ///
+    /// MEASURED and REJECTED, offline (scripts/HSTR/bench/spectral_fit.py): a node carrying spectral extinction (a few oriented
+    /// harmonics / Gabor-like modes over a macro-node, integrated analytically along the chord) instead of sampled points. On the
+    /// bench cloud's true level-0 density (cumulus_1_size_1, 22 source voxels a domain voxel), 160 occupied nodes x 96 chords per
+    /// shape, best-M terms kept, every chord within |dT| tol: an 8^3 node (512 dof, 0.7-1.4 domain voxels) needs a median 128-256
+    /// DCT / 64-128 Haar terms at 0.02 and 256-512 at 0.005; 16^3 and larger (the macro-nodes meant to coarsen the push) fail even at
+    /// 2048 terms; plane waves (the proposed cos(w.x + phi) mode) do worse than both. Per crossing, 8 terms barely beat 1 (a
+    /// constant): L1 8^3 over 0.02 28.8% at M = 1, 20.9% at 8, 8.0% at 64. The fine density is broadband inside a node; no choice of
+    /// basis makes it few coefficients. Only the analytic integral itself holds (Epanechnikov x cosine closed form, 1e-12).
     void buildPushOperator(uint thread)
     {
         const uint slot = thread / 27u;
