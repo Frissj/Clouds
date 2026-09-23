@@ -304,7 +304,7 @@ private:
     ref<ComputePass> mpBeamDirtyQueryPass;
     ref<ComputePass> mpBeamDirtyMarchPass;
     ref<ComputePass> mpBeamDirtyUnitArgsPass;
-    // Cell views (cellViews): the dirty passes compose rays from cached per-cell views of the transfer (composeBeam).
+    // Cell views (cellViews): cached per-cell views of the transfer. No reader since composeBeam's removal.
     bool mCellViews = false;
     bool mCellViewsClear = true;           ///< The map and the views must be emptied before the next use.
     uint32_t mCellViewFrame = 0;
@@ -325,6 +325,47 @@ private:
     ref<ComputePass> mpCellInvalidatePass;
     /// Creates (or re-creates, on a size change) the cell view resources, empties them when asked, and sets their parameters.
     void ensureCellViews(RenderContext* pRenderContext);
+    /// Creates the cell occupancy, rebuilds it when the domain changed, and relists the occupied cells for beamPushProbe.
+    void ensureCellOccupancy(RenderContext* pRenderContext);
+    // beamPushProbe: occupied world cells projected into BeamTiles, counted and binned, no radiance (see projectPushCell).
+    bool mPushProbe = false;
+    bool mPushEval = false;        ///< Also consume the lists at sample directions (needs cellViews); see evaluatePushSample.
+    ref<Buffer> mpPushSamples;
+    ref<Buffer> mpPushSlotKeys;    ///< Per visible cell: its packed key (the lists hold slots).
+    ref<Buffer> mpPushOps;         ///< Per visible cell: its operator, 27 uint4 (buildPushOperator).
+    ref<ComputePass> mpPushOpsPass;
+    ref<ComputePass> mpPushEvalPass;
+    ref<ComputePass> mpPushComparePass;
+    /// pushShare: after the dirty passes, count what the push lists' cell x tile interactions could share (see countPushShare).
+    bool mPushShare = false;
+    ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
+    ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
+    ref<Buffer> mpPushShareAges;    ///< Per list entry: the temporal oracle's worst crossing error per age.
+    float3 mPushShareCamera = float3(0.f);
+    float3 mPushShareMotion = float3(0.f);
+    ref<ComputePass> mpPushShareCountPass;
+    ref<ComputePass> mpPushShareHistogramPass;
+    void runPushShare(RenderContext* pRenderContext);
+    ref<Buffer> mpPushCandidates;  ///< Occupied domain cells, packed keys (hstrPushCandidates).
+    ref<Buffer> mpPushCandidateCount; ///< [0] cells listed, [1] of them with density of their own.
+    ref<Buffer> mpPushArgs;        ///< [0..2] the projection's dispatch, [3..5] the scatter's, [6..8] the sort's.
+    ref<Buffer> mpPushPieces;      ///< This frame's projected octant pieces: cell key and tile rectangle.
+    ref<Buffer> mpPushTileCounts;  ///< Per tile: cells binned; then the running cursor of the scatter.
+    ref<Buffer> mpPushTileOffsets; ///< Per tile: first entry of its list.
+    ref<Buffer> mpPushList;        ///< The tiles' cell lists, compact.
+    ref<Buffer> mpPushCounts;      ///< kPush* counters; [kPushCountSlots] pieces appended, [+1] list entries allocated.
+    ref<Buffer> mpPushSortTiles;   ///< Tiles holding two or more cells, for the sort's dispatch.
+    ref<ComputePass> mpPushListPass;
+    ref<ComputePass> mpPushArgsPass;
+    ref<ComputePass> mpPushSortArgsPass;
+    ref<ComputePass> mpPushProjectPass;
+    ref<ComputePass> mpPushAllocatePass;
+    ref<ComputePass> mpPushScatterPass;
+    ref<ComputePass> mpPushSortPass;
+    bool mPushCandidatesDirty = true;
+    uint32_t mPushListings = 0;    ///< Candidate listings, cumulative (one per content change).
+    /// Runs the probe for this frame's camera (beam view, octahedral image, cloud sea).
+    void runPushProbe(RenderContext* pRenderContext);
     ref<Texture> mpBeamDirtyMark;  ///< Per guard block: its first dirty-list slot this build (hstrBeamDirtyMark).
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.

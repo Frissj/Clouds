@@ -65,6 +65,29 @@ Run from the Falcor root with PowerShell:
 cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul 2>nul && "C:\packman-repo\chk\cmake\3.24.1+nv3-windows-x86_64\bin\cmake.exe" --build "C:\Users\Friss\Documents\Falcor\build\windows-ninja-msvc" --config Release --target HSTRCloud 2>&1' | Select-String -Pattern "error|FAILED|Linking" | Select-Object -First 10
 ```
 
+## Nsight Systems (GPU metrics) - the ONLY way to do it
+
+```bash
+python scripts/HSTR/bench/run_sea.py motion TAG scripts/HSTR/bench/sweeps/oct_ship.py --steps 0 --motions "walk 2 0.004" --nsys
+```
+
+- Any sweep and motions work; `--steps 0` skips the scored steps. Mogwai runs under `nsys launch` (API tracing armed, nothing
+  recorded); sea_motion.py sends `nsys start` (GPU metrics) right before each arm's 48-frame timed flight and `nsys stop` right
+  after, so there is one small report per arm x motion: `HSTR_results/nsight/TAG_<motion>_<arm>.nsys-rep`. Never capture the
+  whole run (the settle is not the question). A capture finishes within seconds of its stop: if nsys is still busy minutes
+  later it is hung, not importing. Log `HSTR_results/TAG.log`.
+  Run it in the background once; you are notified when it exits. Do not poll.
+- Mogwai is always `--headless`. `nsys.exe` is set to run as administrator in its compatibility settings (GPU metrics need admin).
+  Windows only starts such an exe through ShellExecute: `subprocess`/CreateProcess fails with WinError 740. `--nsys` therefore
+  re-runs `run_sea.py` elevated (ShellExecuteEx "runas" on pythonw.exe) and waits; the elevated copy sets the HSTR_* environment
+  itself, starts nsys with CREATE_NO_WINDOW, and everything under it is elevated. No window may appear: a console program started
+  through ShellExecute gets a console window even with SW_HIDE (Windows Terminal ignores it), hence pythonw + CREATE_NO_WINDOW. Do not use ProfileNsight.ps1, PowerShell, a .vbs wrapper, or a UAC helper of your own.
+- Read it: `python scripts/HSTR/bench/nsys_export.py <report>.nsys-rep` (nsys needs admin for export too; the script elevates the
+  same way) writes `<report>.sqlite` in seconds. FALCOR_PROFILE scopes are GPU ranges in DX12_WORKLOAD (textId -> StringIds, e.g.
+  `query`, `units`, `resolve`); GPU_METRICS (names in TARGET_INFO_GPU_METRICS) averaged over those ranges gives SMs Active, SM
+  Issue, Compute Warps in Flight, Unallocated Warps, DRAM Read/Write. GPU metrics inflate frame time (walk 7.5 -> 11.0 ms): compare
+  ratios, not milliseconds.
+
 When I say commit, you fucking commit on the spot instantly without hesitation unless I give additional instructions. What I say goes. 
 
 DO NOT MONITOR THE LOGS OF RUNNING BUILDS IN THE BACKGROUND, THIS USES UP MY TOKENS AND THEREFORE MY MONEY WHICH IS BOLD OF YOU TO DO WITHOUT MY PERMISSION. WHEN THE RUNNING TASK FINISHES, YOU AUTOMATICALLY GET AN UPDATE ANYWAY SO JUST SHUT UP AND STOP RUNNING IN THE BACKGROUND TO PRESERVE TOKENS.

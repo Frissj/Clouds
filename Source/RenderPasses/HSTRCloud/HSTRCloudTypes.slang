@@ -316,8 +316,8 @@ struct HSTRCloudStaging
     uint brick;     ///< GPU brick index (its occupancy in hstrCloudOccupancy).
 };
 
-/// One cached cell view (cellViews): the transfer of a domain cell [cell, cell + 1)^3 (voxel coordinates, voxel i centred at i) as
-/// seen from camera, on a cellViewEdge^2 texel grid over the cell's projection. See composeBeam.
+/// One cached cell view (cellViews): the transfer of a domain cell [cell - 0.5, cell + 0.5)^3 (voxel coordinates, voxel i centred
+/// at i) as seen from camera, on a cellViewEdge^2 texel grid over the cell's projection. See buildCellViewTexel.
 struct CellView
 {
     float3 camera; ///< Build camera, voxel coordinates.
@@ -1285,9 +1285,9 @@ struct HSTRCloudParams
     /// cost before anything is skipped. A carried block keeps its old values and is certified from the current camera
     /// (beamShadowCertify). 0: off.
     uint beamShadowCarry = 0;
-    /// Cell views: the dirty query and the dirty unit march compose each ray from cached per-cell views of its transfer (a world-
-    /// space transport cache, keyed by domain cell, each view seen from the camera that built it) instead of marching it; a cell
-    /// without a usable view is marched exactly along its chord and queued for a build. 0: off. See composeBeam.
+    /// Cell views: a world-space transport cache keyed by domain cell, each view the cell's transfer seen from the camera that built
+    /// it. Its only reader, the per-ray composeBeam, was removed as the wrong architecture (see the note where it was), so nothing
+    /// requests builds now; the structures stay for a projected cell x BeamTile consumer. 0: off.
     uint cellViews = 0;
     uint cellViewEdge = 16;          ///< Texels along each side of a view.
     uint cellViewCapacity = 16384;   ///< Views the atlas holds (a ring: a build takes the oldest slot).
@@ -1301,9 +1301,136 @@ struct HSTRCloudParams
     float cellViewAtlasInvWidth = 0.f; ///< Scalars, not a float2: see beamCoarseShift on mid-row vectors.
     float cellViewAtlasInvHeight = 0.f;
     uint cellViewRefine = 1;         ///< Second lookup at the chord's opacity centroid (1) or only at its midpoint (0).
-    /// DEBUG: 1 marches the whole ray in one call (composeBeam's own march), 2 splits it at cells but marches the zero blocks too.
-    uint cellViewDebug = 0;
+    /// PROBE (beamPushProbe): the push architecture's work count, with no radiance. Every occupied domain cell (hstrPushCandidates,
+    /// listed when the occupancy changes) is culled, projected once into the octahedral beam image and appended to the list of
+    /// every pushTileSize^2 beam-texel tile its projection overlaps that the screen can see. See projectPushCell.
+    uint pushTileSize = 16;
+    /// Distance shells: 0 bins every cell at pushTileSize. Otherwise a cell nearer than pushShellDistance / 2^(k-1) voxels is binned
+    /// at tiles of pushTileSize << k (k < pushShells), so that it spans about two tiles of its shell whatever its distance.
+    uint pushShells = 0;
+    float pushShellDistance = 0.f;
+    uint pushTileTotal = 0;          ///< Tiles over every shell's grid.
+    /// pushEval: one sample direction per pushSampleStep^2 beam texels over the screen's box, from sample (origin + i + 0.5) * step.
+    uint pushSampleStep = 8;
+    uint pushSampleOriginX = 0;
+    uint pushSampleOriginY = 0;
+    uint pushSampleDimsX = 0;
+    uint pushSampleDimsY = 0;
+    /// pushEval's cell payload: 0 cell views; else the cell operator (buildPushOperator) with 1 its extinction and the exact source
+    /// of the chord (an oracle), 2 a constant source, 3 a linear source, 4 trilinear emission. See evaluatePushSample.
+    uint pushEvalMode = 0;
+    uint pushSlotCapacity = 0;       ///< Visible cells a frame can hold operators for (hstrPushSlotKeys).
+    uint pushCandidateCapacity = 0;
+    uint pushPieceCapacity = 0;
+    uint pushListCapacity = 0;
+    uint pushDilate = 0;             ///< Candidates: cells within this many cells of an occupied one (see listPushCandidate).
+    uint pushShareMode = 2;          ///< countPushShare's oracles: 1 the payloads (experiments 2, 3), 2 the temporal one (4).
+    float pushShareMotionX = 0.f;    ///< The camera's last displacement per frame (world), for the temporal oracle's ages.
+    float pushShareMotionY = 0.f;
+    float pushShareMotionZ = 0.f;
 };
+/// beamPushProbe counters (hstrPushCounts).
+static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
+static const uint kPushCandidatesOwn = 1;  ///< Of those, cells whose own voxel holds density.
+static const uint kPushCulledDistance = 2; ///< Past the sea's view distance (its fade is zero there).
+static const uint kPushCulledFrustum = 3;  ///< Bounding sphere outside the view frustum.
+static const uint kPushVisible = 4;        ///< Cells projected.
+static const uint kPushNear = 5;           ///< Cells the camera is inside or touching (their projection is the whole screen).
+static const uint kPushPieces = 6;         ///< Octant pieces projected (a cell spanning the camera's axis planes splits).
+static const uint kPushOverlaps = 7;       ///< Cell x tile pairs binned (on-screen tiles, pieces deduplicated).
+static const uint kPushRectTiles = 8;      ///< Four: overlaps a cell's projected box would have at tiles of 4, 8, 16, 32 texels.
+static const uint kPushMaxPerCell = 12;
+static const uint kPushTilesNonEmpty = 13;
+static const uint kPushMaxPerTile = 14;
+static const uint kPushTilesOnScreen = 15;
+static const uint kPushDropped = 16;       ///< Overlaps or pieces beyond the capacities (the counts above still include them).
+static const uint kPushNearOverlaps = 17;  ///< Overlaps of cells nearer than 8 voxels.
+static const uint kPushMidOverlaps = 18;   ///< Overlaps of cells between 8 and 32 voxels.
+static const uint kPushHistCell = 20;      ///< 32 bins: cells by floor(log2(overlaps)) + 1 (bin 0: none).
+static const uint kPushHistTile = 52;      ///< 32 bins: on-screen tiles by floor(log2(cells)) + 1.
+static const uint kPushHistDistance = 84;  ///< 16 bins: visible cells by floor(log2(camera distance in voxels)) + 1.
+static const uint kPushMinDistance = 100;  ///< ~asuint of the nearest visible cell's distance in voxels (0: none), by InterlockedMax.
+static const uint kPushSortOverflow = 101; ///< Tiles with more cells than a sort group holds (kPushSortMax), left unsorted.
+static const uint kPushSortMax = 1024;
+static const uint kPushMaxShells = 16;
+static const uint kPushShellCells = 102;    ///< Per shell: cells binned there.
+static const uint kPushShellOverlaps = 118; ///< Per shell: their overlaps.
+static const uint kPushSortTiles = 134;     ///< Tiles with two or more cells, listed for the sort.
+/// pushEval (evaluatePushSample, comparePushSample), per build: samples evaluated; list entries they read; cells their ray crossed
+/// (a chord), composited from a view, of those empty, and marched as residual chords, with the residual's march steps; samples that
+/// went opaque before their lists ended; views requested; samples with any residual chord. Against the exact march of the same
+/// direction: samples over 0.02 in log(1 + radiance) (any channel) and in transmittance, the sum of the log error x 1e4, its
+/// maximum (asuint), and the exact march's steps.
+static const uint kPushEvalSamples = 135;
+static const uint kPushEvalEntries = 136;
+static const uint kPushEvalCrossed = 137;
+static const uint kPushEvalViewHits = 138;
+static const uint kPushEvalViewEmpty = 139;
+static const uint kPushEvalResidual = 140;
+static const uint kPushEvalResidualSteps = 141;
+static const uint kPushEvalTerminated = 142;
+static const uint kPushEvalRequests = 143;
+static const uint kPushEvalResidualSamples = 144;
+static const uint kPushEvalOver02 = 145;
+static const uint kPushEvalOverT = 146;
+static const uint kPushEvalErrorSum = 147;
+static const uint kPushEvalErrorMax = 148;
+static const uint kPushEvalExactSteps = 149;
+static const uint kPushSlotsDropped = 150; ///< Visible cells past pushSlotCapacity (not binned at all).
+static const uint kPushCountSlots = 151;   ///< Then [+0] pieces, [+1] list entries, [+2] visible slots.
+/// pushShare (countPushShare, histogramPushShare), per frame: the dirty query points listed (over capacity too), the dirty units;
+/// rays walked, those that went opaque, their list crossings and the march steps inside them, and the same rays' exact march steps
+/// (what the crossings must account for). Per shell: the cell x tile interactions some dirty ray crossed, their crossings, their
+/// steps. And interactions by floor(log2(rays crossing it)), with the steps inside them (the cost-weighted distribution).
+static const uint kPushShareQueries = 155;
+static const uint kPushShareUnits = 156;
+static const uint kPushShareRays = 157;
+static const uint kPushShareOpaque = 158;
+static const uint kPushShareCrossings = 159;
+static const uint kPushShareSteps = 160;
+static const uint kPushShareExactSteps = 161;
+static const uint kPushShareShell = 162;     ///< 16 shells x (interactions, crossings, steps).
+static const uint kPushShareHistCount = 210; ///< 16 bins.
+static const uint kPushShareHistSteps = 226; ///< 16 bins.
+/// The same rays marched whole with the chords' marcher: its steps; rays whose chord composite differs from it by over 0.02 in
+/// transmittance, and in log(1 + radiance); the optical depth it holds beyond the chords' (clamped to [0, 10]) and in total, x 1000.
+static const uint kPushShareFullSteps = 242;
+static const uint kPushShareOverT = 243;
+static const uint kPushShareOver02 = 244;
+static const uint kPushShareDepthMissing = 245;
+static const uint kPushShareDepthTotal = 246;
+/// Rays off screen (the guard's reach), those of them over 0.02 in transmittance, and the rays over it by floor(log2(voxels to the
+/// whole march's opacity centroid)) + 1.
+static const uint kPushShareOffscreen = 247;
+static const uint kPushShareOffscreenOverT = 248;
+static const uint kPushShareMissDistance = 249; ///< 16 bins.
+/// Experiment 2, per payload variant (0: each ray's own chords marched alone; r > 0: a lattice of (2^(r-1) + 1)^2 chords per tile,
+/// read bilinearly), against the chords' composite: rays over 0.02 in log radiance and in transmittance, the error sum x 1e4, and
+/// the lattice chords' steps (four a crossing, so per interaction it is (2^(r-1) + 1)^2 / 4 of the crossings' mean).
+static const uint kPushSharePayloads = 5;
+static const uint kPushSharePayloadOver02 = 265;
+static const uint kPushSharePayloadOverT = 270;
+static const uint kPushSharePayloadErrorSum = 275;
+static const uint kPushSharePayloadSteps = 280;
+static const uint kPushSharePayloadResidual = 285; ///< Crossings no lattice corner's ray meets the cell for (the ray's own chord).
+/// Experiment 3, per payload (3^2, 5^2) and tolerance (0.005, 0.01, 0.02): interactions whose every crossing is within it, and
+/// their chord steps.
+static const uint kPushShareSafe = 290;
+static const uint kPushShareDepthExtra = 302; ///< Optical depth the chords hold beyond the whole march's, x 1000.
+static const uint kPushShareOverTMore = 303;  ///< Of kPushShareOverT, the rays whose chords are the more transparent (depth missed).
+/// Experiment 4, the temporal oracle (pushShareMode 2), per cache (the old ray through the chord's midpoint 1 frame old; that ray
+/// snapped to its beam texel's centre 1 and 4 frames old - see countPushShare) and tolerance (0.005, 0.01, 0.02): interactions
+/// whose every crossing the cached exact result answers, and their chord steps; the chord steps of the crossings it answers; and
+/// rays whose composite of reused crossings is over 0.02, per age.
+static const uint kPushShareAgeSafe = 304;           ///< 18: per age, per tolerance, interactions then steps.
+static const uint kPushShareAgeCrossingSteps = 322;  ///< 9: per age, per tolerance.
+static const uint kPushShareAgeOver02 = 331;         ///< 3.
+static const uint kPushShareEntriesDropped = 334;    ///< Crossings of list entries past the share buffers.
+/// The snapped caches (1, 4 frames): crossings by how far the snapped ray passes from the chord's midpoint, in fine voxels, bin
+/// floor(2 log2(offset)) + 32 (clamped to 0-47, so bin 32 starts at one fine voxel); and the largest offset (asuint).
+static const uint kPushShareSnapOffsets = 335; ///< 2 x 48.
+static const uint kPushShareSnapMax = 431;     ///< 2.
+static const uint kPushCountTotal = 433;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and

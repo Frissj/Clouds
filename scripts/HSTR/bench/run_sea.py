@@ -28,9 +28,16 @@ parser.add_argument("--live", action="store_true", help="leave residency running
 parser.add_argument("--spp", type=int, default=256, help="path-traced reference samples (truth harness)")
 parser.add_argument("--components", default="15", help="comma-separated hstComponents masks, one config each (ab harness)")
 parser.add_argument("--views", default="sea", help="comma-separated views of ab_test.py: near, farside, sea (ab harness)")
+parser.add_argument("--nsys", action="store_true",
+                    help="wrap the headless Mogwai in Nsight Systems with GPU metrics; report at HSTR_results/nsight/TAG.nsys-rep "
+                         "(nsys.exe is set to run as administrator in its compatibility settings, which GPU metrics need)")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
+from elevate import NSYS, elevate, run_hidden  # noqa: E402
+
+if args.nsys:
+    elevate(__file__, ROOT)  # nsys needs admin; see elevate.py. Mogwai stays --headless.
 from sea_config import REFERENCE  # noqa: E402
 
 tests = runpy.run_path(args.sweep)["TESTS"]
@@ -53,8 +60,17 @@ else:
     env.update(HSTR_STEPS=str(args.steps), HSTR_FREEZE="0" if args.live else "1")
     script = "scripts/HSTR/bench/sea_motion.py"
 log = RESULTS / f"{args.tag}.log"
+command = [str(MOGWAI), "--headless", f"--script={script}"]
+if args.nsys:
+    # Mogwai starts under `nsys launch`, which traces nothing until told: sea_motion.py sends `nsys start` just before each timed
+    # flight and `nsys stop` after it, so each report holds that flight's frames and not the ~1,200-frame settle (a whole-run
+    # capture with GPU metrics was an 807 MB stream that took 20 GB and many minutes to import).
+    (RESULTS / "nsight").mkdir(exist_ok=True)
+    session = f"hstr_{args.tag}"
+    env.update(HSTR_NSYS=NSYS, HSTR_NSYS_SESSION=session, HSTR_NSYS_OUTPUT=str(RESULTS / "nsight" / args.tag))
+    command = [NSYS, "launch", f"--session-new={session}", "--trace=dx12,dx12-annotations,nvtx", "--wait=all"] + command
 with open(log, "w") as f:
-    subprocess.run([str(MOGWAI), "--headless", f"--script={script}"], cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
+    (run_hidden if args.nsys else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
 errors = [line for line in open(log, errors="replace") if "(Error)" in line or "Exception" in line or "Error when loading" in line or "RuntimeError" in line]
 if errors:
     print("".join(errors[:5]))

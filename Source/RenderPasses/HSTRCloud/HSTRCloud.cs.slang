@@ -36,8 +36,8 @@ import HSTRCloudTypes;
 #ifndef HSTR_BEAM_REPAIR_PROBE
 #define HSTR_BEAM_REPAIR_PROBE 0
 #endif
-#ifndef HSTR_CELL_VIEWS
-#define HSTR_CELL_VIEWS 0 // Nonzero (cellViews, set by the host on the dirty passes): dirty rays compose from cell views (composeBeam).
+#ifndef HSTR_PUSH_SHARE
+#define HSTR_PUSH_SHARE 0 // The dirty query lists the points it marches for countPushShare.
 #endif
 #define SHIP_BIT_cloudTransferClasses 1
 #define SHIP_BIT_cloudCostProbe 2
@@ -378,7 +378,7 @@ struct HSTRCloudRenderer
     /// policies that would have carried it (kBeamProbeAcceptSignatures), for the unit march to score its residual against.
     Texture2D<float4> hstrBeamGuardCameraSnapshot;
     RWTexture2D<uint> hstrBeamProbeAccept;
-    /// Cell views (cellViews, see composeBeam): per domain cell (wrapped into the domain), its view's slot plus one (0: none); per
+    /// Cell views (cellViews, see buildCellViewTexel): per domain cell (wrapped into the domain), its view's slot plus one (0: none); per
     /// cell, the cellViewFrame + 1 it was last queued for a build in; the views; their texels in an atlas of cellViewEdge^2 tiles,
     /// (cache rgb, transmittance) and (single rgb, opacity centroid as a fraction of the chord); the cells queued this frame, how
     /// many, the ring cursor that hands out slots, and the build dispatch's arguments.
@@ -387,6 +387,29 @@ struct HSTRCloudRenderer
     /// Per domain cell: 1 where a sample inside it can read density (any of its 27 voxels has a nonzero conservative maximum).
     Texture3D<uint> hstrCellOccupancy;
     RWTexture3D<uint> hstrCellOccupancyOutput;
+    /// beamPushProbe (see projectPushCell): the occupied cells and how many ([0] listed, [1] of them with density of their own);
+    /// this frame's projected pieces (cell key, first and past-last tile, the cell's first piece and shell << 27); per tile of
+    /// every shell its count and then scatter cursor, and its list offset; the tiles to sort; the lists; counters; the indirect
+    /// arguments (projection, scatter, sort).
+    RWStructuredBuffer<uint> hstrPushCandidates;
+    RWStructuredBuffer<uint> hstrPushCandidateCount;
+    RWStructuredBuffer<uint4> hstrPushPieces;
+    RWStructuredBuffer<uint> hstrPushTileCounts;
+    RWStructuredBuffer<uint> hstrPushTileOffsets;
+    RWStructuredBuffer<uint> hstrPushSortTiles;
+    RWStructuredBuffer<float4> hstrPushSamples; ///< pushEval: per sample, the composited radiance and transmittance (a < 0: none).
+    /// Per visible cell (the slot the lists hold): its packed key; and its operator, 27 points of packed halves (sigma, sun
+    /// emission rgb, cache emission rgb), see buildPushOperator.
+    RWStructuredBuffer<uint> hstrPushSlotKeys;
+    RWStructuredBuffer<uint4> hstrPushOps;
+    RWStructuredBuffer<uint> hstrPushList;
+    RWStructuredBuffer<uint> hstrPushCounts;
+    RWStructuredBuffer<uint> hstrPushArgs;
+    /// pushShare: the lattice points the dirty query marched this frame (packed beam position), and per list entry (cell x tile)
+    /// the dirty rays that crossed it and the march steps they spent inside it. See countPushShare.
+    RWStructuredBuffer<uint> hstrPushShareRays;
+    RWStructuredBuffer<uint4> hstrPushShareEntries; ///< And z, w: the largest crossing error under the 3^2, 5^2 payloads (asuint).
+    RWStructuredBuffer<uint4> hstrPushShareAges;    ///< Per list entry: the largest crossing error reusing 1, 4, 16 frames old.
     RWStructuredBuffer<CellView> hstrCellViews;
     Texture2D<float4> hstrCellTexels;
     Texture2D<float4> hstrCellTexelsSingle;
@@ -1975,8 +1998,8 @@ struct HSTRCloudRenderer
     }
 
     /// marchSegmentMoment continuing from fineVoxels: the sampled voxel edge the march last read, which bounds its next step. A
-    /// march resumed mid-ray (composeBeam's cells) passes the one it stopped with; starting at 1 makes the first step cross a whole
-    /// domain voxel on one sample.
+    /// march resumed mid-ray passes the one it stopped with; starting at 1 makes the first step cross a whole domain voxel on one
+    /// sample. Found splitting rays at cells for the cell views (51c2dace), where every resumed chord's first step was that long.
     void marchSegmentMoment(
         CutRay ray,
         float2 segment,
@@ -4310,192 +4333,10 @@ struct HSTRCloudRenderer
         return float2(enter, exit);
     }
 
-    /// Adds per-thread counts to hstrBeamCounts once per wave.
-    void cellViewCount(uint slot, uint value)
-    {
-        const uint total = WaveActiveSum(value);
-        if (WaveIsFirstLane() && total != 0u)
-        {
-            uint unused;
-            InterlockedAdd(hstrBeamCounts[slot], total, unused);
-        }
-    }
-
-    /// marchBeam over the whole ray, composed from cell views where they hold (see above) and marched exactly per cell elsewhere.
-    BeamSample composeBeam(float3 direction)
-    {
-        BeamSample result = {};
-        CutRay ray;
-        const GridVolume volume = gScene.getGridVolume(0);
-        const float3 cameraWorld = gScene.camera.data.posW;
-        const bool made = makeCutRay(cameraWorld, direction, volume, ray);
-        uint hits = 0;
-        uint emptyHits = 0;
-        uint exact = 0;
-        uint cells = 0;
-        uint exactSteps = 0;
-        if (made)
-        {
-            ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
-            const float cellWidth = float(params.hstrCellWidth);
-            const float3 origin = ray.position * cellWidth;
-            const float3 dv = ray.direction * cellWidth;
-            const float voxelsPerUnit = length(dv);
-            const float3 camera = worldToVoxel(cameraWorld, volume) - float3(params.hstrGridMin);
-            const bool withCache = beamWithCache();
-            const bool withSingle = beamWithSingle();
-            const float3 dims = float3(params.hstrExtinctionDims);
-            const uint frameStamp = params.cellViewFrame + 1u;
-            float3 cache = 0.f;
-            float3 single = 0.f;
-            float transmittance = 1.f;
-            float opacityDistance = 0.f;
-            uint steps = 0;
-            float fineVoxels = 1.f; // The exact chords resume the march's step state from cell to cell.
-            const float nudge = 1e-3f / max(voxelsPerUnit, 1e-6f);
-            float t = 0.f;
-            if (params.cellViewDebug == 1)
-            {
-                marchSegmentMoment(ray, float2(0.f, 1.f), withCache, withSingle, cache, single, transmittance, steps, opacityDistance, fineVoxels);
-                t = 1.f;
-            }
-            [loop]
-            for (uint k = 0; k < 2048u && t < 1.f && transmittance > params.cloudMinTransmittance && voxelsPerUnit > 1e-6f; ++k)
-            {
-                const float3 p = origin + (t + nudge) * dv;
-                // A zero majorant block holds nothing any sample could read: cross it, and the zero 16-voxel blocks after it, at once.
-                if (params.cellViewDebug != 2 && majorantAt(p) <= 0.f)
-                {
-                    const float3 block = floor(p * 0.25f) * 4.f;
-                    float exitBlock = 1e30f;
-                    [unroll]
-                    for (uint a = 0; a < 3; ++a)
-                        if (abs(dv[a]) > 1e-12f)
-                            exitBlock = min(exitBlock, (block[a] + (dv[a] > 0.f ? 4.f : 0.f) - origin[a]) / dv[a]);
-                    t = max(max(exitBlock, majorantZeroExit(ray, t)), t + nudge);
-                    continue;
-                }
-                const float3 cell = floor(p + 0.5f);
-                const float2 slab = cellViewSlab(origin, dv, cell - 0.5f);
-                const float exit = max(min(slab.y, 1.f), t + nudge);
-                const float2 chord = float2(max(slab.x, 0.f), exit);
-                ++cells;
-                const uint3 key = cellViewKey(cell);
-                const bool inside = cell.y >= 0.f && cell.y < dims.y;
-                // No sample in the cell can read density: nothing to march, view or request.
-                if (params.cellViewDebug != 2 && inside && hstrCellOccupancy.Load(int4(int3(key), 0)) == 0u)
-                {
-                    t = exit;
-                    continue;
-                }
-                const float distance = length(cell - camera);
-                const bool keyed = inside && distance >= 4.f;
-                bool usable = false;
-                bool request = keyed;
-                if (keyed)
-                {
-                    const uint entry = hstrCellMap[key];
-                    if (entry != 0u)
-                    {
-                        const uint slot = entry - 1u;
-                        const CellView view = hstrCellViews[slot];
-                        // How far the build ray through the chord's midpoint strays from this chord at the chord's ends.
-                        const float3 m = origin + 0.5f * (chord.x + chord.y) * dv;
-                        const float3 toMid = normalize(m - camera);
-                        const float3 moved = camera - view.camera;
-                        const float3 across = moved - dot(moved, toMid) * toMid;
-                        const float drift = length(across) / max(length(m - view.camera), 1e-3f) * 0.5f * (chord.y - chord.x) * voxelsPerUnit;
-                        const uint age = frameStamp - view.frame;
-                        const float fadeNow = cellViewFade(distance);
-                        const float fadeRatio = view.fade > 1e-4f ? fadeNow / view.fade : (fadeNow <= 1e-4f ? 1.f : 1e30f);
-                        const bool same = view.frame != 0u && all(view.cell == int3(cell));
-                        usable = same && distance >= view.bandLow && distance <= view.bandHigh && drift <= params.cellViewDrift &&
-                                 age <= 2u * params.cellViewMaxAge && fadeRatio >= 0.9f && fadeRatio <= 1.1f;
-                        request = !usable || drift > 0.5f * params.cellViewDrift || age > params.cellViewMaxAge ||
-                                  fadeRatio < 0.95f || fadeRatio > 1.05f;
-                        if (usable && (view.flags & kCellViewEmpty) != 0u)
-                            ++emptyHits;
-                        else if (usable)
-                        {
-                            const float3 centre = cell;
-                            float2 uv = cellViewAtlasUv(slot, cellViewTexel(m, centre, view.camera));
-                            float4 a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-                            float4 b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-                            // Where the chord's light comes from: an opaque skin sits at its centroid, and the build ray through THAT
-                            // point is the one that saw the same skin.
-                            if (params.cellViewRefine != 0 && a.a < 0.98f)
-                            {
-                                const float3 c = origin + (chord.x + saturate(b.a) * (chord.y - chord.x)) * dv;
-                                uv = cellViewAtlasUv(slot, cellViewTexel(c, centre, view.camera));
-                                a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-                                b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-                            }
-                            // The fade scales the cell's extinction: exact for the transmittance, and for the light where the source is
-                            // constant along the chord.
-                            float T = saturate(a.a);
-                            float scale = 1.f;
-                            if (abs(fadeRatio - 1.f) > 1e-4f)
-                            {
-                                const float faded = pow(max(T, 1e-12f), fadeRatio);
-                                scale = T < 0.9999f ? (1.f - faded) / (1.f - T) : fadeRatio;
-                                T = faded;
-                            }
-                            cache += transmittance * scale * a.rgb;
-                            single += transmittance * scale * b.rgb;
-                            const float d0 = ray.entryDistance + chord.x * ray.worldLength;
-                            const float d1 = ray.entryDistance + chord.y * ray.worldLength;
-                            opacityDistance += transmittance * (1.f - T) * (d0 + saturate(b.a) * (d1 - d0));
-                            transmittance *= T;
-                            fineVoxels = cellViewFineVoxels(cell);
-                            ++hits;
-                        }
-                    }
-                }
-                if (!usable)
-                {
-                    const uint before = steps;
-                    marchSegmentMoment(ray, float2(t, exit), withCache, withSingle, cache, single, transmittance, steps, opacityDistance, fineVoxels);
-                    exactSteps += steps - before;
-                    ++exact;
-                }
-                if (request && hstrCellRequest[key] != frameStamp)
-                {
-                    uint previous;
-                    InterlockedExchange(hstrCellRequest[key], frameStamp, previous);
-                    if (previous != frameStamp)
-                    {
-                        uint index;
-                        InterlockedAdd(hstrCellCounters[0], 1u, index);
-                        if (index < params.cellViewBuildCapacity)
-                            hstrCellBuild[index] = int4(int3(cell), 0);
-                    }
-                }
-                t = exit;
-            }
-            result.cache = cache;
-            result.single = single;
-            result.depth = -log(max(transmittance, 1e-12f));
-            result.steps = float(steps + hits);
-            result.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
-        }
-        cellViewCount(kCellViewRays, made ? 1u : 0u);
-        cellViewCount(kCellViewHits, hits);
-        cellViewCount(kCellViewEmptyHits, emptyHits);
-        cellViewCount(kCellViewExact, exact);
-        cellViewCount(kCellViewCells, cells);
-        cellViewCount(kCellViewSteps, exactSteps);
-        return result;
-    }
-
-    /// The march a dirty ray takes: composed from cell views (HSTR_CELL_VIEWS), or marched.
-    BeamSample marchBeamDirty(float3 direction)
-    {
-#if HSTR_CELL_VIEWS
-        return composeBeam(direction);
-#else
-        return marchBeam(direction, float2(0.f, 1.f));
-#endif
-    }
+    /// REMOVED (51c2dace, 4K walk, cvdebug5): composeBeam walked each dirty ray cell by cell, reading these views in place of
+    /// density - 10.05 ms against 7.57 marched, 0.297% over 0.02 against 0.137%, ~46 cells visited and ~10 occupied per ray, ~58k
+    /// distinct occupied cells a frame. Per-ray traversal cost what the march did: the views are not the problem, walking them
+    /// from every ray is (README red flag). Their consumer is to be projected cell x BeamTile work (beamPushProbe), not a ray.
 
     /// Starts the build of cell's view: takes the ring's next slot, unmaps the cell that held it, and writes the header. ~0 when the
     /// camera is too close to the cell for a view (it is then marched every time).
@@ -4617,6 +4458,1261 @@ struct HSTRCloudRenderer
         uint previous;
         InterlockedCompareExchange(hstrCellMap[cellViewKey(float3(view.cell))], slot + 1u, 0u, previous);
         hstrCellViews[slot].frame = 0u;
+    }
+
+    /// beamPushProbe: the push architecture's work count, before any transfer is evaluated. The README's work unit is projected
+    /// transport node x BeamTile, so this starts from the world cells, not from rays: each occupied domain cell is culled, projected
+    /// once into the octahedral beam image and appended to the list of every tile its projection overlaps that the screen sees.
+    /// Its counters (kPush*) answer how many cells, overlaps and cells per tile that work is at park, walk and sprint.
+
+    /// Shells: shell k tiles the image at pushTileSize << k texels, each shell's grid after the previous one's in the tile index.
+    uint pushShellCount() { return clamp(params.pushShells, 1u, kPushMaxShells); }
+    uint pushShellEdge(uint shell) { return params.pushTileSize << shell; }
+    uint2 pushShellDims(uint shell) { return (params.beamFrameDim + pushShellEdge(shell) - 1u) / pushShellEdge(shell); }
+    uint pushShellBase(uint shell)
+    {
+        uint base = 0;
+        for (uint k = 0; k < shell; ++k)
+        {
+            const uint2 dims = pushShellDims(k);
+            base += dims.x * dims.y;
+        }
+        return base;
+    }
+
+    /// The shell of a cell at a camera distance (voxels): the one whose tiles its projection spans about two of.
+    uint pushShellOf(float distance)
+    {
+        if (params.pushShells == 0u)
+            return 0u;
+        return uint(clamp(ceil(log2(params.pushShellDistance / max(distance, 1e-3f))), 0.f, float(pushShellCount() - 1u)));
+    }
+
+    /// The screen's box of the beam image (beamScreenBounds) in a shell's tiles, [low, high).
+    void pushTileBox(uint shell, out uint2 low, out uint2 high)
+    {
+        const float s = float(pushShellEdge(shell));
+        low = uint2(max(floor(params.beamScreenBounds.xy / s), 0.f));
+        high = min(uint2(ceil(params.beamScreenBounds.zw / s)), pushShellDims(shell));
+    }
+
+    /// Whether the screen sees a tile of a shell (beamBoxOnScreen).
+    bool pushTileOnScreen(uint shell, uint2 tile)
+    {
+        const float s = float(pushShellEdge(shell));
+        return beamBoxOnScreen(float2(tile) * s, float2(tile + 1u) * s);
+    }
+
+    /// Adds per-thread counts to hstrPushCounts once per wave.
+    void pushCount(uint slot, uint value)
+    {
+        const uint total = WaveActiveSum(value);
+        if (WaveIsFirstLane() && total != 0u)
+        {
+            uint unused;
+            InterlockedAdd(hstrPushCounts[slot], total, unused);
+        }
+    }
+
+    /// Histogram bin of a count: 0 for none, else floor(log2) + 1.
+    uint pushBin(uint value) { return value == 0u ? 0u : min(firstbithigh(value) + 1u, 31u); }
+
+    /// Lists an occupied domain cell (27-voxel occupancy, hstrCellOccupancy) as a candidate. Runs when the domain changed only.
+    void listPushCandidate(uint3 key)
+    {
+        const uint3 dims = params.hstrExtinctionDims;
+        if (any(key >= dims))
+            return;
+        // pushDilate: also list cells within that many cells of an occupied one (x and z wrap), for the density the march's coarse
+        // levels spread past the occupancy (see countPushShare).
+        bool occupied = false;
+        const int dilate = int(params.pushDilate);
+        for (int dz = -dilate; dz <= dilate && !occupied; ++dz)
+            for (int dy = -dilate; dy <= dilate && !occupied; ++dy)
+                for (int dx = -dilate; dx <= dilate && !occupied; ++dx)
+                {
+                    const int3 n = int3(key) + int3(dx, dy, dz);
+                    if (n.y < 0 || n.y >= int(dims.y))
+                        continue;
+                    const int3 wrapped = int3((n.x + int(dims.x)) % int(dims.x), n.y, (n.z + int(dims.z)) % int(dims.z));
+                    occupied = hstrCellOccupancy.Load(int4(wrapped, 0)) != 0u;
+                }
+        const uint n = WaveActiveCountBits(occupied);
+        uint base = 0;
+        if (WaveIsFirstLane() && n != 0u)
+            InterlockedAdd(hstrPushCandidateCount[0], n, base);
+        base = WaveReadLaneFirst(base);
+        if (occupied)
+        {
+            const uint index = base + WavePrefixCountBits(occupied);
+            if (index < params.pushCandidateCapacity)
+                hstrPushCandidates[index] = key.x + dims.x * (key.y + dims.y * key.z);
+        }
+        const bool own = occupied && hstrDomainVolume.Load(int4(int3(key), 0)).y > 0.f;
+        const uint owned = WaveActiveCountBits(own);
+        if (WaveIsFirstLane() && owned != 0u)
+        {
+            uint unused;
+            InterlockedAdd(hstrPushCandidateCount[1], owned, unused);
+        }
+    }
+
+    /// A packed candidate's centre relative to the camera, in voxels, at its periodic image nearest the camera (x and z wrap).
+    float3 pushCellOffset(uint linear)
+    {
+        const uint3 dims = params.hstrExtinctionDims;
+        const float3 camera = worldToVoxel(gScene.camera.data.posW, gScene.getGridVolume(0)) - float3(params.hstrGridMin);
+        float3 cell = float3(uint3(linear % dims.x, (linear / dims.x) % dims.y, linear / (dims.x * dims.y)));
+        cell.x += float(dims.x) * round((camera.x - cell.x) / float(dims.x));
+        cell.z += float(dims.z) * round((camera.z - cell.z) / float(dims.z));
+        return cell - camera;
+    }
+
+    /// Projects one candidate cell and counts it into the tiles it overlaps.
+    ///
+    /// The cell is the domain voxel box [key - 0.5, key + 0.5) at the periodic image nearest the camera (x and z wrap). Inside one
+    /// octant of directions the octahedral map is a central projection onto the octant's face followed by an affine map, so the
+    /// image of a box is the convex hull of its corners' images and their bounding box is conservative. A box spanning one of the
+    /// camera's axis planes is therefore split at it into up to eight pieces, each projected alone - which is also what keeps a cell
+    /// straddling the map's seam (x = 0 or y = 0 below the horizon) from claiming the whole image between its two halves. A tile
+    /// several pieces overlap is counted once. A cell the camera is inside covers every direction: it claims the screen's box.
+    ///
+    /// With pushShells the tile size follows the cell's distance (pushShellOf). MEASURED with one tile size (push3, 4K, camera in
+    /// a cloud's occupancy at (0, 40, 0)): 3.3M overlaps against 0.95M from clear air, 66% of them from the 7% of visible cells
+    /// nearer than 32 voxels, one cell spanning all 29,230 on-screen tiles; each cell's tiles are one thread's loop, so the probe took
+    /// 62-117 ms (project 36-71, scatter 25-45). A cell's projected area grows as 1 / distance^2; its tiles must grow with it.
+    /// MEASURED with shells (push4, same run, pushShells 10 against 0): near park 3.33M overlaps / 170 ms -> 464k / 0.47 ms, at most
+    /// 12 tiles a cell; clear-air walk 951k / 0.62 ms -> 388k / 0.43 ms (project 0.22, scatter 0.04, sort 0.14). pushShellDistance
+    /// (~202 voxels at 4K) is conservative, so shell 0 held nothing there and the far field sat in 32-texel tiles.
+    void projectPushCell(uint index)
+    {
+        if (index == 0u)
+        {
+            hstrPushCounts[kPushCandidates] = hstrPushCandidateCount[0];
+            hstrPushCounts[kPushCandidatesOwn] = hstrPushCandidateCount[1];
+        }
+        if (index >= min(hstrPushCandidateCount[0], params.pushCandidateCapacity) || gScene.getGridVolumeCount() == 0)
+            return;
+        const uint linear = hstrPushCandidates[index];
+        const float3 d = pushCellOffset(linear);
+        const float3 scale = params.seaVoxelSize;
+        const float3 w = d * scale;
+        const float radius = 0.8660254f * scale.x;
+        // Past the view distance the sea's fade (cellViewFade) is zero, so nothing in the cell reaches the camera.
+        if (params.seaMode != 0 && length(w) - radius >= params.seaViewDistance)
+        {
+            pushCount(kPushCulledDistance, 1u);
+            return;
+        }
+        // The frustum's planes through the eye, from the camera basis inverse (ndc = c.xy / c.z, c = beamRefInverse * w), against
+        // the cell's bounding sphere.
+        const float3 r0 = params.beamRefInverse0;
+        const float3 r1 = params.beamRefInverse1;
+        const float3 r2 = params.beamRefInverse2;
+        bool outside = dot(-r2, w) > radius * length(r2);
+        outside = outside || dot(r0 - r2, w) > radius * length(r0 - r2) || dot(-r0 - r2, w) > radius * length(r0 + r2);
+        outside = outside || dot(r1 - r2, w) > radius * length(r1 - r2) || dot(-r1 - r2, w) > radius * length(r1 + r2);
+        if (outside)
+        {
+            pushCount(kPushCulledFrustum, 1u);
+            return;
+        }
+
+        const uint shell = pushShellOf(length(d));
+        uint2 boxLow, boxHigh;
+        pushTileBox(shell, boxLow, boxHigh);
+        const uint tileBase = pushShellBase(shell);
+        const uint tileRow = pushShellDims(shell).x;
+        const float2 image = float2(params.beamFrameDim);
+        const float s = float(pushShellEdge(shell));
+        const float4 bounds = params.beamScreenBounds;
+        const bool near = all(abs(d) <= 0.5f + 1e-3f);
+        uint4 rects[8];
+        uint pieces = 0;
+        uint rectTiles[4] = { 0u, 0u, 0u, 0u };
+        if (near)
+        {
+            rects[0] = uint4(boxLow, boxHigh);
+            pieces = 1;
+            [unroll]
+            for (uint k = 0; k < 4; ++k)
+            {
+                const float edge = float(4u << k);
+                const uint2 span = uint2(floor(bounds.zw / edge) - floor(bounds.xy / edge)) + 1u;
+                rectTiles[k] = span.x * span.y;
+            }
+        }
+        else
+        {
+            const float3 lo = d - 0.5f;
+            const float3 hi = d + 0.5f;
+            const float eps = 1e-4f; // Keeps a corner on an axis plane on its piece's side of the map's seam.
+            [loop]
+            for (uint p = 0; p < 8; ++p)
+            {
+                float3 plo = lo;
+                float3 phi = hi;
+                bool valid = true;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                {
+                    const bool upper = ((p >> a) & 1u) != 0u;
+                    if (lo[a] < 0.f && hi[a] > 0.f)
+                    {
+                        plo[a] = upper ? eps : lo[a];
+                        phi[a] = upper ? hi[a] : -eps;
+                    }
+                    else
+                    {
+                        valid = valid && !upper;
+                        if (lo[a] >= 0.f)
+                            plo[a] = max(lo[a], eps);
+                        else
+                            phi[a] = min(hi[a], -eps);
+                    }
+                }
+                if (!valid)
+                    continue;
+                float2 mn = image;
+                float2 mx = 0.f;
+                [unroll]
+                for (uint c = 0; c < 8; ++c)
+                {
+                    const float3 corner = float3((c & 1u) ? phi.x : plo.x, (c & 2u) ? phi.y : plo.y, (c & 4u) ? phi.z : plo.z);
+                    const float2 q = octEncode(corner * scale) * image;
+                    mn = min(mn, q);
+                    mx = max(mx, q);
+                }
+                const float2 cmn = max(mn, bounds.xy);
+                const float2 cmx = min(mx, bounds.zw);
+                if (any(cmn > cmx))
+                    continue;
+                [unroll]
+                for (uint k = 0; k < 4; ++k)
+                {
+                    const float edge = float(4u << k);
+                    const uint2 span = uint2(floor(cmx / edge) - floor(cmn / edge)) + 1u;
+                    rectTiles[k] += span.x * span.y;
+                }
+                const uint2 tl = max(uint2(floor(mn / s)), boxLow);
+                const uint2 th = min(uint2(floor(mx / s)) + 1u, boxHigh);
+                if (all(tl < th))
+                    rects[pieces++] = uint4(tl, th);
+            }
+        }
+
+        uint overlaps = 0;
+        for (uint i = 0; i < pieces; ++i)
+            for (uint y = rects[i].y; y < rects[i].w; ++y)
+                for (uint x = rects[i].x; x < rects[i].z; ++x)
+                {
+                    const uint2 tile = uint2(x, y);
+                    bool seen = false;
+                    for (uint j = 0; j < i; ++j)
+                        seen = seen || (all(tile >= rects[j].xy) && all(tile < rects[j].zw));
+                    if (seen || !pushTileOnScreen(shell, tile))
+                        continue;
+                    uint unused;
+                    InterlockedAdd(hstrPushTileCounts[tileBase + x + tileRow * y], 1u, unused);
+                    ++overlaps;
+                }
+        // Only a cell that reaches a tile the screen sees is a piece of work. It takes a slot, which is what the lists hold: the
+        // slot addresses its key and its operator. A cell past the slots is counted and left out of the lists entirely.
+        uint first = 0;
+        uint slot = ~0u;
+        if (overlaps != 0u)
+        {
+            InterlockedAdd(hstrPushCounts[kPushCountSlots + 2u], 1u, slot);
+            if (slot < params.pushSlotCapacity)
+            {
+                hstrPushSlotKeys[slot] = linear;
+                InterlockedAdd(hstrPushCounts[kPushCountSlots], pieces, first);
+                for (uint i = 0; i < pieces; ++i)
+                    if (first + i < params.pushPieceCapacity)
+                        hstrPushPieces[first + i] =
+                            uint4(slot, rects[i].x | (rects[i].y << 16), rects[i].z | (rects[i].w << 16), first | (shell << 27));
+            }
+            uint unused;
+            if (slot >= params.pushSlotCapacity)
+                InterlockedAdd(hstrPushCounts[kPushSlotsDropped], 1u, unused);
+            InterlockedAdd(hstrPushCounts[kPushShellCells + shell], 1u, unused);
+            InterlockedAdd(hstrPushCounts[kPushShellOverlaps + shell], overlaps, unused);
+            InterlockedMax(hstrPushCounts[kPushMaxPerCell], overlaps, unused);
+            InterlockedAdd(hstrPushCounts[kPushHistCell + pushBin(overlaps)], 1u, unused);
+            InterlockedAdd(hstrPushCounts[kPushHistDistance + min(pushBin(uint(length(d))), 15u)], 1u, unused);
+            InterlockedMax(hstrPushCounts[kPushMinDistance], ~asuint(length(d)), unused);
+        }
+        const float voxels = length(d);
+        pushCount(kPushVisible, overlaps != 0u ? 1u : 0u);
+        pushCount(kPushNear, near && overlaps != 0u ? 1u : 0u);
+        pushCount(kPushPieces, overlaps != 0u ? pieces : 0u);
+        pushCount(kPushOverlaps, overlaps);
+        pushCount(kPushNearOverlaps, voxels < 8.f ? overlaps : 0u);
+        pushCount(kPushMidOverlaps, voxels >= 8.f && voxels < 32.f ? overlaps : 0u);
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+            pushCount(kPushRectTiles + k, overlaps != 0u ? rectTiles[k] : 0u);
+        pushCount(kPushDropped, overlaps != 0u && first + pieces > params.pushPieceCapacity ? 1u : 0u);
+    }
+
+    /// Gives a tile its list: an offset for its count, and its count back to zero as the scatter's cursor; a tile of two or more
+    /// cells is listed for the sort. The first thread also writes the scatter's arguments, now that the pieces are counted.
+    void allocatePushTile(uint id)
+    {
+        if (id == 0u)
+        {
+            const uint pieces = min(hstrPushCounts[kPushCountSlots], params.pushPieceCapacity);
+            hstrPushArgs[3] = (pieces + 63u) / 64u;
+            hstrPushArgs[4] = 1u;
+            hstrPushArgs[5] = 1u;
+            // The operators' build: 27 threads per visible cell, in rows of 32768 groups of 64.
+            const uint threads = min(hstrPushCounts[kPushCountSlots + 2u], params.pushSlotCapacity) * 27u;
+            const uint groups = (threads + 63u) / 64u;
+            hstrPushArgs[9] = min(groups, 32768u);
+            hstrPushArgs[10] = (groups + 32767u) / 32768u;
+            hstrPushArgs[11] = 1u;
+        }
+        if (id >= params.pushTileTotal)
+            return;
+        uint shell = 0;
+        uint base = 0;
+        uint2 dims = pushShellDims(0);
+        while (shell + 1u < pushShellCount() && id >= base + dims.x * dims.y)
+        {
+            base += dims.x * dims.y;
+            dims = pushShellDims(++shell);
+        }
+        const uint2 tile = uint2((id - base) % dims.x, (id - base) / dims.x);
+        uint2 low, high;
+        pushTileBox(shell, low, high);
+        const bool inBox = all(tile >= low) && all(tile < high);
+        const uint count = inBox ? hstrPushTileCounts[id] : 0u;
+        const uint total = WaveActiveSum(count);
+        uint offset = 0;
+        if (WaveIsFirstLane() && total != 0u)
+            InterlockedAdd(hstrPushCounts[kPushCountSlots + 1u], total, offset);
+        offset = WaveReadLaneFirst(offset);
+        hstrPushTileOffsets[id] = offset + WavePrefixSum(count);
+        hstrPushTileCounts[id] = 0u;
+        pushCount(kPushTilesNonEmpty, count != 0u ? 1u : 0u);
+        if (count != 0u)
+        {
+            uint unused;
+            InterlockedMax(hstrPushCounts[kPushMaxPerTile], count, unused);
+        }
+        if (count >= 2u)
+        {
+            uint slot;
+            InterlockedAdd(hstrPushCounts[kPushSortTiles], 1u, slot);
+            hstrPushSortTiles[slot] = id;
+        }
+        // Tiles by cells: the finest shell only, where the screen sees them (empty ones included).
+        if (shell == 0u && inBox && pushTileOnScreen(0u, tile))
+        {
+            uint unused;
+            InterlockedAdd(hstrPushCounts[kPushHistTile + pushBin(count)], 1u, unused);
+            InterlockedAdd(hstrPushCounts[kPushTilesOnScreen], 1u, unused);
+        }
+    }
+
+    /// Appends a piece's cell to the lists of the tiles it overlaps, skipping the tiles an earlier piece of its cell took.
+    void scatterPushPiece(uint index)
+    {
+        if (index >= min(hstrPushCounts[kPushCountSlots], params.pushPieceCapacity))
+            return;
+        const uint4 piece = hstrPushPieces[index];
+        const uint2 low = uint2(piece.y & 0xFFFFu, piece.y >> 16);
+        const uint2 high = uint2(piece.z & 0xFFFFu, piece.z >> 16);
+        const uint shell = piece.w >> 27;
+        const uint first = piece.w & 0x7FFFFFFu;
+        const uint tileBase = pushShellBase(shell);
+        const uint tileRow = pushShellDims(shell).x;
+        uint dropped = 0;
+        for (uint y = low.y; y < high.y; ++y)
+            for (uint x = low.x; x < high.x; ++x)
+            {
+                const uint2 tile = uint2(x, y);
+                bool seen = false;
+                for (uint j = first; j < index; ++j)
+                {
+                    const uint4 other = hstrPushPieces[j];
+                    seen = seen || (all(tile >= uint2(other.y & 0xFFFFu, other.y >> 16)) && all(tile < uint2(other.z & 0xFFFFu, other.z >> 16)));
+                }
+                if (seen || !pushTileOnScreen(shell, tile))
+                    continue;
+                const uint id = tileBase + x + tileRow * y;
+                uint slot;
+                InterlockedAdd(hstrPushTileCounts[id], 1u, slot);
+                const uint at = hstrPushTileOffsets[id] + slot;
+                if (at < params.pushListCapacity)
+                    hstrPushList[at] = piece.x;
+                else
+                    ++dropped;
+            }
+        pushCount(kPushDropped, dropped);
+    }
+
+    /// The cell operator: a camera-independent description of what the march integrates across a visible cell, built once per cell
+    /// rather than resampled per ray. It holds 27 points, 3 x 3 x 3 at -0.5, 0 and +0.5 voxels about the centre, of the extinction
+    /// (cameraExtinctionAtVoxel), the sun emission sigma * residualAtDepth(sunDepthAt) and the cache emission sigma * worldCacheRadiance
+    /// toward the cell - emission rather than source, so a point without density needs no sun march and the interpolation carries
+    /// no bias from it. The domain's proxy is trilinear between voxel centres, so inside each octant of the cell (between its centre
+    /// and a corner) the extinction the proxy gives is exactly the trilinear function of that octant's 8 points: along a chord of
+    /// the octant it is a cubic, and Simpson's rule integrates it exactly. Fine bricks under the proxy are what it cannot hold.
+    /// PROBE: built every frame for every visible cell; a real one would be cached in world space and rebuilt with its content.
+    ///
+    /// MEASURED and REJECTED (eval2, 4K walk, the same 68k samples scored against their exact march; built 0.44 ms for 104k cells):
+    /// transmittance off by more than 0.02 in 3.65% of samples in EVERY operator arm - Simpson or sub-stepped alike - so the
+    /// extinction the march reads is not the octants' trilinear function: at these distances cameraExtinctionAtVoxel reads fine
+    /// bricks below the proxy, and 27 points a voxel cannot hold them. Radiance over 0.02: tau + the chord's exact source 17.5%
+    /// (exact emission behind a wrong transmittance), constant source 10.2%, linear 7.0%, trilinear emission 6.3%; views 2.7%;
+    /// the gate is 0.137%. Evaluating is also 2.5-6.8 ms against 1.09 for the exact march of the same directions. A node at domain-
+    /// voxel resolution is too coarse for the density this renderer shows; a node fine enough is the bricks themselves.
+    void buildPushOperator(uint thread)
+    {
+        const uint slot = thread / 27u;
+        const uint g = thread % 27u;
+        if (slot >= min(hstrPushCounts[kPushCountSlots + 2u], params.pushSlotCapacity) || gScene.getGridVolumeCount() == 0)
+            return;
+        const float3 camera = worldToVoxel(gScene.camera.data.posW, gScene.getGridVolume(0)) - float3(params.hstrGridMin);
+        const float3 centre = camera + pushCellOffset(hstrPushSlotKeys[slot]);
+        const float3 p = centre + (float3(uint3(g % 3u, (g / 3u) % 3u, g / 9u)) - 1.f) * 0.5f;
+        const float footprint = length((p - camera) * params.seaVoxelSize) * params.cloudPixelAngle;
+        float fineVoxels = 1.f;
+        CloudSample sample = {};
+        const float sigma = cameraExtinctionAtVoxel(p, footprint, fineVoxels, sample);
+        float3 sun = 0.f;
+        float3 cached = 0.f;
+        if (sigma > 0.f)
+        {
+            if (beamWithSingle())
+                sun = sigma * residualAtDepth(p, sunDepthAt(p, footprint, sample), float4(1.f, 0.f, 0.f, 0.f));
+            if (beamWithCache())
+                cached = sigma * worldCacheRadiance(p, normalize((centre - camera) * params.seaVoxelSize));
+        }
+        hstrPushOps[slot * 27u + g] = uint4(
+            f32tof16(sigma) | (f32tof16(sun.r) << 16), f32tof16(sun.g) | (f32tof16(sun.b) << 16),
+            f32tof16(cached.r) | (f32tof16(cached.g) << 16), f32tof16(cached.b)
+        );
+    }
+
+    /// Trilinear value of an octant's 8 points (x fastest) at local coordinates u in [0, 1]^3.
+    float pushTrilinear(float v[8], float3 u)
+    {
+        const float4 x = lerp(float4(v[0], v[2], v[4], v[6]), float4(v[1], v[3], v[5], v[7]), u.x);
+        const float2 y = lerp(x.xz, x.yw, u.y);
+        return lerp(y.x, y.y, u.z);
+    }
+
+    /// Composites a chord of a cell from its operator (pushEvalMode 1-4): the chord splits at the cell's centre planes into
+    /// segments inside one octant each, whose extinction is the octant's trilinear function.
+    ///   1: the operator's optical depth (Simpson, exact on the octant's cubic) and the chord's source from the exact march of it,
+    ///      alone - an oracle, so any error is the extinction's;
+    ///   2: one source per cell, the extinction-weighted mean of the emission over the 27 points;
+    ///   3: that mean plus an extinction-weighted gradient, axis by axis;
+    ///   4: emission trilinear per octant, like the extinction.
+    /// 2-4 integrate each segment in four sub-steps with the exact exponential of each.
+    void pushOperatorChord(
+        CutRay ray,
+        float3 origin,
+        float3 dv,
+        float3 cell,
+        uint slot,
+        float2 chord,
+        bool withCache,
+        bool withSingle,
+        inout float3 cache,
+        inout float3 single,
+        inout float transmittance
+    )
+    {
+        float sigma[27];
+        float3 sun[27];
+        float3 cached[27];
+        for (uint g = 0; g < 27u; ++g)
+        {
+            const uint4 packed = hstrPushOps[slot * 27u + g];
+            sigma[g] = f16tof32(packed.x & 0xFFFFu);
+            sun[g] = float3(f16tof32(packed.x >> 16), f16tof32(packed.y & 0xFFFFu), f16tof32(packed.y >> 16));
+            cached[g] = float3(f16tof32(packed.z & 0xFFFFu), f16tof32(packed.z >> 16), f16tof32(packed.w & 0xFFFFu));
+        }
+        // Constant and linear sources: extinction-weighted mean and per-axis gradient of source = emission / extinction.
+        float3 meanSun = 0.f;
+        float3 meanCache = 0.f;
+        float3 gradSun[3] = { float3(0.f), float3(0.f), float3(0.f) };
+        float3 gradCache[3] = { float3(0.f), float3(0.f), float3(0.f) };
+        if (params.pushEvalMode == 2u || params.pushEvalMode == 3u)
+        {
+            float weight = 0.f;
+            float3 centroid = 0.f;
+            for (uint g = 0; g < 27u; ++g)
+            {
+                weight += sigma[g];
+                meanSun += sun[g];
+                meanCache += cached[g];
+                centroid += sigma[g] * (float3(uint3(g % 3u, (g / 3u) % 3u, g / 9u)) - 1.f) * 0.5f;
+            }
+            const float inverse = weight > 1e-12f ? 1.f / weight : 0.f;
+            meanSun *= inverse;
+            meanCache *= inverse;
+            centroid *= inverse;
+            if (params.pushEvalMode == 3u)
+            {
+                float3 spread = 0.f;
+                for (uint g = 0; g < 27u; ++g)
+                {
+                    const float3 x = (float3(uint3(g % 3u, (g / 3u) % 3u, g / 9u)) - 1.f) * 0.5f - centroid;
+                    const float3 sourceSun = sigma[g] > 1e-12f ? sun[g] / sigma[g] : meanSun;
+                    const float3 sourceCache = sigma[g] > 1e-12f ? cached[g] / sigma[g] : meanCache;
+                    [unroll]
+                    for (uint a = 0; a < 3; ++a)
+                    {
+                        gradSun[a] += sigma[g] * (sourceSun - meanSun) * x[a];
+                        gradCache[a] += sigma[g] * (sourceCache - meanCache) * x[a];
+                    }
+                    spread += sigma[g] * x * x;
+                }
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                {
+                    gradSun[a] = spread[a] > 1e-12f ? gradSun[a] / spread[a] : 0.f;
+                    gradCache[a] = spread[a] > 1e-12f ? gradCache[a] / spread[a] : 0.f;
+                }
+                // The gradient is about the centroid; the evaluation below measures from the centre.
+                meanSun -= gradSun[0] * centroid.x + gradSun[1] * centroid.y + gradSun[2] * centroid.z;
+                meanCache -= gradCache[0] * centroid.x + gradCache[1] * centroid.y + gradCache[2] * centroid.z;
+            }
+        }
+        // The chord's segment ends: its own ends and the centre planes it crosses, in order.
+        float cuts[3];
+        [unroll]
+        for (uint a = 0; a < 3; ++a)
+        {
+            const float tc = abs(dv[a]) > 1e-12f ? (cell[a] - origin[a]) / dv[a] : -1.f;
+            cuts[a] = tc > chord.x && tc < chord.y ? tc : chord.y;
+        }
+        if (cuts[0] > cuts[1]) { const float s = cuts[0]; cuts[0] = cuts[1]; cuts[1] = s; }
+        if (cuts[1] > cuts[2]) { const float s = cuts[1]; cuts[1] = cuts[2]; cuts[2] = s; }
+        if (cuts[0] > cuts[1]) { const float s = cuts[0]; cuts[0] = cuts[1]; cuts[1] = s; }
+        float operatorDepth = 0.f;
+        float3 localCache = 0.f;
+        float3 localSingle = 0.f;
+        float localTransmittance = 1.f;
+        float start = chord.x;
+        for (uint k = 0; k < 4u; ++k)
+        {
+            const float end = k < 3u ? cuts[k] : chord.y;
+            if (end <= start)
+                continue;
+            // The segment's octant, and its 8 points of the 27 (x fastest).
+            const float3 middle = origin + 0.5f * (start + end) * dv;
+            const uint3 octant = uint3(middle >= cell);
+            const float3 low = cell - 0.5f + 0.5f * float3(octant);
+            float s8[8];
+            float3 sun8[8];
+            float3 cache8[8];
+            [unroll]
+            for (uint c = 0; c < 8; ++c)
+            {
+                const uint3 at = octant + uint3(c & 1u, (c >> 1) & 1u, (c >> 2) & 1u);
+                const uint g = at.x + 3u * at.y + 9u * at.z;
+                s8[c] = sigma[g];
+                sun8[c] = sun[g];
+                cache8[c] = cached[g];
+            }
+            const float worldLength = (end - start) * ray.worldLength;
+            if (params.pushEvalMode == 1u)
+            {
+                const float s0 = pushTrilinear(s8, (origin + start * dv - low) * 2.f);
+                const float sm = pushTrilinear(s8, (middle - low) * 2.f);
+                const float s1 = pushTrilinear(s8, (origin + end * dv - low) * 2.f);
+                operatorDepth += worldLength / 6.f * (s0 + 4.f * sm + s1);
+            }
+            else
+            {
+                const float dt = 0.25f * (end - start);
+                for (uint q = 0; q < 4u; ++q)
+                {
+                    const float3 p = origin + (start + (float(q) + 0.5f) * dt) * dv;
+                    const float3 u = (p - low) * 2.f;
+                    const float s = max(pushTrilinear(s8, u), 0.f);
+                    const float alpha = 1.f - exp(-s * 0.25f * worldLength);
+                    float3 sourceSun;
+                    float3 sourceCache;
+                    if (params.pushEvalMode == 4u)
+                    {
+                        float r[8];
+                        float gr[8];
+                        float b[8];
+                        [unroll]
+                        for (uint c = 0; c < 8; ++c) { r[c] = sun8[c].r; gr[c] = sun8[c].g; b[c] = sun8[c].b; }
+                        const float3 emitSun = float3(pushTrilinear(r, u), pushTrilinear(gr, u), pushTrilinear(b, u));
+                        [unroll]
+                        for (uint c = 0; c < 8; ++c) { r[c] = cache8[c].r; gr[c] = cache8[c].g; b[c] = cache8[c].b; }
+                        const float3 emitCache = float3(pushTrilinear(r, u), pushTrilinear(gr, u), pushTrilinear(b, u));
+                        sourceSun = s > 1e-12f ? emitSun / s : 0.f;
+                        sourceCache = s > 1e-12f ? emitCache / s : 0.f;
+                    }
+                    else
+                    {
+                        const float3 x = p - cell;
+                        sourceSun = meanSun + gradSun[0] * x.x + gradSun[1] * x.y + gradSun[2] * x.z;
+                        sourceCache = meanCache + gradCache[0] * x.x + gradCache[1] * x.y + gradCache[2] * x.z;
+                    }
+                    localSingle += localTransmittance * alpha * max(sourceSun, 0.f);
+                    localCache += localTransmittance * alpha * max(sourceCache, 0.f);
+                    localTransmittance *= 1.f - alpha;
+                }
+            }
+            start = end;
+        }
+        if (params.pushEvalMode == 1u)
+        {
+            // The oracle: the chord's own source, exactly, from unit transmittance; the operator's transmittance for what follows.
+            uint oracleSteps = 0;
+            float oracleDistance = 0.f;
+            float oracleTransmittance = 1.f;
+            float fineVoxels = cellViewFineVoxels(cell);
+            marchSegmentMoment(ray, chord, withCache, withSingle, localCache, localSingle, oracleTransmittance, oracleSteps, oracleDistance, fineVoxels);
+            localTransmittance = exp(-operatorDepth);
+        }
+        cache += transmittance * localCache;
+        single += transmittance * localSingle;
+        transmittance *= localTransmittance;
+    }
+
+    /// pushEval sample index -> beam image position, or false where the grid runs past its dimensions.
+    bool pushSamplePosition(uint2 index, out float2 position)
+    {
+        position = (float2(params.pushSampleOriginX, params.pushSampleOriginY) + float2(index) + 0.5f) * float(params.pushSampleStep);
+        return all(index < uint2(params.pushSampleDimsX, params.pushSampleDimsY));
+    }
+
+    /// pushEval, Step 5 of the handoff as a MEASUREMENT: what the push lists cost to consume and how good cell views are through
+    /// them. A sample direction takes the sorted list of the tile containing it in every shell, nearest shell first (shells are
+    /// ordered by distance, so this is one front-to-back order), and composites each listed cell its ray crosses: from the cell's
+    /// view where one is usable (the validity composeBeam used: same cell, distance band, drift, age, fade), else by marching only
+    /// that cell's chord - the residual - and queueing the view's build. It stops once opaque. Nothing here walks the volume: the
+    /// lists are the work. Samples are one per pushSampleStep^2 texels, so the counts are the measurement, not the time.
+    ///
+    /// MEASURED (eval1, 4K, shells, views 8 x 8, 131k capacity, 16k builds a frame, same run, same 68k samples; drift .04 / .1
+    /// nearly identical): walk - 60 list entries read per sample, 6.6 cells crossed, views answer 87% of crossings (65% empty
+    /// views), residual chords 12.7% at 4.6% of the exact march's steps; but 3.0% of samples over 0.02 against the exact march
+    /// (the frame gate is 0.137%) and 2.05 ms to evaluate them against 1.09 ms to march them exactly (30 against 16 ns a sample).
+    /// Sprint - views answer only 41% (59% residual), 4.9 ms against 1.2. Near walk (camera in cloud) - every sample goes opaque in
+    /// cells nearer than 4 voxels, all residual, exact. So reading an 8 x 8 camera-conditioned view per crossed cell costs more
+    /// than marching the cell and is far less accurate: the view payload fails Question B, whatever consumes it.
+    void evaluatePushSample(uint2 index)
+    {
+        float2 position;
+        if (!pushSamplePosition(index, position))
+            return;
+        const uint sampleId = index.x + params.pushSampleDimsX * index.y;
+        hstrPushSamples[sampleId] = float4(0.f, 0.f, 0.f, -1.f);
+        if (!beamBoxOnScreen(position - 0.5f, position + 0.5f) || gScene.getGridVolumeCount() == 0)
+            return;
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float3 cameraWorld = gScene.camera.data.posW;
+        const float3 w = beamRayDirection(position);
+        CutRay ray;
+        if (!makeCutRay(cameraWorld, w, volume, ray))
+            return;
+        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+        const float cellWidth = float(params.hstrCellWidth);
+        const float3 origin = ray.position * cellWidth;
+        const float3 dv = ray.direction * cellWidth;
+        const float voxelsPerUnit = length(dv);
+        const float3 camera = worldToVoxel(cameraWorld, volume) - float3(params.hstrGridMin);
+        const float3 dims = float3(params.hstrExtinctionDims);
+        const bool withCache = beamWithCache();
+        const bool withSingle = beamWithSingle();
+        const uint frameStamp = params.cellViewFrame + 1u;
+        float3 cache = 0.f;
+        float3 single = 0.f;
+        float transmittance = 1.f;
+        float opacityDistance = 0.f;
+        uint steps = 0;
+        uint entries = 0;
+        uint crossed = 0;
+        uint viewHits = 0;
+        uint viewEmpty = 0;
+        uint residual = 0;
+        uint requests = 0;
+        for (int shell = int(pushShellCount()) - 1; shell >= 0 && transmittance > params.cloudMinTransmittance; --shell)
+        {
+            const uint2 tile = uint2(position / float(pushShellEdge(uint(shell))));
+            const uint2 shellDims = pushShellDims(uint(shell));
+            if (any(tile >= shellDims))
+                continue;
+            const uint id = pushShellBase(uint(shell)) + tile.x + shellDims.x * tile.y;
+            const uint base = hstrPushTileOffsets[id];
+            const uint count = base < params.pushListCapacity ? min(hstrPushTileCounts[id], params.pushListCapacity - base) : 0u;
+            for (uint i = 0; i < count && transmittance > params.cloudMinTransmittance; ++i)
+            {
+                ++entries;
+                const uint cellSlot = hstrPushList[base + i];
+                const float3 cell = camera + pushCellOffset(hstrPushSlotKeys[cellSlot]);
+                const float2 slab = cellViewSlab(origin, dv, cell - 0.5f);
+                const float2 chord = float2(max(slab.x, 0.f), min(slab.y, 1.f));
+                if (!(chord.y > chord.x))
+                    continue;
+                ++crossed;
+                const uint3 key = cellViewKey(cell);
+                const float distance = length(cell - camera);
+                const bool keyed = cell.y >= 0.f && cell.y < dims.y && distance >= 4.f;
+                bool usable = false;
+                bool request = keyed && params.pushEvalMode == 0u;
+                // The cell operator: far enough out that it stands for the cell (nearer cells stay residual, as the views did).
+                if (params.pushEvalMode != 0u && keyed)
+                {
+                    pushOperatorChord(ray, origin, dv, cell, cellSlot, chord, withCache, withSingle, cache, single, transmittance);
+                    usable = true;
+                    ++viewHits;
+                }
+                else if (keyed && params.pushEvalMode == 0u)
+                {
+                    const uint entry = hstrCellMap[key];
+                    if (entry != 0u)
+                    {
+                        const uint slot = entry - 1u;
+                        const CellView view = hstrCellViews[slot];
+                        // How far the build ray through the chord's midpoint strays from this chord at the chord's ends.
+                        const float3 m = origin + 0.5f * (chord.x + chord.y) * dv;
+                        const float3 toMid = normalize(m - camera);
+                        const float3 moved = camera - view.camera;
+                        const float3 across = moved - dot(moved, toMid) * toMid;
+                        const float drift = length(across) / max(length(m - view.camera), 1e-3f) * 0.5f * (chord.y - chord.x) * voxelsPerUnit;
+                        const uint age = frameStamp - view.frame;
+                        const float fadeNow = cellViewFade(distance);
+                        const float fadeRatio = view.fade > 1e-4f ? fadeNow / view.fade : (fadeNow <= 1e-4f ? 1.f : 1e30f);
+                        const bool same = view.frame != 0u && all(view.cell == int3(cell));
+                        usable = same && distance >= view.bandLow && distance <= view.bandHigh && drift <= params.cellViewDrift &&
+                                 age <= 2u * params.cellViewMaxAge && fadeRatio >= 0.9f && fadeRatio <= 1.1f;
+                        request = !usable || drift > 0.5f * params.cellViewDrift || age > params.cellViewMaxAge ||
+                                  fadeRatio < 0.95f || fadeRatio > 1.05f;
+                        if (usable && (view.flags & kCellViewEmpty) != 0u)
+                            ++viewEmpty;
+                        else if (usable)
+                        {
+                            float2 uv = cellViewAtlasUv(slot, cellViewTexel(m, cell, view.camera));
+                            float4 a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            float4 b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            // An opaque skin sits at the chord's opacity centroid, and the build ray through THAT point saw it.
+                            if (params.cellViewRefine != 0 && a.a < 0.98f)
+                            {
+                                const float3 c = origin + (chord.x + saturate(b.a) * (chord.y - chord.x)) * dv;
+                                uv = cellViewAtlasUv(slot, cellViewTexel(c, cell, view.camera));
+                                a = hstrCellTexels.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                                b = hstrCellTexelsSingle.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+                            }
+                            // The fade scales the cell's extinction: exact for the transmittance, and for the light where the
+                            // source is constant along the chord.
+                            float T = saturate(a.a);
+                            float scale = 1.f;
+                            if (abs(fadeRatio - 1.f) > 1e-4f)
+                            {
+                                const float faded = pow(max(T, 1e-12f), fadeRatio);
+                                scale = T < 0.9999f ? (1.f - faded) / (1.f - T) : fadeRatio;
+                                T = faded;
+                            }
+                            cache += transmittance * scale * a.rgb;
+                            single += transmittance * scale * b.rgb;
+                            const float d0 = ray.entryDistance + chord.x * ray.worldLength;
+                            const float d1 = ray.entryDistance + chord.y * ray.worldLength;
+                            opacityDistance += transmittance * (1.f - T) * (d0 + saturate(b.a) * (d1 - d0));
+                            transmittance *= T;
+                            ++viewHits;
+                        }
+                    }
+                }
+                if (!usable)
+                {
+                    uint residualSteps = 0;
+                    float fineVoxels = cellViewFineVoxels(cell);
+                    marchSegmentMoment(ray, chord, withCache, withSingle, cache, single, transmittance, residualSteps, opacityDistance, fineVoxels);
+                    steps += residualSteps;
+                    ++residual;
+                }
+                if (request && hstrCellRequest[key] != frameStamp)
+                {
+                    uint previous;
+                    InterlockedExchange(hstrCellRequest[key], frameStamp, previous);
+                    if (previous != frameStamp)
+                    {
+                        uint slot;
+                        InterlockedAdd(hstrCellCounters[0], 1u, slot);
+                        if (slot < params.cellViewBuildCapacity)
+                            hstrCellBuild[slot] = int4(int3(cell), 0);
+                        ++requests;
+                    }
+                }
+            }
+        }
+        const float depth = -log(max(transmittance, 1e-12f));
+        hstrPushSamples[sampleId] = float4(beamRadiance(cache, single, depth, w, volume.data.albedo), transmittance);
+        pushCount(kPushEvalSamples, 1u);
+        pushCount(kPushEvalEntries, entries);
+        pushCount(kPushEvalCrossed, crossed);
+        pushCount(kPushEvalViewHits, viewHits);
+        pushCount(kPushEvalViewEmpty, viewEmpty);
+        pushCount(kPushEvalResidual, residual);
+        pushCount(kPushEvalResidualSteps, steps);
+        pushCount(kPushEvalTerminated, transmittance <= params.cloudMinTransmittance ? 1u : 0u);
+        pushCount(kPushEvalRequests, requests);
+        pushCount(kPushEvalResidualSamples, residual != 0u ? 1u : 0u);
+    }
+
+    /// pushEval: the exact march of a sample's direction, and the composited sample's error against it.
+    void comparePushSample(uint2 index)
+    {
+        float2 position;
+        if (!pushSamplePosition(index, position))
+            return;
+        const float4 composed = hstrPushSamples[index.x + params.pushSampleDimsX * index.y];
+        if (composed.a < 0.f)
+            return;
+        const float3 w = beamRayDirection(position);
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        const float3 radiance = beamRadiance(exact.cache, exact.single, exact.depth, w, gScene.getGridVolume(0).data.albedo);
+        const float3 difference = abs(log(1.f + max(composed.rgb, 0.f)) - log(1.f + max(radiance, 0.f)));
+        const float error = max(difference.r, max(difference.g, difference.b));
+        pushCount(kPushEvalOver02, error > 0.02f ? 1u : 0u);
+        pushCount(kPushEvalOverT, abs(composed.a - exp(-exact.depth)) > 0.02f ? 1u : 0u);
+        pushCount(kPushEvalErrorSum, uint(min(error, 100.f) * 1e4f));
+        pushCount(kPushEvalExactSteps, uint(exact.steps));
+        uint unused;
+        InterlockedMax(hstrPushCounts[kPushEvalErrorMax], asuint(error), unused);
+    }
+
+    /// pushShare, experiment 1 as a MEASUREMENT: how many of this frame's dirty rays (every lattice point the dirty query marched,
+    /// every unit the dirty march marched) cross each cell x tile interaction of the push lists, and the march steps they spend
+    /// inside it. That is the most work one shared evaluation per interaction could replace. A ray walks its tile's lists front
+    /// to back as evaluatePushSample does, marching each crossed cell's chord (the shipping march, so the steps are the real
+    /// cost), and stops once opaque as the march does. Its exact march's steps are counted too: the crossings should account for
+    /// them, or the lists miss work.
+    ///
+    /// MEASURED (share1, 4K, shipping frame, shells 10, last scored step): walk - 742k dirty rays (456k query points, 295k units),
+    /// 32% opaque; 10.44M crossings (14.1 a ray) of 161k interactions, so 65 rays and 166 chord steps an interaction, 2.6 steps a
+    /// crossing; 93% of the chord steps are in interactions 32 or more rays cross, 61% in those 128 or more. Sprint - 803k rays,
+    /// 9.49M crossings, 172k interactions (55 rays, 140 steps each), 90% of steps at 32+ rays. But the chords hold only 57% (walk,
+    /// 26.8M of 47.0M) and 52% (sprint) of the same rays' exact march steps: nearly half the march is outside the listed cells.
+    /// MEASURED (share2, walk, same counts as share1): the whole ray with the chords' marcher takes exactly the shipping march's
+    /// 47.02M steps, and the 20.2M (43%) outside the chords hold 3.8% of its optical depth - the march spends 43% of its steps
+    /// crossing empty space. But that 3.8% is density the lists miss: 1.16% of the rays differ by over 0.02 in transmittance,
+    /// 0.53% in log radiance.
+    /// MEASURED (share3, walk): those misses are on screen (331 of 8,609 are not) and sit 64-256 voxels out, around the view
+    /// distance (192), where the march reads the coarse levels - filtered density reaching past the occupancy's one-cell dilation.
+    /// Payloads, rays over 0.02 against the chords' composite: each ray's own chords marched alone 1 of 742k (composition is
+    /// exact); a lattice per tile interpolating each cell's transfer as is: 2^2 49%, 3^2 46%, 5^2 34%, 9^2 17.5% (mean log error
+    /// 0.128, 0.063, 0.029, 0.012), the 9^2 costing 81 x 2.25 = 182 steps an interaction against the rays' own 166.
+    /// MEASURED (share4, walk): normalised by the cell's geometry (extinction per length and source per opacity from the corners
+    /// that meet the cell, along the ray's own chord), 2^2 25% (54% of its crossings meet no corner), 3^2 35%, 5^2 25%, 9^2 13%.
+    /// So the cube's silhouette is not what fails: the transfer has structure at the scale of the image's texels. And listing every
+    /// cell within one cell of an occupied one (pushDilate 1) added 3.2M crossings and no density: the same 8,604 rays miss.
+    /// MEASURED (share5, walk): nor do they miss - the chords hold 28.2k (x 1e3) optical depth beyond the whole march as well as
+    /// 46.0k short of it, and of the 8,609 rays over 0.02 in transmittance 4,202 are the more transparent, 4,407 the more opaque:
+    /// a march restarted at every cell face places its steps differently, which moves 1.2% of rays either way. The lists are
+    /// complete. Experiment 3, the oracle: interactions whose every crossing a payload answers within 0.005 / 0.01 / 0.02 -
+    /// 3^2: 82 / 84 / 86% of the 161k, holding 49 / 51 / 55% of the chord steps; 5^2: the same to 1%. The easy interactions are easy
+    /// at any resolution and the hard 14% (45% of the steps) are hard at all of them: at domain-cell nodes a payload can take at most
+    /// about half of the in-cell march, i.e. with the empty space the lists skip, 47.0M steps become ~12M residual + ~10M crossings
+    /// to compose + the payloads' builds - about 2x, not the 6-8x the budget needs.
+    void countPushShare(uint thread)
+    {
+        uint listed, units, stride;
+        hstrPushShareRays.GetDimensions(listed, stride);
+        hstrBeamDirtyUnits.GetDimensions(units, stride);
+        const uint queries = min(hstrPushCounts[kPushShareQueries], listed);
+        units = min(hstrBeamDirtyCount[1], units);
+        if (thread == 0u)
+            hstrPushCounts[kPushShareUnits] = units;
+        if (thread >= queries + units || gScene.getGridVolumeCount() == 0)
+            return;
+        // A lattice point's ray goes through its integer position, a unit's through its texel centre (see marchBeamUnitExact).
+        const uint packed = thread < queries ? hstrPushShareRays[thread] : hstrBeamDirtyUnits[thread - queries];
+        const float2 position = float2(packed & 0xFFFFu, packed >> 16) + (thread < queries ? 0.f : 0.5f);
+        const GridVolume volume = gScene.getGridVolume(0);
+        const float3 cameraWorld = gScene.camera.data.posW;
+        const float3 w = beamRayDirection(position);
+        CutRay ray;
+        if (!makeCutRay(cameraWorld, w, volume, ray))
+            return;
+        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+        const float cellWidth = float(params.hstrCellWidth);
+        const float3 origin = ray.position * cellWidth;
+        const float3 dv = ray.direction * cellWidth;
+        const float3 camera = worldToVoxel(cameraWorld, volume) - float3(params.hstrGridMin);
+        const bool withCache = beamWithCache();
+        const bool withSingle = beamWithSingle();
+        float3 cache = 0.f;
+        float3 single = 0.f;
+        float transmittance = 1.f;
+        float opacityDistance = 0.f;
+        uint crossings = 0;
+        uint steps = 0;
+        float3 payCache[kPushSharePayloads];
+        float3 paySingle[kPushSharePayloads];
+        float payT[kPushSharePayloads];
+        uint paySteps[kPushSharePayloads];
+        [unroll]
+        for (uint r = 0; r < kPushSharePayloads; ++r)
+        {
+            payCache[r] = 0.f;
+            paySingle[r] = 0.f;
+            payT[r] = 1.f;
+            paySteps[r] = 0u;
+        }
+        float3 ageCache[3];
+        float3 ageSingle[3];
+        float ageT[3];
+        [unroll]
+        for (uint k = 0; k < 3; ++k)
+        {
+            ageCache[k] = 0.f;
+            ageSingle[k] = 0.f;
+            ageT[k] = 1.f;
+        }
+        uint entryCapacity;
+        hstrPushShareEntries.GetDimensions(entryCapacity, stride);
+        for (int shell = int(pushShellCount()) - 1; shell >= 0 && transmittance > params.cloudMinTransmittance; --shell)
+        {
+            const uint2 tile = uint2(position / float(pushShellEdge(uint(shell))));
+            const uint2 shellDims = pushShellDims(uint(shell));
+            if (any(tile >= shellDims))
+                continue;
+            const uint id = pushShellBase(uint(shell)) + tile.x + shellDims.x * tile.y;
+            const uint base = hstrPushTileOffsets[id];
+            const uint count = base < params.pushListCapacity ? min(hstrPushTileCounts[id], params.pushListCapacity - base) : 0u;
+            for (uint i = 0; i < count && transmittance > params.cloudMinTransmittance; ++i)
+            {
+                const float3 cell = camera + pushCellOffset(hstrPushSlotKeys[hstrPushList[base + i]]);
+                const float2 slab = cellViewSlab(origin, dv, cell - 0.5f);
+                const float2 chord = float2(max(slab.x, 0.f), min(slab.y, 1.f));
+                if (!(chord.y > chord.x))
+                    continue;
+                uint chordSteps = 0;
+                float fineVoxels = cellViewFineVoxels(cell);
+                const float before = transmittance;
+                marchSegmentMoment(ray, chord, withCache, withSingle, cache, single, transmittance, chordSteps, opacityDistance, fineVoxels);
+                uint unused;
+                if (base + i < entryCapacity)
+                {
+                    InterlockedAdd(hstrPushShareEntries[base + i].x, 1u, unused);
+                    InterlockedAdd(hstrPushShareEntries[base + i].y, chordSteps, unused);
+                }
+                else
+                    pushCount(kPushShareEntriesDropped, 1u);
+                ++crossings;
+                steps += chordSteps;
+                // Experiment 2: the cell's shared payload over this tile. Variant 0 is the ray's own chord marched alone (what
+                // composing separately marched chords costs in accuracy); variant r > 0 is a lattice of (2^(r-1) + 1)^2 chords
+                // over the tile, the payload one evaluation per interaction would store, read bilinearly at the ray.
+                float3 c0, s0;
+                uint payloadSteps;
+                float ownLength;
+                const float T0 = pushChordAt(position, cell, cameraWorld, volume, c0, s0, payloadSteps, ownLength);
+                // Experiment 4, the temporal oracle: this interaction's exact result as a cache would hold it from frames ago - the
+                // same cell, from where the camera was then - against its result now. Nothing is approximated: a hit reuses a
+                // result that was exact when it was marched.
+                // MEASURED (share6, 4K), slot 0 as the same texel's direction 1 / 4 / 16 frames old, at 0.02: walk - 83% of the
+                // interactions reusable but only 53 / 51 / 52% of the chord steps (77 / 69 / 69% counted per crossing), 24.5 / 46 /
+                // 51% of rays over 0.02 reusing all; sprint (1 frame) 53% of steps, 40% of rays. The dense interactions change.
+                // MEASURED (share7), the midpoint ray, 1 / 4 frames old, interactions reusable and their chord steps at 0.005 /
+                // 0.01 / 0.02: walk - 1 frame 93 / 96 / 99% of interactions, 73 / 84 / 94% of steps (per crossing 93 / 96 / 99%),
+                // 3.7% of rays over 0.02 reusing every crossing; 4 frames 77% of steps at 0.02, 8.0% of rays. Sprint - 1 frame
+                // (20 units) 90% of interactions, 66% of steps at 0.02 (per crossing 89%), 8.5% of rays; 4 frames 57%, 14%. This
+                // is a DENSE cache: the old ray through exactly this chord's midpoint, which the old frame never marched.
+                // MEASURED (share8, same settle, anchor reproduced at 94%): snapped to the centre of the old beam texel, as a cache
+                // of one result per texel must be, walk keeps 50 / 53 / 58% of the steps at 0.005 / 0.01 / 0.02 (1 frame; 56% at 4
+                // frames), 6.9% of rays over 0.02 reusing all; sprint 57% (1 frame), 56% (4). The snap moves the ray a median of
+                // under 0.5 fine voxels from the midpoint (p90 under 1, p99 under 1.41, max 1.6-1.7): a beam texel is about a fine
+                // voxel here, and half of one loses 36 of the 94 points. Temporal reuse fails for the reason the payloads did.
+                if ((params.pushShareMode & 2u) != 0u)
+                {
+                    const float3 motion = float3(params.pushShareMotionX, params.pushShareMotionY, params.pushShareMotionZ);
+                    const float3 now = beamRadiance(c0, s0, -log(max(T0, 1e-12f)), w, volume.data.albedo);
+                    // A world-keyed cache: the old camera's ray through the same world point, the chord's midpoint - its ends stray
+                    // only by the sideways step x half the chord / the distance. Slot 0 is that exact ray 1 frame ago (the dense
+                    // cache, the anchor); slots 1 and 2 snap it to the centre of the beam texel it lands in, 1 and 4 frames ago - the
+                    // ray a cache holding one result per texel would have. (share6's slot 0, the texel's direction from the old
+                    // camera, is MEASURED below: translation moves that ray sideways by the whole step.)
+                    const float3 midpoint = cameraWorld + w * (ray.entryDistance + 0.5f * (chord.x + chord.y) * ray.worldLength);
+                    [unroll]
+                    for (uint k = 0; k < 3; ++k)
+                    {
+                        const float3 old = cameraWorld - (k == 2u ? 4.f : 1.f) * motion;
+                        float3 direction = normalize(midpoint - old);
+                        float2 texel;
+                        if (k != 0u && beamImagePosition(direction, texel))
+                        {
+                            direction = beamRayDirection(floor(texel) + 0.5f);
+                            // How far the snapped ray passes from the midpoint, in the cell's fine voxels: half-octave bins.
+                            const float offset = length(cross(midpoint - old, direction)) / params.seaVoxelSize.x / max(cellViewFineVoxels(cell), 1e-3f);
+                            const uint bin = uint(clamp(floor(2.f * log2(max(offset, 1e-12f))) + 32.f, 0.f, 47.f));
+                            InterlockedAdd(hstrPushCounts[kPushShareSnapOffsets + 48u * (k - 1u) + bin], 1u, unused);
+                            InterlockedMax(hstrPushCounts[kPushShareSnapMax + k - 1u], asuint(offset), unused);
+                        }
+                        float3 c, s;
+                        float length;
+                        uint oldSteps;
+                        const float T = pushChordAlong(direction, cell, old, volume, c, s, oldSteps, length);
+                        const float3 then = beamRadiance(c, s, -log(max(T, 1e-12f)), w, volume.data.albedo);
+                        const float3 e3 = abs(log(1.f + before * max(then, 0.f)) - log(1.f + before * max(now, 0.f)));
+                        const float local = max(max(e3.r, max(e3.g, e3.b)), before * abs(T - T0));
+                        if (base + i < entryCapacity && k == 0u)
+                            InterlockedMax(hstrPushShareAges[base + i].x, asuint(local), unused);
+                        else if (base + i < entryCapacity && k == 1u)
+                            InterlockedMax(hstrPushShareAges[base + i].y, asuint(local), unused);
+                        else if (base + i < entryCapacity)
+                            InterlockedMax(hstrPushShareAges[base + i].z, asuint(local), unused);
+                        [unroll]
+                        for (uint t = 0; t < 3; ++t)
+                        {
+                            const float tolerance = t == 0u ? 0.005f : (t == 1u ? 0.01f : 0.02f);
+                            pushCount(kPushShareAgeCrossingSteps + 3u * k + t, local <= tolerance ? chordSteps : 0u);
+                        }
+                        ageCache[k] += ageT[k] * c;
+                        ageSingle[k] += ageT[k] * s;
+                        ageT[k] *= T;
+                    }
+                }
+                if ((params.pushShareMode & 1u) == 0u)
+                    continue; // The payloads (experiments 2 and 3) are measured; see above.
+                payCache[0] += payT[0] * c0;
+                paySingle[0] += payT[0] * s0;
+                payT[0] *= T0;
+                const float edge = float(pushShellEdge(uint(shell)));
+                [unroll]
+                for (uint r = 1; r < kPushSharePayloads; ++r)
+                {
+                    // Normalised by the cell's geometry, so the cube's silhouette is not interpolated: the corners' extinction per
+                    // unit length and source per unit opacity, over the corners whose ray meets the cell, applied along this ray's
+                    // own chord. With no corner in the cell the ray's own chord stands (the residual).
+                    const float spacing = edge / float(1u << (r - 1u));
+                    const float2 g = floor(position / spacing);
+                    const float2 f = position / spacing - g;
+                    float3 cc = 0.f;
+                    float3 ss = 0.f;
+                    float opacity = 0.f;
+                    float sigma = 0.f;
+                    float hit = 0.f;
+                    [unroll]
+                    for (uint k = 0; k < 4; ++k)
+                    {
+                        const float2 corner = float2(k & 1u, k >> 1u);
+                        const float weight = (corner.x != 0.f ? f.x : 1.f - f.x) * (corner.y != 0.f ? f.y : 1.f - f.y);
+                        float3 c, s;
+                        float length;
+                        const float T = pushChordAt((g + corner) * spacing, cell, cameraWorld, volume, c, s, payloadSteps, length);
+                        paySteps[r] += payloadSteps;
+                        if (length > 0.f)
+                        {
+                            cc += weight * c;
+                            ss += weight * s;
+                            opacity += weight * (1.f - T);
+                            sigma += weight * -log(max(T, 1e-12f)) / length;
+                            hit += weight;
+                        }
+                    }
+                    float3 cellCache = c0;
+                    float3 cellSingle = s0;
+                    float cellT = T0;
+                    if (hit > 1e-6f)
+                    {
+                        cellT = exp(-sigma / hit * ownLength);
+                        const float perOpacity = opacity > 1e-6f ? (1.f - cellT) / opacity : 0.f;
+                        cellCache = cc * perOpacity;
+                        cellSingle = ss * perOpacity;
+                    }
+                    else
+                        pushCount(kPushSharePayloadResidual + r, 1u);
+                    // Experiment 3's oracle: this crossing's own error under the 3^2 and 5^2 payloads - the cell's light and
+                    // transmittance against its own chord's, as seen through what lies in front - kept as the interaction's maximum.
+                    if ((r == 2u || r == 3u) && base + i < entryCapacity)
+                    {
+                        const float3 mine = beamRadiance(c0, s0, -log(max(T0, 1e-12f)), w, volume.data.albedo);
+                        const float3 theirs = beamRadiance(cellCache, cellSingle, -log(max(cellT, 1e-12f)), w, volume.data.albedo);
+                        const float3 e3 = abs(log(1.f + before * max(theirs, 0.f)) - log(1.f + before * max(mine, 0.f)));
+                        const float local = max(max(e3.r, max(e3.g, e3.b)), before * abs(cellT - T0));
+                        if (r == 2u)
+                            InterlockedMax(hstrPushShareEntries[base + i].z, asuint(local), unused);
+                        else
+                            InterlockedMax(hstrPushShareEntries[base + i].w, asuint(local), unused);
+                    }
+                    payCache[r] += payT[r] * cellCache;
+                    paySingle[r] += payT[r] * cellSingle;
+                    payT[r] *= cellT;
+                }
+            }
+        }
+        [unroll]
+        for (uint r = 0; r < kPushSharePayloads; ++r)
+        {
+            const float3 payload = beamRadiance(payCache[r], paySingle[r], -log(max(payT[r], 1e-12f)), w, volume.data.albedo);
+            const float3 chords = beamRadiance(cache, single, -log(max(transmittance, 1e-12f)), w, volume.data.albedo);
+            const float3 error3 = abs(log(1.f + max(payload, 0.f)) - log(1.f + max(chords, 0.f)));
+            const float error = max(error3.r, max(error3.g, error3.b));
+            pushCount(kPushSharePayloadOver02 + r, error > 0.02f ? 1u : 0u);
+            pushCount(kPushSharePayloadOverT + r, abs(payT[r] - transmittance) > 0.02f ? 1u : 0u);
+            pushCount(kPushSharePayloadErrorSum + r, uint(min(error, 100.f) * 1e4f));
+            pushCount(kPushSharePayloadSteps + r, paySteps[r]);
+        }
+        // The temporal oracle per ray: every crossing reused from k frames ago, composited, against the chords now.
+        [unroll]
+        for (uint k = 0; k < 3; ++k)
+        {
+            const float3 reused = beamRadiance(ageCache[k], ageSingle[k], -log(max(ageT[k], 1e-12f)), w, volume.data.albedo);
+            const float3 chords = beamRadiance(cache, single, -log(max(transmittance, 1e-12f)), w, volume.data.albedo);
+            const float3 error3 = abs(log(1.f + max(reused, 0.f)) - log(1.f + max(chords, 0.f)));
+            pushCount(kPushShareAgeOver02 + k, max(error3.r, max(error3.g, error3.b)) > 0.02f ? 1u : 0u);
+        }
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        // The whole ray with the chords' own marcher: its steps less theirs are the march outside every listed cell, and its
+        // optical depth and radiance against the chords' composite say whether that march met density the lists miss.
+        float3 fullCache = 0.f;
+        float3 fullSingle = 0.f;
+        float fullTransmittance = 1.f;
+        uint fullSteps = 0;
+        float fullDistance = 0.f;
+        marchSegmentMoment(ray, float2(0.f, 1.f), withCache, withSingle, fullCache, fullSingle, fullTransmittance, fullSteps, fullDistance);
+        const float chordDepth = -log(max(transmittance, 1e-12f));
+        const float fullDepth = -log(max(fullTransmittance, 1e-12f));
+        const float3 chordRadiance = beamRadiance(cache, single, chordDepth, w, volume.data.albedo);
+        const float3 fullRadiance = beamRadiance(fullCache, fullSingle, fullDepth, w, volume.data.albedo);
+        const float3 difference = abs(log(1.f + max(chordRadiance, 0.f)) - log(1.f + max(fullRadiance, 0.f)));
+        pushCount(kPushShareFullSteps, fullSteps);
+        pushCount(kPushShareOverT, abs(transmittance - fullTransmittance) > 0.02f ? 1u : 0u);
+        // Where the density the lists miss is: rays the screen cannot see (the guard's reach past its edge), and the rays that
+        // miss by camera distance of the whole march's opacity centroid.
+        const bool onScreen = beamBoxOnScreen(position - 0.5f, position + 0.5f);
+        const bool missed = abs(transmittance - fullTransmittance) > 0.02f;
+        pushCount(kPushShareOffscreen, onScreen ? 0u : 1u);
+        pushCount(kPushShareOffscreenOverT, !onScreen && missed ? 1u : 0u);
+        if (missed)
+        {
+            const float voxels = fullDistance / max(1.f - fullTransmittance, 1e-6f) / params.seaVoxelSize.x;
+            uint unused;
+            InterlockedAdd(hstrPushCounts[kPushShareMissDistance + min(pushBin(uint(max(voxels, 0.f))), 15u)], 1u, unused);
+        }
+        pushCount(kPushShareOver02, max(difference.r, max(difference.g, difference.b)) > 0.02f ? 1u : 0u);
+        pushCount(kPushShareDepthMissing, uint(clamp(fullDepth - chordDepth, 0.f, 10.f) * 1000.f));
+        // The other sign: if the chords also hold depth the whole march lacks, the difference is where the steps fall, not a miss.
+        pushCount(kPushShareDepthExtra, uint(clamp(chordDepth - fullDepth, 0.f, 10.f) * 1000.f));
+        pushCount(kPushShareOverTMore, transmittance - fullTransmittance > 0.02f ? 1u : 0u);
+        pushCount(kPushShareDepthTotal, uint(min(fullDepth, 10.f) * 1000.f));
+        pushCount(kPushShareRays, 1u);
+        pushCount(kPushShareOpaque, transmittance <= params.cloudMinTransmittance ? 1u : 0u);
+        pushCount(kPushShareCrossings, crossings);
+        pushCount(kPushShareSteps, steps);
+        pushCount(kPushShareExactSteps, uint(exact.steps));
+    }
+
+    /// pushShare's payload: a cell's transfer along the camera ray through beam position p, marched alone (cache and single
+    /// premultiplied by its own transmittance, which it returns). Nothing where the ray misses the cell.
+    float pushChordAt(float2 p, float3 cell, float3 cameraWorld, GridVolume volume, out float3 cache, out float3 single, out uint steps,
+                      out float length)
+    {
+        return pushChordAlong(beamRayDirection(p), cell, cameraWorld, volume, cache, single, steps, length);
+    }
+
+    /// pushChordAt along direction w from cameraWorld; cell is in the voxel frame of the current camera (pushCellOffset).
+    float pushChordAlong(float3 w, float3 cell, float3 cameraWorld, GridVolume volume, out float3 cache, out float3 single, out uint steps,
+                         out float length)
+    {
+        cache = 0.f;
+        single = 0.f;
+        steps = 0u;
+        length = 0.f;
+        CutRay ray;
+        if (!makeCutRay(cameraWorld, w, volume, ray))
+            return 1.f;
+        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+        const float cellWidth = float(params.hstrCellWidth);
+        const float2 slab = cellViewSlab(ray.position * cellWidth, ray.direction * cellWidth, cell - 0.5f);
+        const float2 chord = float2(max(slab.x, 0.f), min(slab.y, 1.f));
+        if (!(chord.y > chord.x))
+            return 1.f;
+        length = (chord.y - chord.x) * ray.worldLength;
+        float transmittance = 1.f;
+        float opacityDistance = 0.f;
+        float fineVoxels = cellViewFineVoxels(cell);
+        marchSegmentMoment(ray, chord, beamWithCache(), beamWithSingle(), cache, single, transmittance, steps, opacityDistance, fineVoxels);
+        return transmittance;
+    }
+
+    /// pushShare: per tile, its interactions some dirty ray crossed, by shell and by how many rays crossed each.
+    void histogramPushShare(uint id)
+    {
+        if (id >= params.pushTileTotal)
+            return;
+        uint shell = 0;
+        uint next = pushShellDims(0).x * pushShellDims(0).y;
+        while (id >= next && shell + 1u < pushShellCount())
+        {
+            ++shell;
+            next += pushShellDims(shell).x * pushShellDims(shell).y;
+        }
+        const uint base = hstrPushTileOffsets[id];
+        uint entryCapacity, stride;
+        hstrPushShareEntries.GetDimensions(entryCapacity, stride);
+        const uint count = base < entryCapacity ? min(hstrPushTileCounts[id], entryCapacity - base) : 0u;
+        uint interactions = 0;
+        uint crossings = 0;
+        uint steps = 0;
+        uint unused;
+        for (uint i = 0; i < count; ++i)
+        {
+            const uint4 e = hstrPushShareEntries[base + i];
+            if (e.x == 0u)
+                continue;
+            // Experiment 4: the interactions whose every crossing a cache k frames old answers within a tolerance.
+            if ((params.pushShareMode & 2u) != 0u)
+            {
+                const uint4 ages = hstrPushShareAges[base + i];
+                [unroll]
+                for (uint k = 0; k < 3; ++k)
+                {
+                    const float worst = asfloat(k == 0u ? ages.x : (k == 1u ? ages.y : ages.z));
+                    [unroll]
+                    for (uint t = 0; t < 3; ++t)
+                    {
+                        const float tolerance = t == 0u ? 0.005f : (t == 1u ? 0.01f : 0.02f);
+                        if (worst <= tolerance)
+                        {
+                            InterlockedAdd(hstrPushCounts[kPushShareAgeSafe + 6u * k + 2u * t], 1u, unused);
+                            InterlockedAdd(hstrPushCounts[kPushShareAgeSafe + 6u * k + 2u * t + 1u], e.y, unused);
+                        }
+                    }
+                }
+            }
+            ++interactions;
+            crossings += e.x;
+            steps += e.y;
+            // Experiment 3: the interactions whose every crossing the payload answers within a tolerance, and their chord steps.
+            [unroll]
+            for (uint p = 0; p < 2; ++p)
+            {
+                const float worst = asfloat(p == 0u ? e.z : e.w);
+                [unroll]
+                for (uint k = 0; k < 3; ++k)
+                {
+                    const float tolerance = k == 0u ? 0.005f : (k == 1u ? 0.01f : 0.02f);
+                    if (worst <= tolerance)
+                    {
+                        InterlockedAdd(hstrPushCounts[kPushShareSafe + 6u * p + 2u * k], 1u, unused);
+                        InterlockedAdd(hstrPushCounts[kPushShareSafe + 6u * p + 2u * k + 1u], e.y, unused);
+                    }
+                }
+            }
+            const uint bin = min(firstbithigh(e.x), 15u);
+            InterlockedAdd(hstrPushCounts[kPushShareHistCount + bin], 1u, unused);
+            InterlockedAdd(hstrPushCounts[kPushShareHistSteps + bin], e.y, unused);
+        }
+        if (interactions == 0u)
+            return;
+        InterlockedAdd(hstrPushCounts[kPushShareShell + 3u * shell], interactions, unused);
+        InterlockedAdd(hstrPushCounts[kPushShareShell + 3u * shell + 1u], crossings, unused);
+        InterlockedAdd(hstrPushCounts[kPushShareShell + 3u * shell + 2u], steps, unused);
     }
 
     /// marchSegmentMoment in the beam view with every HSTR_SHIP switch at its shipping value (HSTR_SHIP bit 512): a midpoint march
@@ -6697,7 +7793,7 @@ struct HSTRCloudRenderer
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        const BeamSample exact = marchBeamDirty(w);
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
@@ -6773,6 +7869,14 @@ struct HSTRCloudRenderer
     {
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
         beamGuardVerified(position, q.distance);
+#if HSTR_PUSH_SHARE
+        uint listed, stride;
+        hstrPushShareRays.GetDimensions(listed, stride);
+        uint slot;
+        InterlockedAdd(hstrPushCounts[kPushShareQueries], 1u, slot);
+        if (slot < listed)
+            hstrPushShareRays[slot] = position.x | (position.y << 16);
+#endif
         if (params.beamRefreshDebug == 7)
         {
             uint unused;
@@ -8078,7 +9182,7 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #else
     if (!march)
         return;
-    BeamSample ray = gHSTRCloud.marchBeamDirty(gHSTRCloud.beamRayDirection(float2(position)));
+    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
     gHSTRCloud.beamQueryMarched(position, ray);
@@ -8205,6 +9309,151 @@ void buildCellOccupancy(uint3 dispatchThreadId: SV_DispatchThreadID)
 void invalidateCellViews(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.invalidateCellView(dispatchThreadId.x);
+}
+
+/// beamPushProbe: see projectPushCell.
+[numthreads(4, 4, 4)]
+void listPushCandidates(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.listPushCandidate(dispatchThreadId);
+}
+
+[numthreads(1, 1, 1)]
+void writePushArgs()
+{
+    const uint cells = min(gHSTRCloud.hstrPushCandidateCount[0], gHSTRCloud.params.pushCandidateCapacity);
+    gHSTRCloud.hstrPushArgs[0] = (cells + 63u) / 64u;
+    gHSTRCloud.hstrPushArgs[1] = 1u;
+    gHSTRCloud.hstrPushArgs[2] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void projectPushCells(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.projectPushCell(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void allocatePushTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.allocatePushTile(dispatchThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void evaluatePushSamples(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.evaluatePushSample(dispatchThreadId.xy);
+}
+
+/// pushEval: 27 threads per visible cell build its operator (groups in rows of 32768, see allocatePushTile).
+[numthreads(64, 1, 1)]
+void buildPushOperators(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.buildPushOperator((groupId.x + 32768u * groupId.y) * 64u + groupThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void comparePushSamples(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.comparePushSample(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void countPushShares(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.countPushShare(dispatchThreadId.x);
+}
+
+[numthreads(64, 1, 1)]
+void histogramPushShares(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.histogramPushShare(dispatchThreadId.x);
+}
+
+/// The sort's arguments: one group per listed tile, in rows of kPushSortRow groups (a dispatch dimension stops at 65535).
+static const uint kPushSortRow = 32768;
+[numthreads(1, 1, 1)]
+void writePushSortArgs()
+{
+    const uint tiles = gHSTRCloud.hstrPushCounts[kPushSortTiles];
+    gHSTRCloud.hstrPushArgs[6] = min(tiles, kPushSortRow);
+    gHSTRCloud.hstrPushArgs[7] = (tiles + kPushSortRow - 1u) / kPushSortRow;
+    gHSTRCloud.hstrPushArgs[8] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void scatterPushPieces(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.scatterPushPiece(dispatchThreadId.x);
+}
+
+groupshared uint gPushKeys[kPushSortMax];
+groupshared uint gPushIDs[kPushSortMax];
+
+/// beamPushProbe: one group per tile of the screen's box puts its list in front-to-back order, by the distance from the camera to
+/// each cell's centre. The cells are equal cubes of one grid, and for those that order agrees with every ray through the tile.
+[numthreads(kSortGroupSize, 1, 1)]
+void sortPushTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    const HSTRCloudParams params = gHSTRCloud.params;
+    const uint entry = groupId.x + kPushSortRow * groupId.y;
+    const uint lane = groupThreadId.x;
+    if (entry >= gHSTRCloud.hstrPushCounts[kPushSortTiles])
+        return;
+    const uint id = gHSTRCloud.hstrPushSortTiles[entry];
+    const uint base = gHSTRCloud.hstrPushTileOffsets[id];
+    const uint listed = gHSTRCloud.hstrPushTileCounts[id];
+    const uint count = base < params.pushListCapacity ? min(listed, params.pushListCapacity - base) : 0u;
+    // count is uniform across the group, so returning here cannot split a barrier.
+    if (count < 2u)
+        return;
+    if (count > kPushSortMax)
+    {
+        if (lane == 0u)
+        {
+            uint unused;
+            InterlockedAdd(gHSTRCloud.hstrPushCounts[kPushSortOverflow], 1u, unused);
+        }
+        return;
+    }
+    uint sortSize = 2u;
+    while (sortSize < count)
+        sortSize <<= 1;
+    for (uint i = lane; i < sortSize; i += kSortGroupSize)
+    {
+        const uint cell = i < count ? gHSTRCloud.hstrPushList[base + i] : ~0u;
+        // Positive floats order as their bits.
+        gPushKeys[i] = i < count ? asuint(length(gHSTRCloud.pushCellOffset(gHSTRCloud.hstrPushSlotKeys[cell]))) : ~0u;
+        gPushIDs[i] = cell;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = 2; k <= sortSize; k <<= 1)
+    {
+        for (uint j = k >> 1; j > 0; j >>= 1)
+        {
+            for (uint i = lane; i < sortSize; i += kSortGroupSize)
+            {
+                const uint partner = i ^ j;
+                if (partner > i)
+                {
+                    const bool ascending = (i & k) == 0;
+                    const uint a = gPushKeys[i];
+                    const uint b = gPushKeys[partner];
+                    if ((a > b) == ascending)
+                    {
+                        gPushKeys[i] = b;
+                        gPushKeys[partner] = a;
+                        const uint t = gPushIDs[i];
+                        gPushIDs[i] = gPushIDs[partner];
+                        gPushIDs[partner] = t;
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+    for (uint i = lane; i < count; i += kSortGroupSize)
+        gHSTRCloud.hstrPushList[base + i] = gPushIDs[i];
 }
 
 groupshared uint gResidualMask[2]; ///< Which of the group's 64 pixels the residual resolve has to write.

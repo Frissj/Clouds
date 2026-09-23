@@ -355,9 +355,51 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cellViewRefine = bool(value) ? 1u : 0u;
             continue;
         }
-        if (key == "cellViewDebug")
+        if (key == "beamPushProbe")
         {
-            mParams.cellViewDebug = uint32_t(value);
+            mPushProbe = bool(value);
+            continue;
+        }
+        if (key == "pushTileSize")
+        {
+            mParams.pushTileSize = std::clamp(uint32_t(value), 1u, 256u);
+            continue;
+        }
+        if (key == "pushEval")
+        {
+            mPushEval = bool(value);
+            continue;
+        }
+        if (key == "pushShare")
+        {
+            mPushShare = bool(value);
+            continue;
+        }
+        if (key == "pushShareMode")
+        {
+            mParams.pushShareMode = std::min(uint32_t(value), 3u);
+            continue;
+        }
+        if (key == "pushDilate")
+        {
+            const uint32_t dilate = std::min(uint32_t(value), 4u);
+            mPushCandidatesDirty = mPushCandidatesDirty || dilate != mParams.pushDilate;
+            mParams.pushDilate = dilate;
+            continue;
+        }
+        if (key == "pushEvalMode")
+        {
+            mParams.pushEvalMode = std::min(uint32_t(value), 4u);
+            continue;
+        }
+        if (key == "pushSampleStep")
+        {
+            mParams.pushSampleStep = std::clamp(uint32_t(value), 1u, 256u);
+            continue;
+        }
+        if (key == "pushShells")
+        {
+            mParams.pushShells = std::min(uint32_t(value), kPushMaxShells);
             continue;
         }
         if (key == "beamGuard")
@@ -1057,6 +1099,15 @@ Properties HSTRCloud::getProperties() const
     props["cellViewDrift"] = mParams.cellViewDrift;
     props["cellViewMaxAge"] = mParams.cellViewMaxAge;
     props["cellViewRefine"] = mParams.cellViewRefine != 0;
+    props["beamPushProbe"] = mPushProbe;
+    props["pushTileSize"] = mParams.pushTileSize;
+    props["pushShells"] = mParams.pushShells;
+    props["pushEval"] = mPushEval;
+    props["pushShare"] = mPushShare;
+    props["pushDilate"] = mParams.pushDilate;
+    props["pushShareMode"] = mParams.pushShareMode;
+    props["pushSampleStep"] = mParams.pushSampleStep;
+    props["pushEvalMode"] = mParams.pushEvalMode;
     props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
@@ -1135,6 +1186,103 @@ Properties HSTRCloud::getProperties() const
         const char* cellNames[] = {"Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests", "Built", "Steps"};
         for (uint32_t k = 0; k < 8; ++k)
             cloud[std::string("cellView") + cellNames[k]] = mBeamLevelCounts[kCellViewRays + k];
+        // beamPushProbe: the last probed frame's counters (a readback, so only when asked for), and the list's footprint.
+        if (mPushProbe && mpPushCounts)
+        {
+            const std::vector<uint32_t> push = mpPushCounts->getElements<uint32_t>(0, kPushCountTotal);
+            const char* pushNames[] = {"Candidates", "CandidatesOwn", "CulledDistance", "CulledFrustum", "Visible", "Near", "Pieces",
+                                       "Overlaps", "Rect4", "Rect8", "Rect16", "Rect32", "MaxPerCell", "TilesNonEmpty", "MaxPerTile",
+                                       "TilesOnScreen", "Dropped", "NearOverlaps", "MidOverlaps"};
+            for (uint32_t k = 0; k < 19; ++k)
+                cloud[std::string("push") + pushNames[k]] = push[k];
+            const uint32_t nearest = ~push[kPushMinDistance];
+            cloud["pushMinDistance"] = push[kPushMinDistance] ? double(reinterpret_cast<const float&>(nearest)) : -1.0;
+            cloud["pushSortOverflow"] = push[kPushSortOverflow];
+            // Histograms as "n0,n1,...", bin b holding counts in [2^(b-1), 2^b) (bin 0: zero).
+            auto histogram = [&](uint32_t first)
+            {
+                std::string text;
+                for (uint32_t b = 0; b < 32; ++b)
+                    text += (b ? "," : "") + std::to_string(push[first + b]);
+                return text;
+            };
+            cloud["pushHistCell"] = histogram(kPushHistCell);
+            cloud["pushHistTile"] = histogram(kPushHistTile);
+            auto row = [&](uint32_t first, uint32_t count)
+            {
+                std::string text;
+                for (uint32_t b = 0; b < count; ++b)
+                    text += (b ? "," : "") + std::to_string(push[first + b]);
+                return text;
+            };
+            cloud["pushHistDistance"] = row(kPushHistDistance, 16);
+            cloud["pushShellCells"] = row(kPushShellCells, kPushMaxShells);
+            cloud["pushShellOverlaps"] = row(kPushShellOverlaps, kPushMaxShells);
+            cloud["pushSortTiles"] = push[kPushSortTiles];
+            if (mPushEval)
+            {
+                const char* evalNames[] = {"Samples", "Entries", "Crossed", "ViewHits", "ViewEmpty", "Residual", "ResidualSteps",
+                                           "Terminated", "Requests", "ResidualSamples", "Over02", "OverT", "ErrorSum"};
+                for (uint32_t k = 0; k < 13; ++k)
+                    cloud[std::string("pushEval") + evalNames[k]] = push[kPushEvalSamples + k];
+                const uint32_t maximum = push[kPushEvalErrorMax];
+                cloud["pushEvalErrorMax"] = double(reinterpret_cast<const float&>(maximum));
+                cloud["pushEvalExactSteps"] = push[kPushEvalExactSteps];
+                cloud["pushEvalMode"] = mParams.pushEvalMode;
+                cloud["pushSlots"] = push[kPushCountSlots + 2];
+                cloud["pushSlotsDropped"] = push[kPushSlotsDropped];
+                cloud["pushEvalQueued"] = mpCellCounters ? mpCellCounters->getElement<uint32_t>(0) : 0u; // Builds queued (capped).
+            }
+            if (mPushShare)
+            {
+                const char* shareNames[] = {"Queries", "Units", "Rays", "Opaque", "Crossings", "Steps", "ExactSteps"};
+                for (uint32_t k = 0; k < 7; ++k)
+                    cloud[std::string("pushShare") + shareNames[k]] = push[kPushShareQueries + k];
+                cloud["pushShareShell"] = row(kPushShareShell, 3 * kPushMaxShells); // Interactions, crossings, steps per shell.
+                cloud["pushShareHistCount"] = row(kPushShareHistCount, 16);
+                cloud["pushShareHistSteps"] = row(kPushShareHistSteps, 16);
+                const char* fullNames[] = {"FullSteps", "OverT", "Over02", "DepthMissing", "DepthTotal"};
+                for (uint32_t k = 0; k < 5; ++k)
+                    cloud[std::string("pushShare") + fullNames[k]] = push[kPushShareFullSteps + k];
+                cloud["pushSlotsDropped"] = push[kPushSlotsDropped];
+                cloud["pushShareOffscreen"] = push[kPushShareOffscreen];
+                cloud["pushShareOffscreenOverT"] = push[kPushShareOffscreenOverT];
+                cloud["pushShareMissDistance"] = row(kPushShareMissDistance, 16);
+                cloud["pushSharePayloadOver02"] = row(kPushSharePayloadOver02, kPushSharePayloads);
+                cloud["pushSharePayloadOverT"] = row(kPushSharePayloadOverT, kPushSharePayloads);
+                cloud["pushSharePayloadErrorSum"] = row(kPushSharePayloadErrorSum, kPushSharePayloads);
+                cloud["pushSharePayloadSteps"] = row(kPushSharePayloadSteps, kPushSharePayloads);
+                cloud["pushSharePayloadResidual"] = row(kPushSharePayloadResidual, kPushSharePayloads);
+                if (mParams.pushShareMode & 1u)
+                    cloud["pushShareSafe"] = row(kPushShareSafe, 12); // 3^2 then 5^2; per tolerance .005/.01/.02: interactions, steps.
+                // Caches: midpoint ray 1 frame old, snapped to its texel 1 and 4 frames old; per tolerance: interactions, steps.
+                cloud["pushShareAgeSafe"] = row(kPushShareAgeSafe, 18);
+                cloud["pushShareAgeCrossingSteps"] = row(kPushShareAgeCrossingSteps, 9);
+                cloud["pushShareAgeOver02"] = row(kPushShareAgeOver02, 3);
+                cloud["pushShareEntriesDropped"] = push[kPushShareEntriesDropped];
+                cloud["pushShareSnapOffsets"] = row(kPushShareSnapOffsets, 96); // 1 then 4 frames; bin floor(2 log2(fine voxels)) + 32.
+                for (uint32_t k = 0; k < 2; ++k)
+                {
+                    const uint32_t bits = push[kPushShareSnapMax + k];
+                    cloud["pushShareSnapMax" + std::to_string(k)] = double(reinterpret_cast<const float&>(bits));
+                }
+                cloud["pushShareMode"] = mParams.pushShareMode;
+                cloud["pushShareMotion"] = std::to_string(mPushShareMotion.x) + "," + std::to_string(mPushShareMotion.y) + "," +
+                                           std::to_string(mPushShareMotion.z);
+                cloud["pushShareDepthExtra"] = push[kPushShareDepthExtra];
+                cloud["pushShareOverTMore"] = push[kPushShareOverTMore];
+                cloud["pushViewVoxels"] = mParams.seaViewDistance / std::max(mParams.seaVoxelSize.x, 1e-6f);
+            }
+            cloud["pushShells"] = mParams.pushShells;
+            cloud["pushShellDistance"] = mParams.pushShellDistance;
+            cloud["pushPiecesAppended"] = push[kPushCountSlots];
+            cloud["pushListEntries"] = push[kPushCountSlots + 1];
+            cloud["pushListings"] = mPushListings;
+            cloud["pushTileSize"] = mParams.pushTileSize;
+            cloud["pushTileGrid"] = mParams.pushTileTotal;
+            cloud["pushDomainCells"] = mParams.hstrExtinctionDims.x * mParams.hstrExtinctionDims.y * mParams.hstrExtinctionDims.z;
+            cloud["beamFrameDim"] = mParams.beamFrameDim.x;
+        }
         const char* blockNames[] = {"Blocks", "BlocksOk", "BlockOkSteps", "BlockSteps", "TightSteps", "TightBadSteps", "LooseSteps", "LooseBadSteps"};
         for (uint32_t k = 0; k < 8; ++k)
             cloud[std::string("beamProbe") + blockNames[k]] = mBeamLevelCounts[kBeamProbeBlocks + k];
@@ -1371,6 +1519,18 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCellBuildPass = createPass("buildCellViews");
     mpCellInvalidatePass = createPass("invalidateCellViews");
     mpCellOccupancyPass = createPass("buildCellOccupancy");
+    mpPushListPass = createPass("listPushCandidates");
+    mpPushArgsPass = createPass("writePushArgs");
+    mpPushSortArgsPass = createPass("writePushSortArgs");
+    mpPushEvalPass = createPass("evaluatePushSamples");
+    mpPushComparePass = createPass("comparePushSamples");
+    mpPushShareCountPass = createPass("countPushShares");
+    mpPushShareHistogramPass = createPass("histogramPushShares");
+    mpPushOpsPass = createPass("buildPushOperators");
+    mpPushProjectPass = createPass("projectPushCells");
+    mpPushAllocatePass = createPass("allocatePushTiles");
+    mpPushScatterPass = createPass("scatterPushPieces");
+    mpPushSortPass = createPass("sortPushTiles");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
@@ -2069,6 +2229,9 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     const size_t tileBytes = size_t(r) * dims.y * r * sizeof(uint32_t);
     auto* pRenderContext = mpDevice->getRenderContext();
     const auto readWrite = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    // The domain's content changes here, so the cell occupancy and beamPushProbe's candidates are rebuilt before they are next read.
+    mCellOccupancyDirty = true;
+    mPushCandidatesDirty = true;
     auto ensure = [&](ref<Texture>& texture, uint3 size, ResourceFormat format)
     {
         if (!texture || texture->getWidth() != size.x || texture->getHeight() != size.y || texture->getDepth() != size.z ||
@@ -3290,6 +3453,21 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrCellCounters"] = mpCellCounters;
     var["hstrCellCursor"] = mpCellCursor;
     var["hstrCellArgs"] = mpCellArgs;
+    var["hstrPushCandidates"] = mpPushCandidates;
+    var["hstrPushCandidateCount"] = mpPushCandidateCount;
+    var["hstrPushPieces"] = mpPushPieces;
+    var["hstrPushTileCounts"] = mpPushTileCounts;
+    var["hstrPushTileOffsets"] = mpPushTileOffsets;
+    var["hstrPushSortTiles"] = mpPushSortTiles;
+    var["hstrPushSamples"] = mpPushSamples;
+    var["hstrPushSlotKeys"] = mpPushSlotKeys;
+    var["hstrPushOps"] = mpPushOps;
+    var["hstrPushList"] = mpPushList;
+    var["hstrPushCounts"] = mpPushCounts;
+    var["hstrPushArgs"] = mpPushArgs;
+    var["hstrPushShareRays"] = mpPushShareRays;
+    var["hstrPushShareEntries"] = mpPushShareEntries;
+    var["hstrPushShareAges"] = mpPushShareAges;
     var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
@@ -3686,7 +3864,6 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
-    pPass->getProgram()->addDefine("HSTR_CELL_VIEWS", mCellViews && mParams.seaMode != 0 ? "1" : "0");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -3697,7 +3874,6 @@ void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
     {
         mpCellMap = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R32Uint, 1, nullptr, flags);
         mpCellRequest = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R32Uint, 1, nullptr, flags);
-        mpCellOccupancy = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R8Uint, 1, nullptr, flags);
         mCellViewsClear = true;
     }
     const uint32_t capacity = mParams.cellViewCapacity;
@@ -3732,6 +3908,22 @@ void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
         pRenderContext->clearUAV(mpCellViews->getUAV().get(), uint4(0));
         pRenderContext->clearUAV(mpCellCursor->getUAV().get(), uint4(0));
         mCellViewsClear = false;
+    }
+    ensureCellOccupancy(pRenderContext);
+    mParams.cellViews = 1;
+    mParams.cellViewSlotsPerRow = perRow;
+    mParams.cellViewAtlasInvWidth = 1.f / float(perRow * edge);
+    mParams.cellViewAtlasInvHeight = 1.f / float(rows * edge);
+}
+
+void HSTRCloud::ensureCellOccupancy(RenderContext* pRenderContext)
+{
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const uint3 dims = mParams.hstrExtinctionDims;
+    if (!mpCellOccupancy || mpCellOccupancy->getWidth() != dims.x || mpCellOccupancy->getHeight() != dims.y ||
+        mpCellOccupancy->getDepth() != dims.z)
+    {
+        mpCellOccupancy = mpDevice->createTexture3D(dims.x, dims.y, dims.z, ResourceFormat::R8Uint, 1, nullptr, flags);
         mCellOccupancyDirty = true;
     }
     if (mCellOccupancyDirty)
@@ -3741,11 +3933,179 @@ void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
         mpCellOccupancyPass->getRootVar()["CB"]["gHSTRCloud"]["hstrDomainVolume"] = mpDomainVolume;
         mpCellOccupancyPass->execute(pRenderContext, dims);
         mCellOccupancyDirty = false;
+        mPushCandidatesDirty = true;
     }
-    mParams.cellViews = 1;
-    mParams.cellViewSlotsPerRow = perRow;
-    mParams.cellViewAtlasInvWidth = 1.f / float(perRow * edge);
-    mParams.cellViewAtlasInvHeight = 1.f / float(rows * edge);
+}
+
+void HSTRCloud::runPushProbe(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "push");
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const uint3 dims = mParams.hstrExtinctionDims;
+    // Capacities: every domain cell may be a candidate; pieces and list entries are bounded and their overflow counted.
+    const uint32_t cells = dims.x * dims.y * dims.z;
+    const uint32_t s = std::max(mParams.pushTileSize, 1u);
+    constexpr uint32_t kPieces = 1u << 22;
+    constexpr uint32_t kList = 1u << 25;
+    mParams.pushCandidateCapacity = cells;
+    mParams.pushPieceCapacity = kPieces;
+    mParams.pushListCapacity = kList;
+    constexpr uint32_t kSlots = 524288; // Visible cells: 104-173k measured (push1-4 and the near search), more with pushDilate.
+    mParams.pushSlotCapacity = kSlots;
+    // Every shell's tile grid, one after another (pushShellBase), and the distance past which a cell is in the finest shell: a
+    // cell's angular diameter is at most sqrt(3) / distance, and a texel spans 2.4 / beamFrameDim radians at the map's smallest
+    // singular value (1.20, see beamGuardParallaxAngle), so there it covers at most two tiles of pushTileSize.
+    const uint32_t shells = std::clamp(mParams.pushShells, 1u, kPushMaxShells);
+    uint32_t tileTotal = 0;
+    for (uint32_t k = 0; k < shells; ++k)
+    {
+        const uint2 shellDims = (mParams.beamFrameDim + (s << k) - 1u) / (s << k);
+        tileTotal += shellDims.x * shellDims.y;
+    }
+    mParams.pushTileTotal = tileTotal;
+    mParams.pushShellDistance = 1.7320508f * (float(mParams.beamFrameDim.x) / 2.4f) / (2.f * float(s));
+    auto buffer = [&](ref<Buffer>& b, uint32_t stride, uint32_t count, ResourceBindFlags extra = ResourceBindFlags::None)
+    {
+        if (!b || b->getElementCount() != count)
+            b = mpDevice->createStructuredBuffer(stride, count, flags | extra, MemoryType::DeviceLocal, nullptr, false);
+    };
+    buffer(mpPushCandidates, sizeof(uint32_t), cells);
+    buffer(mpPushCandidateCount, sizeof(uint32_t), 2);
+    buffer(mpPushArgs, sizeof(uint32_t), 12, ResourceBindFlags::IndirectArg);
+    buffer(mpPushSlotKeys, sizeof(uint32_t), kSlots);
+    buffer(mpPushPieces, sizeof(uint4), kPieces);
+    buffer(mpPushTileCounts, sizeof(uint32_t), tileTotal);
+    buffer(mpPushTileOffsets, sizeof(uint32_t), tileTotal);
+    buffer(mpPushSortTiles, sizeof(uint32_t), tileTotal);
+    buffer(mpPushList, sizeof(uint32_t), kList);
+    buffer(mpPushCounts, sizeof(uint32_t), kPushCountTotal);
+    if (mPushShare)
+    {
+        buffer(mpPushShareRays, sizeof(uint32_t), 1u << 21);
+        // List entries a frame's crossings can land in (walk: 388k; past it kPushShareEntriesDropped counts them).
+        buffer(mpPushShareEntries, sizeof(uint4), 1u << 22);
+        buffer(mpPushShareAges, sizeof(uint4), 1u << 22);
+    }
+
+    ensureCellOccupancy(pRenderContext);
+    if (mPushCandidatesDirty)
+    {
+        // Only when the domain's content changed: the occupied cells, listed once for every later frame to project.
+        FALCOR_PROFILE(pRenderContext, "candidates");
+        pRenderContext->clearUAV(mpPushCandidateCount->getUAV().get(), uint4(0));
+        bindRenderer(pRenderContext, mpPushListPass);
+        mpPushListPass->getRootVar()["CB"]["gHSTRCloud"]["hstrDomainVolume"] = mpDomainVolume;
+        mpPushListPass->execute(pRenderContext, dims);
+        bindRenderer(pRenderContext, mpPushArgsPass);
+        mpPushArgsPass->execute(pRenderContext, uint3(1));
+        mPushCandidatesDirty = false;
+        ++mPushListings;
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "clear");
+        pRenderContext->clearUAV(mpPushCounts->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mpPushTileCounts->getUAV().get(), uint4(0));
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "project");
+        bindRenderer(pRenderContext, mpPushProjectPass);
+        mpPushProjectPass->executeIndirect(pRenderContext, mpPushArgs.get(), 0);
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "allocate");
+        bindRenderer(pRenderContext, mpPushAllocatePass);
+        mpPushAllocatePass->execute(pRenderContext, uint3(tileTotal, 1, 1));
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "scatter");
+        bindRenderer(pRenderContext, mpPushScatterPass);
+        mpPushScatterPass->executeIndirect(pRenderContext, mpPushArgs.get(), 12); // Bytes: the second three uints.
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "sort");
+        bindRenderer(pRenderContext, mpPushSortArgsPass);
+        mpPushSortArgsPass->execute(pRenderContext, uint3(1));
+        bindRenderer(pRenderContext, mpPushSortPass);
+        mpPushSortPass->executeIndirect(pRenderContext, mpPushArgs.get(), 24); // Bytes: the third three uints, groups per tile.
+    }
+    const bool views = mParams.pushEvalMode == 0;
+    if (!mPushEval || (views && !mCellViews))
+        return;
+    // Step 5 measurement: sample directions consume the lists (the cells' views or operators, else residual chords), then the
+    // exact march scores them; the views they requested are built from this camera for the next frame.
+    if (views)
+    {
+        ensureCellViews(pRenderContext);
+        mParams.cellViewFrame = ++mCellViewFrame;
+        pRenderContext->clearUAV(mpCellCounters->getUAV().get(), uint4(0));
+    }
+    else
+    {
+        buffer(mpPushOps, sizeof(uint4), kSlots * 27u);
+        FALCOR_PROFILE(pRenderContext, "operators");
+        setBeamDirtyMarchDefines(mpPushOpsPass);
+        bindRenderer(pRenderContext, mpPushOpsPass);
+        mpPushOpsPass->executeIndirect(pRenderContext, mpPushArgs.get(), 36); // Bytes: the fourth three uints.
+    }
+    const uint32_t step = std::max(mParams.pushSampleStep, 1u);
+    const float4 bounds = mParams.beamScreenBounds;
+    const uint2 origin(uint32_t(std::max(bounds.x, 0.f)) / step, uint32_t(std::max(bounds.y, 0.f)) / step);
+    const uint2 end(uint32_t(std::ceil(std::max(bounds.z, 0.f) / float(step))), uint32_t(std::ceil(std::max(bounds.w, 0.f) / float(step))));
+    mParams.pushSampleOriginX = origin.x;
+    mParams.pushSampleOriginY = origin.y;
+    mParams.pushSampleDimsX = end.x > origin.x ? end.x - origin.x : 0u;
+    mParams.pushSampleDimsY = end.y > origin.y ? end.y - origin.y : 0u;
+    const uint32_t samples = std::max(mParams.pushSampleDimsX * mParams.pushSampleDimsY, 1u);
+    buffer(mpPushSamples, sizeof(float4), samples);
+    const uint3 grid(mParams.pushSampleDimsX, mParams.pushSampleDimsY, 1);
+    {
+        FALCOR_PROFILE(pRenderContext, "evaluate");
+        setBeamDirtyMarchDefines(mpPushEvalPass);
+        bindRenderer(pRenderContext, mpPushEvalPass);
+        mpPushEvalPass->execute(pRenderContext, grid);
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "exact");
+        setBeamDirtyMarchDefines(mpPushComparePass);
+        bindRenderer(pRenderContext, mpPushComparePass);
+        mpPushComparePass->execute(pRenderContext, grid);
+    }
+    if (views)
+    {
+        FALCOR_PROFILE(pRenderContext, "cellViews");
+        bindRenderer(pRenderContext, mpCellArgsPass);
+        mpCellArgsPass->execute(pRenderContext, uint3(1));
+        setBeamDirtyMarchDefines(mpCellBuildPass);
+        bindRenderer(pRenderContext, mpCellBuildPass);
+        bindOutput(mpCellBuildPass, "hstrCellTexelsOutput", mpCellTexels, "hstrCellTexels");
+        bindOutput(mpCellBuildPass, "hstrCellTexelsSingleOutput", mpCellTexelsSingle, "hstrCellTexelsSingle");
+        mpCellBuildPass->executeIndirect(pRenderContext, mpCellArgs.get(), 0);
+    }
+}
+
+void HSTRCloud::runPushShare(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "pushShare");
+    pRenderContext->clearUAV(mpPushShareEntries->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(mpPushShareAges->getUAV().get(), uint4(0));
+    // The temporal oracle's ages step the camera back by its last displacement. The harness holds a pose over a scored step's
+    // frames, so only a change of position counts as one.
+    const float3 camera = mpScene->getCamera()->getPosition();
+    if (any(camera != mPushShareCamera))
+    {
+        mPushShareMotion = camera - mPushShareCamera;
+        mPushShareCamera = camera;
+    }
+    mParams.pushShareMotionX = mPushShareMotion.x;
+    mParams.pushShareMotionY = mPushShareMotion.y;
+    mParams.pushShareMotionZ = mPushShareMotion.z;
+    setBeamDirtyMarchDefines(mpPushShareCountPass);
+    bindRenderer(pRenderContext, mpPushShareCountPass);
+    // Every listed query point and dirty unit (walk: ~414k and ~280k), up to one dispatch row; kPushShareRays says if any is left.
+    const uint32_t rays = std::min(mpPushShareRays->getElementCount() + mpBeamDirtyUnits->getElementCount(), 65535u * 64u);
+    mpPushShareCountPass->execute(pRenderContext, uint3(rays, 1, 1));
+    bindRenderer(pRenderContext, mpPushShareHistogramPass);
+    mpPushShareHistogramPass->execute(pRenderContext, uint3(mParams.pushTileTotal, 1, 1));
 }
 
 void HSTRCloud::ensureCameraResources()
@@ -4497,6 +4857,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
         const bool reuse = temporal && mBeamReusable && all(cameraPosition == mBeamCameraPosition) &&
                            all(cameraTarget == mBeamCameraTarget) && mBeamBakes == mWorldCacheBakes;
+        // PROBE: the push architecture's work count for this camera, beside the frame (it writes nothing the frame reads).
+        if (mPushProbe && mParams.beamOct != 0 && mParams.beamRefFrame != 0 && mParams.seaMode != 0 && mpDomainVolume)
+            runPushProbe(pRenderContext);
         if (!reuse)
         {
             FALCOR_PROFILE(pRenderContext, "beamQueries");
@@ -4813,13 +5176,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
                                 pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
+                                // Cell views are requested and built by pushEval (runPushProbe); this path only unmaps changed ones.
                                 const bool cellViews = mCellViews && mParams.seaMode != 0;
                                 if (cellViews)
-                                {
                                     ensureCellViews(pRenderContext);
-                                    mParams.cellViewFrame = ++mCellViewFrame;
-                                    pRenderContext->clearUAV(mpCellCounters->getUAV().get(), uint4(0));
-                                }
                                 // Content that changed since the last build unverifies the blocks whose directions cross it, before
                                 // the classification lists what is not certified. A few regions a tile crossing; past the buffer, or
                                 // when every sun page changed, every block.
@@ -4957,6 +5317,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     // longest ray, so the two it used to be cost two of those back to back.
                                     // One thread per ray compiles without the slice composition (beamDirtySegments).
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine(
+                                        "HSTR_PUSH_SHARE", mPushProbe && mPushShare && mpPushShareRays ? "1" : "0"
+                                    );
                                     mpBeamDirtyQueryPass->getProgram()->addDefine(
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
@@ -5233,18 +5596,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         bindDirty(mpBeamDirtyMarchPass);
                         mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                     }
-                    // Cell views: build the views this frame's dirty rays queued, from this camera, for the next frame to read.
-                    if (mCellViews && mParams.seaMode != 0 && mpCellArgs)
-                    {
-                        FALCOR_PROFILE(pRenderContext, "cellViews");
-                        bindRenderer(pRenderContext, mpCellArgsPass);
-                        mpCellArgsPass->execute(pRenderContext, uint3(1));
-                        setBeamDirtyMarchDefines(mpCellBuildPass);
-                        bindRenderer(pRenderContext, mpCellBuildPass);
-                        bindOutput(mpCellBuildPass, "hstrCellTexelsOutput", mpCellTexels, "hstrCellTexels");
-                        bindOutput(mpCellBuildPass, "hstrCellTexelsSingleOutput", mpCellTexelsSingle, "hstrCellTexelsSingle");
-                        mpCellBuildPass->executeIndirect(pRenderContext, mpCellArgs.get(), 0);
-                    }
+                    if (mPushProbe && mPushShare && mpPushShareRays)
+                        runPushShare(pRenderContext);
                 }
             }
             else if (unitMarch)

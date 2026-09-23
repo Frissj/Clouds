@@ -34,6 +34,7 @@ m.resizeFrameBuffer(*[int(v) for v in os.environ.get("HSTR_RES", "3840x2160").sp
 hstr = m.activeGraph.getPass("HSTRCloud")
 cam = m.scene.camera
 START_POSITION, START_TARGET = float3(0, 140, 0), float3(0, 40, 600)
+ORIGIN = START_POSITION  # The pose frame 0 passes through; motions labelled "near ..." move it to NEAR_POSITION (see below).
 lines = []
 
 
@@ -83,12 +84,23 @@ def pose(frame, forward, yaw, sun=0.0):
     angle = yaw * frame
     view = START_TARGET - START_POSITION
     turned = float3(view.x * math.cos(angle) - view.z * math.sin(angle), view.y, view.x * math.sin(angle) + view.z * math.cos(angle))
-    cam.position = START_POSITION + offset
-    cam.target = START_POSITION + offset + turned
+    cam.position = ORIGIN + offset
+    cam.target = ORIGIN + offset + turned
 
 
-def timed(frames, first, forward, yaw, sun=0.0):
+NSYS = os.environ.get("HSTR_NSYS")  # run_sea.py --nsys: capture each timed flight, and only it.
+
+
+def nsys(verb, *options):
+    import subprocess
+    subprocess.run([NSYS, verb, f"--session={os.environ['HSTR_NSYS_SESSION']}", *options], creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def timed(frames, first, forward, yaw, sun=0.0, report=None):
     import time
+    if NSYS and report:
+        nsys("start", "--sample=none", "--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000", "--force-overwrite=true",
+             f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
     m.profiler.enabled = True
     m.profiler.start_capture()
     before = stats()
@@ -108,6 +120,8 @@ def timed(frames, first, forward, yaw, sun=0.0):
     wall = (time.perf_counter() - wall) / frames * 1000.0
     capture = m.profiler.end_capture()
     m.profiler.enabled = False
+    if NSYS and report:
+        nsys("stop")  # After end_capture, which has waited for the flight's GPU work.
     t = {name[:-len("/gpu_time")].split("HSTRCloud", 1)[-1].strip("/") or "HSTRCloud": lane["stats"]["mean"]
          for name, lane in capture["events"].items() if name.endswith("gpu_time") and "HSTRCloud" in name}
     t["wall"] = wall
@@ -151,7 +165,34 @@ log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun ba
     f"{settled.get('sunWaiting', 0)}, slots free {settled.get('sunSlotsFree', 0)}, world cache samples "
     f"{hstr.properties.get('worldCacheSampleCount', 0)}, fades {settled.get('activeFades', 0)}, map backlog "
     f"{settled.get('mapBacklog', 0)}, fading out {settled.get('undesiredFadingOut', 0)})")
+# Near cloud: the start pose looks at cloud from clear air (beamPushProbe, 2026-09-23: no visible cell within 8 voxels), which never
+# exercises cells covering much of the screen. Motions labelled "near ..." fly through the pose, among a few around the start with
+# the same view direction, whose cells nearer than 8 voxels overlap the most tiles (the probe's pushNearOverlaps).
+NEAR_POSITION = START_POSITION
+if any(motion.startswith("near") for motion, *_ in MOTIONS):
+    # The probe only runs in the octahedral beam view, so the first arm's configuration, not BASE (the reference's).
+    hstr.set_properties(dict(BASE, **dict(TESTS[0][1], beamPushProbe=True, pushTileSize=16)))
+    best = None
+    for dy in (-120.0, -100.0, -60.0, -20.0):
+        for dx in (-150.0, 0.0, 150.0):
+            for dz in (0.0, 150.0, 300.0, 450.0, 600.0):
+                ORIGIN = START_POSITION + float3(dx, dy, dz)
+                pose(0, 0.0, 0.0)
+                m.renderFrame()
+                m.renderFrame()
+                s = stats()
+                nearest = float(s.get("pushMinDistance", -1))
+                score = (int(s.get("pushNearOverlaps", 0)), -(nearest if nearest >= 0 else 1e9))
+                log(f"near search {dx:+.0f} {dy:+.0f} {dz:+.0f}: nearest {float(s.get('pushMinDistance', -1)):.1f} voxels, near "
+                    f"overlaps {s.get('pushNearOverlaps', 0)}, mid {s.get('pushMidOverlaps', 0)}, visible {s.get('pushVisible', 0)}, "
+                    f"camera in a cell {s.get('pushNear', 0)}")
+                if best is None or score > best[0]:
+                    best = (score, ORIGIN)
+    NEAR_POSITION = best[1]
+    ORIGIN = START_POSITION
+    log(f"near pose {NEAR_POSITION}")
 for motion, forward, yaw, *rest in MOTIONS:
+    ORIGIN = NEAR_POSITION if motion.startswith("near") else START_POSITION
     sun = float(rest[0]) if rest else SUN_RATE
     for test, properties in TESTS:
         hstr.set_properties(dict(BASE, **properties))
@@ -167,7 +208,7 @@ for motion, forward, yaw, *rest in MOTIONS:
         for i in range(WARM):
             pose(i - WARM - TIMED, forward, yaw, sun)
             m.renderFrame()
-        t = timed(TIMED, -TIMED, forward, yaw, sun)
+        t = timed(TIMED, -TIMED, forward, yaw, sun, report=f"{motion}_{test}".replace(" ", "_"))
         tilesBeforeSteps = int(stats().get("seaTilesChanged", 0)) - tilesAtStart
         tilesPerStep = []
         errors = []
@@ -190,12 +231,15 @@ for motion, forward, yaw, *rest in MOTIONS:
                            "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0)),
                            # cellViews: the scored frame's composition (0 with it off).
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
-                                                                                 "Built", "Steps")}})
+                                                                                 "Built", "Steps")},
+                           # beamPushProbe: the scored frame's cell x tile work count (absent with it off).
+                           "push": {k: s[k] for k in s if k.startswith("push") or k == "beamFrameDim"}})
         if not errors:  # HSTR_STEPS=0: timings and residency only.
             errors = [{"over02": 0.0, "p999": 0.0, "max": 0.0, "marched": 0.0, "carriedPoints": 0, "carriedPixels": 0, "marchTiles": 0,
                        "debug": 0, "marchedSteps": 0, "carriedSteps": 0}]
-        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k != "cell"}
+        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k not in ("cell", "push")}
         cell = errors[-1].get("cell", {})
+        push = errors[-1].get("push", {})
         worst = max(e["over02"] for e in errors)
         with open(f"{OUT}/{TAG}_test.jsonl", "a") as f:
             f.write(json.dumps({"motion": motion, "test": test, "gpu": t, "errors": errors}) + "\n")
@@ -207,5 +251,7 @@ for motion, forward, yaw, *rest in MOTIONS:
             f">0.02 mean {100 * mean['over02']:.3f}% worst {100 * worst:.3f}%, p99.9 {mean['p999']:.2e}, max {max(e['max'] for e in errors):.2e}"
             f"; sea tiles changed before steps {tilesBeforeSteps}, by step {tilesPerStep}"
             f", invalidating builds {int(stats().get('beamInvalidatedBuilds', 0)) - invalidatedAtStart}"
-            f", per-step >0.02 {[round(100 * e['over02'], 3) for e in errors]}" + (f"; cell views (last step) {cell}" if cell.get("Rays") else ""))
+            f", per-step >0.02 {[round(100 * e['over02'], 3) for e in errors]}" + (f"; cell views (last step) {cell}" if cell.get("Rays") else "")
+            + (f"; push (last step) {json.dumps(push)}; push ms " + json.dumps({k: round(v, 3) for k, v in t.items() if k.startswith("push")})
+               if push else ""))
 exit()
