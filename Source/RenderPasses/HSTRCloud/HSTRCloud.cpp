@@ -377,7 +377,7 @@ void HSTRCloud::parseProperties(const Properties& props)
         }
         if (key == "pushShareMode")
         {
-            mParams.pushShareMode = std::min(uint32_t(value), 3u);
+            mParams.pushShareMode = std::min(uint32_t(value), 15u);
             continue;
         }
         if (key == "pushDilate")
@@ -390,6 +390,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "pushEvalMode")
         {
             mParams.pushEvalMode = std::min(uint32_t(value), 4u);
+            continue;
+        }
+        if (key == "pushEvalExactDepth")
+        {
+            mParams.pushEvalExactDepth = bool(value) ? 1u : 0u;
             continue;
         }
         if (key == "pushSampleStep")
@@ -1108,6 +1113,7 @@ Properties HSTRCloud::getProperties() const
     props["pushShareMode"] = mParams.pushShareMode;
     props["pushSampleStep"] = mParams.pushSampleStep;
     props["pushEvalMode"] = mParams.pushEvalMode;
+    props["pushEvalExactDepth"] = mParams.pushEvalExactDepth != 0;
     props[kCloudZeroSkip] = mParams.cloudZeroSkip;
     props[kCloudSunReuse] = mParams.cloudSunReuse;
     props[kCloudTightReject] = mParams.cloudTightReject;
@@ -1265,6 +1271,63 @@ Properties HSTRCloud::getProperties() const
                 {
                     const uint32_t bits = push[kPushShareSnapMax + k];
                     cloud["pushShareSnapMax" + std::to_string(k)] = double(reinterpret_cast<const float&>(bits));
+                }
+                if (mParams.pushShareMode & 4u)
+                {
+                    // Per tolerance .005/.01/.02, chord steps: snapped ok, jet ok; J-change guard accepts, wrongly; L1 guard accepts,
+                    // wrongly; jet self-guard accepts, wrongly. Then rays over 0.02 per guard at .005 and .02, and unkeyed steps.
+                    cloud["pushShareCertify"] = row(kPushShareCertify, 24);
+                    cloud["pushShareCertifyOver02"] = row(kPushShareCertifyOver02, 6);
+                    cloud["pushShareCertifyUnkeyed"] = push[kPushShareCertifyUnkeyed];
+                    cloud["pushShareCertifySteps"] = push[kPushShareCertifySteps]; // Every kPushShareCertifyStride-th ray only.
+                    cloud["pushShareCertifyRays"] = push[kPushShareCertifyRays];
+                }
+                if ((mParams.pushShareMode & 8u) && mpPushBrickVisits)
+                {
+                    // Experiment 6: the visits aggregated per (listing tile, atlas brick) - what one workgroup per tile staging each
+                    // brick once would load, against the samples it would then serve.
+                    const uint32_t written = push[kPushShareVisits];
+                    const uint32_t count = std::min<uint32_t>(written, mpPushBrickVisits->getElementCount());
+                    const std::vector<uint2> visits = mpPushBrickVisits->getElements<uint2>(0, count);
+                    std::unordered_map<uint64_t, uint2> pairs; // (tile, entry) -> visits, samples.
+                    std::unordered_map<uint32_t, uint32_t> bricks; // entry -> samples.
+                    pairs.reserve(count / 4 + 1);
+                    uint64_t samples = 0;
+                    for (const uint2& v : visits)
+                    {
+                        const uint32_t entry = v.y & 0xFFFFFu;
+                        const uint32_t n = v.y >> 20;
+                        uint2& p = pairs[(uint64_t(v.x) << 32) | entry];
+                        p.x += 1u;
+                        p.y += n;
+                        bricks[entry] += n;
+                        samples += n;
+                    }
+                    std::vector<uint64_t> pairCount(24, 0), pairSamples(24, 0), visitCount(24, 0);
+                    for (const auto& [key, p] : pairs)
+                    {
+                        const uint32_t bin = std::min(p.y == 0u ? 0u : uint32_t(std::log2(double(p.y))) + 1u, 23u);
+                        pairCount[bin] += 1;
+                        pairSamples[bin] += p.y;
+                        visitCount[std::min(p.x == 0u ? 0u : uint32_t(std::log2(double(p.x))) + 1u, 23u)] += 1;
+                    }
+                    auto join = [](const std::vector<uint64_t>& v)
+                    {
+                        std::string out;
+                        for (size_t i = 0; i < v.size(); ++i)
+                            out += (i ? "," : "") + std::to_string(v[i]);
+                        return out;
+                    };
+                    cloud["pushBrickVisits"] = written;
+                    cloud["pushBrickVisitsDropped"] = push[kPushShareVisitsDropped];
+                    cloud["pushBrickWalkSamples"] = push[kPushShareVisitSamples];
+                    cloud["pushBrickSamples"] = double(samples);
+                    cloud["pushBrickPairs"] = double(pairs.size());
+                    cloud["pushBrickUnique"] = double(bricks.size());
+                    // By floor(log2(samples)) + 1 per pair: pairs and their samples; and pairs by floor(log2(visits)) + 1.
+                    cloud["pushBrickPairHist"] = join(pairCount);
+                    cloud["pushBrickPairSampleHist"] = join(pairSamples);
+                    cloud["pushBrickPairVisitHist"] = join(visitCount);
                 }
                 cloud["pushShareMode"] = mParams.pushShareMode;
                 cloud["pushShareMotion"] = std::to_string(mPushShareMotion.x) + "," + std::to_string(mPushShareMotion.y) + "," +
@@ -3468,6 +3531,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrPushShareRays"] = mpPushShareRays;
     var["hstrPushShareEntries"] = mpPushShareEntries;
     var["hstrPushShareAges"] = mpPushShareAges;
+    var["hstrPushBrickVisits"] = mpPushBrickVisits;
     var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
@@ -3985,6 +4049,8 @@ void HSTRCloud::runPushProbe(RenderContext* pRenderContext)
         // List entries a frame's crossings can land in (walk: 388k; past it kPushShareEntriesDropped counts them).
         buffer(mpPushShareEntries, sizeof(uint4), 1u << 22);
         buffer(mpPushShareAges, sizeof(uint4), 1u << 22);
+        // Experiment 6's brick visits (pushShareMode 8): 16M records, 128 MB, only while the probe is on.
+        buffer(mpPushBrickVisits, sizeof(uint2), (mParams.pushShareMode & 8u) ? 1u << 24 : 1u);
     }
 
     ensureCellOccupancy(pRenderContext);

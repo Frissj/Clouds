@@ -410,6 +410,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrPushShareRays;
     RWStructuredBuffer<uint4> hstrPushShareEntries; ///< And z, w: the largest crossing error under the 3^2, 5^2 payloads (asuint).
     RWStructuredBuffer<uint4> hstrPushShareAges;    ///< Per list entry: the largest crossing error reusing 1, 4, 16 frames old.
+    RWStructuredBuffer<uint2> hstrPushBrickVisits;  ///< pushShareMode 8: per brick visit of a dirty chord, tile id and entry | samples << 20.
     RWStructuredBuffer<CellView> hstrCellViews;
     Texture2D<float4> hstrCellTexels;
     Texture2D<float4> hstrCellTexelsSingle;
@@ -5095,6 +5096,26 @@ struct HSTRCloudRenderer
             marchSegmentMoment(ray, chord, withCache, withSingle, localCache, localSingle, oracleTransmittance, oracleSteps, oracleDistance, fineVoxels);
             localTransmittance = exp(-operatorDepth);
         }
+        else if (params.pushEvalExactDepth != 0u)
+        {
+            // The converse oracle: the chord's exact transmittance, the operator's source. The operator's emission is rescaled to
+            // the exact opacity, i.e. its opacity-weighted source per unit opacity is kept - exact for a constant source.
+            // MEASURED (certify2, 68k samples against their exact march, walk / sprint): transmittance off by over 0.02 in 0.15% of
+            // samples (the extinction is right), but log radiance over 0.02 in 7.8 / 3.7% with a constant source and 2.1 / 2.4%
+            // with trilinear emission, against a 0.137% frame gate. The source varies inside a domain cell too (sun shadowing at
+            // fine-voxel scale): a compact per-node source fails 15x over even with exact extinction.
+            float3 exactCache = 0.f;
+            float3 exactSingle = 0.f;
+            uint exactSteps = 0;
+            float exactDistance = 0.f;
+            float exactTransmittance = 1.f;
+            float fineVoxels = cellViewFineVoxels(cell);
+            marchSegmentMoment(ray, chord, withCache, withSingle, exactCache, exactSingle, exactTransmittance, exactSteps, exactDistance, fineVoxels);
+            const float scale = (1.f - exactTransmittance) / max(1.f - localTransmittance, 1e-6f);
+            localCache *= scale;
+            localSingle *= scale;
+            localTransmittance = exactTransmittance;
+        }
         cache += transmittance * localCache;
         single += transmittance * localSingle;
         transmittance *= localTransmittance;
@@ -5336,6 +5357,95 @@ struct HSTRCloudRenderer
     /// at any resolution and the hard 14% (45% of the steps) are hard at all of them: at domain-cell nodes a payload can take at most
     /// about half of the in-cell march, i.e. with the empty space the lists skip, 47.0M steps become ~12M residual + ~10M crossings
     /// to compose + the payloads' builds - about 2x, not the 6-8x the budget needs.
+    /// pushShare's per-crossing error, as experiments 3 and 4 score it: a crossing's light and transmittance against a reference's,
+    /// seen through what lies in front of it (before).
+    float pushShareLocal(float3 c, float3 s, float T, float3 cRef, float3 sRef, float TRef, float before, float3 w, float3 albedo)
+    {
+        const float3 a = beamRadiance(c, s, -log(max(T, 1e-12f)), w, albedo);
+        const float3 b = beamRadiance(cRef, sRef, -log(max(TRef, 1e-12f)), w, albedo);
+        const float3 e3 = abs(log(1.f + before * max(a, 0.f)) - log(1.f + before * max(b, 0.f)));
+        return max(max(e3.r, max(e3.g, e3.b)), before * abs(T - TRef));
+    }
+
+    /// The larger error of a value moved by +-bound (light up and transmittance down, and the reverse) against the value itself.
+    float pushShareBound(float3 c, float3 s, float T, float3 bc, float3 bs, float bT, float before, float3 w, float3 albedo)
+    {
+        const float up = pushShareLocal(c + bc, s + bs, saturate(T - bT), c, s, T, before, w, albedo);
+        const float down = pushShareLocal(max(c - bc, 0.f), max(s - bs, 0.f), saturate(T + bT), c, s, T, before, w, albedo);
+        return max(up, down);
+    }
+
+    /// Experiment 6: one hstrPushBrickVisits record for a run of a chord's samples in one atlas brick.
+    void pushBrickVisit(uint tile, uint entry, uint samples)
+    {
+        if (entry == kCloudRefNone || samples == 0u)
+            return;
+        uint capacity, stride;
+        hstrPushBrickVisits.GetDimensions(capacity, stride);
+        uint slot;
+        InterlockedAdd(hstrPushCounts[kPushShareVisits], 1u, slot);
+        if (slot < capacity)
+            hstrPushBrickVisits[slot] = uint2(tile, entry | (min(samples, 4095u) << 20));
+        else
+            InterlockedAdd(hstrPushCounts[kPushShareVisitsDropped], 1u, slot);
+    }
+
+    /// Experiment 6: re-walks a dirty chord at the march's step rule (majorant step, fine-voxel minimum, midpoint sample, early out
+    /// at the march's opacity) and records the atlas bricks its samples read, in runs. What a tile workgroup staging each brick
+    /// once in shared memory would amortise its load over is the samples per (tile, brick) pair across all the tile's rays.
+    /// MEASURED and REJECTED (brickshare1, 4K, walk / sprint): of 26.6M / 23.3M chord steps, 10.2M / 8.4M read a fine brick; they
+    /// fall in 265k / 261k (tile, brick) pairs over 92k distinct bricks - 38 / 32 samples a pair (20 / 17 ray visits), 111 / 92 a
+    /// brick. Staging a 4 KB brick (fp16 density + sun, 10^3) per pair is 104 / 124 bytes a sample, 1.06 GB a frame (~2.5 ms of
+    /// DRAM); even staged once per distinct brick, 36 B a sample and 0.37 GB a frame. The dirty work is broad and thin across the
+    /// sea, not concentrated. And the cooperative kernel itself (scripts/HSTR/bench/tile_transport_rate.py, Warp, RTX 4080
+    /// Laptop, real bricks, persistent tile workgroups of 64-256 rays): 5.6-11 G steps/s staged (153-232 GB/s of staging at
+    /// 96-282 steps a stage, a denser case than this), 17-30 G/s with the brick left resident (the inner loop's ceiling) -
+    /// against the ~7.3 G/s shipping march and the 50-70 G/s a 2 ms frame needs. Brick x tile staging does not pay.
+    void pushBrickWalk(CutRay ray, float2 chord, float transmittance, uint tile, float fineVoxels)
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        uint entry = kCloudRefNone;
+        uint samples = 0;
+        uint total = 0;
+        uint guard = 0;
+        float t = chord.x;
+        [loop]
+        while (t < chord.y && transmittance > params.cloudMinTransmittance && guard < params.maxMarchSteps)
+        {
+            ++guard;
+            const float3 v = (ray.position + t * ray.direction) * cellWidth;
+            const float majorant = majorantAt(v);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+            const float dt = min(stepVoxels / voxelsPerUnit, chord.y - t);
+            if (majorant > 0.f)
+            {
+                CloudSample sample = {};
+                const float tm = t + 0.5f * dt;
+                const float sigma = cameraExtinctionAtVoxel((ray.position + tm * ray.direction) * cellWidth, rayFootprint(ray, tm), fineVoxels, sample);
+                transmittance *= exp(-sigma * dt * ray.worldLength);
+                if (sample.brick && !sample.empty)
+                {
+                    if (sample.entry != entry)
+                    {
+                        pushBrickVisit(tile, entry, samples);
+                        entry = sample.entry;
+                        samples = 0;
+                    }
+                    ++samples;
+                    ++total;
+                }
+            }
+            t += dt;
+        }
+        pushBrickVisit(tile, entry, samples);
+        pushCount(kPushShareVisitSamples, total);
+    }
+
     void countPushShare(uint thread)
     {
         uint listed, units, stride;
@@ -5391,6 +5501,25 @@ struct HSTRCloudRenderer
             ageSingle[k] = 0.f;
             ageT[k] = 1.f;
         }
+        // Experiment 5: chord steps per tolerance (see kPushShareCertify), and per guard and tolerance (.005, .02) the ray's composite
+        // taking what the guard accepts and the exact chord for the rest.
+        uint certify[24];
+        [unroll]
+        for (uint k = 0; k < 24; ++k)
+            certify[k] = 0u;
+        float3 certCache[6];
+        float3 certSingle[6];
+        float certT[6];
+        [unroll]
+        for (uint k = 0; k < 6; ++k)
+        {
+            certCache[k] = 0.f;
+            certSingle[k] = 0.f;
+            certT[k] = 1.f;
+        }
+        uint unkeyedSteps = 0;
+        // Whole waves certify or not: one lane in eight would still hold its wave for all nine marches.
+        const bool certifying = (params.pushShareMode & 4u) != 0u && (thread / 64u) % kPushShareCertifyStride == 0u;
         uint entryCapacity;
         hstrPushShareEntries.GetDimensions(entryCapacity, stride);
         for (int shell = int(pushShellCount()) - 1; shell >= 0 && transmittance > params.cloudMinTransmittance; --shell)
@@ -5423,6 +5552,8 @@ struct HSTRCloudRenderer
                     pushCount(kPushShareEntriesDropped, 1u);
                 ++crossings;
                 steps += chordSteps;
+                if ((params.pushShareMode & 8u) != 0u)
+                    pushBrickWalk(ray, chord, before, id, cellViewFineVoxels(cell));
                 // Experiment 2: the cell's shared payload over this tile. Variant 0 is the ray's own chord marched alone (what
                 // composing separately marched chords costs in accuracy); variant r > 0 is a lattice of (2^(r-1) + 1)^2 chords
                 // over the tile, the payload one evaluation per interaction would store, read bilinearly at the ray.
@@ -5502,6 +5633,127 @@ struct HSTRCloudRenderer
                         ageCache[k] += ageT[k] * c;
                         ageSingle[k] += ageT[k] * s;
                         ageT[k] *= T;
+                    }
+                }
+                // Experiment 5, certification: share8's snapped 1-frame cache, which half the time is already right, is only worth
+                // having if something can tell WHICH half without marching. A central-difference Jacobian of the snapped chord in the
+                // 4 ray coordinates (offset across the ray at the plane through its point nearest the midpoint, and tilt about that
+                // point) predicts the new crossing and gives three guards: its predicted change accepts the stale value; the L1 sum
+                // of |J_i dr_i| (what one scalar sensitivity per offset / tilt pair would store) accepts it; the second differences
+                // estimate the jet's own error and accept its prediction. Each is scored against the exact chord now.
+                // MEASURED and REJECTED (certify2, 4K, one settle, 1 in 8 blocks of 64 dirty rays, ~90k rays; on battery, so no
+                // timings), chord steps per crossing at 0.02, walk / sprint: snapped value right 91 / 86%, jet 96 / 89%. Guards
+                // (accepted, of which wrong): J change 92 / 93% (2.8 / 8.1%), L1 scalar 90 / 89% (2.2 / 7.0%), jet self 95 / 94%
+                // (1.7 / 8.0%); at 0.005 walk 79-87% accepted with 5-7% wrong. After each guard 3.7-4.0% (walk) and 5.7-6.6%
+                // (sprint) of the dirty rays are over 0.02 against the chords - the frame's gate is 0.137% of pixels. The wrong
+                // accepts are as large as the headroom: a local derivative cannot see the voxel-edge kinks it would cross, so it
+                // cannot certify. The jet's own ceiling at sprint (89% at 0.02, oracle routing) is under the 93% that pays for it.
+                if (certifying)
+                {
+                    const float3 albedo = volume.data.albedo;
+                    const float3 motion = float3(params.pushShareMotionX, params.pushShareMotionY, params.pushShareMotionZ);
+                    const float3 old = cameraWorld - motion;
+                    const float3 midpoint = cameraWorld + w * (ray.entryDistance + 0.5f * (chord.x + chord.y) * ray.worldLength);
+                    float2 texel;
+                    bool keyed = beamImagePosition(normalize(midpoint - old), texel);
+                    const float3 d0 = keyed ? beamRayDirection(floor(texel) + 0.5f) : w;
+                    const float3 e1 = normalize(cross(d0, abs(d0.y) < 0.9f ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f)));
+                    const float3 e2 = cross(d0, e1);
+                    const float span = dot(midpoint - old, d0);
+                    const float3 pivot = old + span * d0;
+                    const float along = dot(w, d0);
+                    keyed = keyed && along > 1e-3f && span > 1e-3f;
+                    float3 cS = c0;
+                    float3 sS = s0;
+                    float TS = T0;
+                    float3 cJ = c0;
+                    float3 sJ = s0;
+                    float TJ = T0;
+                    float eNear = 1e30f;
+                    float eJet = 1e30f;
+                    float estChange = 1e30f;
+                    float estL1 = 1e30f;
+                    float estSelf = 1e30f;
+                    if (keyed)
+                    {
+                        const float tNew = dot(pivot - cameraWorld, d0) / along;
+                        const float3 x = cameraWorld + tNew * w - pivot;
+                        const float4 dr = float4(dot(x, e1), dot(x, e2), dot(w, e1) / along, dot(w, e2) / along);
+                        // Steps: a quarter of the cell's fine voxel across, and a tilt moving the chord's ends by as much.
+                        const float h = 0.25f * max(cellViewFineVoxels(cell), 1e-3f) * params.seaVoxelSize.x;
+                        const float tilt = 2.f * h / max((chord.y - chord.x) * ray.worldLength, 1e-3f);
+                        const float4 step = float4(h, h, tilt, tilt);
+                        uint unusedSteps;
+                        float unusedLength;
+                        TS = pushChordAlong(d0, cell, old, volume, cS, sS, unusedSteps, unusedLength);
+                        float3 jC = 0.f, jS = 0.f, aC = 0.f, aS = 0.f, kC = 0.f, kS = 0.f;
+                        float jT = 0.f, aT = 0.f, kT = 0.f;
+                        [unroll]
+                        for (uint a = 0; a < 4; ++a)
+                        {
+                            const float3 axis = (a & 1u) == 0u ? e1 : e2;
+                            float3 cp, sp, cm, sm;
+                            float Tp, Tm;
+                            if (a < 2u)
+                            {
+                                Tp = pushChordAlong(d0, cell, old + step[a] * axis, volume, cp, sp, unusedSteps, unusedLength);
+                                Tm = pushChordAlong(d0, cell, old - step[a] * axis, volume, cm, sm, unusedSteps, unusedLength);
+                            }
+                            else
+                            {
+                                const float3 dp = normalize(d0 + step[a] * axis);
+                                const float3 dm = normalize(d0 - step[a] * axis);
+                                Tp = pushChordAlong(dp, cell, pivot - span * dp, volume, cp, sp, unusedSteps, unusedLength);
+                                Tm = pushChordAlong(dm, cell, pivot - span * dm, volume, cm, sm, unusedSteps, unusedLength);
+                            }
+                            const float u = dr[a] / step[a];
+                            jC += 0.5f * (cp - cm) * u;
+                            jS += 0.5f * (sp - sm) * u;
+                            jT += 0.5f * (Tp - Tm) * u;
+                            aC += abs(0.5f * (cp - cm) * u);
+                            aS += abs(0.5f * (sp - sm) * u);
+                            aT += abs(0.5f * (Tp - Tm) * u);
+                            kC += 0.5f * abs(cp + cm - 2.f * cS) * u * u;
+                            kS += 0.5f * abs(sp + sm - 2.f * sS) * u * u;
+                            kT += 0.5f * abs(Tp + Tm - 2.f * TS) * u * u;
+                        }
+                        cJ = max(cS + jC, 0.f);
+                        sJ = max(sS + jS, 0.f);
+                        TJ = saturate(TS + jT);
+                        eNear = pushShareLocal(cS, sS, TS, c0, s0, T0, before, w, albedo);
+                        eJet = pushShareLocal(cJ, sJ, TJ, c0, s0, T0, before, w, albedo);
+                        estChange = pushShareLocal(cJ, sJ, TJ, cS, sS, TS, before, w, albedo);
+                        estL1 = pushShareBound(cS, sS, TS, aC, aS, aT, before, w, albedo);
+                        estSelf = pushShareBound(cJ, sJ, TJ, kC, kS, kT, before, w, albedo);
+                    }
+                    else
+                        unkeyedSteps += chordSteps;
+                    [unroll]
+                    for (uint t = 0; t < 3; ++t)
+                    {
+                        const float tolerance = t == 0u ? 0.005f : (t == 1u ? 0.01f : 0.02f);
+                        certify[8u * t + 0u] += eNear <= tolerance ? chordSteps : 0u;
+                        certify[8u * t + 1u] += eJet <= tolerance ? chordSteps : 0u;
+                        certify[8u * t + 2u] += estChange <= tolerance ? chordSteps : 0u;
+                        certify[8u * t + 3u] += estChange <= tolerance && eNear > tolerance ? chordSteps : 0u;
+                        certify[8u * t + 4u] += estL1 <= tolerance ? chordSteps : 0u;
+                        certify[8u * t + 5u] += estL1 <= tolerance && eNear > tolerance ? chordSteps : 0u;
+                        certify[8u * t + 6u] += estSelf <= tolerance ? chordSteps : 0u;
+                        certify[8u * t + 7u] += estSelf <= tolerance && eJet > tolerance ? chordSteps : 0u;
+                    }
+                    [unroll]
+                    for (uint g = 0; g < 6; ++g)
+                    {
+                        const float tolerance = g < 3u ? 0.005f : 0.02f;
+                        const uint guard = g % 3u;
+                        const float estimate = guard == 0u ? estChange : (guard == 1u ? estL1 : estSelf);
+                        const bool accept = estimate <= tolerance;
+                        const float3 c = accept ? (guard == 2u ? cJ : cS) : c0;
+                        const float3 s = accept ? (guard == 2u ? sJ : sS) : s0;
+                        const float T = accept ? (guard == 2u ? TJ : TS) : T0;
+                        certCache[g] += certT[g] * c;
+                        certSingle[g] += certT[g] * s;
+                        certT[g] *= T;
                     }
                 }
                 if ((params.pushShareMode & 1u) == 0u)
@@ -5593,6 +5845,23 @@ struct HSTRCloudRenderer
             const float3 chords = beamRadiance(cache, single, -log(max(transmittance, 1e-12f)), w, volume.data.albedo);
             const float3 error3 = abs(log(1.f + max(reused, 0.f)) - log(1.f + max(chords, 0.f)));
             pushCount(kPushShareAgeOver02 + k, max(error3.r, max(error3.g, error3.b)) > 0.02f ? 1u : 0u);
+        }
+        if ((params.pushShareMode & 4u) != 0u)
+        {
+            [unroll]
+            for (uint k = 0; k < 24; ++k)
+                pushCount(kPushShareCertify + k, certify[k]);
+            pushCount(kPushShareCertifyUnkeyed, unkeyedSteps);
+            pushCount(kPushShareCertifySteps, certifying ? steps : 0u);
+            pushCount(kPushShareCertifyRays, certifying ? 1u : 0u);
+            const float3 chords = beamRadiance(cache, single, -log(max(transmittance, 1e-12f)), w, volume.data.albedo);
+            [unroll]
+            for (uint g = 0; g < 6; ++g)
+            {
+                const float3 guarded = beamRadiance(certCache[g], certSingle[g], -log(max(certT[g], 1e-12f)), w, volume.data.albedo);
+                const float3 error3 = abs(log(1.f + max(guarded, 0.f)) - log(1.f + max(chords, 0.f)));
+                pushCount(kPushShareCertifyOver02 + g, certifying && max(error3.r, max(error3.g, error3.b)) > 0.02f ? 1u : 0u);
+            }
         }
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
         // The whole ray with the chords' own marcher: its steps less theirs are the march outside every listed cell, and its

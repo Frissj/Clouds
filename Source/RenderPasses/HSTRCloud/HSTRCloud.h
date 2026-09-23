@@ -341,6 +341,7 @@ private:
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
     ref<Buffer> mpPushShareAges;    ///< Per list entry: the temporal oracle's worst crossing error per age.
+    ref<Buffer> mpPushBrickVisits;  ///< pushShareMode 8: per brick visit of a dirty chord, tile and entry | samples << 20.
     float3 mPushShareCamera = float3(0.f);
     float3 mPushShareMotion = float3(0.f);
     ref<ComputePass> mpPushShareCountPass;

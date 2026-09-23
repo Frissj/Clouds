@@ -1324,10 +1324,11 @@ struct HSTRCloudParams
     uint pushPieceCapacity = 0;
     uint pushListCapacity = 0;
     uint pushDilate = 0;             ///< Candidates: cells within this many cells of an occupied one (see listPushCandidate).
-    uint pushShareMode = 2;          ///< countPushShare's oracles: 1 the payloads (experiments 2, 3), 2 the temporal one (4).
+    uint pushShareMode = 2;          ///< countPushShare's oracles: 1 the payloads (experiments 2, 3), 2 the temporal one (4), 4 certification (5).
     float pushShareMotionX = 0.f;    ///< The camera's last displacement per frame (world), for the temporal oracle's ages.
     float pushShareMotionY = 0.f;
     float pushShareMotionZ = 0.f;
+    uint pushEvalExactDepth = 0;     ///< pushEval modes 2-4: the chord's exact transmittance under the operator's source (see pushOperatorChord).
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
@@ -1430,7 +1431,25 @@ static const uint kPushShareEntriesDropped = 334;    ///< Crossings of list entr
 /// floor(2 log2(offset)) + 32 (clamped to 0-47, so bin 32 starts at one fine voxel); and the largest offset (asuint).
 static const uint kPushShareSnapOffsets = 335; ///< 2 x 48.
 static const uint kPushShareSnapMax = 431;     ///< 2.
-static const uint kPushCountTotal = 433;
+/// Experiment 5, certification (pushShareMode 4): the snapped 1-frame cache with a central-difference Jacobian in the 4 ray
+/// coordinates about it. Per tolerance (0.005, 0.01, 0.02), 8 chord-step counts: [0] the snapped value is within it, [1] the
+/// Jacobian's prediction is; [2] the Jacobian's predicted change accepts the snapped value, [3] of those, wrongly; [4] the
+/// one-scalar L1 sensitivity bound accepts it, [5] wrongly; [6] the jet's curvature estimate accepts its own prediction, [7] wrongly.
+static const uint kPushShareCertify = 433;         ///< 24.
+static const uint kPushShareCertifyOver02 = 457;   ///< 6: per guard (J change, L1, jet self), at tolerance 0.005 then 0.02.
+static const uint kPushShareCertifyUnkeyed = 463;  ///< Chord steps of crossings whose old ray has no beam texel.
+/// Experiment 5 runs on every kPushShareCertifyStride-th block of 64 dirty rays (9 chord marches a crossing on all of them trips the TDR):
+/// that sample's chord steps and rays, the denominators of the counts above.
+static const uint kPushShareCertifyStride = 8;
+static const uint kPushShareCertifySteps = 464;
+static const uint kPushShareCertifyRays = 465;
+/// Experiment 6, fine-brick reuse (pushShareMode 8): every dirty chord re-walked at the march's step rule, one record per visit of
+/// an atlas brick (hstrPushBrickVisits: listing tile, entry | samples << 20); records written, dropped past capacity, and the walk's
+/// brick samples (against pushShareSteps: the walk's step placement is the march's, not its exact steps).
+static const uint kPushShareVisits = 466;
+static const uint kPushShareVisitsDropped = 467;
+static const uint kPushShareVisitSamples = 468;
+static const uint kPushCountTotal = 469;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and
