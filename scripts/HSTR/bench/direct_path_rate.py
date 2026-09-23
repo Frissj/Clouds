@@ -13,6 +13,10 @@ dirty rays at worst).
 
     python scripts/HSTR/bench/direct_path_rate.py
 
+INVALID - the two MEASURED paragraphs below timed the benchmark, not the path: every thread did three same-address atomic_adds
+(1M serialised atomics cost ~1-2 ms alone) and perf_counter timed Python's launches. With counters in an untimed launch and GPU
+events (gather_path_rate.py) this kernel does the same 1M rays in 0.14 ms coherent / 0.62 ms shuffled (16% hit). The "7-9 G
+iterations/s ceiling" does not exist; tile_transport_rate.py's per-thread atomicAdd is suspect the same way.
 MEASURED (RTX 4080 Laptop, 1M rays, 1.32M fine visits, 16.4M DDA brick steps): 2.3-3.2 ms whatever the step - 1.8M / 3.6M /
 7.1M fine samples at step 4 / 2 / 1 all cost the same, so the traversal, not the sampling, sets the time: 5-7 G DDA brick steps/s,
 0.4-0.6 G fine visits/s, coherent and shuffled alike. Counting brick steps and samples together, ~8-9 G loop iterations/s - the
@@ -118,9 +122,10 @@ def direct(table: wp.array3d(dtype=wp.int32), dist: wp.array3d(dtype=wp.int32), 
             tNext = tNext + wp.ceil(wp.max(tExit - tNext, 0.0) / step) * step
         t = tExit
     out[tid] = T + L * 1.0e-9
-    wp.atomic_add(counts, 0, wp.int64(samples))
-    wp.atomic_add(counts, 1, wp.int64(visits))
-    wp.atomic_add(counts, 2, wp.int64(guard))
+    if counts.shape[0] > 0:  # timed launches pass an empty array: 1M same-address atomics serialise into ~1 ms by themselves
+        wp.atomic_add(counts, 0, wp.int64(samples))
+        wp.atomic_add(counts, 1, wp.int64(visits))
+        wp.atomic_add(counts, 2, wp.int64(guard))
 
 
 def main():
