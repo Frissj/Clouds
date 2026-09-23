@@ -4584,6 +4584,16 @@ struct HSTRCloudRenderer
     /// MEASURED with shells (push4, same run, pushShells 10 against 0): near park 3.33M overlaps / 170 ms -> 464k / 0.47 ms, at most
     /// 12 tiles a cell; clear-air walk 951k / 0.62 ms -> 388k / 0.43 ms (project 0.22, scatter 0.04, sort 0.14). pushShellDistance
     /// (~202 voxels at 4K) is conservative, so shell 0 held nothing there and the far field sat in 32-texel tiles.
+    ///
+    /// MEASURED and REJECTED, offline: pushing the fine density itself object-order (shear-warp slices front to back into the beam
+    /// image, every frame, no temporal reuse). The work is not fewer contributions, only cheaper ones. This walk's 104k visible cells
+    /// (25k at 64-128 voxels, 79k at 128-256) hold ~584M fine voxels at 4K pixel footprint; 52% non-empty in occupied cells, 13-22%
+    /// of those in front of T = 1e-3 (the bench cloud) - ~50M contributions a frame at perfect occlusion, plausibly up to ~150M.
+    /// scripts/HSTR/bench/shear_warp_rate.py (NVIDIA Warp, RTX 4080 Laptop, real density as a dense float16 array, slice-major):
+    /// on the cloud's core (38-47% of samples non-empty) shear-warp composites 10-11 G contributions/s, a per-pixel perspective
+    /// march 8.7 G/s - coherence buys ~1.2x once samples do work (the whole cloud's 4.6 vs 0.5 G/s is only cheap empty space, which
+    /// these lists already skip). The shipping dirty march runs ~7.3 G steps/s with virtual addressing and lighting. A full frame
+    /// is ~5-15 ms against a ~0.9 ms dirty budget, before LOD, sectors, virtual bricks or a real per-voxel source.
     void projectPushCell(uint index)
     {
         if (index == 0u)
@@ -5436,6 +5446,15 @@ struct HSTRCloudRenderer
                 // frames), 6.9% of rays over 0.02 reusing all; sprint 57% (1 frame), 56% (4). The snap moves the ray a median of
                 // under 0.5 fine voxels from the midpoint (p90 under 1, p99 under 1.41, max 1.6-1.7): a beam texel is about a fine
                 // voxel here, and half of one loses 36 of the 94 points. Temporal reuse fails for the reason the payloads did.
+                // MEASURED offline (scripts/HSTR/bench/ray_jet_fit.py, whole rays through the bench cloud at mip 1, texel = 1 fine
+                // voxel, oracle routing): a texel storing its ray's transfer plus 4D ray-space derivatives ("ray jet"). Of the steps
+                // the snapped texel loses, sprint recovers at 0.02 / 0.005 - Jacobian 69 / 51% (D 300) and 87 / 73% (D 800), bilinear
+                // 57 / 27% and 70 / 41%, Hessian 26 / 20% and 86 / 70% (finite differences across voxel-edge kinks: worse than J
+                // near). Predicting tau (the Lie-algebra log of [[T, E], [0, 1]]) instead of T, E gains nothing. On share8's
+                // population that projects to ~87% (near) / ~94% (far) of dirty steps at 0.02, 79 / 89% at 0.005 - under the 90%
+                // sprint kill line near, and that is with oracle routing: a real cache needs a bound to trust a jet unmarched, and
+                // every miss marches 4 tangents in a register-bound kernel. Random frustum rays are easy (nearest keeps 92-96%), so
+                // only the recovered share transfers; confirming it needs the jet predictor in this probe on the real dirty rays.
                 if ((params.pushShareMode & 2u) != 0u)
                 {
                     const float3 motion = float3(params.pushShareMotionX, params.pushShareMotionY, params.pushShareMotionZ);
