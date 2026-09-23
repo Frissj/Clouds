@@ -5412,6 +5412,7 @@ struct HSTRCloudRenderer
         uint samples = 0;
         uint total = 0;
         uint guard = 0;
+        uint air = 0, empty = 0, proxy = 0, proxyZero = 0;
         float t = chord.x;
         [loop]
         while (t < chord.y && transmittance > params.cloudMinTransmittance && guard < params.maxMarchSteps)
@@ -5422,12 +5423,16 @@ struct HSTRCloudRenderer
             const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
             const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
             const float dt = min(stepVoxels / voxelsPerUnit, chord.y - t);
+            air += majorant > 0.f ? 0u : 1u;
             if (majorant > 0.f)
             {
                 CloudSample sample = {};
                 const float tm = t + 0.5f * dt;
                 const float sigma = cameraExtinctionAtVoxel((ray.position + tm * ray.direction) * cellWidth, rayFootprint(ray, tm), fineVoxels, sample);
                 transmittance *= exp(-sigma * dt * ray.worldLength);
+                empty += sample.brick && sample.empty ? 1u : 0u;
+                proxy += !sample.brick && sigma > 0.f ? 1u : 0u;
+                proxyZero += !sample.brick && sigma <= 0.f ? 1u : 0u;
                 if (sample.brick && !sample.empty)
                 {
                     if (sample.entry != entry)
@@ -5444,6 +5449,11 @@ struct HSTRCloudRenderer
         }
         pushBrickVisit(tile, entry, samples);
         pushCount(kPushShareVisitSamples, total);
+        pushCount(kPushShareWalkSteps, guard);
+        pushCount(kPushShareWalkAir, air);
+        pushCount(kPushShareWalkEmpty, empty);
+        pushCount(kPushShareWalkProxy, proxy);
+        pushCount(kPushShareWalkProxyZero, proxyZero);
     }
 
     void countPushShare(uint thread)

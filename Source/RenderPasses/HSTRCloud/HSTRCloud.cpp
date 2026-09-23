@@ -1321,6 +1321,11 @@ Properties HSTRCloud::getProperties() const
                     cloud["pushBrickVisits"] = written;
                     cloud["pushBrickVisitsDropped"] = push[kPushShareVisitsDropped];
                     cloud["pushBrickWalkSamples"] = push[kPushShareVisitSamples];
+                    cloud["pushWalkSteps"] = push[kPushShareWalkSteps];
+                    cloud["pushWalkAir"] = push[kPushShareWalkAir];
+                    cloud["pushWalkEmpty"] = push[kPushShareWalkEmpty];
+                    cloud["pushWalkProxy"] = push[kPushShareWalkProxy];
+                    cloud["pushWalkProxyZero"] = push[kPushShareWalkProxyZero];
                     cloud["pushBrickSamples"] = double(samples);
                     cloud["pushBrickPairs"] = double(pairs.size());
                     cloud["pushBrickUnique"] = double(bricks.size());

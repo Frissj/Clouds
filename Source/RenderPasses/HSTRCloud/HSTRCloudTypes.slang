@@ -1449,7 +1449,14 @@ static const uint kPushShareCertifyRays = 465;
 static const uint kPushShareVisits = 466;
 static const uint kPushShareVisitsDropped = 467;
 static const uint kPushShareVisitSamples = 468;
-static const uint kPushCountTotal = 469;
+/// The same walk's steps by what answered them: all steps; no majorant (air); an empty fine brick; the proxy with density; the proxy
+/// at zero (the fine-brick samples are kPushShareVisitSamples).
+static const uint kPushShareWalkSteps = 469;
+static const uint kPushShareWalkAir = 470;
+static const uint kPushShareWalkEmpty = 471;
+static const uint kPushShareWalkProxy = 472;
+static const uint kPushShareWalkProxyZero = 473;
+static const uint kPushCountTotal = 474;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and
