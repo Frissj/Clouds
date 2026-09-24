@@ -6266,12 +6266,14 @@ struct HSTRCloudRenderer
             const uint2 resolved = hstrCloudSunResolved[hit.entry * kCloudSunClasses + instance.sunClass];
             if (resolved.x != kCloudRefNone)
             {
-                const float depth = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * instance.sourceVoxelWorld;
-                if (depth > kCloudSunDepthOpaque)
-                    return depth;
+                // The far field fetched beside the bake rather than after it: its address never depended on the bake, only the
+                // opaque early-out did, which put one more memory round trip in series on every lit sample. Exact.
+                // MEASURED (leanchain1, 4K, errors identical): walk 6.02 / 6.02 -> 5.97 ms, sprint 7.50 / 7.51 -> 7.46.
                 const float near = params.sunNearVoxels * instance.sourceVoxelWorld / hstrCloudAssets[instance.asset].sourceVoxelWorld;
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
-                return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+                const float farDepth = hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+                const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * instance.sourceVoxelWorld;
+                return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
         }
 #endif
@@ -6321,6 +6323,12 @@ struct HSTRCloudRenderer
         // Step classes (probe, pushShare's counters): all, majorant zero, empty box, proxy, contributing (alpha > 1e-6).
         uint countSteps = 0, countZero = 0, countEmpty = 0, countProxy = 0, countLit = 0;
 #endif
+        // MEASURED and REMOVED (leandefer1, 4K, errors identical): deferred lighting. The loop issues 81.4M lane steps for 61.5M
+        // steps (76%, leancount3 walk), but only 28% of steps are lit, so the light body ran with ~7 of 32 lanes (Nsight: 14.3
+        // threads per warp active). A lit sample parked its light (midpoint, T alpha, footprint, hit) and stopped stepping; the
+        // wave lit the parked samples together once pending * K >= lanes in the loop. Walk 6.01 / 6.03 -> 9.34 / 6.57 / 6.37 ms at
+        // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
+        // hide its latency better, and the parked state and the stalled traversal cost more.
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
         {
@@ -6368,6 +6376,8 @@ struct HSTRCloudRenderer
                     // MEASURED and REMOVED (leanstride1, 4K walk / sprint): holding it over 2 / 4 / 8 samples (never across a cache
                     // cell) saved nothing - 6.39 -> 6.37 / 6.38 / 6.64 ms - for 0.137% -> 0.153% / 1.048% / 4.985% of walk over 0.02,
                     // and carrying the hold state cost ~0.3 ms even at stride 1 (6.06 in leanflat2). The cache is not what this waits on.
+                    // MEASURED and REMOVED (leanchain1, 4K, errors identical): the cache evaluated ahead of the sun chain, so its
+                    // independent fetches would not wait behind it - walk 6.02 -> 6.53 ms, sprint 7.50 -> 8.09. Codegen, not memory.
                     if (withSource)
                         radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
                 }
@@ -6392,6 +6402,15 @@ struct HSTRCloudRenderer
         pushCount(kPushShareWalkProxy, countProxy);
         pushCount(kPushShareWalkProxyZero, countLit);
         pushCount(kPushShareVisitSamples, 1u); // Rays.
+        // Against the sums above: the share of issued lane slots that march a step (SIMD efficiency over the loop).
+        const uint waveSteps = WaveActiveMax(countSteps) * WaveGetLaneCount();
+        const uint waveLit = WaveActiveMax(countLit) * WaveGetLaneCount();
+        if (WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrPushCounts[kPushShareWalkWaveSteps], waveSteps, unused);
+            InterlockedAdd(hstrPushCounts[kPushShareWalkWaveLit], waveLit, unused);
+        }
 #endif
     }
 
@@ -9703,6 +9722,12 @@ void writeFoldedDirtyArgs(uint at, uint threads)
 }
 
 uint foldedDirtyThread(uint3 groupId, uint groupThread) { return (groupId.y * kDirtyRow + groupId.x) * 64u + groupThread; }
+
+// MEASURED and REMOVED (leanorder1, 4K, errors identical): the dirty passes' 64-thread waves dispatched in a scrambled order, each
+// wave keeping its own rays - walk 6.03 / 6.04 -> 6.63 ms (query 2.21 -> 2.50, units 2.47 -> 2.77), sprint 7.51 / 7.55 -> 8.22.
+// Random order is the worst an ordering can do and costs only 10%, so the listed order (guard blocks appended roughly in raster,
+// a tile's units together) already gets nearly all the cross-wave brick reuse there is: reordering (Morton, tile sorts) cannot buy
+// back the frame's DRAM reads. The whole resident sea is 140 MB, so those reads are per-sample sector misses, not brick refetch.
 
 /// Dispatch arguments for the blocks the coarse level could not answer for.
 [numthreads(1, 1, 1)]

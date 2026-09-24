@@ -8,4 +8,7 @@ from pathlib import Path
 # Run: python scripts/HSTR/bench/run_sea.py motion TAG scripts/HSTR/bench/sweeps/lean_count.py --steps 1
 #          --motions "walk 2 0.004" "sprint 20 0"
 SHARE = runpy.run_path(str(Path(__file__).with_name("push_share.py")))["SHARE"]
-TESTS = [("count", dict(SHARE, pushDilate=0, pushShareMode=0, beamShipMask=509 | 1024 | 2048 | 4096))]
+# pushWalkWaveSteps / pushWalkWaveLit: per wave, its longest ray's steps (contributing samples) times its lanes, so pushWalkSteps /
+# pushWalkWaveSteps is the loop's SIMD efficiency - how much of the idle lanes Nsight shows (14.3 of 32 threads active) is rays of
+# unequal length.
+TESTS = [("count", dict(SHARE, pushDilate=0, pushShareMode=0, beamShipMask=509 | 1024 | 2048 | 4096 | 8192))]

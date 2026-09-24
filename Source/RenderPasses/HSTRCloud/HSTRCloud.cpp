@@ -312,6 +312,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunAncestors = uint32_t(value);
             continue;
         }
+        if (key == "cloudSunResolveAlways")
+        {
+            mSunResolveAlways = bool(value);
+            continue;
+        }
         if (key == "beamShadowCarry")
         {
             mParams.beamShadowCarry = uint32_t(value);
@@ -1289,6 +1294,8 @@ Properties HSTRCloud::getProperties() const
                 cloud["pushWalkEmpty"] = push[kPushShareWalkEmpty];
                 cloud["pushWalkProxy"] = push[kPushShareWalkProxy];
                 cloud["pushWalkProxyZero"] = push[kPushShareWalkProxyZero];
+                cloud["pushWalkWaveSteps"] = push[kPushShareWalkWaveSteps];
+                cloud["pushWalkWaveLit"] = push[kPushShareWalkWaveLit];
                 if ((mParams.pushShareMode & 8u) && mpPushBrickVisits)
                 {
                     // Experiment 6: the visits aggregated per (listing tile, atlas brick) - what one workgroup per tile staging each
@@ -1455,6 +1462,8 @@ Properties HSTRCloud::getProperties() const
 RenderPassReflection HSTRCloud::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
+    // MEASURED and REMOVED (leanhalf1, 4K, errors identical): the frame at RGBA16Float, half the resolve's 133 MB of writes. The
+    // resolve went 0.47 -> 0.41 ms, but the frame did not follow (walk 5.78 / 5.82 -> 5.92, sprint 7.28 / 7.27 -> 7.25).
     reflector.addOutput(kColor, "Hierarchical Schur transport cloud radiance")
         .bindFlags(ResourceBindFlags::UnorderedAccess)
         .format(ResourceFormat::RGBA32Float);
@@ -2665,13 +2674,15 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         residency.pageUpdatesDispatched();
     }
     // Sun bakes last: they read the bricks and occupancy committed above.
+    bool sunSlotsChanged = false;
     if (mCloudGpuSun)
     {
-        dispatchSunScheduling(pRenderContext);
+        sunSlotsChanged = dispatchSunScheduling(pRenderContext);
         mpCloudResidency->gpuSunDispatched();
     }
     else if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
     {
+        sunSlotsChanged = true;
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
         mParams.cloudCommitCount = bakes;
@@ -2681,9 +2692,20 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mParams.cloudCommitCount = 0;
         mBeamReusable = false;
     }
-    // After every slot change and bake of the frame: the sun bake each brick's samples read, per orientation class.
-    if ((beamShipDefine() & 2048u) != 0)
+    // After every slot change and bake of the frame: the sun bake each brick's samples read, per orientation class. Only when
+    // something it reads changed - the sun slot table (a scheduling run's evictions and assignments, or CPU bakes), the brick table
+    // (maps, commits, fades) or the generations and ancestor reach it selects with. Every frame it cost ~0.3 ms at 4K walk (Nsight,
+    // 0.445 of 9.19 ms under metrics) for a table a settled frame never changes.
+    const uint4 sunResolveInputs(mParams.cloudSunGeneration, mParams.cloudSunOldestGeneration, mParams.cloudSunAncestors,
+                                 uint32_t(reinterpret_cast<uintptr_t>(mpCloudResidency->getSunResolved().get())));
+    const bool sunResolveDirty = mSunResolveAlways || !mSunResolveValid || sunSlotsChanged || densityChanged || mpCloudResidency->fadesRunning() ||
+                                 any(sunResolveInputs != mSunResolveInputs);
+    if ((beamShipDefine() & 2048u) == 0)
+        mSunResolveValid = false; // Nothing keeps the table while it is not read.
+    else if (sunResolveDirty)
     {
+        mSunResolveValid = true;
+        mSunResolveInputs = sunResolveInputs;
         FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
         if (bindResidencyPass(pRenderContext, mpResolveCloudSunSlotsPass, false))
         {
@@ -2738,7 +2760,7 @@ bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<Compu
     return first;
 }
 
-void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
+bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
 {
     auto& residency = *mpCloudResidency;
     // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle. The copy was
@@ -2777,7 +2799,7 @@ void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
     if (info.ageRows > 0)
         run("age", mpAgeSunPass, uint3(kCloudSunFieldWidth, info.ageRows, 1));
     if (!sun.run)
-        return; // The counters keep the last run's (the stats read them).
+        return false; // The counters keep the last run's (the stats read them).
     pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
     if (info.releaseCount > 0)
@@ -2816,6 +2838,7 @@ void HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         residency.gpuSunQueued();
         mSunReadbackRecorded = true;
     }
+    return true;
 }
 
 void HSTRCloud::uploadHierarchy()
@@ -5731,9 +5754,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
 
     if (mStoreExact)
     {
-        if (!mpExactFrame || mpExactFrame->getWidth() != frameDim.x || mpExactFrame->getHeight() != frameDim.y)
+        if (!mpExactFrame || mpExactFrame->getWidth() != frameDim.x || mpExactFrame->getHeight() != frameDim.y ||
+            mpExactFrame->getFormat() != color->getFormat())
             mpExactFrame = mpDevice->createTexture2D(
-                frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, ResourceBindFlags::ShaderResource
+                frameDim.x, frameDim.y, color->getFormat(), 1, 1, nullptr, ResourceBindFlags::ShaderResource
             );
         pRenderContext->copyResource(mpExactFrame.get(), color.get());
         mStoreExact = false;

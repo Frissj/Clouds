@@ -512,7 +512,11 @@ private:
     ref<Fence> mpSunFence;
     uint64_t mSunReadbackPending = 0;
     bool mSunReadbackRecorded = false; ///< The copy is in the command list; its fence is signalled next frame.
-    void dispatchSunScheduling(RenderContext* pRenderContext);
+    /// Returns whether a scheduling run was dispatched (it can evict and assign sun slots).
+    bool dispatchSunScheduling(RenderContext* pRenderContext);
+    bool mSunResolveAlways = false; ///< cloudSunResolveAlways: resolve every frame (the A/B anchor for the dirty test).
+    bool mSunResolveValid = false; ///< hstrCloudSunResolved holds the resolve of mSunResolveInputs and the current slot and brick tables.
+    uint4 mSunResolveInputs = uint4(0); ///< Sun generation, oldest generation, ancestor reach, resolved buffer it was written to.
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.

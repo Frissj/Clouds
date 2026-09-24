@@ -1462,7 +1462,10 @@ static const uint kPushShareWalkAir = 470;
 static const uint kPushShareWalkEmpty = 471;
 static const uint kPushShareWalkProxy = 472;
 static const uint kPushShareWalkProxyZero = 473;
-static const uint kPushCountTotal = 474;
+/// Lane slots the lean march's waves issue: per wave, its longest ray's steps (contributing samples) times the wave's lanes.
+static const uint kPushShareWalkWaveSteps = 474;
+static const uint kPushShareWalkWaveLit = 475;
+static const uint kPushCountTotal = 476;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and

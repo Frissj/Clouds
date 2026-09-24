@@ -73,6 +73,62 @@ TSTEP = [
 # MEASURED (leantstep1, 4K): walk 5.99 / 5.99 -> 5.44 (2x) / 5.38 (4x) ms for 0.137% -> 0.146% / 0.143% over 0.02 (p99.9 the same,
 # max 0.171 -> 0.135); sprint 7.44 / 7.48 -> 6.83 / 6.78 ms for 0.028% -> 0.028% / 0.029%. Opt-in: it trades quality.
 
+# Dispatch order of the dirty passes' waves (HSTR_SHIP bit 262144, shuffledDirtyThread): the same rays per wave, the waves in a
+# scrambled order. Exact: the error columns must match. Answers whether the brick refetch (Nsight: ~4x the frame's unique brick
+# bytes) is an ordering problem - if scrambling costs little, the listed order already gets what reordering could.
+ORDER = [
+    ("listed", dict(BASE, beamShipMask=SHIP_MASK)),
+    ("shuffled", dict(BASE, beamShipMask=SHIP_MASK | 262144)),
+    ("listed again", dict(BASE, beamShipMask=SHIP_MASK)),
+]
+# MEASURED and REMOVED (leanorder1, 4K, errors identical): walk 6.03 / 6.04 -> 6.63 ms shuffled, sprint 7.51 / 7.55 -> 8.22. The
+# worst order costs 10%: the listed order already has the cross-wave reuse, so reordering is not a lever. Bit 262144 is gone.
+
+# Deferred lighting (HSTR_SHIP bits 262144 / 524288: K = 1 / 2 / 4, marchBeamLean): a lit sample's light is parked and the wave
+# evaluates the parked samples together once pending * K >= lanes still in the loop. leancount3 (walk): the loop issues 81.4M lane
+# steps for 61.5M steps (76%), but only 28% of steps are lit, so the light body ran with ~7 of 32 lanes. Exact: errors must match.
+DEFER = [
+    ("ship", dict(BASE, beamShipMask=SHIP_MASK)),
+    ("defer all", dict(BASE, beamShipMask=SHIP_MASK | 262144)),
+    ("defer half", dict(BASE, beamShipMask=SHIP_MASK | 524288)),
+    ("defer quarter", dict(BASE, beamShipMask=SHIP_MASK | 786432)),
+    ("ship again", dict(BASE, beamShipMask=SHIP_MASK)),
+]
+# MEASURED and REMOVED (leandefer1, 4K, errors identical): walk 6.01 / 6.03 -> 9.34 / 6.57 / 6.37 ms (all / half / quarter), sprint
+# 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light is latency-bound, not lane-bound. Bits 262144 / 524288 are gone.
+
+# The lit sample's memory chain shortened, exactly: the sun's far field fetched beside the bake instead of after its opaque test
+# (HSTR_SHIP bit 1048576), and the cache fetched ahead of the sun chain instead of behind it (bit 2097152). Errors must match.
+CHAIN = [
+    ("ship", dict(BASE, beamShipMask=SHIP_MASK)),
+    ("far beside", dict(BASE, beamShipMask=SHIP_MASK | 1048576)),
+    ("cache first", dict(BASE, beamShipMask=SHIP_MASK | 2097152)),
+    ("both", dict(BASE, beamShipMask=SHIP_MASK | 1048576 | 2097152)),
+    ("ship again", dict(BASE, beamShipMask=SHIP_MASK)),
+]
+# MEASURED (leanchain1, 4K, errors identical): walk 6.02 / 6.02 -> far beside 5.97, cache first 6.53, both 6.51 ms; sprint 7.50 /
+# 7.51 -> 7.46 / 8.09 / 8.05. The far field beside the bake is now unconditional (leanSunDepth); cache first removed. The bits
+# are gone, so these arms no longer vary.
+
+# The sun slot resolve (resolveCloudSunSlots) only when something it reads changed, against every frame (cloudSunResolveAlways).
+# Exact: the errors must match. Run parked motion and a moving sun too, since sun scheduling is what re-dirties it.
+RESOLVE = [
+    ("always", dict(BASE, cloudSunResolveAlways=True)),
+    ("on change", dict(BASE, cloudSunResolveAlways=False)),
+    ("always again", dict(BASE, cloudSunResolveAlways=True)),
+]
+# MEASURED (leanresolve1, 4K, errors identical): walk 5.97 / 5.95 -> 5.74 ms, sprint 7.41 / 7.43 -> 7.20. On change is the default.
+
+# The frame written at RGBA16Float (colorHalf) instead of RGBA32Float: the resolve is write-bound (Nsight walk: VRAM 64%, reads
+# 9%) and writes 133 MB a 4K frame. A precision change (half keeps ~3 significant digits): judged against the reference.
+HALF = [
+    ("float", dict(BASE, colorHalf=False)),
+    ("half", dict(BASE, colorHalf=True)),
+    ("float again", dict(BASE, colorHalf=False)),
+]
+# MEASURED and REMOVED (leanhalf1, 4K, errors identical): resolve 0.47 / 0.49 -> 0.41 ms, frame walk 5.78 / 5.82 -> 5.92, sprint
+# 7.28 / 7.27 -> 7.25. Not worth the format change; the colorHalf property is gone.
+
 # MEASURED and REMOVED (leanloads1, errors identical): exact load cuts that cost registers - the proxy only where it answers
 # (bits 65536) 6.04 -> 6.16 ms walk, the sea tile instance cached along the ray (131072) 6.04 -> 6.53, both 6.62 (anchor 6.07);
 # sprint 7.52 -> 7.68 / 8.12 / 8.22 (anchor 7.58). See leanExtinction.
