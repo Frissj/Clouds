@@ -58,6 +58,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
 
     mpPayload = std::make_unique<CloudPayloadPool>(mpDevice, mDesc.files, mDesc.payloadPoolMB, mDesc.directStorage);
     std::vector<HSTRCloudAsset> gpuAssets;
+    uint32_t levelPageCount = 0;
     for (uint32_t a = 0; a < assets.size(); ++a)
     {
         const CloudAsset& asset = assets[a];
@@ -101,6 +102,14 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         gpu.pageOffset = mAssets[a].pageOffset;
         const uint3 brickDims = asset.dims / kCloudBrickCore;
         mPages.resize(mPages.size() + size_t(brickDims.x) * brickDims.y * brickDims.z, {kCloudRefNone, 0u});
+        FALCOR_CHECK(all(brickDims < 1024u), "HSTRCloud: cloud '{}' has more than 1023 pages along an axis.", asset.name);
+        mAssets[a].levelPageBase = levelPageCount;
+        gpu.levelPageBase = levelPageCount;
+        for (uint32_t level = 0; level <= asset.topLevel; ++level)
+        {
+            const uint3 levelDims = (brickDims + (1u << level) - 1u) >> level;
+            levelPageCount += levelDims.x * levelDims.y * levelDims.z;
+        }
         gpuAssets.push_back(gpu);
     }
     if (mDirectory.empty())
@@ -124,6 +133,13 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mpPages = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudVirtualPage), uint32_t(mPages.size()), pageFlags, MemoryType::DeviceLocal, mPages.data(), false
     );
+    {
+        FALCOR_CHECK(brickCapacity < (1u << 24), "HSTRCloud: resolved level pages hold 24-bit brick indices.");
+        const std::vector<uint32_t> none(std::max(levelPageCount, 1u), kCloudRefNone);
+        mpLevelPages = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), uint32_t(none.size()), pageFlags, MemoryType::DeviceLocal, none.data(), false
+        );
+    }
     mpDirtyPageRegions = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudDirtyPageRegion), 2u * brickCapacity, shaderResource, MemoryType::DeviceLocal, nullptr, false
     );
@@ -188,6 +204,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mSunTableBlocksDirty.assign((brickCapacity + kBrickBlock - 1) / kBrickBlock, 0);
     mpSunSlotTable = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), uint32_t(mSunSlotTable.size()), readWrite, MemoryType::DeviceLocal, mSunSlotTable.data(), false
+    );
+    mpSunResolved = mpDevice->createStructuredBuffer(
+        sizeof(uint2), brickCapacity * kCloudSunClasses, readWrite, MemoryType::DeviceLocal, nullptr, false
     );
     if (mDesc.gpuSun)
     {
@@ -724,6 +743,13 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             releaseSunField(slot);
         mInstances[slot] = tiles[slot].instance;
         const HSTRCloudInstance& i = tiles[slot].instance;
+        if (i.asset < mAssets.size())
+        {
+            const uint3 pages = mAssetRecords[i.asset]->dims / kCloudBrickCore;
+            mInstances[slot].levelPageBase = mAssets[i.asset].levelPageBase;
+            mInstances[slot].pageDims = pages.x | (pages.y << 10) | (pages.z << 20);
+            mInstances[slot].topLevel = mAssetRecords[i.asset]->topLevel;
+        }
         if (tiles[slot].occupied)
         {
             mTileForward[slot] = inverse(float3x3{i.row0.x, i.row0.y, i.row0.z, i.row1.x, i.row1.y, i.row1.z, i.row2.x, i.row2.y, i.row2.z});
@@ -2446,12 +2472,14 @@ void CloudResidency::bind(const ShaderVar& var) const
     var["hstrCloudDirectory"] = mpDirectory;
     var["hstrCloudNodes"] = mpNodes;
     var["hstrCloudPages"] = mpPages;
+    var["hstrCloudLevelPages"] = mpLevelPages;
     var["hstrCloudBricks"] = mpBricks;
     var["hstrCloudAtlas"] = mpAtlas;
     var["hstrCloudOccupancy"] = mpOccupancy;
     var["hstrCloudSunAtlas"] = mpSunAtlas;
     var["hstrCloudSunBakes"] = mpSunBakes;
     var["hstrCloudSunSlots"] = mpSunSlotTable;
+    var["hstrCloudSunResolved"] = mpSunResolved;
     var["hstrCloudPayload"] = mpPayload->getBuffer();
     var["hstrCloudResiduals"] = mpResiduals;
     var["hstrCloudStagingInfo"] = mpStagingInfo;

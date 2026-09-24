@@ -99,8 +99,9 @@ def nsys(verb, *options):
 def timed(frames, first, forward, yaw, sun=0.0, report=None):
     import time
     if NSYS and report:
+        metric_set = [f"--gpu-metrics-set={os.environ['HSTR_NSYS_SET']}"] if os.environ.get("HSTR_NSYS_SET") else []
         nsys("start", "--sample=none", "--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000", "--force-overwrite=true",
-             f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
+             *metric_set, f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
     m.profiler.enabled = True
     m.profiler.start_capture()
     before = stats()

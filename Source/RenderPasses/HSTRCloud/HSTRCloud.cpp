@@ -1282,6 +1282,13 @@ Properties HSTRCloud::getProperties() const
                     cloud["pushShareCertifySteps"] = push[kPushShareCertifySteps]; // Every kPushShareCertifyStride-th ray only.
                     cloud["pushShareCertifyRays"] = push[kPushShareCertifyRays];
                 }
+                // Written by pushBrickWalk (pushShareMode 8) or by the lean march's step counters (HSTR_SHIP bit 4096).
+                cloud["pushBrickWalkSamples"] = push[kPushShareVisitSamples];
+                cloud["pushWalkSteps"] = push[kPushShareWalkSteps];
+                cloud["pushWalkAir"] = push[kPushShareWalkAir];
+                cloud["pushWalkEmpty"] = push[kPushShareWalkEmpty];
+                cloud["pushWalkProxy"] = push[kPushShareWalkProxy];
+                cloud["pushWalkProxyZero"] = push[kPushShareWalkProxyZero];
                 if ((mParams.pushShareMode & 8u) && mpPushBrickVisits)
                 {
                     // Experiment 6: the visits aggregated per (listing tile, atlas brick) - what one workgroup per tile staging each
@@ -1320,12 +1327,6 @@ Properties HSTRCloud::getProperties() const
                     };
                     cloud["pushBrickVisits"] = written;
                     cloud["pushBrickVisitsDropped"] = push[kPushShareVisitsDropped];
-                    cloud["pushBrickWalkSamples"] = push[kPushShareVisitSamples];
-                    cloud["pushWalkSteps"] = push[kPushShareWalkSteps];
-                    cloud["pushWalkAir"] = push[kPushShareWalkAir];
-                    cloud["pushWalkEmpty"] = push[kPushShareWalkEmpty];
-                    cloud["pushWalkProxy"] = push[kPushShareWalkProxy];
-                    cloud["pushWalkProxyZero"] = push[kPushShareWalkProxyZero];
                     cloud["pushBrickSamples"] = double(samples);
                     cloud["pushBrickPairs"] = double(pairs.size());
                     cloud["pushBrickUnique"] = double(bricks.size());
@@ -1615,6 +1616,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpMarkDirtyCloudPagesPass = createPass("markDirtyCloudPages");
     mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
     mpResolveDirtyCloudPagesPass = createPass("resolveDirtyCloudPages");
+    mpResolveCloudSunSlotsPass = createPass("resolveCloudSunSlots");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
     mpScanSunPass = createPass("scanSunBakes");
@@ -2655,6 +2657,8 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             ShaderVar pageVar = mpResolveDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"];
             pageVar["hstrCloudPages"] = ref<Buffer>();
             pageVar["hstrCloudPagesOutput"] = residency.getPages();
+            pageVar["hstrCloudLevelPages"] = ref<Buffer>();
+            pageVar["hstrCloudLevelPagesOutput"] = residency.getLevelPages();
             mpResolveDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
         }
         mParams.cloudPageRegionCount = 0;
@@ -2676,6 +2680,18 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * bakes));
         mParams.cloudCommitCount = 0;
         mBeamReusable = false;
+    }
+    // After every slot change and bake of the frame: the sun bake each brick's samples read, per orientation class.
+    if ((beamShipDefine() & 2048u) != 0)
+    {
+        FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
+        if (bindResidencyPass(pRenderContext, mpResolveCloudSunSlotsPass, false))
+        {
+            ShaderVar sunVar = mpResolveCloudSunSlotsPass->getRootVar()["CB"]["gHSTRCloud"];
+            sunVar["hstrCloudSunResolved"] = ref<Buffer>();
+            sunVar["hstrCloudSunResolvedOutput"] = mpCloudResidency->getSunResolved();
+        }
+        mpResolveCloudSunSlotsPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
     }
     if (mpCloudResidency->getStats().sunBakesFrame > 0)
         ++mSunBakeFrames;

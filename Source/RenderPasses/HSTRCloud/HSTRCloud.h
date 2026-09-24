@@ -272,7 +272,9 @@ private:
     /// 7.25 -> 5.40 ms but slowed near 14.3 -> 19.5 and farside 11.4 -> 14.7 - a DXC codegen cliff no single group causes; every
     /// group but the cost probe (509) is faster everywhere: near 12.5, farside 9.9, sea 5.5, flying 2 units 7.9 -> 5.8, 20 units
     /// 10.0 -> 8.0.
-    uint32_t mBeamShipMask = 509;
+    /// 509 | 1024 | 2048 | 8192: the lean march (marchBeamLean) on the resolved level pages and sun slots, crossing zero 4-voxel
+    /// majorant blocks whole (lean_march.py).
+    uint32_t mBeamShipMask = 11773;
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
     uint32_t beamShipDefine() const;
@@ -544,6 +546,7 @@ private:
     ref<ComputePass> mpMarkDirtyCloudPagesPass;
     ref<ComputePass> mpCloudPageArgsPass;
     ref<ComputePass> mpResolveDirtyCloudPagesPass;
+    ref<ComputePass> mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
     ref<ComputePass> mpClearWorldCacheTilesPass;
     ref<ComputePass> mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;

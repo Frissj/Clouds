@@ -31,6 +31,7 @@ parser.add_argument("--views", default="sea", help="comma-separated views of ab_
 parser.add_argument("--nsys", action="store_true",
                     help="wrap the headless Mogwai in Nsight Systems with GPU metrics; report at HSTR_results/nsight/TAG.nsys-rep "
                          "(nsys.exe is set to run as administrator in its compatibility settings, which GPU metrics need)")
+parser.add_argument("--nsys-set", default="", help="--nsys: the GPU metric set (nsys --gpu-metrics-set), e.g. ad10x-gfxt; default set if empty")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
@@ -67,7 +68,8 @@ if args.nsys:
     # capture with GPU metrics was an 807 MB stream that took 20 GB and many minutes to import).
     (RESULTS / "nsight").mkdir(exist_ok=True)
     session = f"hstr_{args.tag}"
-    env.update(HSTR_NSYS=NSYS, HSTR_NSYS_SESSION=session, HSTR_NSYS_OUTPUT=str(RESULTS / "nsight" / args.tag))
+    env.update(HSTR_NSYS=NSYS, HSTR_NSYS_SESSION=session, HSTR_NSYS_OUTPUT=str(RESULTS / "nsight" / args.tag),
+               HSTR_NSYS_SET=args.nsys_set)
     command = [NSYS, "launch", f"--session-new={session}", "--trace=dx12,dx12-annotations,nvtx", "--wait=all"] + command
 with open(log, "w") as f:
     (run_hidden if args.nsys else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)

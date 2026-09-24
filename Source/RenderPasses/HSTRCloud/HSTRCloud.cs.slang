@@ -194,6 +194,16 @@ struct CloudSample
     uint mappedLevel; ///< Level of the brick the descent found, BEFORE the parent climb: level - mappedLevel is what the climb walked.
 };
 
+/// What the lean march (HSTR_SHIP bit 1024) keeps of a density sample for its sun lookup: the brick it read, or kCloudRefNone where
+/// the proxy answered. Eight words instead of CloudSample's twenty-five, and only while the sample is being lit.
+struct LeanHit
+{
+    uint entry;
+    uint instance;
+    uint levels; ///< level | desired << 8.
+    float3 x;
+};
+
 /// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
 /// 15 unbounded.
 uint cloudCellCode(float maximum)
@@ -260,6 +270,8 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint> hstrCloudNodes;
     StructuredBuffer<HSTRCloudVirtualPage> hstrCloudPages;
     RWStructuredBuffer<HSTRCloudVirtualPage> hstrCloudPagesOutput;
+    StructuredBuffer<uint> hstrCloudLevelPages;         ///< Resolved level pages (HSTRCloudAsset::levelPageBase).
+    RWStructuredBuffer<uint> hstrCloudLevelPagesOutput;
     StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudDirtyRegions;
     RWStructuredBuffer<uint> hstrCloudDirtyBits;
     RWStructuredBuffer<uint> hstrCloudDirtyPages;
@@ -285,6 +297,10 @@ struct HSTRCloudRenderer
     RWTexture3D<float> hstrCloudSunAtlasOutput;
     StructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakes;
     StructuredBuffer<uint> hstrCloudSunSlots; ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun atlas slot).
+    /// Per GPU brick and orientation class (resolveCloudSunSlots, every frame): cloudSunSlotUp's answer - the sun atlas slot, and the
+    /// brick whose bake it is with its level in bits 24-27.
+    StructuredBuffer<uint2> hstrCloudSunResolved;
+    RWStructuredBuffer<uint2> hstrCloudSunResolvedOutput;
     // GPU sun bake scheduling (CloudResidencyDesc::gpuSun): the scheduler owns the slot table, the bake frames and the free slots.
     RWStructuredBuffer<uint> hstrCloudSunSlotsOutput;
     RWStructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakesOutput;
@@ -640,6 +656,33 @@ struct HSTRCloudRenderer
     /// MEASURED (4K): zero-majorant steps 21.0 -> 14.1 per pixel on the near view and 27.0 -> 17.9 on the sea view, and pixels still
     /// marching after 32 steps 62% -> 49% (near) and 74% -> 41% (sea). Exact: the dilated majorant already covers the trilinear
     /// support, so a block of zero majorant blocks holds no density a sample could read.
+    /// majorantZeroExit, and where the 16-voxel block is not all zero, the exit of the zero 4-voxel majorant block t lies in and of
+    /// up to three more zero blocks behind it: a zero dilated majorant already bounds the trilinear support, so they hold nothing.
+    float majorantZeroExitFine(CutRay ray, float t)
+    {
+        const float coarse = majorantZeroExit(ray, t);
+        if (coarse > t)
+            return coarse;
+        const float3 dv = ray.direction * float(params.hstrCellWidth);
+        const float nudge = 0.125f / max(length(dv), 1e-9f);
+        float cursor = t;
+        [loop]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const float3 p = seaVoxel((ray.position + (cursor + (k == 0 ? 0.f : nudge)) * ray.direction) * float(params.hstrCellWidth));
+            const int3 b = int3(floor(p * 0.25f));
+            if (any(b < 0) || any(b >= int3(params.hstrMajorantDims)) || hstrMajorant.Load(int4(b, 0)) > 0.f)
+                break;
+            const float3 lo = float3(b) * 4.f;
+            float exit = 1e30f;
+            for (uint a = 0; a < 3; ++a)
+                if (abs(dv[a]) > 1e-12f)
+                    exit = min(exit, ((dv[a] > 0.f ? lo[a] + 4.f : lo[a]) - p[a]) / dv[a]);
+            cursor += (k == 0 ? 0.f : nudge) + max(exit, 0.f);
+        }
+        return max(cursor, t);
+    }
+
     float majorantZeroExit(CutRay ray, float t)
     {
         const float3 v = seaVoxel((ray.position + t * ray.direction) * float(params.hstrCellWidth));
@@ -753,9 +796,11 @@ struct HSTRCloudRenderer
         InterlockedAdd(hstrTransferProbeOutput[params.cloudTransferWords - 1u], 1u);
     }
 
-    float cloudEmptyExit(CutRay ray, float t, CloudSample box)
+    float cloudEmptyExit(CutRay ray, float t, CloudSample box) { return cloudEmptyExitOf(ray, t, box, hstrCloudInstances[box.instance]); }
+
+    /// cloudEmptyExit for a sample whose instance is already loaded.
+    float cloudEmptyExitOf(CutRay ray, float t, CloudSample box, HSTRCloudInstance instance)
     {
-        const HSTRCloudInstance instance = hstrCloudInstances[box.instance];
         const float3 dv = ray.direction * float(params.hstrCellWidth);
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
         float exit = box.cell ? cloudCellRunExit(box, dx) : 1e30f;
@@ -907,6 +952,56 @@ struct HSTRCloudRenderer
         // 6 adds the octant test and the parent climb to mode 5 but stops before the occupancy read, splitting the rest in two.
         if (SHIP(cloudCostProbe, 0u) == 6)
             return false;
+        cloudBrickCellTest(entry, level, i, x, settledOnly, thinDensity, sample);
+        return true;
+    }
+
+    /// cloudAssetBrickAt from the resolved level pages: one word instead of the page, the octant test and the parent climb. The
+    /// same sample (sample.mappedLevel is the level read, not the page's finest), from the instance alone.
+    bool cloudAssetBrickAtFlat(HSTRCloudInstance instance, float3 x, uint desired, bool settledOnly, float thinDensity, out CloudSample sample)
+    {
+        sample = {};
+        sample.x = x;
+        sample.desired = desired;
+        sample.entry = kCloudRefNone;
+        const int3 i = int3(floor(x + 0.5f));
+        const uint3 pages = uint3(instance.pageDims & 1023u, (instance.pageDims >> 10) & 1023u, instance.pageDims >> 20);
+        if (any(i < 0) || any(i >= int3(pages * 8u)))
+            return false;
+        const uint level = min(desired, instance.topLevel);
+        uint base = instance.levelPageBase;
+        for (uint l = 0; l < level; ++l)
+        {
+            const uint3 d = (pages + (1u << l) - 1u) >> l;
+            base += d.x * d.y * d.z;
+        }
+        const uint3 levelDims = (pages + (1u << level) - 1u) >> level;
+        const uint3 c = (uint3(i) >> 3u) >> level;
+        const uint word = hstrCloudLevelPages[base + c.x + levelDims.x * (c.y + levelDims.y * c.z)];
+        if (word == kCloudRefNone)
+            return false;
+        sample.brick = true;
+        if ((word & kCloudLevelEmpty) != 0)
+        {
+            const uint mapped = word & 15u;
+            sample.empty = true;
+            sample.lo = float3((uint3(i) >> (mapped + 2u)) << (mapped + 2u)) - 0.5f;
+            sample.hi = sample.lo + float(1u << (mapped + 2u));
+            sample.level = mapped - 1u;
+            sample.mappedLevel = mapped;
+            return true;
+        }
+        sample.entry = word & 0xFFFFFFu;
+        sample.level = (word >> 24) & 15u;
+        sample.mappedLevel = sample.level;
+        cloudBrickCellTest(sample.entry, sample.level, i, x, settledOnly, thinDensity, sample);
+        return true;
+    }
+
+    /// The empty-cell part of cloudAssetBrickAt: marks sample empty where x lies in a skippable 2-voxel cell of brick entry, and
+    /// records the cell, octant and brick bounds around it.
+    void cloudBrickCellTest(uint entry, uint level, int3 i, float3 x, bool settledOnly, float thinDensity, inout CloudSample sample)
+    {
         if (SHIP(cloudEmptySkip, 1u) != 0 && (!settledOnly || hstrCloudBricks[entry].fade >= 1.f))
         {
             // An empty 2-voxel cell of the brick: every trilinear texel it can read is zero. Voxels of the cell whose finest mapped
@@ -937,7 +1032,6 @@ struct HSTRCloudRenderer
                 sample.hi = sample.lo + 2.f * levelScale;
             }
         }
-        return true;
     }
 
     float cameraExtinctionUnfaded(float3 v, float footprint, inout float fineVoxels, out CloudSample sample)
@@ -1024,9 +1118,11 @@ struct HSTRCloudRenderer
     }
 
     /// Baked sun optical depth of a brick at source position x from its bake in sun atlas slot sunSlot, in source voxel lengths.
-    float cloudBrickSun(uint brickIndex, uint sunSlot, float3 x)
+    float cloudBrickSun(uint brickIndex, uint sunSlot, float3 x) { return cloudBrickSunAt(hstrCloudBricks[brickIndex].info & 15u, sunSlot, x); }
+
+    /// cloudBrickSun for a baked brick of known level.
+    float cloudBrickSunAt(uint level, uint sunSlot, float3 x)
     {
-        const uint level = hstrCloudBricks[brickIndex].info & 15u;
         const int3 i = int3(floor(x + 0.5f));
         const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
         const float3 local = clamp(levelPosition - float3(((i >> int(level)) >> 3) * 8), -0.5f, 7.5f);
@@ -4193,7 +4289,9 @@ struct HSTRCloudRenderer
         float transmittance = 1.f;
         uint steps = 0;
         float opacityDistance = 0.f;
-#if (HSTR_SHIP & 512) != 0
+#if (HSTR_SHIP & 1024) != 0
+        marchBeamLean(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
+#elif (HSTR_SHIP & 512) != 0
         marchBeamShipping(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
 #else
         marchSegmentMoment(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
@@ -6100,6 +6198,201 @@ struct HSTRCloudRenderer
             transmittance *= 1.f - alpha;
             t = sample.empty ? min(max(t + dt, cloudEmptyExit(ray, tSample, sample)), segment.y) : t + dt;
         }
+    }
+
+    /// cameraExtinctionAtVoxel for the lean march: the same value, but whatever the rest of the step needs from the lookup is taken
+    /// out here - the empty box's exit (skipTo, negative where the sample is not an empty box) and the brick for the sun (hit) -
+    /// so the CloudSample dies inside this function instead of staying live across the lighting.
+    /// MEASURED and REMOVED (leanloads1, 4K walk / sprint, errors identical): two exact load cuts, both slower - the proxy fetched
+    /// only where it answers, 6.04 -> 6.16 / 7.52 -> 7.68 ms (the up-front fetch is independent and overlaps the chain), and the
+    /// sea tile instance cached in registers along the ray, reloaded only on a tile change, 6.04 -> 6.53 / 7.52 -> 8.12 ms (its ~20
+    /// registers cost more occupancy than its L1-hit loads cost latency). Registers are the currency here, not load counts.
+    float leanExtinction(CutRay ray, float3 v, float footprint, float tSample, inout float fineVoxels, out LeanHit hit, out float skipTo)
+    {
+        hit.entry = kCloudRefNone;
+        hit.instance = 0;
+        hit.levels = 0;
+        hit.x = 0.f;
+        skipTo = -1.f;
+        fineVoxels = 1.f;
+        const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
+                               ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
+                               : 1.f;
+        const float proxy = extinctionAtVoxel(v);
+        uint instanceIndex;
+        float3 x;
+        float footprintLevel;
+        HSTRCloudInstance instance;
+        if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel, instance))
+            return fade * proxy;
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
+        CloudSample sample;
+#if (HSTR_SHIP & 2048) != 0
+        const bool found = cloudAssetBrickAtFlat(instance, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+#else
+        const bool found = cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+#endif
+        sample.instance = instanceIndex;
+        if (!found)
+            return fade * proxy;
+        fineVoxels = float(1u << sample.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x;
+        if (sample.empty)
+        {
+            skipTo = cloudEmptyExitOf(ray, tSample, sample, instance);
+            return 0.f;
+        }
+        hit.entry = sample.entry;
+        hit.instance = instanceIndex;
+        hit.levels = sample.level | (sample.desired << 8);
+        hit.x = x;
+        const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
+        const int3 i = int3(floor(x + 0.5f));
+        float density = cloudBrickDensity(sample.entry, x, i) * scale;
+        if (brick.fade < 1.f)
+            density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, x, i) * scale : proxy, density, brick.fade);
+        return fade * density;
+    }
+
+    /// sunDepthAt for a lean sample, from the few words of it the lean march kept.
+    float leanSunDepth(float3 v, float footprint, LeanHit hit, HSTRCloudInstance instance)
+    {
+#if (HSTR_SHIP & 2048) != 0
+        // The frame's resolved bake (resolveCloudSunSlots): sunDepthAt's baked branch without the key search. Anything else - no
+        // bake of the brick or an ancestor, a brick coarser than the footprint asked for, no near reach - takes sunDepthAt below.
+        // instance is hit.instance's record.
+        if (hit.entry != kCloudRefNone && params.sunNearVoxels > 0.f && SHIP(cloudSunCache, 1u) != 0 && (hit.levels & 255u) >= (hit.levels >> 8))
+        {
+            const uint2 resolved = hstrCloudSunResolved[hit.entry * kCloudSunClasses + instance.sunClass];
+            if (resolved.x != kCloudRefNone)
+            {
+                const float depth = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * instance.sourceVoxelWorld;
+                if (depth > kCloudSunDepthOpaque)
+                    return depth;
+                const float near = params.sunNearVoxels * instance.sourceVoxelWorld / hstrCloudAssets[instance.asset].sourceVoxelWorld;
+                const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
+                return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+            }
+        }
+#endif
+        CloudSample sample = {};
+        sample.brick = hit.entry != kCloudRefNone;
+        sample.entry = hit.entry;
+        sample.instance = hit.instance;
+        sample.level = hit.levels & 255u;
+        sample.desired = hit.levels >> 8;
+        sample.x = hit.x;
+        return sunDepthAt(v, footprint, sample);
+    }
+
+    /// The shipping beam march (every HSTR_SHIP switch at its shipping value, lightingStride 1, cloudSunReuse 0) with as little
+    /// state live across a step as it can have: the Nsight capture of the shipping walk frame showed its dirty passes at 22% / 32%
+    /// warps in flight with 68% / 63% of the warp slots unallocated on active SMs and DRAM read at 31% / 22% - occupancy-bound, not
+    /// bandwidth-bound, so every register the loop holds is latency the SM cannot hide. Same samples, same values: the step rule,
+    /// the midpoint, the empty-box and zero-majorant skips, the baked sun and the cache at every contributing sample.
+    /// MEASURED (lean1, 4K, one settle, against ship / ship again): walk 7.45 / 7.42 -> 6.63 ms (dirty query 2.90 -> 2.62, units
+    /// 3.43 -> 2.90), sprint 9.18 / 9.18 -> 8.18 ms, with every error statistic identical (0.137% / 0.028% over 0.02, p99.9, max).
+    /// MEASURED and REMOVED (leanbatch1): B = 2 / 4 / 8 steps in flight - planned ahead on the majorant, density, sun and cache
+    /// fetched before any compositing, a batch cut where a skip or a new fineVoxels left its plan, so the samples stayed exact -
+    /// took walk 6.68 -> 9.06 / 22.2 / 70.1 ms and sprint 8.25 -> 11.2 / 27.5 / 87.4. Unrolling this 8-10-load branchy lookup
+    /// chain multiplies the code and the live state, and occupancy was already the limit. The offline gather's win
+    /// (gather_path_rate.py) needs its two-load branch-free lookup first; batch only after the chain is flat.
+    void marchBeamLean(
+        CutRay ray,
+        float2 segment,
+        bool withSource,
+        bool residual,
+        inout float3 radiance,
+        inout float3 residualRadiance,
+        inout float transmittance,
+        inout uint steps,
+        inout float opacityDistance
+    )
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return;
+        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
+        float fineVoxels = 1.f;
+        float t = segment.x;
+#if (HSTR_SHIP & 4096) != 0
+        // Step classes (probe, pushShare's counters): all, majorant zero, empty box, proxy, contributing (alpha > 1e-6).
+        uint countSteps = 0, countZero = 0, countEmpty = 0, countProxy = 0, countLit = 0;
+#endif
+        [loop]
+        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
+        {
+            const float3 v = (ray.position + t * ray.direction) * cellWidth;
+            const float majorant = majorantAt(v);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+#if (HSTR_SHIP & (16384 | 32768)) != 0
+            // Transmittance-scaled steps (an approximation, judged against the path-traced reference): a step's error reaches the
+            // pixel weighted by the transmittance in front of it, so behind transmittance T the step may grow by 1 / sqrt(T), up to
+            // 2x (bit 16384) or 4x (bit 32768).
+            const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
+            const float dt = min(boost * stepVoxels / voxelsPerUnit, segment.y - t);
+#else
+            const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
+#endif
+            float next = t + dt;
+#if (HSTR_SHIP & 4096) != 0
+            ++countSteps;
+            countZero += majorant > 0.f ? 0u : 1u;
+#endif
+            if (majorant > 0.f)
+            {
+                const float tSample = t + 0.5f * dt;
+                const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                const float footprint = rayFootprint(ray, tSample);
+                LeanHit hit;
+                float skipTo;
+                const float sigma = leanExtinction(ray, midpoint, footprint, tSample, fineVoxels, hit, skipTo);
+                const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+#if (HSTR_SHIP & 4096) != 0
+                countEmpty += skipTo >= 0.f ? 1u : 0u;
+                countProxy += hit.entry == kCloudRefNone && skipTo < 0.f ? 1u : 0u;
+                countLit += alpha > 1e-6f ? 1u : 0u;
+#endif
+                if (alpha > 1e-6f)
+                {
+                    if (residual)
+                    {
+                        const HSTRCloudInstance instance = hstrCloudInstances[hit.instance];
+                        residualRadiance +=
+                            transmittance * alpha * residualAtDepth(midpoint, leanSunDepth(midpoint, footprint, hit, instance), ray.sunOctaves);
+                    }
+                    // The cache at every contributing sample: the shipping lightingStride 1, and the only stride this march takes.
+                    // MEASURED and REMOVED (leanstride1, 4K walk / sprint): holding it over 2 / 4 / 8 samples (never across a cache
+                    // cell) saved nothing - 6.39 -> 6.37 / 6.38 / 6.64 ms - for 0.137% -> 0.153% / 1.048% / 4.985% of walk over 0.02,
+                    // and carrying the hold state cost ~0.3 ms even at stride 1 (6.06 in leanflat2). The cache is not what this waits on.
+                    if (withSource)
+                        radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
+                }
+                opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
+                transmittance *= 1.f - alpha;
+                if (skipTo >= 0.f)
+                    next = min(max(next, skipTo), segment.y);
+            }
+            else
+#if (HSTR_SHIP & 8192) != 0
+                next = min(max(next, majorantZeroExitFine(ray, t)), segment.y);
+#else
+                next = min(max(next, majorantZeroExit(ray, t)), segment.y);
+#endif
+            t = next;
+            ++steps;
+        }
+#if (HSTR_SHIP & 4096) != 0
+        pushCount(kPushShareWalkSteps, countSteps);
+        pushCount(kPushShareWalkAir, countZero);
+        pushCount(kPushShareWalkEmpty, countEmpty);
+        pushCount(kPushShareWalkProxy, countProxy);
+        pushCount(kPushShareWalkProxyZero, countLit);
+        pushCount(kPushShareVisitSamples, 1u); // Rays.
+#endif
     }
 
     bool beamWithCache() { return (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0; }
@@ -10225,6 +10518,56 @@ void resolveDirtyCloudPages(uint3 id: SV_DispatchThreadID)
     }
     HSTRCloudVirtualPage page = {entry, entry == kCloudRefNone ? 0u : (gHSTRCloud.hstrCloudBricks[entry].info & 15u)};
     gHSTRCloud.hstrCloudPagesOutput[pageIndex] = page;
+
+    // The resolved level pages: what cloudAssetBrickAt returns for a sample in this page asking for level L, for every L. It is the
+    // same for every page of a level-L brick - the hierarchy is closed under parents, so every page there climbs to the same
+    // level-L ancestor, and a missing child octant of a coarser brick covers the whole level-L brick - so each dirty page writes its
+    // level-L brick's word and pages sharing one write the same value.
+    uint base = asset.levelPageBase;
+    for (uint level = 0; level <= asset.topLevel; ++level)
+    {
+        const uint3 levelDims = (dims + (1u << level) - 1u) >> level;
+        const uint3 c = brick >> level;
+        uint word = kCloudRefNone;
+        if (entry != kCloudRefNone)
+        {
+            uint resolved = entry;
+            uint resolvedLevel = page.mappedLevel;
+            const uint3 child = (brick >> max(page.mappedLevel, 1u) - 1u) & 1u;
+            if (level < page.mappedLevel &&
+                ((gHSTRCloud.hstrCloudBricks[entry].info >> 4) & (1u << (child.x + 2u * child.y + 4u * child.z))) == 0)
+                word = kCloudLevelEmpty | page.mappedLevel;
+            else
+            {
+                for (uint k = 0; k < 15 && resolvedLevel < level && gHSTRCloud.hstrCloudBricks[resolved].parent != kCloudRefNone; ++k)
+                {
+                    resolved = gHSTRCloud.hstrCloudBricks[resolved].parent;
+                    resolvedLevel = gHSTRCloud.hstrCloudBricks[resolved].info & 15u;
+                }
+                word = resolved | (resolvedLevel << 24);
+            }
+        }
+        gHSTRCloud.hstrCloudLevelPagesOutput[base + c.x + levelDims.x * (c.y + levelDims.y * c.z)] = word;
+        base += levelDims.x * levelDims.y * levelDims.z;
+    }
+}
+
+/// The sun bake every brick's samples read, per orientation class, resolved once a frame (after the frame's bakes and slot changes)
+/// so the lean march's lit samples read one pair instead of searching kCloudSunBakesPerBrick keys on the brick and its ancestors.
+[numthreads(64, 1, 1)]
+void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
+{
+    uint bricks, stride;
+    gHSTRCloud.hstrCloudBricks.GetDimensions(bricks, stride);
+    if (id.x >= bricks)
+        return;
+    for (uint c = 0; c < kCloudSunClasses; ++c)
+    {
+        uint entry = id.x;
+        const uint slot = gHSTRCloud.cloudSunSlotUp(entry, c);
+        gHSTRCloud.hstrCloudSunResolvedOutput[id.x * kCloudSunClasses + c] =
+            uint2(slot, entry | ((gHSTRCloud.hstrCloudBricks[entry].info & 15u) << 24));
+    }
 }
 
 /// Sun bakes of this frame (cloudCommitOffset, cloudCommitCount): for every atlas texel of a brick, the optical depth (in source

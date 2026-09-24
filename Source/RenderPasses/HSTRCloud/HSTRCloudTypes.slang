@@ -92,6 +92,9 @@ static const uint kCloudBrickEdge = 10;        ///< Stored edge: core plus apron
 static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 bricks (128 source voxels).
 static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
 static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
+/// Resolved level page word (hstrCloudLevelPages): kCloudRefNone (the proxy), a brick (index in bits 0-23, its level in bits
+/// 24-27), or kCloudLevelEmpty with the mapped brick's level in bits 0-3 (the asked-for level lies in a missing child octant).
+static const uint kCloudLevelEmpty = 0x40000000;
 static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
 static const uint kCloudTransformHaar = 1;     ///< HSTRCloudStaging.transform: CloudFormat.h kTransformHaar.
 static const float kCloudSeaMinScale = 0.65f;  ///< Smallest instance scale of the sea (CloudSea::makeTile draws 0.65-1).
@@ -108,9 +111,10 @@ struct HSTRCloudInstance
     float proxyLevel;       ///< Pyramid level whose voxels are as coarse as the domain proxy: from here on the proxy is used.
     uint occupied;
     uint sunClass; ///< Orientation class (the signed permutation of the rows): instances of one class share baked sun depth.
-    uint padInstance0;
-    uint padInstance1;
-    uint padInstance2;
+    /// The asset's resolved level pages (hstrCloudLevelPages), copied here so a camera sample never loads the asset record.
+    uint levelPageBase;
+    uint pageDims; ///< Level-0 pages per axis, 10 bits each (x | y << 10 | z << 20).
+    uint topLevel;
 };
 
 struct HSTRCloudAsset
@@ -121,7 +125,9 @@ struct HSTRCloudAsset
     uint topLevel;
     float sourceVoxelWorld; ///< World size of one source voxel at instance scale 1.
     uint pageOffset; ///< First level-0 virtual page in the persistent dense page table.
-    uint padAsset1;
+    /// First entry of the asset's resolved level pages: for every level L of the pyramid, one word per level-L brick naming what a
+    /// sample asking for level L reads there (cloudLevelPage). Levels follow each other, each (pages + 2^L - 1) >> L per axis.
+    uint levelPageBase;
     uint padAsset2;
 };
 

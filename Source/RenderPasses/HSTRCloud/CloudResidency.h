@@ -140,6 +140,8 @@ public:
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
+    const ref<Buffer>& getLevelPages() const { return mpLevelPages; }
+    const ref<Buffer>& getSunResolved() const { return mpSunResolved; }
     const ref<Buffer>& getDirtyPageRegions() const { return mpDirtyPageRegions; }
     const ref<Buffer>& getDirtyPageBits() const { return mpDirtyPageBits; }
     const ref<Buffer>& getDirtyPages() const { return mpDirtyPages; }
@@ -254,6 +256,7 @@ private:
         uint64_t top = kNoHandle;
         uint32_t directoryOffset = 0;
         uint32_t pageOffset = 0;
+        uint32_t levelPageBase = 0; ///< First word of the asset's resolved level pages (HSTRCloudAsset::levelPageBase).
         std::vector<uint32_t> chunkStores; ///< Per chunk: store index, kNone or kPendingStore.
         std::vector<uint64_t> chunkBrick;  ///< Per chunk: handle of its level-4 brick.
         uint3 changeDims = uint3(0);
@@ -399,6 +402,8 @@ private:
     ref<Buffer> mpDirectory;
     ref<Buffer> mpNodes;
     ref<Buffer> mpPages;
+    ref<Buffer> mpLevelPages; ///< Resolved level pages of every asset (resolveDirtyCloudPages writes them with the pages).
+    ref<Buffer> mpSunResolved; ///< Per brick and orientation class, the sun bake a sample uses (resolveCloudSunSlots, per frame).
     ref<Buffer> mpDirtyPageRegions;
     ref<Buffer> mpDirtyPageBits;
     ref<Buffer> mpDirtyPages;
