@@ -203,7 +203,7 @@ private:
     bool mBeamRefPrebuild = false;
     bool mBeamOct = false;      ///< The beam image is the octahedral sphere: no anchor, so no re-anchoring.
     bool mBeamOctFull = false;  ///< Build the whole sphere rather than the screen's footprint.
-    float mBeamOctScale = 1.f;  ///< Texel angular size against a screen pixel at the view centre.
+    float mBeamOctScale = 0.5f; ///< Texel angular size against a screen pixel at the view centre (CloudSea.py: why 0.5).
     uint2 mBeamOctDim = { 0, 0 };
     uint32_t mBeamOctAxis = 0;  ///< World axis the octahedral map's +z points along, and so where its derivative kinks.
     bool mBeamScreenResidual = false; ///< March failed tiles in screen space instead of resampling the beam-image residual.
@@ -275,7 +275,7 @@ private:
     /// 10.0 -> 8.0.
     /// 509 | 1024 | 2048 | 8192: the lean march (marchBeamLean) on the resolved level pages and sun slots, crossing zero 4-voxel
     /// majorant blocks whole (lean_march.py).
-    uint32_t mBeamShipMask = 11773;
+    uint32_t mBeamShipMask = 11773 | 32768; // With the transmittance-scaled steps (CloudSea.py).
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
     uint32_t beamShipDefine() const;
@@ -288,8 +288,8 @@ private:
     ref<Texture> mpBeamGuardCamera; ///< Per block: the camera position its points were last tested against.
     bool mBeamGuard = false;        ///< Certify translation survival per block instead of per point.
     bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
-    float mBeamGuardParallax = 1.f; ///< Texels of parallax a guard block may accumulate before it is re-marched.
-    bool mBeamWarp = false;         ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
+    float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
+    bool mBeamWarp = true;        ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
     ref<ComputePass> mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.

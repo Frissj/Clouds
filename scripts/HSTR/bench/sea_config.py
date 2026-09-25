@@ -18,7 +18,7 @@ REFERENCE = {
 
 BEAM = {
     "debugView": 9, "hstComponents": 15, "beamTemporal": False, "cloudSunCache": True, "cloudZeroSkip": 8,
-    "minStepVoxels": 2, "maxStepVoxels": 1, "cloudLongitudinalOracle": 0, "cloudOracleCentroid": False,
+    "minStepVoxels": 4, "maxStepVoxels": 2, "cloudLongitudinalOracle": 0, "cloudOracleCentroid": False,
     "beamTileSize": 4, "beamLevels": 1, "beamTolerance": 0.01, "cloudThinDepth": 0.05, "cloudEmptySkip": True,
     "cloudTightReject": 0, "cloudCostProbe": 0, "cloudSunReuse": 0.0, "cloudMinTransmittance": 0.02,
     "cloudLocalStep": False, "cloudTrapezoid": False, "cloudSlabClamp": True, "beamSegments": 1,
@@ -26,12 +26,16 @@ BEAM = {
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 256,
     "beamDepthTolerance": 0.05, "beamShip": True, "beamRefreshDebug": 0, "beamParallax": 0.0,
     "beamCarryTolerance": 0.0, "beamRefreshBlock": 4, "beamRefreshCentres": 0,
-    "cloudCutMargin": 8.0, "beamShipMask": 11773, "cloudCutAsync": True,
+    "cloudCutMargin": 8.0, "beamShipMask": 11773 | 32768, "cloudCutAsync": True,
+    # 2026-09-25 defaults (CloudSea.py has the numbers): 2x steps, transmittance-scaled steps (32768), beamOctScale 0.5,
+    # beamGuardParallax 8 with the warp field. 4K walk 5.73 -> 2.19 ms at 0.137 -> 0.938% of pixels over 0.02 (budgetwarpfield1),
+    # sprint 7.15 -> ~2.9 ms at 0.028 -> 0.283%. Sweeps that measure the old frame set these back.
+    "beamGuardParallax": 8.0, "beamWarp": True,
     # The persistent octahedral beam image (a3d4d427): world-fixed, guarded against translation, residual resolved from the best
     # value of every unit. 4K, GPU ms park / look / flick / walk / sprint 0.49 / 0.51 / 0.72 / 0.92 / 0.56, 0.137% of pixels
     # over 0.02 against the exact march - better than beamScreenResidual's 0.156% at 3.4-7.6 ms. Before it this was the anchored
     # screen-space rectangle at beamTolerance 0.05 and no refresh; sweeps that want that set beamOct / beamRefFrame off.
-    "beamRefFrame": True, "beamOct": True, "beamOctFull": False, "beamOctScale": 1.0, "beamGuard": True,
+    "beamRefFrame": True, "beamOct": True, "beamOctFull": False, "beamOctScale": 0.5, "beamGuard": True,
     "beamPrebuild": True, "beamScreenResidual": False, "beamSparse": False, "beamSparseCut": False, "beamQueue": False,
 }
 

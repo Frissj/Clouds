@@ -30,8 +30,14 @@ g.addPass(createPass("HSTRCloud", {
     # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross
     # ~5 of its voxels with one sample: against the 4K path tracer (farside, 8x8 blocks) 0.1265 log error, 0.0998 capped, 0.0996 at
     # 1-voxel steps, which cost 60-78% more; the cap costs 3-8%.
-    "minStepVoxels": 2.0,
-    "maxStepVoxels": 1.0,
+    # Doubled (2026-09-25, 4K, one settle, against the exact march; the gate is under 1% of pixels over 0.02): walk 5.73 -> 4.14
+    # ms at 0.137 -> 0.425%, sprint 7.15 -> 5.36 at 0.028 -> 0.127% (budgetstep1). 3x fails walk (2.94%). A deliberate
+    # approximation: it spends the gate's headroom on the step, with beamOctScale 0.5 and the warp below.
+    "minStepVoxels": 4.0,
+    "maxStepVoxels": 2.0,
+    # The shipping switch mask (11773) with transmittance-scaled steps (bit 32768: behind transmittance T a step grows by up to
+    # 1 / sqrt(T), 4x at most): walk 4.14 -> 3.91 ms at 0.425 -> 0.513% (budgetstep1).
+    "beamShipMask": 11773 | 32768,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
@@ -52,8 +58,15 @@ g.addPass(createPass("HSTRCloud", {
     "beamRefFrame": True,
     "beamOct": True,
     "beamOctFull": False,
-    "beamOctScale": 1.0,
+    # Half the octahedral image's angular resolution (a texel ~2 pixels at the view centre): walk 3.91 -> 2.46 ms at 0.513 ->
+    # 0.760%, sprint 5.06 -> 2.90 at 0.155 -> 0.283% (budgetoct2 / budgetjitter2).
+    "beamOctScale": 0.5,
     "beamGuard": True,
+    # A guard block holds through 8 texels of parallax, and the resolve warps what it holds to the current camera by the query
+    # depths (beamWarp, a field per lattice point). Walk 2.52 -> 2.19 ms at 0.761 -> 0.938% (budgetwarpfield1); unwarped at 8 it
+    # fails (1.986%). Sprint is unchanged: every block expires at 20 units a frame, so there is nothing held to warp.
+    "beamGuardParallax": 8.0,
+    "beamWarp": True,
     # The anchoring build covers the whole sphere (about 97 ms once, at 4K), so a turn lands on directions already built.
     "beamPrebuild": True,
     "beamRefresh": 256,
