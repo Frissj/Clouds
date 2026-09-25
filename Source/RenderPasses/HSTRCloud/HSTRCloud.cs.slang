@@ -9058,35 +9058,8 @@ struct HSTRCloudRenderer
         }
     }
 
-    /// One entry of the pyramid: level 0 from the guard depths (never verified: unbounded), each level above the 2 x 2 minimum.
-    void buildBeamGuardPyramid(uint2 thread)
-    {
-        const uint level = params.beamGuardPyramidLevel;
-        uint offset;
-        uint2 dims;
-        beamGuardPyramidLevel(level, offset, dims);
-        if (any(thread >= dims))
-            return;
-        float nearest = 3.4e38f;
-        if (level == 0)
-        {
-            const uint stored = hstrBeamGuardDepth[thread];
-            nearest = stored == 0xFFFFFFFFu ? 3.4e38f : asfloat(stored);
-        }
-        else
-        {
-            uint below;
-            uint2 belowDims;
-            beamGuardPyramidLevel(level - 1u, below, belowDims);
-            for (uint y = 0; y < 2; ++y)
-                for (uint x = 0; x < 2; ++x)
-                {
-                    const uint2 c = min(thread * 2u + uint2(x, y), belowDims - 1u);
-                    nearest = min(nearest, hstrBeamGuardPyramid[below + c.y * belowDims.x + c.x]);
-                }
-        }
-        hstrBeamGuardPyramid[offset + thread.y * dims.x + thread.x] = nearest;
-    }
+    // The pyramid itself is built by buildBeamGuardPyramidTiles / buildBeamGuardPyramidTop: level 0 from the guard depths (never
+    // verified: unbounded), each level above the 2 x 2 minimum.
 
     /// Appends the block to this build's work list if translation could have invalidated anything in it.
     ///
@@ -10025,10 +9998,94 @@ void invalidateBeamGuardBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
     gHSTRCloud.invalidateBeamGuardBlock(dispatchThreadId.xy);
 }
 
-[numthreads(8, 8, 1)]
-void buildBeamGuardPyramids(uint3 dispatchThreadId: SV_DispatchThreadID)
+groupshared float gPyramid[16 * 16]; ///< buildBeamGuardPyramidTiles: one level of the group's tile at a time.
+
+/// The guard's min-depth pyramid in two dispatches instead of one per level (twelve at 4K, 0.07 ms of launches and barriers:
+/// classify/pyramid in policy4). One 16 x 16 group per 32 x 32 tile of level 0 writes levels 0 - 5 of that tile, reducing in
+/// groupshared memory. Exact: level L entry j is the minimum over level 0's [j 2^L, (j + 1) 2^L), which the ceil-halving levels
+/// cover aligned from the origin, and a cell past the edge is +inf, which the minimum ignores just as the clamped read did.
+[numthreads(16, 16, 1)]
+void buildBeamGuardPyramidTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
-    gHSTRCloud.buildBeamGuardPyramid(dispatchThreadId.xy);
+    const uint levels = gHSTRCloud.params.beamGuardPyramidLevels;
+    const uint2 local = groupThreadId.xy;
+    // Level 0: this thread's 2 x 2 cells, then level 1 from them.
+    uint offset = 0;
+    uint2 dims = gHSTRCloud.params.beamGuardDims;
+    float nearest = 3.4e38f;
+    for (uint k = 0; k < 4; ++k)
+    {
+        const uint2 cell = groupId.xy * 32u + local * 2u + uint2(k & 1u, k >> 1);
+        if (all(cell < dims))
+        {
+            const uint stored = gHSTRCloud.hstrBeamGuardDepth[cell];
+            const float depth = stored == 0xFFFFFFFFu ? 3.4e38f : asfloat(stored);
+            gHSTRCloud.hstrBeamGuardPyramid[cell.y * dims.x + cell.x] = depth;
+            nearest = min(nearest, depth);
+        }
+    }
+    // Levels 1 - 5: at level L the tile holds 32 >> L entries a side, the first (32 >> L)^2 threads each one.
+    for (uint level = 1; level < min(levels, 6u); ++level)
+    {
+        offset += dims.x * dims.y;
+        dims = (dims + 1u) / 2u;
+        const uint side = 32u >> level;
+        if (level > 1)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (all(local < side))
+            {
+                const uint2 c = local * 2u;
+                const uint below = side * 2u;
+                nearest = min(min(gPyramid[c.y * below + c.x], gPyramid[c.y * below + c.x + 1u]),
+                              min(gPyramid[(c.y + 1u) * below + c.x], gPyramid[(c.y + 1u) * below + c.x + 1u]));
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (all(local < side))
+        {
+            gPyramid[local.y * side + local.x] = nearest;
+            const uint2 entry = groupId.xy * side + local;
+            if (all(entry < dims))
+                gHSTRCloud.hstrBeamGuardPyramid[offset + entry.y * dims.x + entry.x] = nearest;
+        }
+    }
+}
+
+/// The levels above 5, which the tiles leave (levels 6 and up of a 560 x 560 guard grid are at most 9 x 9 entries): one group,
+/// level after level, each from the one below in memory.
+[numthreads(256, 1, 1)]
+void buildBeamGuardPyramidTop(uint3 groupThreadId: SV_GroupThreadID)
+{
+    const uint levels = gHSTRCloud.params.beamGuardPyramidLevels;
+    uint below = 0;
+    uint2 belowDims = gHSTRCloud.params.beamGuardDims;
+    for (uint l = 1; l < 6u && l < levels; ++l)
+    {
+        below += belowDims.x * belowDims.y;
+        belowDims = (belowDims + 1u) / 2u;
+    }
+    // below / belowDims now describe level 5.
+    for (uint level = 6; level < levels; ++level)
+    {
+        const uint offset = below + belowDims.x * belowDims.y;
+        const uint2 dims = (belowDims + 1u) / 2u;
+        for (uint i = groupThreadId.x; i < dims.x * dims.y; i += 256u)
+        {
+            const uint2 thread = uint2(i % dims.x, i / dims.x);
+            float nearest = 3.4e38f;
+            for (uint y = 0; y < 2; ++y)
+                for (uint x = 0; x < 2; ++x)
+                {
+                    const uint2 c = min(thread * 2u + uint2(x, y), belowDims - 1u);
+                    nearest = min(nearest, gHSTRCloud.hstrBeamGuardPyramid[below + c.y * belowDims.x + c.x]);
+                }
+            gHSTRCloud.hstrBeamGuardPyramid[offset + thread.y * dims.x + thread.x] = nearest;
+        }
+        DeviceMemoryBarrierWithGroupSync();
+        below = offset;
+        belowDims = dims;
+    }
 }
 
 [numthreads(8, 8, 1)]

@@ -412,7 +412,8 @@ private:
     void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
     ref<ComputePass> mpBeamDirtyTilePass;
     ref<ComputePass> mpBeamRefreshListPass;
-    ref<ComputePass> mpBeamGuardPyramidPass;
+    ref<ComputePass> mpBeamGuardPyramidPass;    ///< Levels 0 - 5 per 32 x 32 tile (buildBeamGuardPyramidTiles) ...
+    ref<ComputePass> mpBeamGuardPyramidTopPass; ///< ... and the levels above, in one group (buildBeamGuardPyramidTop).
     ref<Buffer> mpBeamGuardPyramid;     ///< Min-depth pyramid over the guard blocks (beamCellRadius).
     uint32_t mBeamGuardPyramidLevels = 0;
     bool mBeamGuardDriven = false; ///< This build's blocks all came from the guard's dirty list: no grid regions, no sweeps.

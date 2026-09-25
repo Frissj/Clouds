@@ -1717,7 +1717,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
-    mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramids");
+    mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramidTiles");
+    mpBeamGuardPyramidTopPass = createPass("buildBeamGuardPyramidTop");
     mpBeamInvalidatePass = createPass("invalidateBeamGuardBlocks");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
@@ -5565,15 +5566,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         // Certificates read the min-depth pyramid (beamCellRadius), so it is rebuilt from the
                                         // depths as they now stand: level 0 from the blocks, each level above from the one below.
                                         {
+                                            // Two dispatches: levels 0 - 5 per 32 x 32 tile, then the few above in one group. One
+                                            // dispatch per level was 0.07 ms at 4K (policy4), nearly all launches and barriers.
                                             FALCOR_PROFILE(pRenderContext, "pyramid");
-                                            for (uint32_t pyramidLevel = 0; pyramidLevel < mBeamGuardPyramidLevels; ++pyramidLevel)
+                                            bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
+                                            mpBeamGuardPyramidPass->execute(pRenderContext, uint3((mParams.beamGuardDims + 31u) / 32u * 16u, 1));
+                                            if (mBeamGuardPyramidLevels > 6)
                                             {
-                                                mParams.beamGuardPyramidLevel = pyramidLevel;
-                                                uint2 dims = mParams.beamGuardDims;
-                                                for (uint32_t l = 0; l < pyramidLevel; ++l)
-                                                    dims = (dims + 1u) / 2u;
-                                                bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
-                                                mpBeamGuardPyramidPass->execute(pRenderContext, uint3(dims, 1));
+                                                bindRenderer(pRenderContext, mpBeamGuardPyramidTopPass);
+                                                mpBeamGuardPyramidTopPass->execute(pRenderContext, uint3(256, 1, 1));
                                             }
                                         }
                                         FALCOR_PROFILE(pRenderContext, "certify");
