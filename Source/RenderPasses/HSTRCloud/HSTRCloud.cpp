@@ -442,6 +442,31 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamWarpAuto = value;
             continue;
         }
+        if (key == "beamPolicy")
+        {
+            mBeamPolicy = bool(value);
+            continue;
+        }
+        if (key == "beamPolicyStep")
+        {
+            mBeamPolicyStep = value;
+            continue;
+        }
+        if (key == "beamPolicyTolerance")
+        {
+            mBeamPolicyTolerance = value;
+            continue;
+        }
+        if (key == "beamPolicyHeldLow")
+        {
+            mBeamPolicyHeldLow = value;
+            continue;
+        }
+        if (key == "beamPolicyHeldHigh")
+        {
+            mBeamPolicyHeldHigh = value;
+            continue;
+        }
         if (key == "colorFormat")
         {
             const uint32_t format = value;
@@ -1083,6 +1108,11 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamWarp"] = mBeamWarp;
     props["beamWarpAuto"] = mBeamWarpAuto;
+    props["beamPolicy"] = mBeamPolicy;
+    props["beamPolicyStep"] = mBeamPolicyStep;
+    props["beamPolicyTolerance"] = mBeamPolicyTolerance;
+    props["beamPolicyHeldLow"] = mBeamPolicyHeldLow;
+    props["beamPolicyHeldHigh"] = mBeamPolicyHeldHigh;
     props["colorFormat"] = mColorFormat;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
@@ -1452,6 +1482,8 @@ Properties HSTRCloud::getProperties() const
         cloud["beamWarpHeld"] = mBeamWarpHeld;
         cloud["beamWarpListed"] = mBeamWarpListed;
         cloud["beamWarpOn"] = mBeamWarpOn;
+        cloud["beamPolicyStepNow"] = mBeamPolicyStepNow;
+        cloud["beamPolicyToleranceNow"] = mBeamPolicyToleranceNow;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -1574,6 +1606,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamResidualResolvePass = nullptr;
     mpBeamResidualArgsPass = nullptr;
     mpBeamWarpArgsPass = nullptr;
+    mpBeamPolicyPass = nullptr;
     mpBeamResolveWarpPass = nullptr;
     mpBeamResidualResolveWarpPass = nullptr;
     mpBeamMarchPass = nullptr;
@@ -1639,6 +1672,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamWarpFieldPass = createPass("buildBeamWarpField");
     mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
+    mpBeamPolicyPass = createPass("decideBeamPolicy");
     mpBeamResolveWarpPass = createPass("resolveBeam");
     mpBeamResidualResolveWarpPass = createPass("resolveBeamResidual");
     mpBeamSparseResolvePass = createPass("resolveBeamSparse");
@@ -4416,6 +4450,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     const auto& color = renderData.getTexture(kColor);
+    // beamPolicy only ever reaches the guard-driven build that decided it (see decideBeamPolicy); every other march, the exact
+    // reference frame's included, takes the steps and tolerance as set.
+    mParams.beamPolicy = 0;
     const auto& error = renderData.getTexture(kTransportError);
     const auto& cutStats = renderData.getTexture(kCutStats);
     const uint2 frameDim(color->getWidth(), color->getHeight());
@@ -4898,6 +4935,16 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
                 mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3); // Blocks listed, units to march, blocks held.
+                if (!mpBeamWarpArgs)
+                {
+                    // Warp on, step scale 1, the set tolerance, until a translating build decides (decideBeamPolicy).
+                    mpBeamWarpArgs = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 12, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                                  ResourceBindFlags::IndirectArg
+                    );
+                    const uint32_t initial[12] = {0, 1, 1, 0, 1, 1, 0, 1, 1, 1, math::asuint(1.f), math::asuint(mParams.beamTolerance)};
+                    mpBeamWarpArgs->setBlob(initial, 0, sizeof(initial));
+                }
                 mpBeamDirtyMark = mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 // Every unit of every block: each tile is tested once (beamDirtyTileOwner) and lists its own units, so it cannot overflow.
                 const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
@@ -5561,9 +5608,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     }
                                     bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
                                     mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
-                                    // beamWarpAuto decides from this build's counts only when it classified while translating; a
-                                    // stationary build classifies nothing new and keeps the last decision (writeBeamWarpArgs).
-                                    mParams.beamWarpClassified = classify && mParams.beamStationary == 0 ? 1u : 0u;
+                                    // The warp decision and beamPolicy, from this build's counts, only when it classified while
+                                    // translating; a stationary build classifies nothing new and keeps the last (decideBeamPolicy).
+                                    mParams.beamPolicy = mBeamPolicy ? 1u : 0u;
+                                    mParams.beamPolicyStep = mBeamPolicyStep;
+                                    mParams.beamPolicyTolerance = mBeamPolicyTolerance;
+                                    mParams.beamPolicyHeldLow = mBeamPolicyHeldLow;
+                                    mParams.beamPolicyHeldHigh = mBeamPolicyHeldHigh;
+                                    mParams.beamWarpAuto = mBeamWarp ? mBeamWarpAuto : 0.f;
+                                    if (classify && mParams.beamStationary == 0 && (mParams.beamWarpAuto > 0.f || mBeamPolicy))
+                                    {
+                                        bindRenderer(pRenderContext, mpBeamPolicyPass);
+                                        mpBeamPolicyPass->execute(pRenderContext, uint3(1));
+                                    }
                                 }
                                 if (mSpanProbe)
                                 {
@@ -5736,7 +5793,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
             // beamWarpAuto: the GPU decides from this build's held share (writeBeamWarpArgs) and both resolve variants dispatch
             // indirectly, the one not chosen with no groups. Only the common resolve; the sparse one keeps the host's define.
-            const bool warpAuto = warp && mBeamWarpAuto > 0.f && !mBeamSparseBuilt;
+            const bool warpAuto = warp && mBeamWarpAuto > 0.f && !mBeamSparseBuilt && mpBeamWarpArgs;
             mParams.beamWarpAuto = warpAuto ? mBeamWarpAuto : 0.f;
             pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
@@ -5752,18 +5809,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             if (warpAuto)
             {
                 FALCOR_PROFILE(pRenderContext, "warp");
-                if (!mpBeamWarpArgs)
-                {
-                    mpBeamWarpArgs = mpDevice->createStructuredBuffer(
-                        sizeof(uint32_t), 10, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
-                                                  ResourceBindFlags::IndirectArg
-                    );
-                    const uint32_t warpOn[10] = {0, 1, 1, 0, 1, 1, 0, 1, 1, 1}; // Warp until a build says otherwise.
-                    mpBeamWarpArgs->setBlob(warpOn, 0, sizeof(warpOn));
-                }
                 bindRenderer(pRenderContext, mpBeamWarpArgsPass);
                 mpBeamWarpArgsPass->execute(pRenderContext, uint3(1));
-                mParams.beamWarpClassified = 0;
                 bindRenderer(pRenderContext, mpBeamWarpFieldPass);
                 bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
                 mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
@@ -6019,6 +6066,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mBeamWarpHeld = mpBeamDirtyCount->getElement<uint32_t>(2);
             }
             mBeamWarpOn = mpBeamWarpArgs && mBeamWarpAuto > 0.f ? mpBeamWarpArgs->getElement<uint32_t>(9) : uint32_t(mBeamWarp);
+            mBeamPolicyStepNow = mpBeamWarpArgs && mBeamPolicy ? math::asfloat(mpBeamWarpArgs->getElement<uint32_t>(10)) : 1.f;
+            mBeamPolicyToleranceNow =
+                mpBeamWarpArgs && mBeamPolicy ? math::asfloat(mpBeamWarpArgs->getElement<uint32_t>(11)) : mParams.beamTolerance;
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);
         ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];

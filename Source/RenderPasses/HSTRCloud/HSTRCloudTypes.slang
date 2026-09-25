@@ -1284,12 +1284,19 @@ struct HSTRCloudParams
     uint beamGuardPyramidLevel = 0;
     /// Changed-content regions in hstrBeamInvalidations for this build's invalidateBeamGuardBlocks.
     uint beamInvalidateCount = 0;
-    /// beamWarpAuto: the share of classified on-screen guard blocks that have to be held for the warp to run (0: always), and
-    /// whether this build classified while translating, so writeBeamWarpArgs may take a new decision from hstrBeamDirtyCount.
+    /// beamWarpAuto: the share of classified on-screen guard blocks that have to be held for the warp to run (0: always); see
+    /// decideBeamPolicy.
     float beamWarpAuto = 0.f;
-    uint beamWarpClassified = 0;
-    uint beamWarpPad0 = 0; ///< With beamWarpPad1, keeps the fields after these on their 16-byte alignment.
-    uint beamWarpPad1 = 0;
+    /// beamPolicy: the guard-driven beam view spends the error its held blocks do not, from the held share h this build classified
+    /// (decideBeamPolicy): s = saturate((beamPolicyHeldHigh - h) / (beamPolicyHeldHigh - beamPolicyHeldLow)), the march steps
+    /// scaled by lerp(1, beamPolicyStep, s) and the tile tolerance lerp(beamTolerance, beamPolicyTolerance, s). 0: off.
+    uint beamPolicy = 0;
+    float beamPolicyStep = 1.f;
+    float beamPolicyTolerance = 0.f;
+    float beamPolicyHeldLow = 0.f;
+    float beamPolicyHeldHigh = 1.f;
+    uint beamPolicyPad0 = 0; ///< With beamPolicyPad1, keeps the fields after these on their 16-byte alignment.
+    uint beamPolicyPad1 = 0;
     /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
     uint cloudSunAncestors = kCloudSunAncestors;
     /// PROBE (beamRepairProbe only): 1 + signature * kBeamProbePolicies + policy makes the dirty query keep the OLD lattice values of

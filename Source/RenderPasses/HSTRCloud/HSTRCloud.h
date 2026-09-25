@@ -299,6 +299,16 @@ private:
     float mBeamWarpAuto = 0.25f;
     uint32_t mColorFormat = 1; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     ref<ComputePass> mpBeamWarpArgsPass;
+    ref<ComputePass> mpBeamPolicyPass; ///< decideBeamPolicy: the warp decision and beamPolicy's step scale and tolerance.
+    /// beamPolicy (see HSTRCloudParams): what a build holding few guard blocks spends on a looser tile test (and could on longer
+    /// steps, which fail on harder content: policy3). Shipped tolerance-only, 0.01 -> 0.05 as the held share falls 0.25 -> 0.05.
+    bool mBeamPolicy = true;
+    float mBeamPolicyStep = 1.f;
+    float mBeamPolicyTolerance = 0.05f;
+    float mBeamPolicyHeldLow = 0.05f;
+    float mBeamPolicyHeldHigh = 0.25f;
+    float mBeamPolicyStepNow = 1.f;      ///< The compared frame's step scale ...
+    float mBeamPolicyToleranceNow = 0.f; ///< ... and tolerance (stats, read with the comparison).
     ref<ComputePass> mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
     ref<ComputePass> mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
     ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.

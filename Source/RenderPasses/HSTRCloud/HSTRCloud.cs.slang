@@ -460,6 +460,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch, [4..6] its warped one.
     /// beamWarpAuto (writeBeamWarpArgs): [0..2] the warp field's dispatch, [3..5] the warped resolve's, [6..8] the plain resolve's -
     /// one of the two resolves gets no groups - and [9] the decision (1: warp), kept across builds that do not classify.
+    /// beamPolicy (decideBeamPolicy): [10] the march step scale and [11] the tile tolerance, as float bits.
     RWStructuredBuffer<uint> hstrBeamWarpArgs;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
@@ -6335,6 +6336,10 @@ struct HSTRCloudRenderer
             return;
         const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
         const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
+        // beamPolicy: the step bounds scaled by what this build's motion lets the steps spend (1 when off).
+        const float stepScale = beamPolicyStepScale();
+        const float minStepVoxels = params.minStepVoxels * stepScale;
+        const float maxStepVoxels = params.maxStepVoxels * stepScale;
         float fineVoxels = 1.f;
         float t = segment.x;
 #if (HSTR_SHIP & 4096) != 0
@@ -6366,8 +6371,8 @@ struct HSTRCloudRenderer
         {
             const float3 v = (ray.position + t * ray.direction) * cellWidth;
             const float majorant = majorantAt(v);
-            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
-            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, params.maxStepVoxels);
+            const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * minStepVoxels;
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, maxStepVoxels);
 #if (HSTR_SHIP & (16384 | 32768)) != 0
             // Transmittance-scaled steps (an approximation, judged against the path-traced reference): a step's error reaches the
             // pixel weighted by the transmittance in front of it, so behind transmittance T the step may grow by 1 / sqrt(T), up to
@@ -6404,7 +6409,7 @@ struct HSTRCloudRenderer
                 {
                     countFaint += alpha < 1e-3f ? 1u : 0u;
                     countThin += alpha >= 1e-3f && alpha < 1e-2f ? 1u : 0u;
-                    countAtMax += stepVoxels >= params.maxStepVoxels ? 1u : 0u;
+                    countAtMax += stepVoxels >= maxStepVoxels ? 1u : 0u;
                     countAtMin += stepVoxels <= minimumStep ? 1u : 0u;
                     countDeep += transmittance < 0.25f ? 1u : 0u;
                 }
@@ -7693,12 +7698,12 @@ struct HSTRCloudRenderer
         const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
         if (centreless)
         {
-            bool refine = beamCornerCurvature(tile, sparse) > params.beamTolerance;
+            bool refine = beamCornerCurvature(tile, sparse) > beamPolicyTolerance();
             if (!refine && params.beamEdgeContrast > 0.f)
                 refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
             return refine;
         }
-        bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > params.beamTolerance;
+        bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
         if (!refine && params.beamEdgeContrast > 0.f)
             refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
         if (!refine && (params.beamGuide == 1 || (params.beamGuide == 2 && level + 1 < params.beamLevels)))
@@ -8095,6 +8100,10 @@ struct HSTRCloudRenderer
         beamWarpPosition(beamRayDirection(position), warped, read);
         hstrBeamWarpFieldOutput[texel] = warped - position;
     }
+
+    /// beamPolicy's march step scale and tile tolerance for this build (decideBeamPolicy); off, the parameters as set.
+    float beamPolicyStepScale() { return params.beamPolicy != 0 ? asfloat(hstrBeamWarpArgs[10]) : 1.f; }
+    float beamPolicyTolerance() { return params.beamPolicy != 0 ? asfloat(hstrBeamWarpArgs[11]) : params.beamTolerance; }
 
     /// Where the resolve reads a beam-image position under beamWarp: the field's offset, interpolated between lattice points.
     float2 beamWarpedPosition(float2 position)
@@ -10533,21 +10542,33 @@ void writeBeamResidualArgs()
     gHSTRCloud.hstrBeamResidualArgs[idle + 2] = 1u;
 }
 
-/// beamWarpAuto, before the resolve: whether the warp runs this frame, from the held and listed guard blocks this build's
-/// classification just counted (hstrBeamDirtyCount[2] and [0]); a build that did not classify while translating keeps the last
-/// decision. On the GPU, so the decision is this frame's and nothing waits on a readback. Sprint expires every block, so there
-/// nothing is held and the warp field and warped resolve are skipped.
+/// Right after the classification, from the held and listed guard blocks it just counted (hstrBeamDirtyCount[2] and [0]): whether
+/// the resolve warps (beamWarpAuto) and the march step scale and tile tolerance (beamPolicy), for this build's query, tiles and
+/// units and its resolve. Only a build that classified while translating runs it; any other keeps the last decision. On the GPU,
+/// so the decision is this frame's and nothing waits on a readback. Sprint expires every block, so it holds none: no warp, and
+/// the error its held blocks would have carried goes into longer steps and a looser tile test instead.
+[numthreads(1, 1, 1)]
+void decideBeamPolicy()
+{
+    const HSTRCloudParams p = gHSTRCloud.params;
+    const uint listed = gHSTRCloud.hstrBeamDirtyCount[0];
+    const uint held = gHSTRCloud.hstrBeamDirtyCount[2];
+    const float share = held + listed == 0 ? 1.f : float(held) / float(held + listed);
+    if (p.beamWarpAuto > 0.f)
+        gHSTRCloud.hstrBeamWarpArgs[9] = share >= p.beamWarpAuto ? 1u : 0u;
+    if (p.beamPolicy != 0)
+    {
+        const float s = saturate((p.beamPolicyHeldHigh - share) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
+        gHSTRCloud.hstrBeamWarpArgs[10] = asuint(lerp(1.f, p.beamPolicyStep, s));
+        gHSTRCloud.hstrBeamWarpArgs[11] = asuint(lerp(p.beamTolerance, p.beamPolicyTolerance, s));
+    }
+}
+
+/// beamWarpAuto, before the resolve: the warp field's and both resolves' arguments from decideBeamPolicy's decision.
 [numthreads(1, 1, 1)]
 void writeBeamWarpArgs()
 {
-    bool warp = gHSTRCloud.hstrBeamWarpArgs[9] != 0;
-    if (gHSTRCloud.params.beamWarpClassified != 0)
-    {
-        const uint listed = gHSTRCloud.hstrBeamDirtyCount[0];
-        const uint held = gHSTRCloud.hstrBeamDirtyCount[2];
-        warp = held + listed == 0 || float(held) >= gHSTRCloud.params.beamWarpAuto * float(held + listed);
-        gHSTRCloud.hstrBeamWarpArgs[9] = warp ? 1u : 0u;
-    }
+    const bool warp = gHSTRCloud.hstrBeamWarpArgs[9] != 0;
     uint2 origin, end;
     gHSTRCloud.beamWarpFieldBox(origin, end);
     const uint2 box = max(end, origin) - origin;

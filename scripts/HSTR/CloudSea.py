@@ -71,6 +71,14 @@ g.addPass(createPass("HSTRCloud", {
     # (writeBeamWarpArgs): walk holds 62%, sprint 0-0.9%, so sprint skips the field and the warped resolve. Sprint 2.95-2.97 ->
     # 2.85 ms, walk unchanged, errors bit-identical in both (warpauto2).
     "beamWarpAuto": 0.25,
+    # Held few blocks, the build loosens its tile test instead: tolerance 0.01 -> 0.05 as the held share falls 0.25 -> 0.05,
+    # decided on the GPU (decideBeamPolicy). 4K sprint 2.93 -> 2.52 ms at 0.28 -> 0.48% over 0.02, jog 2.79 -> 2.66 at 0.58 ->
+    # 0.85%, walk unchanged (policy4). Longer steps as well failed on jog's content (policy3).
+    "beamPolicy": True,
+    "beamPolicyStep": 1.0,
+    "beamPolicyTolerance": 0.05,
+    "beamPolicyHeldLow": 0.05,
+    "beamPolicyHeldHigh": 0.25,
     # The colour output at RGBA16Float: the tone mapper, which reads it, 0.39 -> 0.07 ms at 4K, errors identical (colorfmt1).
     "colorFormat": 1,
     # The anchoring build covers the whole sphere (about 97 ms once, at 4K), so a turn lands on directions already built.

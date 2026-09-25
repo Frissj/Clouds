@@ -33,6 +33,9 @@ BEAM = {
     "beamGuardParallax": 8.0, "beamWarp": True,
     # The warp only while a quarter of the classified blocks are held (writeBeamWarpArgs): sprint 2.95 -> 2.85 ms (warpauto2).
     "beamWarpAuto": 0.25,
+    # beamPolicy: the tile tolerance 0.01 -> 0.05 as the held share falls 0.25 -> 0.05 (policy4): sprint 2.93 -> 2.52 ms at
+    # 0.28 -> 0.48%, jog 2.79 -> 2.66 at 0.58 -> 0.85%, walk and trot unchanged or nearly.
+    "beamPolicy": True, "beamPolicyStep": 1.0, "beamPolicyTolerance": 0.05, "beamPolicyHeldLow": 0.05, "beamPolicyHeldHigh": 0.25,
     # RGBA16Float output: the tone mapper 0.39 -> 0.07 ms, errors identical (colorfmt1).
     "colorFormat": 1,
     # The persistent octahedral beam image (a3d4d427): world-fixed, guarded against translation, residual resolved from the best

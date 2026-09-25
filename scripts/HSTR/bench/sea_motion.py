@@ -256,6 +256,8 @@ for motion, forward, yaw, *rest in MOTIONS:
                                                                            "DirtyApronMarched", "ClassifyCells", "FrameDim", "RefAnchors",
                                                                            "WarpHeld", "WarpListed", "WarpOn")},
                            # cellViews: the scored frame's composition (0 with it off).
+                           # beamPolicy: the step scale and tile tolerance the scored frame's build decided.
+                           "policy": {"step": float(s.get("beamPolicyStepNow", 1.0)), "tolerance": float(s.get("beamPolicyToleranceNow", 0.0))},
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
                                                                                  "Built", "Steps")},
                            # beamPushProbe: the scored frame's cell x tile work count (absent with it off); spanProbe's too.
@@ -263,7 +265,7 @@ for motion, forward, yaw, *rest in MOTIONS:
         if not errors:  # HSTR_STEPS=0: timings and residency only.
             errors = [{"over02": 0.0, "p999": 0.0, "max": 0.0, "marched": 0.0, "carriedPoints": 0, "carriedPixels": 0, "marchTiles": 0,
                        "debug": 0, "marchedSteps": 0, "carriedSteps": 0}]
-        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k not in ("cell", "push", "dirty")}
+        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k not in ("cell", "push", "dirty", "policy")}
         cell = errors[-1].get("cell", {})
         push = errors[-1].get("push", {})
         worst = max(e["over02"] for e in errors)
