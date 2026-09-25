@@ -71,6 +71,8 @@ g.addPass(createPass("HSTRCloud", {
     # (writeBeamWarpArgs): walk holds 62%, sprint 0-0.9%, so sprint skips the field and the warped resolve. Sprint 2.95-2.97 ->
     # 2.85 ms, walk unchanged, errors bit-identical in both (warpauto2).
     "beamWarpAuto": 0.25,
+    # The colour output at RGBA16Float: the tone mapper, which reads it, 0.39 -> 0.07 ms at 4K, errors identical (colorfmt1).
+    "colorFormat": 1,
     # The anchoring build covers the whole sphere (about 97 ms once, at 4K), so a turn lands on directions already built.
     "beamPrebuild": True,
     "beamRefresh": 256,

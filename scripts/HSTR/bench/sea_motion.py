@@ -126,6 +126,9 @@ def timed(frames, first, forward, yaw, sun=0.0, report=None):
     t = {name[:-len("/gpu_time")].split("HSTRCloud", 1)[-1].strip("/") or "HSTRCloud": lane["stats"]["mean"]
          for name, lane in capture["events"].items() if name.endswith("gpu_time") and "HSTRCloud" in name}
     t["wall"] = wall
+    # The tone mapper reads HSTRCloud's colour output, so the output format moves its cost too (outside the HSTRCloud scope).
+    t["toneMapper"] = next((lane["stats"]["mean"] for name, lane in capture["events"].items()
+                            if name.endswith("ToneMapper/gpu_time")), 0.0)
     # Per frame of the flight (a scope's own mean covers only the frames it ran in, so nested means do not add up).
     import math
     def per_frame(lane):

@@ -442,6 +442,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamWarpAuto = value;
             continue;
         }
+        if (key == "colorFormat")
+        {
+            const uint32_t format = value;
+            if (format != mColorFormat)
+            {
+                mColorFormat = format;
+                requestRecompile(); // The output is reallocated in the new format.
+            }
+            continue;
+        }
         if (key == "beamAssumeCarry")
         {
             mParams.beamAssumeCarry = uint32_t(bool(value));
@@ -1073,6 +1083,7 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamWarp"] = mBeamWarp;
     props["beamWarpAuto"] = mBeamWarpAuto;
+    props["colorFormat"] = mColorFormat;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
@@ -1503,11 +1514,20 @@ Properties HSTRCloud::getProperties() const
 RenderPassReflection HSTRCloud::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
-    // MEASURED and REMOVED (leanhalf1, 4K, errors identical): the frame at RGBA16Float, half the resolve's 133 MB of writes. The
-    // resolve went 0.47 -> 0.41 ms, but the frame did not follow (walk 5.78 / 5.82 -> 5.92, sprint 7.28 / 7.27 -> 7.25).
+    // colorFormat: 0 RGBA32Float, 1 RGBA16Float (shipped), 2 R11G11B10Float (alpha is always 1).
+    // MEASURED (colorfmt1, 4K, one settle; HSTRCloud / tone mapper ms, over 0.02): walk 32F 2.13 / 0.39 0.939%, 16F (march passes
+    // drifted +12% in that arm alone) / 0.08 0.938%, 11-11-10 2.11 / 0.06 0.950%, 32F again 2.14 / 0.43; sprint 2.90 / 0.39
+    // 0.283%, 2.85 / 0.07 0.282%, 2.85 / 0.06 0.278%, 2.89 / 0.39. The resolve itself barely moves (pixels 0.37 -> 0.36 walk,
+    // 0.33 -> 0.31 sprint): at 16 bytes a pixel it was near its write limit, at 8 it is not, so its cost is its reads and ALU.
+    // The saving is downstream - the tone mapper reads (and matches) the output's format, 0.39 -> 0.07 ms, errors identical.
+    // 11-11-10 saves 0.02 more there but rounds to 1.6%, and its scored reference passes through the same format, so its
+    // error is only a lower bound. Earlier (leanhalf1, 5.8 ms frame) 16F was measured on HSTRCloud alone and removed.
+    const ResourceFormat colorFormat = mColorFormat == 1   ? ResourceFormat::RGBA16Float
+                                       : mColorFormat == 2 ? ResourceFormat::R11G11B10Float
+                                                           : ResourceFormat::RGBA32Float;
     reflector.addOutput(kColor, "Hierarchical Schur transport cloud radiance")
         .bindFlags(ResourceBindFlags::UnorderedAccess)
-        .format(ResourceFormat::RGBA32Float);
+        .format(colorFormat);
     reflector.addOutput(kTransportError, "Goal-oriented omitted transport bound")
         .bindFlags(ResourceBindFlags::UnorderedAccess)
         .format(ResourceFormat::R32Float);
@@ -5497,15 +5517,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     {
                                         // Certificates read the min-depth pyramid (beamCellRadius), so it is rebuilt from the
                                         // depths as they now stand: level 0 from the blocks, each level above from the one below.
-                                        for (uint32_t pyramidLevel = 0; pyramidLevel < mBeamGuardPyramidLevels; ++pyramidLevel)
                                         {
-                                            mParams.beamGuardPyramidLevel = pyramidLevel;
-                                            uint2 dims = mParams.beamGuardDims;
-                                            for (uint32_t l = 0; l < pyramidLevel; ++l)
-                                                dims = (dims + 1u) / 2u;
-                                            bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
-                                            mpBeamGuardPyramidPass->execute(pRenderContext, uint3(dims, 1));
+                                            FALCOR_PROFILE(pRenderContext, "pyramid");
+                                            for (uint32_t pyramidLevel = 0; pyramidLevel < mBeamGuardPyramidLevels; ++pyramidLevel)
+                                            {
+                                                mParams.beamGuardPyramidLevel = pyramidLevel;
+                                                uint2 dims = mParams.beamGuardDims;
+                                                for (uint32_t l = 0; l < pyramidLevel; ++l)
+                                                    dims = (dims + 1u) / 2u;
+                                                bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
+                                                mpBeamGuardPyramidPass->execute(pRenderContext, uint3(dims, 1));
+                                            }
                                         }
+                                        FALCOR_PROFILE(pRenderContext, "certify");
                                         // A stored coarse certificate was derived from the pyramid as it was then, and a block's
                                         // radius depends on depths well outside its own cell; once the camera translates, none
                                         // of them is trusted, and every on-screen block answers for itself.

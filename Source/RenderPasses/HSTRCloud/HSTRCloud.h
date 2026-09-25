@@ -297,6 +297,7 @@ private:
     /// warped resolve cost it ~0.13 ms for nothing. Decided on the GPU (writeBeamWarpArgs): both resolve variants are dispatched
     /// indirectly and the one not chosen gets no groups.
     float mBeamWarpAuto = 0.25f;
+    uint32_t mColorFormat = 1; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     ref<ComputePass> mpBeamWarpArgsPass;
     ref<ComputePass> mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
     ref<ComputePass> mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
