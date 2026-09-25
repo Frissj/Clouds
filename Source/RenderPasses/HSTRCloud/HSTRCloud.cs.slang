@@ -6362,6 +6362,11 @@ struct HSTRCloudRenderer
             // Transmittance-scaled steps (an approximation, judged against the path-traced reference): a step's error reaches the
             // pixel weighted by the transmittance in front of it, so behind transmittance T the step may grow by 1 / sqrt(T), up to
             // 2x (bit 16384) or 4x (bit 32768).
+            // MEASURED and REMOVED (budgetjitter2, 4K, beamOctScale 0.5, 2x steps + bit 32768): a per-direction phase jitter of
+            // the first step with density after every skip (skips snap t to block boundaries, which is what locks the phase to
+            // the world grid and makes the long step's error structured). Walk 2.46 ms 0.760% -> 2.71 ms 0.639% over 0.02; 2.5x
+            // steps 2.49 ms 1.650%, 3x 2.32 ms 2.481%; sprint 2.90 ms 0.283% -> 3.16 ms 0.238%. The error falls 16-25% but the
+            // extra steps cost ~0.25 ms, and the unjittered shorter step dominates on both axes.
             const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
             const float dt = min(boost * stepVoxels / voxelsPerUnit, segment.y - t);
 #else
