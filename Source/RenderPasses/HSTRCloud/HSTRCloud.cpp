@@ -4772,6 +4772,46 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // Everything below is sized by the BEAM image, which is the screen unless the rotation-invariant frame is on.
         updateBeamReferenceFrame(frameDim);
         const uint2 beamDim = mParams.beamFrameDim;
+        // A new beam image size frees every resource sized by it, and waits for the GPU so the frees happen, before any
+        // replacement is created. Replaced one by one, each old resource lives until its fence passes, so old and new sets
+        // (the 4K octahedral image alone is ~114 M texels at beamOctScale 1) were resident together and overflowed VRAM:
+        // after two or three beamOctScale / beamTileSize changes in one process the same work ran ~10x slower for the rest
+        // of it (budgetoct1 / budgetoct2 / budgettiles1: same tile counts, residency idle). The tile size resizes the lattice,
+        // level and guard resources without changing the image: budgettiles3, sprint, the same 30,027 dirty blocks and 118,048
+        // units before and after a beamTileSize 4 -> 2 -> 4 round trip, query 0.79 -> 17.04 ms, tile tests 0.24 -> 1.45, resolve
+        // 0.47 -> 1.02, and the units pass - whose image was not recreated - unchanged at 1.00.
+        const uint3 allocation(beamDim, mParams.beamTileSize);
+        if (any(mBeamAllocatedDim != allocation))
+        {
+            if (any(mBeamAllocatedDim != uint3(0)))
+            {
+                mpBeamLattice = nullptr;
+                mpBeamLatticePrev = nullptr;
+                mpBeamLevel = nullptr;
+                mpBeamLevelPrev = nullptr;
+                mpBeamGuardDepth = nullptr; // Its block recreates the guard, dirty and pyramid resources with it.
+                mpBeamGuardCamera = nullptr;
+                mpBeamGuardPyramid = nullptr;
+                mpBeamDirty = nullptr;
+                mpBeamDirtyMark = nullptr;
+                mpBeamDirtyUnits = nullptr;
+                mpBeamDescend = nullptr;
+                mpBeamRebuild = nullptr;
+                mpBeamCoarse = nullptr;
+                mpBeamCoarseState = nullptr;
+                mpBeamPixels = {};
+                mpBeamPixelsSnapshot = nullptr;
+                mpBeamLists = {};
+                mpBeamHistory = {};
+                mpBeamQueryMap = nullptr;
+                mpBeamTileMap = nullptr;
+                mpBeamResults = nullptr;
+                mpBeamFinalTiles = nullptr;
+                mpBeamSparseCandidates = nullptr;
+                mpDevice->wait();
+            }
+            mBeamAllocatedDim = allocation;
+        }
         mParams.beamTileDims = (beamDim + mParams.beamTileSize - 1u) / mParams.beamTileSize;
         mParams.beamLatticeDims = mParams.beamTileDims * mParams.beamTileSize / mParams.beamLatticeStep + 1u;
         mParams.beamLevelDims = (beamDim + finest - 1u) / finest;

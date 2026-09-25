@@ -214,22 +214,38 @@ for motion, forward, yaw, *rest in MOTIONS:
         tilesPerStep = []
         errors = []
         for step in range(STEPS):
+            # The scored frame is the arm's own frame in flight: the pose after the last one it rendered, with its guard history
+            # intact. It used to be rendered right after the reference frame, and switching views drops the beam history, so every
+            # scored frame re-marched the whole screen (every guard block dirty and unverified) and no reuse - the guard budget,
+            # carried blocks - was ever scored: budgetparallax1 gave beamGuardParallax 1 / 2 / 4 / 8 identical errors while the
+            # flight's query fell 0.70 -> 0.56 ms at 8. So the arm frame is stored and the reference frame compared against it
+            # (the log error is symmetric). Later steps re-fly WARM frames first, since the previous reference frame broke it.
+            if step > 0:
+                for i in range(WARM):
+                    pose(step - WARM + i, forward, yaw, sun)
+                    m.renderFrame()
             pose(step, forward, yaw, sun)
-            hstr.set_properties(BASE)
+            # compare* too, only so the beam counters (dirty blocks, marched fraction) are read back from this frame: it
+            # compares the frame it has just stored with itself.
+            hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
-            hstr.set_properties({"storeExact": True})
-            m.renderFrame()
-            hstr.set_properties(dict(properties, compareReference=True, compareExact=True, compareBlock=1))
+            s = dict(stats())
+            marched = float(hstr.properties["beamMarchedFraction"])
+            hstr.set_properties(dict(BASE, compareReference=False, compareExact=False))
+            m.renderFrame()  # As before, the reference view renders once before the frame that is compared.
+            hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
             p = hstr.properties
-            hstr.set_properties({"compareReference": False, "compareExact": False})
-            s = p.get("cloudStats", {})
+            hstr.set_properties(dict(BASE, **dict(properties, compareReference=False, compareExact=False)))
             tilesPerStep.append(int(s.get("seaTilesChanged", 0)) - tilesAtStart)
             errors.append({"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]),
-                           "max": float(p["referenceLogMax"]), "marched": float(p["beamMarchedFraction"]),
+                           "max": float(p["referenceLogMax"]), "marched": marched,
                            "carriedPoints": int(s.get("beamCarriedPoints", 0)), "carriedPixels": int(s.get("beamCarriedPixels", 0)),
                            "marchTiles": int(s.get("beamMarchTiles", 0)), "debug": int(s.get("beamRefreshDebugCount", 0)),
                            "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0)),
+                           # The dirty passes' work: blocks listed, units marched (own tile / apron), cells classified.
+                           "dirty": {k: int(s.get("beam" + k, 0)) for k in ("DirtyBlocks", "DirtyUnverified", "DirtyOwnMarched",
+                                                                           "DirtyApronMarched", "ClassifyCells", "FrameDim", "RefAnchors")},
                            # cellViews: the scored frame's composition (0 with it off).
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
                                                                                  "Built", "Steps")},
@@ -238,7 +254,7 @@ for motion, forward, yaw, *rest in MOTIONS:
         if not errors:  # HSTR_STEPS=0: timings and residency only.
             errors = [{"over02": 0.0, "p999": 0.0, "max": 0.0, "marched": 0.0, "carriedPoints": 0, "carriedPixels": 0, "marchTiles": 0,
                        "debug": 0, "marchedSteps": 0, "carriedSteps": 0}]
-        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k not in ("cell", "push")}
+        mean = {k: sum(e[k] for e in errors) / len(errors) for k in errors[0] if k not in ("cell", "push", "dirty")}
         cell = errors[-1].get("cell", {})
         push = errors[-1].get("push", {})
         worst = max(e["over02"] for e in errors)

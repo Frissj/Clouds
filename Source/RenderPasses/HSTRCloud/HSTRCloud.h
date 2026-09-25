@@ -236,6 +236,7 @@ private:
     ref<Texture> mpBeamLatticePrev;
     ref<Texture> mpBeamLevelPrev;
     std::array<ref<Texture>, 2> mpBeamPixels;
+    uint3 mBeamAllocatedDim = uint3(0); ///< The beam image size and tile size the beam resources were last sized for.
     uint32_t mBeamRefresh = 0; ///< Requested beamRefresh; the shader's copy is 0 where the build cannot refresh.
     bool mBeamQueue = false;   ///< Requested beamQueue; the shader's copy is 0 where the build cannot queue.
     ref<Buffer> mpBeamQueue;
