@@ -17,6 +17,13 @@ TESTS = [
     ("par 8 warp", dict(FAST, beamGuardParallax=8.0, beamWarp=True)),
     ("par 1 again", dict(FAST, beamWarp=False)),
 ]
+# MEASURED (budgetwarp3, per-pixel warp in the resolve; ms, over 0.02, resolve): walk par 1 2.47 0.760% 0.44 | par 1 warp 2.78
+# 0.760% 0.78 | par 4 warp 2.71 0.849% | par 8 2.00 1.985% 0.43 | par 8 warp 2.30 0.960% 0.76 | again 2.46; sprint 2.88 unwarped,
+# 3.23-3.24 warped, 0.283% throughout (every block expires, nothing to warp).
+# MEASURED (budgetwarpfield1, the warp field: buildBeamWarpField once per on-screen lattice point, the resolve interpolating it):
+# walk par 1 2.52 0.761% 0.44 | par 1 warp 2.72 0.761% 0.58 | par 4 warp 2.65 0.849% | par 8 2.05 1.986% 0.43 | par 8 warp 2.19
+# 0.938% (p99.9 0.061, max 0.442) 0.56, of which the field pass 0.09 | again 2.55. The warp's cost 0.33 -> 0.13 ms and slightly
+# better (0.960 -> 0.938%, p99.9 0.072 -> 0.061): parallax 8 + warp is 0.33 ms under parallax 1 in the same run, in the gate.
 # Every arm sets beamWarp explicitly (and sea_motion.py resets keys an arm leaves out): see the misreading below. The warp is a
 # define on the two resolve passes (HSTR_BEAM_WARP), so the unwarped arms pay nothing for it.
 # MEASURED (budgetwarp1): the warp arms bit-identical to the unwarped ones (walk par 8 1.439% both), and the resolve 0.45 ->

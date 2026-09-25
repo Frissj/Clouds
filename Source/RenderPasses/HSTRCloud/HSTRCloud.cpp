@@ -1605,6 +1605,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamArgsPass = createPass("writeBeamArgs");
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
+    mpBeamWarpFieldPass = createPass("buildBeamWarpField");
     mpBeamSparseResolvePass = createPass("resolveBeamSparse");
     mpBeamResidualResolvePass = createPass("resolveBeamResidual");
     mpBeamResidualArgsPass = createPass("writeBeamResidualArgs");
@@ -3580,6 +3581,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
+    var["hstrBeamWarpField"] = mpBeamWarpField;
     var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
     var["hstrBeamInvalidations"] = mpBeamInvalidations;
     var["hstrBeamPixelsSnapshot"] = mpBeamPixelsSnapshot;
@@ -4793,6 +4795,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             {
                 mpBeamLattice = nullptr;
                 mpBeamLatticePrev = nullptr;
+                mpBeamWarpField = nullptr;
                 mpBeamLevel = nullptr;
                 mpBeamLevelPrev = nullptr;
                 mpBeamGuardDepth = nullptr; // Its block recreates the guard, dirty and pyramid resources with it.
@@ -5690,6 +5693,29 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
             pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
+            if (warp)
+            {
+                // The warp field over the on-screen lattice box (beamWarpFieldBox computes the same box in the shader).
+                FALCOR_PROFILE(pRenderContext, "warp");
+                const uint2 latticeDims = mParams.beamLatticeDims;
+                if (!mpBeamWarpField || mpBeamWarpField->getWidth() != latticeDims.x || mpBeamWarpField->getHeight() != latticeDims.y)
+                    mpBeamWarpField = mpDevice->createTexture2D(
+                        latticeDims.x, latticeDims.y, ResourceFormat::RG16Float, 1, 1, nullptr,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                    );
+                const float step = float(std::max(mParams.beamLatticeStep, 1u));
+                const float4 bounds = mParams.beamScreenBounds;
+                const uint2 origin(uint32_t(std::max(std::floor(bounds.x / step) - 2.f, 0.f)), uint32_t(std::max(std::floor(bounds.y / step) - 2.f, 0.f)));
+                const uint2 end(
+                    std::min(uint32_t(std::ceil(bounds.z / step) + 2.f), latticeDims.x), std::min(uint32_t(std::ceil(bounds.w / step) + 2.f), latticeDims.y)
+                );
+                if (end.x > origin.x && end.y > origin.y)
+                {
+                    bindRenderer(pRenderContext, mpBeamWarpFieldPass);
+                    bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
+                    mpBeamWarpFieldPass->execute(pRenderContext, uint3(end - origin, 1));
+                }
+            }
             // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
             // common resolve is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel). The
             // resolve queues its 8 x 8 groups that hold such pixels, with a mask, so the second pass runs over them alone.

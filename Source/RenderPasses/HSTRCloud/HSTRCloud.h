@@ -290,6 +290,8 @@ private:
     bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
     float mBeamGuardParallax = 1.f; ///< Texels of parallax a guard block may accumulate before it is re-marched.
     bool mBeamWarp = false;         ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
+    ref<ComputePass> mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
+    ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
     ref<Buffer> mpBeamDirtyCount;

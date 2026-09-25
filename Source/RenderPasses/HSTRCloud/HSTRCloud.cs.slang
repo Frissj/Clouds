@@ -459,6 +459,9 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamResidualList;
     RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch.
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
+    /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
+    Texture2D<float2> hstrBeamWarpField;
+    RWTexture2D<float2> hstrBeamWarpFieldOutput;
     Texture2D<uint> hstrBeamLevel;
     RWTexture2D<uint> hstrBeamLevelOutput;
     Texture2DArray<float4> hstrBeamLatticePrev; ///< beamRefresh: the previous build's lattice.
@@ -8063,6 +8066,41 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// The lattice box buildBeamWarpField covers: the on-screen box (beamScreenBounds) in lattice points, padded by two so the
+    /// resolve's bilinear read of the field never reaches past what was written. The host computes the same box to dispatch it.
+    void beamWarpFieldBox(out uint2 origin, out uint2 end)
+    {
+        const float step = float(max(params.beamLatticeStep, 1u));
+        origin = uint2(max(floor(params.beamScreenBounds.xy / step) - 2.f, 0.f));
+        end = min(uint2(ceil(params.beamScreenBounds.zw / step) + 2.f), params.beamLatticeDims);
+    }
+
+    /// beamWarp's field: once per on-screen lattice point, the offset from its position to where beamWarpPosition finds its
+    /// content was captured. The warp is a function of direction that changes at lattice scale - it reads the nearest query's
+    /// depth and its block's capture camera - so the resolve interpolates it instead of running it: per 4K pixel it cost the
+    /// resolve 0.43 -> 0.76 ms (budgetwarp3), and at beamOctScale 0.5 a lattice point covers ~16 pixels.
+    void buildBeamWarpFieldAt(uint2 thread)
+    {
+        uint2 origin, end;
+        beamWarpFieldBox(origin, end);
+        const uint2 texel = origin + thread;
+        if (any(texel >= end))
+            return;
+        const float2 position = float2(texel * max(params.beamLatticeStep, 1u));
+        float2 warped = position;
+        float3 read;
+        beamWarpPosition(beamRayDirection(position), warped, read);
+        hstrBeamWarpFieldOutput[texel] = warped - position;
+    }
+
+    /// Where the resolve reads a beam-image position under beamWarp: the field's offset, interpolated between lattice points.
+    float2 beamWarpedPosition(float2 position)
+    {
+        const float step = float(max(params.beamLatticeStep, 1u));
+        const float2 uv = (position / step + 0.5f) / float2(params.beamLatticeDims);
+        return position + hstrBeamWarpField.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+    }
+
     /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel
     /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel. Returns whether the pixel is left to
     /// the reference frame's residual resolve instead.
@@ -8075,7 +8113,8 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
 #if HSTR_BEAM_WARP
-        beamWarpPosition(cameraRayDirection(float2(pixel) + 0.5f), beamPosition, w);
+        beamPosition = beamWarpedPosition(beamPosition);
+        w = beamRayDirection(beamPosition);
 #endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
@@ -8123,8 +8162,7 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
 #if HSTR_BEAM_WARP
-        float3 read;
-        beamWarpPosition(cameraRayDirection(float2(pixel) + 0.5f), beamPosition, read);
+        beamPosition = beamWarpedPosition(beamPosition);
 #endif
         const float2 texel = beamPosition - 0.5f;
         const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
@@ -10455,6 +10493,13 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_
 /// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
 /// a 4K frame has 129,600 resolve groups.
 static const uint kResidualRow = 32768;
+
+/// beamWarp: the warp field over the on-screen lattice box (buildBeamWarpFieldAt), before the resolve reads it.
+[numthreads(8, 8, 1)]
+void buildBeamWarpField(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.buildBeamWarpFieldAt(dispatchThreadId.xy);
+}
 
 [numthreads(64, 1, 1)]
 void resolveBeamResidual(uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
