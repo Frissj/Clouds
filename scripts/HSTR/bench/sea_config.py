@@ -31,6 +31,8 @@ BEAM = {
     # beamGuardParallax 8 with the warp field. 4K walk 5.73 -> 2.19 ms at 0.137 -> 0.938% of pixels over 0.02 (budgetwarpfield1),
     # sprint 7.15 -> ~2.9 ms at 0.028 -> 0.283%. Sweeps that measure the old frame set these back.
     "beamGuardParallax": 8.0, "beamWarp": True,
+    # The warp only while a quarter of the classified blocks are held (writeBeamWarpArgs): sprint 2.95 -> 2.85 ms (warpauto2).
+    "beamWarpAuto": 0.25,
     # The persistent octahedral beam image (a3d4d427): world-fixed, guarded against translation, residual resolved from the best
     # value of every unit. 4K, GPU ms park / look / flick / walk / sprint 0.49 / 0.51 / 0.72 / 0.92 / 0.56, 0.137% of pixels
     # over 0.02 against the exact march - better than beamScreenResidual's 0.156% at 3.4-7.6 ms. Before it this was the anchored

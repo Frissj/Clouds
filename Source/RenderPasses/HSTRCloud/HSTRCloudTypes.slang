@@ -1284,6 +1284,12 @@ struct HSTRCloudParams
     uint beamGuardPyramidLevel = 0;
     /// Changed-content regions in hstrBeamInvalidations for this build's invalidateBeamGuardBlocks.
     uint beamInvalidateCount = 0;
+    /// beamWarpAuto: the share of classified on-screen guard blocks that have to be held for the warp to run (0: always), and
+    /// whether this build classified while translating, so writeBeamWarpArgs may take a new decision from hstrBeamDirtyCount.
+    float beamWarpAuto = 0.f;
+    uint beamWarpClassified = 0;
+    uint beamWarpPad0 = 0; ///< With beamWarpPad1, keeps the fields after these on their 16-byte alignment.
+    uint beamWarpPad1 = 0;
     /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
     uint cloudSunAncestors = kCloudSunAncestors;
     /// PROBE (beamRepairProbe only): 1 + signature * kBeamProbePolicies + policy makes the dirty query keep the OLD lattice values of

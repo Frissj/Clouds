@@ -457,7 +457,10 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamRebuild;      ///< Coarse cells whose certificate this build has to rebuild.
     /// Reference frame: per 8 x 8 resolve group holding failed-tile pixels, its packed group position and a 64-bit pixel mask.
     RWStructuredBuffer<uint> hstrBeamResidualList;
-    RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch.
+    RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch, [4..6] its warped one.
+    /// beamWarpAuto (writeBeamWarpArgs): [0..2] the warp field's dispatch, [3..5] the warped resolve's, [6..8] the plain resolve's -
+    /// one of the two resolves gets no groups - and [9] the decision (1: warp), kept across builds that do not classify.
+    RWStructuredBuffer<uint> hstrBeamWarpArgs;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
     Texture2D<float2> hstrBeamWarpField;
@@ -9267,7 +9270,13 @@ struct HSTRCloudRenderer
         if (!beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
             return false;
         if (beamCellCertified(cell))
+        {
+            // Held: read from an older camera, so the warp has something to do (beamWarpAuto reads the count back).
+            const uint held = WaveActiveCountBits(true);
+            if (WaveIsFirstLane())
+                InterlockedAdd(hstrBeamDirtyCount[2], held);
             return false;
+        }
         // Split the reason, because the two have opposite fixes: a block the guard knows nothing about is one whose points never
         // reached the code that vouches for them, and a block whose bound failed is doing its job.
         if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
@@ -10512,9 +10521,47 @@ void resolveBeamResidual(uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupInd
 void writeBeamResidualArgs()
 {
     const uint groups = min(gHSTRCloud.hstrBeamResidualArgs[0], gHSTRCloud.beamResidualGroups());
-    gHSTRCloud.hstrBeamResidualArgs[1] = min(groups, kResidualRow);
-    gHSTRCloud.hstrBeamResidualArgs[2] = (groups + kResidualRow - 1u) / kResidualRow;
-    gHSTRCloud.hstrBeamResidualArgs[3] = 1u;
+    // Under beamWarpAuto the plain [1..3] and warped [4..6] residual resolves are both dispatched; the decision gives one the groups.
+    const bool warped = gHSTRCloud.params.beamWarpAuto > 0.f && gHSTRCloud.hstrBeamWarpArgs[9] != 0;
+    const uint used = warped ? 4u : 1u;
+    const uint idle = warped ? 1u : 4u;
+    gHSTRCloud.hstrBeamResidualArgs[used] = min(groups, kResidualRow);
+    gHSTRCloud.hstrBeamResidualArgs[used + 1] = (groups + kResidualRow - 1u) / kResidualRow;
+    gHSTRCloud.hstrBeamResidualArgs[used + 2] = 1u;
+    gHSTRCloud.hstrBeamResidualArgs[idle] = 0u;
+    gHSTRCloud.hstrBeamResidualArgs[idle + 1] = 1u;
+    gHSTRCloud.hstrBeamResidualArgs[idle + 2] = 1u;
+}
+
+/// beamWarpAuto, before the resolve: whether the warp runs this frame, from the held and listed guard blocks this build's
+/// classification just counted (hstrBeamDirtyCount[2] and [0]); a build that did not classify while translating keeps the last
+/// decision. On the GPU, so the decision is this frame's and nothing waits on a readback. Sprint expires every block, so there
+/// nothing is held and the warp field and warped resolve are skipped.
+[numthreads(1, 1, 1)]
+void writeBeamWarpArgs()
+{
+    bool warp = gHSTRCloud.hstrBeamWarpArgs[9] != 0;
+    if (gHSTRCloud.params.beamWarpClassified != 0)
+    {
+        const uint listed = gHSTRCloud.hstrBeamDirtyCount[0];
+        const uint held = gHSTRCloud.hstrBeamDirtyCount[2];
+        warp = held + listed == 0 || float(held) >= gHSTRCloud.params.beamWarpAuto * float(held + listed);
+        gHSTRCloud.hstrBeamWarpArgs[9] = warp ? 1u : 0u;
+    }
+    uint2 origin, end;
+    gHSTRCloud.beamWarpFieldBox(origin, end);
+    const uint2 box = max(end, origin) - origin;
+    const uint2 fieldGroups = warp ? (box + 7u) / 8u : uint2(0);
+    gHSTRCloud.hstrBeamWarpArgs[0] = fieldGroups.x;
+    gHSTRCloud.hstrBeamWarpArgs[1] = fieldGroups.y;
+    gHSTRCloud.hstrBeamWarpArgs[2] = 1u;
+    const uint2 frameGroups = (gHSTRCloud.params.frameDim + 7u) / 8u;
+    gHSTRCloud.hstrBeamWarpArgs[3] = warp ? frameGroups.x : 0u;
+    gHSTRCloud.hstrBeamWarpArgs[4] = frameGroups.y;
+    gHSTRCloud.hstrBeamWarpArgs[5] = 1u;
+    gHSTRCloud.hstrBeamWarpArgs[6] = warp ? 0u : frameGroups.x;
+    gHSTRCloud.hstrBeamWarpArgs[7] = frameGroups.y;
+    gHSTRCloud.hstrBeamWarpArgs[8] = 1u;
 }
 
 [numthreads(8, 8, 1)]

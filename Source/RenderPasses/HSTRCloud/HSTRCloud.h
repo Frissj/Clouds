@@ -292,6 +292,18 @@ private:
     bool mBeamWarp = true;        ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
     ref<ComputePass> mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
+    /// beamWarpAuto: the warp runs only while at least this share of the on-screen guard blocks this build classified are held
+    /// (certified, so read from an older camera). 0 = always, as beamWarp alone. Sprint expires every block, so the field and the
+    /// warped resolve cost it ~0.13 ms for nothing. Decided on the GPU (writeBeamWarpArgs): both resolve variants are dispatched
+    /// indirectly and the one not chosen gets no groups.
+    float mBeamWarpAuto = 0.25f;
+    ref<ComputePass> mpBeamWarpArgsPass;
+    ref<ComputePass> mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
+    ref<ComputePass> mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
+    ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.
+    uint32_t mBeamWarpHeld = 0;   ///< The compared frame's guard blocks held (hstrBeamDirtyCount[2]) ...
+    uint32_t mBeamWarpListed = 0; ///< ... and listed dirty (hstrBeamDirtyCount[0]) ...
+    uint32_t mBeamWarpOn = 0;     ///< ... and whether its resolve was warped (stats, read with the comparison).
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
     ref<Buffer> mpBeamDirtyCount;

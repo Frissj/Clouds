@@ -437,6 +437,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamWarp = bool(value);
             continue;
         }
+        if (key == "beamWarpAuto")
+        {
+            mBeamWarpAuto = value;
+            continue;
+        }
         if (key == "beamAssumeCarry")
         {
             mParams.beamAssumeCarry = uint32_t(bool(value));
@@ -1067,6 +1072,7 @@ Properties HSTRCloud::getProperties() const
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamWarp"] = mBeamWarp;
+    props["beamWarpAuto"] = mBeamWarpAuto;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
@@ -1432,6 +1438,9 @@ Properties HSTRCloud::getProperties() const
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
+        cloud["beamWarpHeld"] = mBeamWarpHeld;
+        cloud["beamWarpListed"] = mBeamWarpListed;
+        cloud["beamWarpOn"] = mBeamWarpOn;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -1544,6 +1553,9 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamSparseResolvePass = nullptr;
     mpBeamResidualResolvePass = nullptr;
     mpBeamResidualArgsPass = nullptr;
+    mpBeamWarpArgsPass = nullptr;
+    mpBeamResolveWarpPass = nullptr;
+    mpBeamResidualResolveWarpPass = nullptr;
     mpBeamMarchPass = nullptr;
     mpBeamClassifyPass = nullptr;
     mpBeamSparseEmitPass = nullptr;
@@ -1606,6 +1618,9 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamWarpFieldPass = createPass("buildBeamWarpField");
+    mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
+    mpBeamResolveWarpPass = createPass("resolveBeam");
+    mpBeamResidualResolveWarpPass = createPass("resolveBeamResidual");
     mpBeamSparseResolvePass = createPass("resolveBeamSparse");
     mpBeamResidualResolvePass = createPass("resolveBeamResidual");
     mpBeamResidualArgsPass = createPass("writeBeamResidualArgs");
@@ -3621,6 +3636,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
+    var["hstrBeamWarpArgs"] = mpBeamWarpArgs;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
     var["hstrBeamDirtyMark"] = mpBeamDirtyMark;
     var["hstrBeamDirtyUnits"] = mpBeamDirtyUnits;
@@ -4861,7 +4877,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2); // Blocks listed, units to march.
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3); // Blocks listed, units to march, blocks held.
                 mpBeamDirtyMark = mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 // Every unit of every block: each tile is tested once (beamDirtyTileOwner) and lists its own units, so it cannot overflow.
                 const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
@@ -5521,6 +5537,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     }
                                     bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
                                     mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
+                                    // beamWarpAuto decides from this build's counts only when it classified while translating; a
+                                    // stationary build classifies nothing new and keeps the last decision (writeBeamWarpArgs).
+                                    mParams.beamWarpClassified = classify && mParams.beamStationary == 0 ? 1u : 0u;
                                 }
                                 if (mSpanProbe)
                                 {
@@ -5691,18 +5710,45 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             // A define, not a branch on a parameter: compiled in, the warp cost the resolve 0.45 -> 0.74 ms at 4K whether it was
             // on or off (budgetwarp2) - registers, as with the residual below.
             const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
-            pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
-            mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
+            // beamWarpAuto: the GPU decides from this build's held share (writeBeamWarpArgs) and both resolve variants dispatch
+            // indirectly, the one not chosen with no groups. Only the common resolve; the sparse one keeps the host's define.
+            const bool warpAuto = warp && mBeamWarpAuto > 0.f && !mBeamSparseBuilt;
+            mParams.beamWarpAuto = warpAuto ? mBeamWarpAuto : 0.f;
+            pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
+            mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
             if (warp)
             {
-                // The warp field over the on-screen lattice box (beamWarpFieldBox computes the same box in the shader).
-                FALCOR_PROFILE(pRenderContext, "warp");
                 const uint2 latticeDims = mParams.beamLatticeDims;
                 if (!mpBeamWarpField || mpBeamWarpField->getWidth() != latticeDims.x || mpBeamWarpField->getHeight() != latticeDims.y)
                     mpBeamWarpField = mpDevice->createTexture2D(
                         latticeDims.x, latticeDims.y, ResourceFormat::RG16Float, 1, 1, nullptr,
                         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
                     );
+            }
+            if (warpAuto)
+            {
+                FALCOR_PROFILE(pRenderContext, "warp");
+                if (!mpBeamWarpArgs)
+                {
+                    mpBeamWarpArgs = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 10, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                                  ResourceBindFlags::IndirectArg
+                    );
+                    const uint32_t warpOn[10] = {0, 1, 1, 0, 1, 1, 0, 1, 1, 1}; // Warp until a build says otherwise.
+                    mpBeamWarpArgs->setBlob(warpOn, 0, sizeof(warpOn));
+                }
+                bindRenderer(pRenderContext, mpBeamWarpArgsPass);
+                mpBeamWarpArgsPass->execute(pRenderContext, uint3(1));
+                mParams.beamWarpClassified = 0;
+                bindRenderer(pRenderContext, mpBeamWarpFieldPass);
+                bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
+                mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
+            }
+            else if (warp)
+            {
+                // The warp field over the on-screen lattice box (beamWarpFieldBox computes the same box in the shader).
+                FALCOR_PROFILE(pRenderContext, "warp");
+                const uint2 latticeDims = mParams.beamLatticeDims;
                 const float step = float(std::max(mParams.beamLatticeStep, 1u));
                 const float4 bounds = mParams.beamScreenBounds;
                 const uint2 origin(uint32_t(std::max(std::floor(bounds.x / step) - 2.f, 0.f)), uint32_t(std::max(std::floor(bounds.y / step) - 2.f, 0.f)));
@@ -5729,7 +5775,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 {
                     mpBeamResidualList = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3u * groups);
                     mpBeamResidualArgs = mpDevice->createStructuredBuffer(
-                        sizeof(uint32_t), 4, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                        sizeof(uint32_t), 7, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                                  ResourceBindFlags::IndirectArg
                     );
                 }
@@ -5737,9 +5783,23 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
             {
                 FALCOR_PROFILE(pRenderContext, "pixels");
-                bindRenderer(pRenderContext, pResolve);
-                pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
-                pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+                if (warpAuto)
+                {
+                    // Bytes: the warped resolve's arguments at [3..5], the plain one's at [6..8].
+                    mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
+                    bindRenderer(pRenderContext, mpBeamResolveWarpPass);
+                    mpBeamResolveWarpPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    mpBeamResolveWarpPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 12);
+                    bindRenderer(pRenderContext, pResolve);
+                    pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    pResolve->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 24);
+                }
+                else
+                {
+                    bindRenderer(pRenderContext, pResolve);
+                    pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+                }
             }
             if (residual)
             {
@@ -5749,6 +5809,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 bindRenderer(pRenderContext, mpBeamResidualResolvePass);
                 mpBeamResidualResolvePass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
                 mpBeamResidualResolvePass->executeIndirect(pRenderContext, mpBeamResidualArgs.get(), 4); // Bytes: after the count.
+                if (warpAuto)
+                {
+                    mpBeamResidualResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
+                    bindRenderer(pRenderContext, mpBeamResidualResolveWarpPass);
+                    mpBeamResidualResolveWarpPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    mpBeamResidualResolveWarpPass->executeIndirect(pRenderContext, mpBeamResidualArgs.get(), 16);
+                }
             }
         };
         if (mParams.beamRefFrame == 0)
@@ -5922,6 +5989,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mBeamMarchedFraction = float(marchedTiles * finest * finest) / float(frameDim.x * frameDim.y);
             for (uint32_t level = 0; level < kBeamCountSlots; ++level)
                 mBeamLevelCounts[level] = mpBeamCounts[mBeamParity]->getElement<uint32_t>(level);
+            if (mpBeamDirtyCount)
+            {
+                mBeamWarpListed = mpBeamDirtyCount->getElement<uint32_t>(0);
+                mBeamWarpHeld = mpBeamDirtyCount->getElement<uint32_t>(2);
+            }
+            mBeamWarpOn = mpBeamWarpArgs && mBeamWarpAuto > 0.f ? mpBeamWarpArgs->getElement<uint32_t>(9) : uint32_t(mBeamWarp);
         }
         bindRenderer(pRenderContext, mpCompareReferencePass);
         ShaderVar var = mpCompareReferencePass->getRootVar()["CB"]["gHSTRCloud"];

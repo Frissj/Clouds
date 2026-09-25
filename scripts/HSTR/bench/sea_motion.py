@@ -250,7 +250,8 @@ for motion, forward, yaw, *rest in MOTIONS:
                            "marchedSteps": int(s.get("beamMarchedSteps", 0)), "carriedSteps": int(s.get("beamCarriedSteps", 0)),
                            # The dirty passes' work: blocks listed, units marched (own tile / apron), cells classified.
                            "dirty": {k: int(s.get("beam" + k, 0)) for k in ("DirtyBlocks", "DirtyUnverified", "DirtyOwnMarched",
-                                                                           "DirtyApronMarched", "ClassifyCells", "FrameDim", "RefAnchors")},
+                                                                           "DirtyApronMarched", "ClassifyCells", "FrameDim", "RefAnchors",
+                                                                           "WarpHeld", "WarpListed", "WarpOn")},
                            # cellViews: the scored frame's composition (0 with it off).
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
                                                                                  "Built", "Steps")},

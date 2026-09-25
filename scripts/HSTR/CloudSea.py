@@ -67,6 +67,10 @@ g.addPass(createPass("HSTRCloud", {
     # fails (1.986%). Sprint is unchanged: every block expires at 20 units a frame, so there is nothing held to warp.
     "beamGuardParallax": 8.0,
     "beamWarp": True,
+    # ...and only while at least a quarter of the classified on-screen blocks are held, decided on the GPU each build
+    # (writeBeamWarpArgs): walk holds 62%, sprint 0-0.9%, so sprint skips the field and the warped resolve. Sprint 2.95-2.97 ->
+    # 2.85 ms, walk unchanged, errors bit-identical in both (warpauto2).
+    "beamWarpAuto": 0.25,
     # The anchoring build covers the whole sphere (about 97 ms once, at 4K), so a turn lands on directions already built.
     "beamPrebuild": True,
     "beamRefresh": 256,
