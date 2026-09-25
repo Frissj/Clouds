@@ -25,6 +25,10 @@ import HSTRCloudTypes;
 #ifndef HSTR_SHIP
 #define HSTR_SHIP 0
 #endif
+/// beamWarp: the resolve reads a held guard block where its capture camera saw the content (beamWarpPosition).
+#ifndef HSTR_BEAM_WARP
+#define HSTR_BEAM_WARP 0
+#endif
 #ifndef HSTR_BEAM_SPARSE_MIN_LEVEL
 #define HSTR_BEAM_SPARSE_MIN_LEVEL 2
 #endif
@@ -8006,6 +8010,59 @@ struct HSTRCloudRenderer
         return beamReconstruct(level, p, w, false);
     }
 
+    /// beamWarp: where the persistent image holds what the current camera sees along w. A value in the image is the radiance along
+    /// a world direction AS SEEN FROM the camera its guard block was verified from, so from a camera that has moved since, the
+    /// content along w was stored under the direction from that capture camera to it: X = eye + w z, read at normalize(X - Pc),
+    /// with z the query depth (opacity-weighted distance) nearest the position read. Twice, the second time with the depth and
+    /// capture camera found where the first landed. First order in |eye - Pc| / z: the stored depth stands in for the distance
+    /// from the new eye. A block never verified is read as is.
+    /// MEASURED (4K walk, 2x steps + tstep + beamOctScale 0.5, beamGuardParallax 8, in-flight scoring): 1.985% of pixels over
+    /// 0.02 unwarped, 1.439% warped by each query's own depth (budgetwarp1), 0.960% with the sky fallback below (budgetwarp2).
+    void beamWarpPosition(float3 w, inout float2 position, out float3 read)
+    {
+        read = w;
+        const float3 eye = gScene.camera.data.posW;
+        const uint step = max(params.beamLatticeStep, 1u);
+        const uint2 last = (params.beamLatticeDims - 1u) * step;
+        [unroll]
+        for (uint k = 0; k < 2; ++k)
+        {
+            const uint2 lattice = min(uint2(round(max(position, 0.f) / float(step))) * step, last);
+            const uint2 cell = beamGuardCell(lattice);
+            const float4 held = hstrBeamGuardCamera[cell];
+            if (held.w < 0.5f)
+                return;
+            float z = beamLatticeAt(lattice, 1).w;
+            // Sky: no depth of its own, but a cloud may have slid into it since the capture. Warp by the nearest depth among the
+            // guard blocks around; the second pass then reads what is really there. 91.9% of walk's pixels read a query that hit
+            // nothing (budgetwarpdiag1), and warping only by their own depth left every cloud edge moving over sky unfollowed.
+            if (!(z > 0.f))
+            {
+                float nearest = 3.4e38f;
+                for (int y = -1; y <= 1; ++y)
+                    for (int x = -1; x <= 1; ++x)
+                    {
+                        const int2 n = int2(cell) + int2(x, y);
+                        if (all(n >= 0) && all(n < int2(params.beamGuardDims)))
+                        {
+                            const uint stored = hstrBeamGuardDepth[uint2(n)];
+                            if (stored != 0xFFFFFFFFu)
+                                nearest = min(nearest, asfloat(stored));
+                        }
+                    }
+                if (!(nearest < 1e30f))
+                    return;
+                z = nearest;
+            }
+            const float3 d = normalize(eye + w * z - held.xyz);
+            float2 warped;
+            if (!beamImagePosition(d, warped))
+                return;
+            position = warped;
+            read = d;
+        }
+    }
+
     /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel
     /// is touched. Pixels of tiles that failed the finest level are left to marchBeamPixel. Returns whether the pixel is left to
     /// the reference frame's residual resolve instead.
@@ -8013,10 +8070,13 @@ struct HSTRCloudRenderer
     {
         if (any(pixel >= params.frameDim))
             return false;
-        const float3 w = cameraRayDirection(float2(pixel) + 0.5f);
+        float3 w = cameraRayDirection(float2(pixel) + 0.5f);
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
+#if HSTR_BEAM_WARP
+        beamWarpPosition(cameraRayDirection(float2(pixel) + 0.5f), beamPosition, w);
+#endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
         if (level == params.beamLevels + 1u)
@@ -8062,6 +8122,10 @@ struct HSTRCloudRenderer
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
+#if HSTR_BEAM_WARP
+        float3 read;
+        beamWarpPosition(cameraRayDirection(float2(pixel) + 0.5f), beamPosition, read);
+#endif
         const float2 texel = beamPosition - 0.5f;
         const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
         const float2 g = saturate(texel - float2(base));
@@ -9015,6 +9079,15 @@ struct HSTRCloudRenderer
             if (!(nearest > 0.f))
                 return -1.f;
             const float budget = level == 0 ? params.beamGuardParallaxAngle : float(1u << (level - 1u)) * blockAngle;
+            // MEASURED and REMOVED (budgetcertify1, 4K, 2x steps + tstep + beamOctScale 0.5, with beamWarp): a differential
+            // certificate for the warp - a block held while camera motion times the spread of inverse cloud depth around it
+            // (1 / near - 1 / far over a max-depth pyramid beside this one, sky excluded, every level) stayed under the budget, and a
+            // listed block restarted its depth range. Walk at 0.25 / 0.5 / 1 / 2 texels: 8,275 - 5,999 dirty blocks (15,313 at
+            // parallax 1) but 1.578 / 2.225 / 2.999 / 3.874% of pixels over 0.02, against parallax 8 + warp's 0.960% at 11,462 -
+            // it held blocks the warp cannot correct (the depths are one opacity-weighted distance per ray, so a ray through a
+            // thick cloud reads as one depth). Sprint held 28% of its 30,027 blocks for the first time, and saved nothing: query
+            // 0.82 -> 0.79 ms, units unchanged - the blocks it can hold are the cheap ones next to sky, and near dense cloud expires
+            // at 20 units a frame under any certificate.
             if (nearest < 3.4e38f)
                 radius = min(radius, budget * nearest / (1.f + budget));
             offset += dims.x * dims.y;

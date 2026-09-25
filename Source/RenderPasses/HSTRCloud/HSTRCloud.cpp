@@ -432,6 +432,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamGuardParallax = value;
             continue;
         }
+        if (key == "beamWarp")
+        {
+            mBeamWarp = bool(value);
+            continue;
+        }
         if (key == "beamAssumeCarry")
         {
             mParams.beamAssumeCarry = uint32_t(bool(value));
@@ -1061,6 +1066,7 @@ Properties HSTRCloud::getProperties() const
     props["beamGuard"] = mBeamGuard;
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
+    props["beamWarp"] = mBeamWarp;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
@@ -5679,6 +5685,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         {
             FALCOR_PROFILE(pRenderContext, "resolve");
             const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : mpBeamResolvePass;
+            // A define, not a branch on a parameter: compiled in, the warp cost the resolve 0.45 -> 0.74 ms at 4K whether it was
+            // on or off (budgetwarp2) - registers, as with the residual below.
+            const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
+            pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
+            mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp ? "1" : "0");
             // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
             // common resolve is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel). The
             // resolve queues its 8 x 8 groups that hold such pixels, with a mask, so the second pass runs over them alone.

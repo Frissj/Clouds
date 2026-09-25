@@ -10,12 +10,15 @@ from pathlib import Path
 FAST = runpy.run_path(str(Path(__file__).with_name("budget_jitter.py")))["arm"](2)
 
 TESTS = [
-    ("par 1", FAST),
-    ("par 1 warp", dict(FAST, beamWarp=1)),
-    ("par 8", dict(FAST, beamGuardParallax=8.0)),
-    ("par 8 warp", dict(FAST, beamGuardParallax=8.0, beamWarp=1)),
-    ("par 1 again", FAST),
+    ("par 1", dict(FAST, beamWarp=False)),
+    ("par 1 warp", dict(FAST, beamWarp=True)),
+    ("par 4 warp", dict(FAST, beamGuardParallax=4.0, beamWarp=True)),
+    ("par 8", dict(FAST, beamGuardParallax=8.0, beamWarp=False)),
+    ("par 8 warp", dict(FAST, beamGuardParallax=8.0, beamWarp=True)),
+    ("par 1 again", dict(FAST, beamWarp=False)),
 ]
+# Every arm sets beamWarp explicitly (and sea_motion.py resets keys an arm leaves out): see the misreading below. The warp is a
+# define on the two resolve passes (HSTR_BEAM_WARP), so the unwarped arms pay nothing for it.
 # MEASURED (budgetwarp1): the warp arms bit-identical to the unwarped ones (walk par 8 1.439% both), and the resolve 0.45 ->
 # 0.54 ms in every arm with the warp compiled in. The diagnostic arms find which early-out held it off.
 DIAG = [
