@@ -340,6 +340,16 @@ private:
     ref<ComputePass> mpPushComparePass;
     /// pushShare: after the dirty passes, count what the push lists' cell x tile interactions could share (see countPushShare).
     bool mPushShare = false;
+    /// spanProbe: the dirty march records its rays as spans (HSTR_SHIP bit 262144) and evaluateSpans integrates them alone.
+    bool mSpanProbe = false;
+    ref<Buffer> mpSpanRays;
+    ref<Buffer> mpSpanRecords;
+    ref<Buffer> mpSpanCounts;
+    ref<Buffer> mpSpanArgs;
+    ref<ComputePass> mpSpanArgsPass;
+    ref<ComputePass> mpSpanEvalPass;
+    ref<ComputePass> mpSpanCheckPass;
+    void runSpanProbe(RenderContext* pRenderContext);
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
     ref<Buffer> mpPushShareAges;    ///< Per list entry: the temporal oracle's worst crossing error per age.

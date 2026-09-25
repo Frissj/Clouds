@@ -317,6 +317,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mSunResolveAlways = bool(value);
             continue;
         }
+        if (key == "spanProbe")
+        {
+            mSpanProbe = bool(value);
+            continue;
+        }
         if (key == "beamShadowCarry")
         {
             mParams.beamShadowCarry = uint32_t(value);
@@ -911,7 +916,8 @@ uint32_t HSTRCloud::beamShipDefine() const
 {
     if (!beamShipping())
         return 0u;
-    return mParams.cloudSunReuse > 0.f ? (mBeamShipMask & ~256u) : mBeamShipMask;
+    const uint32_t mask = mSpanProbe ? (mBeamShipMask | 262144u) : mBeamShipMask; // The span probe's recording (spanProbe).
+    return mParams.cloudSunReuse > 0.f ? (mask & ~256u) : mask;
 }
 
 void HSTRCloud::setProperties(const Properties& props)
@@ -1197,6 +1203,21 @@ Properties HSTRCloud::getProperties() const
         const char* cellNames[] = {"Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests", "Built", "Steps"};
         for (uint32_t k = 0; k < 8; ++k)
             cloud[std::string("cellView") + cellNames[k]] = mBeamLevelCounts[kCellViewRays + k];
+        // spanProbe: the last frame's span counters (a readback, only while the probe is on).
+        if (mSpanProbe && mpSpanCounts)
+        {
+            const std::vector<uint32_t> span = mpSpanCounts->getElements<uint32_t>(0, kSpanCountTotal);
+            cloud["spanRays"] = span[kSpanRays];
+            cloud["spanSpans"] = span[kSpanSpans];
+            cloud["spanEvaluated"] = span[kSpanEvaluated];
+            cloud["spanOverflow"] = span[kSpanOverflow];
+            cloud["spanMismatchT"] = span[kSpanMismatchT];
+            cloud["spanMismatchL"] = span[kSpanMismatchL];
+            cloud["spanBaked"] = span[kSpanBaked];
+            cloud["spanFallback"] = span[kSpanFallback];
+            cloud["spanMaxDT"] = double(reinterpret_cast<const float&>(span[kSpanMaxDT]));
+            cloud["spanMaxDL"] = double(reinterpret_cast<const float&>(span[kSpanMaxDL]));
+        }
         // beamPushProbe: the last probed frame's counters (a readback, so only when asked for), and the list's footprint.
         if (mPushProbe && mpPushCounts)
         {
@@ -1296,6 +1317,11 @@ Properties HSTRCloud::getProperties() const
                 cloud["pushWalkProxyZero"] = push[kPushShareWalkProxyZero];
                 cloud["pushWalkWaveSteps"] = push[kPushShareWalkWaveSteps];
                 cloud["pushWalkWaveLit"] = push[kPushShareWalkWaveLit];
+                cloud["pushWalkLitFaint"] = push[kPushShareWalkLitFaint];
+                cloud["pushWalkLitThin"] = push[kPushShareWalkLitThin];
+                cloud["pushWalkLitAtMax"] = push[kPushShareWalkLitAtMax];
+                cloud["pushWalkLitAtMin"] = push[kPushShareWalkLitAtMin];
+                cloud["pushWalkLitDeep"] = push[kPushShareWalkLitDeep];
                 if ((mParams.pushShareMode & 8u) && mpPushBrickVisits)
                 {
                     // Experiment 6: the visits aggregated per (listing tile, atlas brick) - what one workgroup per tile staging each
@@ -1593,6 +1619,9 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpSpanArgsPass = createPass("writeSpanArgs");
+    mpSpanEvalPass = createPass("evaluateSpans");
+    mpSpanCheckPass = createPass("checkSpans");
     mpCellArgsPass = createPass("writeCellViewArgs");
     mpCellBuildPass = createPass("buildCellViews");
     mpCellInvalidatePass = createPass("invalidateCellViews");
@@ -3572,6 +3601,10 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrPushList"] = mpPushList;
     var["hstrPushCounts"] = mpPushCounts;
     var["hstrPushArgs"] = mpPushArgs;
+    var["hstrSpanRays"] = mpSpanRays;
+    var["hstrSpanRecords"] = mpSpanRecords;
+    var["hstrSpanCounts"] = mpSpanCounts;
+    var["hstrSpanArgs"] = mpSpanArgs;
     var["hstrPushShareRays"] = mpPushShareRays;
     var["hstrPushShareEntries"] = mpPushShareEntries;
     var["hstrPushShareAges"] = mpPushShareAges;
@@ -4190,6 +4223,25 @@ void HSTRCloud::runPushProbe(RenderContext* pRenderContext)
         bindOutput(mpCellBuildPass, "hstrCellTexelsOutput", mpCellTexels, "hstrCellTexels");
         bindOutput(mpCellBuildPass, "hstrCellTexelsSingleOutput", mpCellTexelsSingle, "hstrCellTexelsSingle");
         mpCellBuildPass->executeIndirect(pRenderContext, mpCellArgs.get(), 0);
+    }
+}
+
+void HSTRCloud::runSpanProbe(RenderContext* pRenderContext)
+{
+    // The recorded rays, integrated from their spans alone: timed ("spans"), then again untimed against the march ("spanCheck").
+    bindRenderer(pRenderContext, mpSpanArgsPass);
+    mpSpanArgsPass->execute(pRenderContext, uint3(1));
+    {
+        FALCOR_PROFILE(pRenderContext, "spans");
+        setBeamDirtyMarchDefines(mpSpanEvalPass);
+        bindRenderer(pRenderContext, mpSpanEvalPass);
+        mpSpanEvalPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "spanCheck");
+        setBeamDirtyMarchDefines(mpSpanCheckPass);
+        bindRenderer(pRenderContext, mpSpanCheckPass);
+        mpSpanCheckPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
     }
 }
 
@@ -5421,6 +5473,23 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     bindRenderer(pRenderContext, mpBeamDirtyArgsPass);
                                     mpBeamDirtyArgsPass->execute(pRenderContext, uint3(1));
                                 }
+                                if (mSpanProbe)
+                                {
+                                    // The span probe's recording: every ray the dirty query and units march this frame. 1.3M rays
+                                    // (sprint lists ~1.2M) x (5 + 2 x kSpanPerRay) uint4s: ~600 MB, only while the probe is on.
+                                    constexpr uint32_t kSpanRayCapacity = 1300000;
+                                    const auto spanFlags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+                                    if (!mpSpanRays)
+                                    {
+                                        mpSpanRays = mpDevice->createStructuredBuffer(sizeof(uint4), kSpanRayCapacity * kSpanRayWords, spanFlags);
+                                        mpSpanRecords = mpDevice->createStructuredBuffer(sizeof(uint4), kSpanRayCapacity * kSpanPerRay * 2u, spanFlags);
+                                        mpSpanCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), kSpanCountTotal, spanFlags);
+                                        mpSpanArgs = mpDevice->createStructuredBuffer(
+                                            sizeof(uint32_t), 3, spanFlags | ResourceBindFlags::IndirectArg
+                                        );
+                                    }
+                                    pRenderContext->clearUAV(mpSpanCounts->getUAV().get(), uint4(0));
+                                }
                                 {
                                     FALCOR_PROFILE(pRenderContext, "query");
                                     // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
@@ -5708,6 +5777,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     }
                     if (mPushProbe && mPushShare && mpPushShareRays)
                         runPushShare(pRenderContext);
+                    if (mSpanProbe && mpSpanRays)
+                        runSpanProbe(pRenderContext);
                 }
             }
             else if (unitMarch)

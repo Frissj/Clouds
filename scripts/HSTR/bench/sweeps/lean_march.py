@@ -126,6 +126,21 @@ HALF = [
     ("half", dict(BASE, colorHalf=True)),
     ("float again", dict(BASE, colorHalf=False)),
 ]
+# Direct-span ceiling (spanProbe): the dirty march records its rays as runs of samples in one brick (or the proxy), and
+# evaluateSpans integrates the same samples from the spans alone - no majorant, instance or page lookup, no empty or majorant-zero
+# steps - with span production free. Density and single sun only (hstComponents 1 | 2) in every arm, so the march arms time the
+# same work: "spans" (timed) against the march arms' query + units; spanMismatch* / spanMaxD* check it is the same integral.
+# Gate A: the span march itself <= ~0.7 ms at walk; gate B, once spans come from the projection: build + march <= ~1.2-1.3 ms.
+DSUN = dict(BASE, hstComponents=1 | 2, spanProbe=False)
+SPAN = [
+    ("march dsun", DSUN),
+    ("span probe", dict(DSUN, spanProbe=True)),
+    ("march dsun again", DSUN),
+]
+# MEASURED (leanspan1, 4K): walk march 3.65 / 3.62 ms (query + units) -> spans 1.77 ms for 80% of 673k rays (20.5% past 12 spans,
+# skipped: ~2.2 ms for all), sprint 4.51 / 4.54 -> 2.24. 3.6 samples a span, ~5.1 G samples/s; 0.2-0.3% of rays not bit-exact.
+# Gate A (<= 0.7 ms) FAILED: the direct-span evaluator buys ~1.7-2x with spans free, not the ~5x the dirty passes need.
+
 # MEASURED and REMOVED (leanhalf1, 4K, errors identical): resolve 0.47 / 0.49 -> 0.41 ms, frame walk 5.78 / 5.82 -> 5.92, sprint
 # 7.28 / 7.27 -> 7.25. Not worth the format change; the colorHalf property is gone.
 

@@ -1465,7 +1465,35 @@ static const uint kPushShareWalkProxyZero = 473;
 /// Lane slots the lean march's waves issue: per wave, its longest ray's steps (contributing samples) times the wave's lanes.
 static const uint kPushShareWalkWaveSteps = 474;
 static const uint kPushShareWalkWaveLit = 475;
-static const uint kPushCountTotal = 476;
+/// Contributing samples of the lean march by kind: alpha < 1e-3, alpha in [1e-3, 1e-2), step at maxStepVoxels, step at its
+/// minimum, and transmittance in front below 0.25 - where an error-bounded or transmittance-scaled step could take fewer.
+static const uint kPushShareWalkLitFaint = 476;
+static const uint kPushShareWalkLitThin = 477;
+static const uint kPushShareWalkLitAtMax = 478;
+static const uint kPushShareWalkLitAtMin = 479;
+static const uint kPushShareWalkLitDeep = 480;
+static const uint kPushCountTotal = 481;
+
+/// Span probe (hstrSpanCounts): rays recorded, spans, samples recorded, rays past kSpanPerRay spans (not evaluated), rays whose
+/// evaluated T / single light differ from the march's, brick / proxy spans, samples evaluated, baked-sun samples, the largest
+/// |dT| and relative |dL| (as float bits), sun fallbacks (no bake: the march's own fallback).
+static const uint kSpanPerRay = 12;
+static const uint kSpanRayWords = 5; ///< uint4s a ray: position | worldLength, direction | entryDistance, spans | T | opacity distance,
+                                     ///< the march's single light, the evaluator's light | T.
+static const uint kSpanRays = 0;
+static const uint kSpanSpans = 1;
+static const uint kSpanSamples = 2;
+static const uint kSpanOverflow = 3;
+static const uint kSpanMismatchT = 4;
+static const uint kSpanMismatchL = 5;
+static const uint kSpanBrickSpans = 6;
+static const uint kSpanProxySpans = 7;
+static const uint kSpanEvaluated = 8;
+static const uint kSpanBaked = 9;
+static const uint kSpanMaxDT = 10;
+static const uint kSpanMaxDL = 11;
+static const uint kSpanFallback = 12;
+static const uint kSpanCountTotal = 16;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and

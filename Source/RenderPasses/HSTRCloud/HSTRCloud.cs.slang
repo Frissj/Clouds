@@ -421,6 +421,14 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrPushList;
     RWStructuredBuffer<uint> hstrPushCounts;
     RWStructuredBuffer<uint> hstrPushArgs;
+    /// Span probe (spanProbe, HSTR_SHIP bit 262144): every dirty ray the lean march takes, as its ordered runs of samples in one
+    /// brick (or the proxy) - hstrSpanRays holds 4 words a ray (the ray, then its span count, T, opacity distance and single light
+    /// as the march found them), hstrSpanRecords kSpanPerRay spans of 2 words a ray, hstrSpanCounts the counters (kSpan*) and
+    /// hstrSpanArgs the evaluator's dispatch. evaluateSpans then integrates the same samples from the spans alone.
+    RWStructuredBuffer<uint4> hstrSpanRays;
+    RWStructuredBuffer<uint4> hstrSpanRecords;
+    RWStructuredBuffer<uint> hstrSpanCounts;
+    RWStructuredBuffer<uint> hstrSpanArgs;
     /// pushShare: the lattice points the dirty query marched this frame (packed beam position), and per list entry (cell x tile)
     /// the dirty rays that crossed it and the march steps they spent inside it. See countPushShare.
     RWStructuredBuffer<uint> hstrPushShareRays;
@@ -6322,6 +6330,20 @@ struct HSTRCloudRenderer
 #if (HSTR_SHIP & 4096) != 0
         // Step classes (probe, pushShare's counters): all, majorant zero, empty box, proxy, contributing (alpha > 1e-6).
         uint countSteps = 0, countZero = 0, countEmpty = 0, countProxy = 0, countLit = 0;
+        uint countFaint = 0, countThin = 0, countAtMax = 0, countAtMin = 0, countDeep = 0;
+#endif
+#if (HSTR_SHIP & 262144) != 0
+        // Span probe: the density samples (neither majorant-zero nor an empty box) in runs of one brick (or the proxy) at one step,
+        // each run evenly spaced from its first midpoint - what evaluateSpans integrates alone. Recording arm only: never timed.
+        uint spanRay;
+        InterlockedAdd(hstrSpanCounts[kSpanRays], 1u, spanRay);
+        uint spanRays, spanStride;
+        hstrSpanRays.GetDimensions(spanRays, spanStride);
+        const bool spanKept = spanRay < spanRays / kSpanRayWords;
+        uint spanCount = 0;
+        bool spanOverflow = false;
+        uint openEntry = 0, openInstance = 0, openSamples = 0;
+        float openFirst = 0.f, openDt = 0.f;
 #endif
         // MEASURED and REMOVED (leandefer1, 4K, errors identical): deferred lighting. The loop issues 81.4M lane steps for 61.5M
         // steps (76%, leancount3 walk), but only 28% of steps are lit, so the light body ran with ~7 of 32 lanes (Nsight: 14.3
@@ -6363,6 +6385,44 @@ struct HSTRCloudRenderer
                 countEmpty += skipTo >= 0.f ? 1u : 0u;
                 countProxy += hit.entry == kCloudRefNone && skipTo < 0.f ? 1u : 0u;
                 countLit += alpha > 1e-6f ? 1u : 0u;
+                if (alpha > 1e-6f)
+                {
+                    countFaint += alpha < 1e-3f ? 1u : 0u;
+                    countThin += alpha >= 1e-3f && alpha < 1e-2f ? 1u : 0u;
+                    countAtMax += stepVoxels >= params.maxStepVoxels ? 1u : 0u;
+                    countAtMin += stepVoxels <= minimumStep ? 1u : 0u;
+                    countDeep += transmittance < 0.25f ? 1u : 0u;
+                }
+#endif
+#if (HSTR_SHIP & 262144) != 0
+                if (skipTo < 0.f && spanKept)
+                {
+                    const uint entry = hit.entry; // kCloudRefNone: the proxy.
+                    const bool continues = openSamples != 0u && entry == openEntry && hit.instance == openInstance && dt == openDt &&
+                                           abs(tSample - (openFirst + float(openSamples) * openDt)) <= 1e-4f * dt;
+                    if (continues)
+                        ++openSamples;
+                    else
+                    {
+                        if (openSamples != 0u)
+                        {
+                            if (spanCount < kSpanPerRay)
+                            {
+                                const uint at = 2u * (spanRay * kSpanPerRay + spanCount);
+                                hstrSpanRecords[at] = uint4(asuint(openFirst), asuint(openDt), openSamples, openEntry);
+                                hstrSpanRecords[at + 1u] = uint4(openInstance, 0u, 0u, 0u);
+                                ++spanCount;
+                            }
+                            else
+                                spanOverflow = true;
+                        }
+                        openEntry = entry;
+                        openInstance = hit.instance;
+                        openFirst = tSample;
+                        openDt = dt;
+                        openSamples = 1u;
+                    }
+                }
 #endif
                 if (alpha > 1e-6f)
                 {
@@ -6395,6 +6455,28 @@ struct HSTRCloudRenderer
             t = next;
             ++steps;
         }
+#if (HSTR_SHIP & 262144) != 0
+        if (spanKept)
+        {
+            if (openSamples != 0u)
+            {
+                if (spanCount < kSpanPerRay)
+                {
+                    const uint at = 2u * (spanRay * kSpanPerRay + spanCount);
+                    hstrSpanRecords[at] = uint4(asuint(openFirst), asuint(openDt), openSamples, openEntry);
+                    hstrSpanRecords[at + 1u] = uint4(openInstance, 0u, 0u, 0u);
+                    ++spanCount;
+                }
+                else
+                    spanOverflow = true;
+            }
+            hstrSpanRays[kSpanRayWords * spanRay] = uint4(asuint(ray.position), asuint(ray.worldLength));
+            hstrSpanRays[kSpanRayWords * spanRay + 1u] = uint4(asuint(ray.direction), asuint(ray.entryDistance));
+            hstrSpanRays[kSpanRayWords * spanRay + 2u] =
+                uint4(spanCount | (spanOverflow ? 0x80000000u : 0u), asuint(transmittance), asuint(opacityDistance), 0u);
+            hstrSpanRays[kSpanRayWords * spanRay + 3u] = uint4(asuint(residualRadiance), 0u);
+        }
+#endif
 #if (HSTR_SHIP & 4096) != 0
         pushCount(kPushShareWalkSteps, countSteps);
         pushCount(kPushShareWalkAir, countZero);
@@ -6402,6 +6484,11 @@ struct HSTRCloudRenderer
         pushCount(kPushShareWalkProxy, countProxy);
         pushCount(kPushShareWalkProxyZero, countLit);
         pushCount(kPushShareVisitSamples, 1u); // Rays.
+        pushCount(kPushShareWalkLitFaint, countFaint);
+        pushCount(kPushShareWalkLitThin, countThin);
+        pushCount(kPushShareWalkLitAtMax, countAtMax);
+        pushCount(kPushShareWalkLitAtMin, countAtMin);
+        pushCount(kPushShareWalkLitDeep, countDeep);
         // Against the sums above: the share of issued lane slots that march a step (SIMD efficiency over the loop).
         const uint waveSteps = WaveActiveMax(countSteps) * WaveGetLaneCount();
         const uint waveLit = WaveActiveMax(countLit) * WaveGetLaneCount();
@@ -6412,6 +6499,159 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrPushCounts[kPushShareWalkWaveLit], waveLit, unused);
         }
 #endif
+    }
+
+    /// Span probe: one recorded ray integrated from its spans alone - the direct-span evaluator's ceiling on the real dirty rays,
+    /// with span production free. Per span the brick, the instance and the resolved sun bake are loaded once; per sample only the
+    /// density atlas, the sun atlas and the far field (or the proxy) are fetched: no majorant, no instance or page lookup, no
+    /// empty-box or majorant-zero steps. The same samples as the march (its own runs, first midpoint and step), density and the
+    /// single-scattered sun only - the arm runs hstComponents 1 | 2 - and the result is checked against the march's (kSpanMismatch*).
+    /// MEASURED (leanspan1, 4K, one settle): walk - march query + units 3.65 ms (anchor 3.62), spans 1.77 ms for the 80% of the
+    /// 673k rays within kSpanPerRay spans (20.5% overflowed and were skipped: ~2.2 ms for all); sprint 4.51 -> 2.24. 2.52M spans,
+    /// 9.06M samples: 3.6 samples a span - a ray crosses a brick in a handful of samples, so the per-span setup is paid every 3-4 -
+    /// at ~5.1 G samples/s (the offline direct arm's 15 was one packed texture, no far sun, no proxy). Exactness: 854 / 1,703 rays
+    /// of ~535k differ in T / light (max |dT| 0.19; fading bricks or sample drift). With spans free and no traversal the direct
+    /// evaluator buys ~1.7-2x on density + sun, not the ~5x the dirty passes need: gate A (<= 0.7 ms) FAILED, and span production,
+    /// the far sun + cache and the overflow rays would all add to it. Kept as a probe (compiled out unless spanProbe).
+    /// counting: the untimed second pass - the same integration, compared with the march and counted. The timed pass only writes
+    /// its result (word 4 of the ray), as a real evaluator would; per-ray atomics in it would time themselves (see
+    /// tile_transport_rate.py).
+    void evaluateSpanRay(uint ray, bool counting)
+    {
+        uint capacity, stride;
+        hstrSpanRays.GetDimensions(capacity, stride);
+        if (ray >= min(hstrSpanCounts[kSpanRays], capacity / kSpanRayWords))
+            return;
+        const uint4 h2 = hstrSpanRays[kSpanRayWords * ray + 2u];
+        if ((h2.x & 0x80000000u) != 0u)
+        {
+            if (counting)
+            {
+                uint unused;
+                InterlockedAdd(hstrSpanCounts[kSpanOverflow], 1u, unused);
+            }
+            return;
+        }
+        const uint4 h0 = hstrSpanRays[kSpanRayWords * ray];
+        const uint4 h1 = hstrSpanRays[kSpanRayWords * ray + 1u];
+        const float3 position = asfloat(h0.xyz);
+        const float worldLength = asfloat(h0.w);
+        const float3 direction = asfloat(h1.xyz);
+        const float entryDistance = asfloat(h1.w);
+        const float cellWidth = float(params.hstrCellWidth);
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        const float fadeScale = params.seaMode != 0 && params.cloudPixelAngle > 0.f ? 1.f / (params.cloudPixelAngle * params.seaViewDistance) : 0.f;
+        const float3 sunColour = params.residualStrength * params.sunRadiance;
+        float T = 1.f;
+        float3 L = 0.f;
+        uint samples = 0, baked = 0, fallback = 0;
+        const uint spans = h2.x;
+        for (uint k = 0; k < spans; ++k)
+        {
+            const uint4 a = hstrSpanRecords[2u * (ray * kSpanPerRay + k)];
+            const float first = asfloat(a.x);
+            const float dt = asfloat(a.y);
+            const uint n = a.z;
+            const uint entry = a.w;
+            const float opticalScale = dt * worldLength;
+            samples += n;
+            if (entry == kCloudRefNone)
+            {
+                // The proxy: its density and its sun (sunDepthProxy), as leanExtinction and leanSunDepth answer there.
+                for (uint j = 0; j < n; ++j)
+                {
+                    const float t = first + float(j) * dt;
+                    const float3 v = (position + t * direction) * cellWidth;
+                    const float footprint = (entryDistance + t * worldLength) * params.cloudPixelAngle;
+                    const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) / 0.3f) : 1.f;
+                    const float alpha = 1.f - exp(-(fade * extinctionAtVoxel(v) * opticalScale));
+                    if (alpha > 1e-6f)
+                        L += T * alpha * sunColour * exp(-sunDepthProxy(v));
+                    T *= 1.f - alpha;
+                }
+                continue;
+            }
+            const uint instanceIndex = hstrSpanRecords[2u * (ray * kSpanPerRay + k) + 1u].x;
+            const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
+            const HSTRCloudBrick brick = hstrCloudBricks[entry];
+            // Source position along the span: cloudInstanceAt's transform, linear in t inside one sea tile.
+            const float tileVoxels = float(params.cloudTileVoxels);
+            const float3 v0 = (position + first * direction) * cellWidth;
+            const float2 worldTile = floor((v0.xz + 0.5f) / tileVoxels);
+            const float3 p0 = float3(v0.x - worldTile.x * tileVoxels, v0.y, v0.z - worldTile.y * tileVoxels);
+            const float3 dv = direction * cellWidth;
+            const float3 x0 = float3(dot(instance.row0.xyz, p0) + instance.row0.w, dot(instance.row1.xyz, p0) + instance.row1.w,
+                                     dot(instance.row2.xyz, p0) + instance.row2.w);
+            const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
+            const uint level = brick.info & 15u;
+            const uint2 resolved = hstrCloudSunResolved[entry * kCloudSunClasses + instance.sunClass];
+            const bool bakeable = resolved.x != kCloudRefNone && params.sunNearVoxels > 0.f && SHIP(cloudSunCache, 1u) != 0;
+            const float near = params.sunNearVoxels * instance.sourceVoxelWorld / hstrCloudAssets[instance.asset].sourceVoxelWorld;
+            for (uint j = 0; j < n; ++j)
+            {
+                const float t = first + float(j) * dt;
+                const float3 x = x0 + (t - first) * dx;
+                const int3 i = int3(floor(x + 0.5f));
+                const float footprint = (entryDistance + t * worldLength) * params.cloudPixelAngle;
+                const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) / 0.3f) : 1.f;
+                float density = cloudBrickDensity(entry, x, i) * scale;
+                if (brick.fade < 1.f)
+                {
+                    const float3 v = (position + t * direction) * cellWidth;
+                    density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, x, i) * scale : extinctionAtVoxel(v),
+                                   density, brick.fade);
+                }
+                const float alpha = 1.f - exp(-(fade * density * opticalScale));
+                if (alpha > 1e-6f)
+                {
+                    const float3 v = (position + t * direction) * cellWidth;
+                    const uint desired = uint(max(log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias, 0.f));
+                    float depth;
+                    if (bakeable && level >= desired)
+                    {
+                        const float bakedDepth = cloudBrickSunAt(resolved.y >> 24, resolved.x, x) * instance.sourceVoxelWorld;
+                        const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
+                        const float farDepth = hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+                        depth = bakedDepth > kCloudSunDepthOpaque ? bakedDepth : bakedDepth + farDepth;
+                        ++baked;
+                    }
+                    else
+                    {
+                        // No bake the lean march would read: its own fallback, from the same few words.
+                        LeanHit hit;
+                        hit.entry = entry;
+                        hit.instance = instanceIndex;
+                        hit.levels = level | (desired << 8);
+                        hit.x = x;
+                        depth = leanSunDepth(v, footprint, hit, instance);
+                        ++fallback;
+                    }
+                    L += T * alpha * sunColour * exp(-depth);
+                }
+                T *= 1.f - alpha;
+            }
+        }
+        if (!counting)
+        {
+            hstrSpanRays[kSpanRayWords * ray + 4u] = uint4(asuint(L), asuint(T));
+            return;
+        }
+        // Against the march's own answer for this ray.
+        const float marchT = asfloat(h2.y);
+        const float3 marchL = asfloat(hstrSpanRays[kSpanRayWords * ray + 3u].xyz);
+        const float dT = abs(T - marchT);
+        const float dL = maxComponent(abs(L - marchL)) / max(maxComponent(marchL), 1e-3f);
+        uint unused;
+        InterlockedAdd(hstrSpanCounts[kSpanSpans], spans, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanEvaluated], samples, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanBaked], baked, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanFallback], fallback, unused);
+        if (dT > 1e-4f)
+            InterlockedAdd(hstrSpanCounts[kSpanMismatchT], 1u, unused);
+        if (dL > 1e-3f)
+            InterlockedAdd(hstrSpanCounts[kSpanMismatchL], 1u, unused);
+        InterlockedMax(hstrSpanCounts[kSpanMaxDT], asuint(dT), unused);
+        InterlockedMax(hstrSpanCounts[kSpanMaxDL], asuint(dL), unused);
     }
 
     bool beamWithCache() { return (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0; }
@@ -9868,6 +10108,33 @@ void writeBeamDirtyUnitArgs()
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
     gHSTRCloud.marchBeamDirtyListedUnit(foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// Span probe: the evaluator's dispatch, one thread per recorded ray (in rows, as the dirty passes'), from the recorded count.
+[numthreads(1, 1, 1)]
+void writeSpanArgs()
+{
+    uint capacity, stride;
+    gHSTRCloud.hstrSpanRays.GetDimensions(capacity, stride);
+    const uint rays = min(gHSTRCloud.hstrSpanCounts[kSpanRays], capacity / kSpanRayWords);
+    const uint groups = (rays + 63u) / 64u;
+    gHSTRCloud.hstrSpanArgs[0] = min(groups, kDirtyRow);
+    gHSTRCloud.hstrSpanArgs[1] = (groups + kDirtyRow - 1u) / kDirtyRow;
+    gHSTRCloud.hstrSpanArgs[2] = 1u;
+}
+
+/// Span probe: the timed evaluator (writes each ray's result only).
+[numthreads(64, 1, 1)]
+void evaluateSpans(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.evaluateSpanRay(foldedDirtyThread(groupId, groupThreadId.x), false);
+}
+
+/// Span probe: the same integration, untimed, compared with the march's and counted.
+[numthreads(64, 1, 1)]
+void checkSpans(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.evaluateSpanRay(foldedDirtyThread(groupId, groupThreadId.x), true);
 }
 
 /// Cell views: the build dispatch's arguments, one group per queued cell.
