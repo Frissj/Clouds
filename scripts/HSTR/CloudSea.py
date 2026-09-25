@@ -75,7 +75,6 @@ g.addPass(createPass("HSTRCloud", {
     # decided on the GPU (decideBeamPolicy). 4K sprint 2.93 -> 2.52 ms at 0.28 -> 0.48% over 0.02, jog 2.79 -> 2.66 at 0.58 ->
     # 0.85%, walk unchanged (policy4). Longer steps as well failed on jog's content (policy3).
     "beamPolicy": True,
-    "beamPolicyStep": 1.0,
     "beamPolicyTolerance": 0.05,
     "beamPolicyHeldLow": 0.05,
     "beamPolicyHeldHigh": 0.25,

@@ -257,7 +257,7 @@ for motion, forward, yaw, *rest in MOTIONS:
                                                                            "WarpHeld", "WarpListed", "WarpOn")},
                            # cellViews: the scored frame's composition (0 with it off).
                            # beamPolicy: the step scale and tile tolerance the scored frame's build decided.
-                           "policy": {"step": float(s.get("beamPolicyStepNow", 1.0)), "tolerance": float(s.get("beamPolicyToleranceNow", 0.0))},
+                           "policy": {"tolerance": float(s.get("beamPolicyToleranceNow", 0.0))},
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
                                                                                  "Built", "Steps")},
                            # beamPushProbe: the scored frame's cell x tile work count (absent with it off); spanProbe's too.

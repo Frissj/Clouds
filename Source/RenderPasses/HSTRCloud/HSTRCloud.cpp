@@ -447,11 +447,6 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamPolicy = bool(value);
             continue;
         }
-        if (key == "beamPolicyStep")
-        {
-            mBeamPolicyStep = value;
-            continue;
-        }
         if (key == "beamPolicyTolerance")
         {
             mBeamPolicyTolerance = value;
@@ -465,6 +460,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamPolicyHeldHigh")
         {
             mBeamPolicyHeldHigh = value;
+            continue;
+        }
+        if (key == "beamStripProbe")
+        {
+            mBeamStripProbe = value;
             continue;
         }
         if (key == "colorFormat")
@@ -1109,11 +1109,11 @@ Properties HSTRCloud::getProperties() const
     props["beamWarp"] = mBeamWarp;
     props["beamWarpAuto"] = mBeamWarpAuto;
     props["beamPolicy"] = mBeamPolicy;
-    props["beamPolicyStep"] = mBeamPolicyStep;
     props["beamPolicyTolerance"] = mBeamPolicyTolerance;
     props["beamPolicyHeldLow"] = mBeamPolicyHeldLow;
     props["beamPolicyHeldHigh"] = mBeamPolicyHeldHigh;
     props["colorFormat"] = mColorFormat;
+    props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
@@ -1482,7 +1482,6 @@ Properties HSTRCloud::getProperties() const
         cloud["beamWarpHeld"] = mBeamWarpHeld;
         cloud["beamWarpListed"] = mBeamWarpListed;
         cloud["beamWarpOn"] = mBeamWarpOn;
-        cloud["beamPolicyStepNow"] = mBeamPolicyStepNow;
         cloud["beamPolicyToleranceNow"] = mBeamPolicyToleranceNow;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
@@ -1695,6 +1694,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpBeamDirtyQueryStripPass = createPass("buildBeamDirtyQueries");
+    mpBeamDirtyMarchStripPass = createPass("marchBeamDirtyUnits");
     mpSpanArgsPass = createPass("writeSpanArgs");
     mpSpanEvalPass = createPass("evaluateSpans");
     mpSpanCheckPass = createPass("checkSpans");
@@ -4084,6 +4085,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+    pPass->getProgram()->addDefine("HSTR_STRIP", "0");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -5612,7 +5614,6 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     // The warp decision and beamPolicy, from this build's counts, only when it classified while
                                     // translating; a stationary build classifies nothing new and keeps the last (decideBeamPolicy).
                                     mParams.beamPolicy = mBeamPolicy ? 1u : 0u;
-                                    mParams.beamPolicyStep = mBeamPolicyStep;
                                     mParams.beamPolicyTolerance = mBeamPolicyTolerance;
                                     mParams.beamPolicyHeldLow = mBeamPolicyHeldLow;
                                     mParams.beamPolicyHeldHigh = mBeamPolicyHeldHigh;
@@ -5678,6 +5679,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         }
                                         pRenderContext->copyResource(mpBeamGuardCameraSnapshot.get(), mpBeamGuardCamera.get());
                                         pRenderContext->clearUAV(mpBeamProbeAccept->getUAV().get(), uint4(0));
+                                    }
+                                    if (mBeamStripProbe != 0)
+                                    {
+                                        // PROBE, before the real pass so it sees the same points needing a march; writes nothing.
+                                        FALCOR_PROFILE(pRenderContext, "queryStrip");
+                                        setBeamDirtyMarchDefines(mpBeamDirtyQueryStripPass);
+                                        mpBeamDirtyQueryStripPass->getProgram()->addDefine("HSTR_STRIP", std::to_string(mBeamStripProbe));
+                                        bindRenderer(pRenderContext, mpBeamDirtyQueryStripPass);
+                                        mpBeamDirtyQueryStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                                     }
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
@@ -5986,6 +5996,16 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     // The units to march were listed by the dirty tile pass (listBeamFailedTileUnits).
                     bindDirty(mpBeamDirtyUnitArgsPass);
                     mpBeamDirtyUnitArgsPass->execute(pRenderContext, uint3(1));
+                    if (mBeamStripProbe != 0)
+                    {
+                        // PROBE: the same units, stripped, writing nothing (see mBeamStripProbe).
+                        FALCOR_PROFILE(pRenderContext, "unitsStrip");
+                        mpBeamDirtyMarchStripPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
+                        setBeamDirtyMarchDefines(mpBeamDirtyMarchStripPass);
+                        mpBeamDirtyMarchStripPass->getProgram()->addDefine("HSTR_STRIP", std::to_string(mBeamStripProbe));
+                        bindDirty(mpBeamDirtyMarchStripPass);
+                        mpBeamDirtyMarchStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
+                    }
                     {
                         FALCOR_PROFILE(pRenderContext, "units");
                         bindDirty(mpBeamDirtyMarchPass);
@@ -6067,7 +6087,6 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mBeamWarpHeld = mpBeamDirtyCount->getElement<uint32_t>(2);
             }
             mBeamWarpOn = mpBeamWarpArgs && mBeamWarpAuto > 0.f ? mpBeamWarpArgs->getElement<uint32_t>(9) : uint32_t(mBeamWarp);
-            mBeamPolicyStepNow = mpBeamWarpArgs && mBeamPolicy ? math::asfloat(mpBeamWarpArgs->getElement<uint32_t>(10)) : 1.f;
             mBeamPolicyToleranceNow =
                 mpBeamWarpArgs && mBeamPolicy ? math::asfloat(mpBeamWarpArgs->getElement<uint32_t>(11)) : mParams.beamTolerance;
         }

@@ -144,7 +144,7 @@ CloudSea::Tile CloudSea::makeTile(int2 world) const
     tile.instance.asset = assetID;
     tile.instance.sourceVoxelWorld = sourceVoxelWorld;
     tile.instance.proxyLevel = std::log2(mVoxelWorld / sourceVoxelWorld);
-    tile.instance.occupied = tile.occupied ? 1u : 0u;
+    tile.instance.scale = tile.occupied ? scale : 0.f;
     const float3 tileCorner = mDesc.origin + float3(float(world.x), 0.f, float(world.y)) * mDesc.tileWorld;
     tile.worldMin = tileCorner + offset;
     tile.worldMax = tileCorner + offset + footprint;

@@ -26,6 +26,11 @@ import HSTRCloudTypes;
 #define HSTR_SHIP 0
 #endif
 /// beamWarp: the resolve reads a held guard block where its capture camera saw the content (beamWarpPosition).
+/// PROBE (mBeamStripProbe): the dirty query and unit passes' timing copies. 1 returns after the ray setup, 2 marches one step,
+/// 3 the full march; each computes and never writes (beamStripSink). 0: the real passes.
+#ifndef HSTR_STRIP
+#define HSTR_STRIP 0
+#endif
 #ifndef HSTR_BEAM_WARP
 #define HSTR_BEAM_WARP 0
 #endif
@@ -204,8 +209,17 @@ struct LeanHit
 {
     uint entry;
     uint instance;
-    uint levels; ///< level | desired << 8.
+    uint levels; ///< level | desired << 8 | the instance's sunClass << 16.
     float3 x;
+    /// The instance's sourceVoxelWorld and scale, taken while leanExtinction holds its record, so the lit sample's sun chain starts
+    /// at the resolved bake instead of reloading the instance and then its asset.
+    /// MEASURED (sunhit1-4, 4K, errors identical in every arm): a first version slower (walk 2.10 / 2.04 -> 2.13 / 2.07 ms) because
+    /// it grew the instance record to 84 bytes, off its 16-byte alignment, for every density sample's instance load; at 80 bytes
+    /// (scale took the occupied flag's word) within noise alone (sunhit2/3). With the march's per-ray registers cut - the
+    /// policy's step scale out (sunhit3: sprint -0.07 ms) and voxelsPerUnit's reciprocal in place of two values - carry + reciprocal
+    /// against reload in the same run (sunhit4): walk 2.066 / 2.033 -> 2.047 / 2.000 ms, sprint 2.414 / 2.416 -> 2.403 / 2.393.
+    float scale;
+    float near;
 };
 
 /// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
@@ -460,7 +474,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch, [4..6] its warped one.
     /// beamWarpAuto (writeBeamWarpArgs): [0..2] the warp field's dispatch, [3..5] the warped resolve's, [6..8] the plain resolve's -
     /// one of the two resolves gets no groups - and [9] the decision (1: warp), kept across builds that do not classify.
-    /// beamPolicy (decideBeamPolicy): [10] the march step scale and [11] the tile tolerance, as float bits.
+    /// beamPolicy (decideBeamPolicy): [11] the tile tolerance, as float bits ([10] unused).
     RWStructuredBuffer<uint> hstrBeamWarpArgs;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
@@ -890,7 +904,7 @@ struct HSTRCloudRenderer
         instanceIndex = slot.x + tiles.x * slot.y;
         const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
         instanceOut = instance;
-        if (instance.occupied == 0)
+        if (!(instance.scale > 0.f)) // An empty tile.
             return false;
         footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
         if (footprintLevel >= instance.proxyLevel)
@@ -4304,6 +4318,11 @@ struct HSTRCloudRenderer
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
             return result;
+#if HSTR_STRIP == 1
+        // PROBE: the ray setup alone; its result depends on the ray so the setup is not compiled away.
+        result.depth = ray.worldLength + ray.entryDistance;
+        return result;
+#endif
         ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
         float transmittance = 1.f;
         uint steps = 0;
@@ -4400,7 +4419,7 @@ struct HSTRCloudRenderer
             float unused;
             HSTRCloudInstance instance;
             cloudInstanceAt(seaVoxel(centre), distance * k, instanceIndex, x, unused, instance);
-            if (instance.occupied != 0)
+            if (instance.scale > 0.f)
             {
                 const float sv = instance.sourceVoxelWorld;
                 const float level = log2(max(distance * k / sv, 1.f)) + params.cloudLodBias;
@@ -4427,7 +4446,7 @@ struct HSTRCloudRenderer
         float unused;
         HSTRCloudInstance instance;
         cloudInstanceAt(seaVoxel(centre), 0.f, instanceIndex, x, unused, instance);
-        return instance.occupied != 0 ? min(instance.sourceVoxelWorld / params.seaVoxelSize.x, 1.f) : 1.f;
+        return instance.scale > 0.f ? min(instance.sourceVoxelWorld / params.seaVoxelSize.x, 1.f) : 1.f;
     }
 
     /// Ray parameters where the ray origin + t dv enters and leaves the box [lo, lo + 1].
@@ -6232,6 +6251,8 @@ struct HSTRCloudRenderer
         hit.instance = 0;
         hit.levels = 0;
         hit.x = 0.f;
+        hit.scale = 0.f;
+        hit.near = 0.f;
         skipTo = -1.f;
         fineVoxels = 1.f;
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
@@ -6263,8 +6284,10 @@ struct HSTRCloudRenderer
         }
         hit.entry = sample.entry;
         hit.instance = instanceIndex;
-        hit.levels = sample.level | (sample.desired << 8);
+        hit.levels = sample.level | (sample.desired << 8) | (instance.sunClass << 16);
         hit.x = x;
+        hit.scale = instance.sourceVoxelWorld;
+        hit.near = instance.scale;
         const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
         const int3 i = int3(floor(x + 0.5f));
         float density = cloudBrickDensity(sample.entry, x, i) * scale;
@@ -6274,24 +6297,26 @@ struct HSTRCloudRenderer
     }
 
     /// sunDepthAt for a lean sample, from the few words of it the lean march kept.
-    float leanSunDepth(float3 v, float footprint, LeanHit hit, HSTRCloudInstance instance)
+    float leanSunDepth(float3 v, float footprint, LeanHit hit)
     {
 #if (HSTR_SHIP & 2048) != 0
         // The frame's resolved bake (resolveCloudSunSlots): sunDepthAt's baked branch without the key search. Anything else - no
         // bake of the brick or an ancestor, a brick coarser than the footprint asked for, no near reach - takes sunDepthAt below.
-        // instance is hit.instance's record.
-        if (hit.entry != kCloudRefNone && params.sunNearVoxels > 0.f && SHIP(cloudSunCache, 1u) != 0 && (hit.levels & 255u) >= (hit.levels >> 8))
+        // The hit carries what the bake needs from the instance (see LeanHit).
+        if (hit.entry != kCloudRefNone && params.sunNearVoxels > 0.f && SHIP(cloudSunCache, 1u) != 0 &&
+            (hit.levels & 255u) >= ((hit.levels >> 8) & 255u))
         {
-            const uint2 resolved = hstrCloudSunResolved[hit.entry * kCloudSunClasses + instance.sunClass];
+            const float sourceVoxelWorld = hit.scale;
+            const float near = params.sunNearVoxels * hit.near;
+            const uint2 resolved = hstrCloudSunResolved[hit.entry * kCloudSunClasses + (hit.levels >> 16)];
             if (resolved.x != kCloudRefNone)
             {
                 // The far field fetched beside the bake rather than after it: its address never depended on the bake, only the
                 // opaque early-out did, which put one more memory round trip in series on every lit sample. Exact.
                 // MEASURED (leanchain1, 4K, errors identical): walk 6.02 / 6.02 -> 5.97 ms, sprint 7.50 / 7.51 -> 7.46.
-                const float near = params.sunNearVoxels * instance.sourceVoxelWorld / hstrCloudAssets[instance.asset].sourceVoxelWorld;
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
                 const float farDepth = hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
-                const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * instance.sourceVoxelWorld;
+                const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * sourceVoxelWorld;
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
         }
@@ -6301,7 +6326,7 @@ struct HSTRCloudRenderer
         sample.entry = hit.entry;
         sample.instance = hit.instance;
         sample.level = hit.levels & 255u;
-        sample.desired = hit.levels >> 8;
+        sample.desired = (hit.levels >> 8) & 255u;
         sample.x = hit.x;
         return sunDepthAt(v, footprint, sample);
     }
@@ -6334,12 +6359,16 @@ struct HSTRCloudRenderer
         const float voxelsPerUnit = length(ray.direction) * cellWidth;
         if (voxelsPerUnit <= 1e-6f)
             return;
-        const float worldPerVoxel = ray.worldLength / voxelsPerUnit;
+        // One per-ray value where there were two (voxelsPerUnit, worldPerVoxel): the reciprocal, the world distance per voxel
+        // taken from worldLength (live anyway) per step, and the step divides as multiplies. With the sun fields carried in the
+        // hit (LeanHit): sunhit4 below.
+        const float unitsPerVoxel = 1.f / voxelsPerUnit;
         const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
-        // beamPolicy: the step bounds scaled by what this build's motion lets the steps spend (1 when off).
-        const float stepScale = beamPolicyStepScale();
-        const float minStepVoxels = params.minStepVoxels * stepScale;
-        const float maxStepVoxels = params.maxStepVoxels * stepScale;
+        // The step bounds as set. MEASURED and REMOVED (sunhit3, 4K, errors identical): beamPolicy scaling them per build (a
+        // scale read from a buffer, so both bounds became live registers instead of constant-buffer values) cost walk 0.02-0.03
+        // and sprint 0.07 ms at scale 1 - and longer steps had already failed on jog's content (policy3).
+        const float minStepVoxels = params.minStepVoxels;
+        const float maxStepVoxels = params.maxStepVoxels;
         float fineVoxels = 1.f;
         float t = segment.x;
 #if (HSTR_SHIP & 4096) != 0
@@ -6366,13 +6395,14 @@ struct HSTRCloudRenderer
         // wave lit the parked samples together once pending * K >= lanes in the loop. Walk 6.01 / 6.03 -> 9.34 / 6.57 / 6.37 ms at
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
+        const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
         [loop]
-        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < params.maxMarchSteps)
+        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
             const float3 v = (ray.position + t * ray.direction) * cellWidth;
             const float majorant = majorantAt(v);
             const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * minStepVoxels;
-            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * worldPerVoxel), minimumStep, maxStepVoxels);
+            const float stepVoxels = clamp(params.stepOpticalDepth / max(1e-6f, majorant * ray.worldLength * unitsPerVoxel), minimumStep, maxStepVoxels);
 #if (HSTR_SHIP & (16384 | 32768)) != 0
             // Transmittance-scaled steps (an approximation, judged against the path-traced reference): a step's error reaches the
             // pixel weighted by the transmittance in front of it, so behind transmittance T the step may grow by 1 / sqrt(T), up to
@@ -6383,9 +6413,9 @@ struct HSTRCloudRenderer
             // steps 2.49 ms 1.650%, 3x 2.32 ms 2.481%; sprint 2.90 ms 0.283% -> 3.16 ms 0.238%. The error falls 16-25% but the
             // extra steps cost ~0.25 ms, and the unjittered shorter step dominates on both axes.
             const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
-            const float dt = min(boost * stepVoxels / voxelsPerUnit, segment.y - t);
+            const float dt = min(boost * stepVoxels * unitsPerVoxel, segment.y - t);
 #else
-            const float dt = min(stepVoxels / voxelsPerUnit, segment.y - t);
+            const float dt = min(stepVoxels * unitsPerVoxel, segment.y - t);
 #endif
             float next = t + dt;
 #if (HSTR_SHIP & 4096) != 0
@@ -6446,19 +6476,18 @@ struct HSTRCloudRenderer
 #endif
                 if (alpha > 1e-6f)
                 {
-                    if (residual)
-                    {
-                        const HSTRCloudInstance instance = hstrCloudInstances[hit.instance];
-                        residualRadiance +=
-                            transmittance * alpha * residualAtDepth(midpoint, leanSunDepth(midpoint, footprint, hit, instance), ray.sunOctaves);
-                    }
+                    // PROBE (HSTR_STRIP 4 / 5 / 6): density alone, density + sun, density + cache.
+                    if (residual && HSTR_STRIP != 4 && HSTR_STRIP != 6)
+                        residualRadiance += transmittance * alpha * residualAtDepth(midpoint, leanSunDepth(midpoint, footprint, hit), ray.sunOctaves);
                     // The cache at every contributing sample: the shipping lightingStride 1, and the only stride this march takes.
                     // MEASURED and REMOVED (leanstride1, 4K walk / sprint): holding it over 2 / 4 / 8 samples (never across a cache
                     // cell) saved nothing - 6.39 -> 6.37 / 6.38 / 6.64 ms - for 0.137% -> 0.153% / 1.048% / 4.985% of walk over 0.02,
                     // and carrying the hold state cost ~0.3 ms even at stride 1 (6.06 in leanflat2). The cache is not what this waits on.
                     // MEASURED and REMOVED (leanchain1, 4K, errors identical): the cache evaluated ahead of the sun chain, so its
                     // independent fetches would not wait behind it - walk 6.02 -> 6.53 ms, sprint 7.50 -> 8.09. Codegen, not memory.
-                    if (withSource)
+                    // MEASURED and REMOVED (sunhit3, errors identical): the view direction recomputed per lit sample, normalize(ray.direction),
+                    // instead of held along the ray - no change (walk 2.074 -> 2.071 ms, sprint 2.400 -> 2.409).
+                    if (withSource && HSTR_STRIP != 4 && HSTR_STRIP != 5)
                         radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
                 }
                 opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
@@ -6641,9 +6670,11 @@ struct HSTRCloudRenderer
                         LeanHit hit;
                         hit.entry = entry;
                         hit.instance = instanceIndex;
-                        hit.levels = level | (desired << 8);
+                        hit.levels = level | (desired << 8) | (instance.sunClass << 16);
                         hit.x = x;
-                        depth = leanSunDepth(v, footprint, hit, instance);
+                        hit.scale = instance.sourceVoxelWorld;
+                        hit.near = instance.scale;
+                        depth = leanSunDepth(v, footprint, hit);
                         ++fallback;
                     }
                     L += T * alpha * sunColour * exp(-depth);
@@ -8101,8 +8132,7 @@ struct HSTRCloudRenderer
         hstrBeamWarpFieldOutput[texel] = warped - position;
     }
 
-    /// beamPolicy's march step scale and tile tolerance for this build (decideBeamPolicy); off, the parameters as set.
-    float beamPolicyStepScale() { return params.beamPolicy != 0 ? asfloat(hstrBeamWarpArgs[10]) : 1.f; }
+    /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
     float beamPolicyTolerance() { return params.beamPolicy != 0 ? asfloat(hstrBeamWarpArgs[11]) : params.beamTolerance; }
 
     /// Where the resolve reads a beam-image position under beamWarp: the field's offset, interpolated between lattice points.
@@ -8767,11 +8797,23 @@ struct HSTRCloudRenderer
 #endif
 
     /// The residual march itself, for a unit beamUnitNeedsMarch has passed.
+    /// PROBE (HSTR_STRIP): keeps a stripped march's work without writing it - the condition cannot hold for a real sample, but
+    /// the compiler cannot know that.
+    void beamStripSink(BeamSample s)
+    {
+        if (s.depth + s.distance + s.steps + dot(s.cache + s.single, 1.f) == -1.f)
+            InterlockedAdd(hstrBeamDirtyCount[2], 1u);
+    }
+
     void marchBeamUnitExact(uint2 unit)
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+#if HSTR_STRIP != 0
+        beamStripSink(exact);
+        return;
+#endif
         hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
@@ -10239,6 +10281,10 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     if (!march)
         return;
     BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+#if HSTR_STRIP != 0
+    gHSTRCloud.beamStripSink(ray);
+    return;
+#endif
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
     gHSTRCloud.beamQueryMarched(position, ray);
@@ -10600,10 +10646,10 @@ void writeBeamResidualArgs()
 }
 
 /// Right after the classification, from the held and listed guard blocks it just counted (hstrBeamDirtyCount[2] and [0]): whether
-/// the resolve warps (beamWarpAuto) and the march step scale and tile tolerance (beamPolicy), for this build's query, tiles and
-/// units and its resolve. Only a build that classified while translating runs it; any other keeps the last decision. On the GPU,
-/// so the decision is this frame's and nothing waits on a readback. Sprint expires every block, so it holds none: no warp, and
-/// the error its held blocks would have carried goes into longer steps and a looser tile test instead.
+/// the resolve warps (beamWarpAuto) and the tile tolerance (beamPolicy), for this build's tiles and its resolve. Only a build that
+/// classified while translating runs it; any other keeps the last decision. On the GPU, so the decision is this frame's and nothing
+/// waits on a readback. Sprint expires every block, so it holds none: no warp, and the error its held blocks would have carried
+/// goes into a looser tile test instead.
 [numthreads(1, 1, 1)]
 void decideBeamPolicy()
 {
@@ -10616,7 +10662,6 @@ void decideBeamPolicy()
     if (p.beamPolicy != 0)
     {
         const float s = saturate((p.beamPolicyHeldHigh - share) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
-        gHSTRCloud.hstrBeamWarpArgs[10] = asuint(lerp(1.f, p.beamPolicyStep, s));
         gHSTRCloud.hstrBeamWarpArgs[11] = asuint(lerp(p.beamTolerance, p.beamPolicyTolerance, s));
     }
 }

@@ -109,7 +109,9 @@ struct HSTRCloudInstance
     uint asset;
     float sourceVoxelWorld; ///< World size of one source voxel of this instance.
     float proxyLevel;       ///< Pyramid level whose voxels are as coarse as the domain proxy: from here on the proxy is used.
-    uint occupied;
+    /// The instance's scale (sourceVoxelWorld over its asset's), which the lit sample's sun reach needs without the asset record;
+    /// 0 for a tile with no cloud (what an occupied flag held here before, so the record stays 80 bytes, 16-byte aligned).
+    float scale;
     uint sunClass; ///< Orientation class (the signed permutation of the rows): instances of one class share baked sun depth.
     /// The asset's resolved level pages (hstrCloudLevelPages), copied here so a camera sample never loads the asset record.
     uint levelPageBase;
@@ -1288,15 +1290,15 @@ struct HSTRCloudParams
     /// decideBeamPolicy.
     float beamWarpAuto = 0.f;
     /// beamPolicy: the guard-driven beam view spends the error its held blocks do not, from the held share h this build classified
-    /// (decideBeamPolicy): s = saturate((beamPolicyHeldHigh - h) / (beamPolicyHeldHigh - beamPolicyHeldLow)), the march steps
-    /// scaled by lerp(1, beamPolicyStep, s) and the tile tolerance lerp(beamTolerance, beamPolicyTolerance, s). 0: off.
+    /// (decideBeamPolicy): s = saturate((beamPolicyHeldHigh - h) / (beamPolicyHeldHigh - beamPolicyHeldLow)), and the tile
+    /// tolerance lerp(beamTolerance, beamPolicyTolerance, s). 0: off.
     uint beamPolicy = 0;
-    float beamPolicyStep = 1.f;
     float beamPolicyTolerance = 0.f;
     float beamPolicyHeldLow = 0.f;
     float beamPolicyHeldHigh = 1.f;
-    uint beamPolicyPad0 = 0; ///< With beamPolicyPad1, keeps the fields after these on their 16-byte alignment.
+    uint beamPolicyPad0 = 0; ///< With beamPolicyPad1 and 2, keeps the fields after these on their 16-byte alignment.
     uint beamPolicyPad1 = 0;
+    uint beamPolicyPad2 = 0;
     /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
     uint cloudSunAncestors = kCloudSunAncestors;
     /// PROBE (beamRepairProbe only): 1 + signature * kBeamProbePolicies + policy makes the dirty query keep the OLD lattice values of

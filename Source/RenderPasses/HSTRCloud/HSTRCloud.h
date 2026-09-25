@@ -297,18 +297,22 @@ private:
     /// warped resolve cost it ~0.13 ms for nothing. Decided on the GPU (writeBeamWarpArgs): both resolve variants are dispatched
     /// indirectly and the one not chosen gets no groups.
     float mBeamWarpAuto = 0.25f;
-    uint32_t mColorFormat = 1; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
+    uint32_t mColorFormat = 1;
+    /// PROBE: after the real dirty query and unit passes, a copy of each over the same list (queryStrip, unitsStrip) compiled with
+    /// HSTR_STRIP = this: 1 returns after the ray setup, 2 marches one step, 3 the full march (the warm-cache calibration). The
+    /// copies compute and never write, so the image and the next frame's work are the real passes'. 0: off.
+    uint32_t mBeamStripProbe = 0;
+    ref<ComputePass> mpBeamDirtyQueryStripPass;
+    ref<ComputePass> mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     ref<ComputePass> mpBeamWarpArgsPass;
     ref<ComputePass> mpBeamPolicyPass; ///< decideBeamPolicy: the warp decision and beamPolicy's step scale and tolerance.
     /// beamPolicy (see HSTRCloudParams): what a build holding few guard blocks spends on a looser tile test (and could on longer
     /// steps, which fail on harder content: policy3). Shipped tolerance-only, 0.01 -> 0.05 as the held share falls 0.25 -> 0.05.
     bool mBeamPolicy = true;
-    float mBeamPolicyStep = 1.f;
     float mBeamPolicyTolerance = 0.05f;
     float mBeamPolicyHeldLow = 0.05f;
     float mBeamPolicyHeldHigh = 0.25f;
-    float mBeamPolicyStepNow = 1.f;      ///< The compared frame's step scale ...
-    float mBeamPolicyToleranceNow = 0.f; ///< ... and tolerance (stats, read with the comparison).
+    float mBeamPolicyToleranceNow = 0.f; ///< The compared frame's tolerance (stats, read with the comparison).
     ref<ComputePass> mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
     ref<ComputePass> mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
     ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.
