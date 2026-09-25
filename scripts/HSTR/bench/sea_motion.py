@@ -192,11 +192,16 @@ if any(motion.startswith("near") for motion, *_ in MOTIONS):
     NEAR_POSITION = best[1]
     ORIGIN = START_POSITION
     log(f"near pose {NEAR_POSITION}")
+# Every key any arm sets, at the value it had before the first arm: an arm that does not set a key gets this back, not the last
+# arm's. Without it a key set by one arm stayed on for every arm after it - budgetwarp1 / budgetwarp2 scored walk "par 8" with
+# the previous arm's beamWarp still on, which read as run-to-run variation (1.439 / 0.960% against 1.985%) and got a working
+# warp removed.
+PRIOR = {k: hstr.properties[k] for test, properties in TESTS for k in properties if k not in BASE and k in hstr.properties}
 for motion, forward, yaw, *rest in MOTIONS:
     ORIGIN = NEAR_POSITION if motion.startswith("near") else START_POSITION
     sun = float(rest[0]) if rest else SUN_RATE
     for test, properties in TESTS:
-        hstr.set_properties(dict(BASE, **properties))
+        hstr.set_properties(dict(BASE, **dict(PRIOR, **properties)))
         # Every arm starts from an empty beam image. The reference frame re-anchors on its own so it hardly noticed, but the
         # octahedral image is fixed to the world and persists until its dimensions change: without this an arm inherits the
         # directions its predecessors marched, and one configuration measured 0.36 ms and then 2.41 ms in consecutive runs while
