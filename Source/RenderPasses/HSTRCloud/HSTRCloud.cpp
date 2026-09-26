@@ -1756,15 +1756,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpPushSortPass = createPass("sortPushTiles");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
     mpBeamDirtyFusedSetupPass = createPass("setupBeamDirtyFused");
-    {
-        // TEMPORARY: the generated HLSL, to check the coherence qualifiers survive the parameter block's legalisation.
-        ProgramDesc desc;
-        desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary(kShaderFile).csEntry("runBeamDirtyFused");
-        desc.addTypeConformances(mpScene->getTypeConformances());
-        desc.compilerFlags = SlangCompilerFlags::DumpIntermediates;
-        mpBeamDirtyFusedPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
-    }
+    mpBeamDirtyFusedPass = createPass("runBeamDirtyFused");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramidTiles");
