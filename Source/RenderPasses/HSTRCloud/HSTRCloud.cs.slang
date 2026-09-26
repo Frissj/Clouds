@@ -9742,6 +9742,12 @@ struct HSTRCloudRenderer
         // build marched this very ray and its value sits at this very index. Nothing is reprojected and nothing is resampled: the
         // only thing that can invalidate it is the camera having MOVED, which parallax answers. This is the whole point of the
         // frame - rotation costs nothing, and the resampling that "tripled the error" for a turning camera cannot happen.
+#if HSTR_DIRTY_FUSED
+        // The fused chain only runs with the reference frame and the guard (mBeamFusedBuild), where this is always false below.
+        // MEASURED (ngfx15, 4K sprint): compiled in, beamPreviousLattice's corner loop held the fused kernel's peak, 126 live
+        // registers (allocated 128, 16 warps an SM, where the separate query's 96 gets 20).
+        return false;
+#endif
         if (params.beamRefFrame != 0)
         {
             // With the guard, a point whose block is certified never gets here (beamQueryNeedsMarch keeps it as it is), so one
@@ -10608,35 +10614,22 @@ uint fusedBackoff(uint idle)
 [numthreads(64, 1, 1)]
 void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
 {
-    const HSTRCloudParams p = gHSTRCloud.params;
-    const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], p.beamDirtyCapacity);
-    const uint rb = max(p.beamDirtyPointStride, 1u);
-    const uint per = rb * rb * (p.beamCentreless != 0 ? 1u : 2u);
-    const uint rays = blocks * per;
-    const uint side = max(p.beamDirtyBlockEdge / max(p.beamTileSize, 1u), 1u);
-    const uint padded = side + 2u * kBeamDirtyApron;
-    const uint items = blocks * padded * padded;
     const uint lane = WaveGetLaneIndex();
-    uint idle = 0;
-    uint sink = 0;
-    // Once the rays run out, waves stop asking for them: the counter's line is left to the block and unit publications.
-    bool raysLeft = true;
-    // Units this wave has claimed and not yet marched, [pending, pendingEnd): a claim may run past what is published, and the
-    // wave goes on testing tiles while it waits rather than waiting on units that only tile tests can list.
-    uint pending = 0;
-    uint pendingEnd = 0;
-    const uint stage = p.beamFusedStage;
-    if (stage == 1u)
+    if (gHSTRCloud.params.beamFusedStage == 1u)
         return;
-    for (;;)
+    // Query rays, a wave's width at a time (4 blocks of 8 at 32 lanes, as the query pass's groups held them), until they run out:
+    // a wave that finds none never comes back for more. Only this loop's own few values are live across the march - MEASURED
+    // (ngfx16, 4K sprint): as one loop with the tile and unit phases, their state (params copy, block, item and unit counts,
+    // claims) held the fused kernel at 128 registers, the peak inside marchBeam's brick lookup, where the separate query takes 96.
     {
-        if (fusedWavePoll(kFusedAbort) != 0)
-            return; // Diagnostic: a wait gave up.
-        // Query rays, a wave's width at a time (4 blocks of 8 at 32 lanes, as the query pass's groups held them).
-        uint2 claim = raysLeft ? fusedTake(kFusedRayNext, rays) : uint2(0, 0);
-        raysLeft = claim.y != 0;
-        if (claim.y != 0)
+        const uint rb = max(gHSTRCloud.params.beamDirtyPointStride, 1u);
+        const uint per = rb * rb * (gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u);
+        const uint rays = min(gHSTRCloud.hstrBeamDirtyCount[0], gHSTRCloud.params.beamDirtyCapacity) * per;
+        for (;;)
         {
+            const uint2 claim = fusedTake(kFusedRayNext, rays);
+            if (claim.y == 0)
+                break;
             const uint ray = claim.x + lane;
             bool completed = false;
             uint index = 0;
@@ -10676,13 +10669,30 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 if (completed)
                 {
                     uint unused;
-                    InterlockedExchange(gFusedBlocks[p.beamDirtyCapacity + base + WavePrefixCountBits(completed)], index + 1u, unused);
+                    InterlockedExchange(gFusedBlocks[gHSTRCloud.params.beamDirtyCapacity + base + WavePrefixCountBits(completed)],
+                                        index + 1u, unused);
                 }
             }
-            continue;
         }
-        if (stage == 2u)
-            break;
+    }
+    const HSTRCloudParams p = gHSTRCloud.params;
+    const uint stage = p.beamFusedStage;
+    if (stage == 2u)
+        return;
+    const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], p.beamDirtyCapacity);
+    const uint side = max(p.beamDirtyBlockEdge / max(p.beamTileSize, 1u), 1u);
+    const uint padded = side + 2u * kBeamDirtyApron;
+    const uint items = blocks * padded * padded;
+    uint idle = 0;
+    uint sink = 0;
+    // Units this wave has claimed and not yet marched, [pending, pendingEnd): a claim may run past what is published, and the
+    // wave goes on testing tiles while it waits rather than waiting on units that only tile tests can list.
+    uint pending = 0;
+    uint pendingEnd = 0;
+    for (;;)
+    {
+        if (fusedWavePoll(kFusedAbort) != 0)
+            return; // Diagnostic: a wait gave up.
         // Items and units are claimed with one add each, like the rays, once a read shows some are there: a claim may run past what
         // is written, and then waits for it. MEASURED (ngfx10, 4K sprint): claimed by compare-exchange instead, ~1,300 waves
         // retried one counter for ~1.1M tile items and the units - 84% of the kernel's samples on the retry's compare, 15 ms.
@@ -10691,7 +10701,7 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
         const uint reserved = WaveReadLaneFirst(gFusedState[kFusedBlocksReserved]);
         if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) < min(reserved * padded * padded, items))
         {
-            claim = fusedTake(kFusedItemNext, items);
+            const uint2 claim = fusedTake(kFusedItemNext, items);
             if (claim.y != 0)
             {
                 const uint item = claim.x + lane;
