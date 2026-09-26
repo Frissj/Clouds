@@ -32,13 +32,17 @@ parser.add_argument("--nsys", action="store_true",
                     help="wrap the headless Mogwai in Nsight Systems with GPU metrics; report at HSTR_results/nsight/TAG.nsys-rep "
                          "(nsys.exe is set to run as administrator in its compatibility settings, which GPU metrics need)")
 parser.add_argument("--nsys-set", default="", help="--nsys: the GPU metric set (nsys --gpu-metrics-set), e.g. ad10x-gfxt; default set if empty")
+parser.add_argument("--ngfx", nargs=2, type=int, metavar=("START", "STOP"),
+                    help="Nsight Graphics GPU Trace of flight frames [START, STOP) (0..47) of each timed flight (motion harness); "
+                         "reports at HSTR_results/ngfx/TAG_<motion>_<arm>_f<START>-<STOP>.ngfx-gputrace")
+parser.add_argument("--ngfx-metrics", default="Throughput Metrics", help="--ngfx: the Ada metric set name")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
-from elevate import NSYS, elevate, run_hidden  # noqa: E402
+from elevate import NGFX, NSYS, elevate, run_hidden  # noqa: E402
 
-if args.nsys:
-    elevate(__file__, ROOT)  # nsys needs admin; see elevate.py. Mogwai stays --headless.
+if args.nsys or args.ngfx:
+    elevate(__file__, ROOT)  # nsys / ngfx need admin for GPU counters; see elevate.py. Mogwai stays --headless.
 from sea_config import REFERENCE  # noqa: E402
 
 tests = runpy.run_path(args.sweep)["TESTS"]
@@ -71,8 +75,18 @@ if args.nsys:
     env.update(HSTR_NSYS=NSYS, HSTR_NSYS_SESSION=session, HSTR_NSYS_OUTPUT=str(RESULTS / "nsight" / args.tag),
                HSTR_NSYS_SET=args.nsys_set)
     command = [NSYS, "launch", f"--session-new={session}", "--trace=dx12,dx12-annotations,nvtx", "--wait=all"] + command
+if args.ngfx:
+    # Nsight Graphics GPU Trace: ngfx launches Mogwai with the trace injected and idle; sea_motion.py starts it before flight frame
+    # START and stops it after frame STOP-1 through the SDK (Mogwai's gpuTraceStart/Stop), so only those frames are traced.
+    # No --platform: ngfx is a Qt program and Qt takes --platform as its own option ("no Qt platform plugin could be initialized").
+    (RESULTS / "ngfx").mkdir(exist_ok=True)
+    env["HSTR_NGFX"] = f"{args.ngfx[0]} {args.ngfx[1]}"
+    command = [NGFX, "--activity", "GPU Trace Profiler", "--exe", str(MOGWAI), "--dir", str(ROOT),
+               "--args", subprocess.list2cmdline(command[1:]), "--output-dir", str(RESULTS / "ngfx"), "--no-timeout",
+               "--start-with-ngfx-sdk", "--stop-with-ngfx-sdk", "--architecture", "Ada", "--metric-set-name", args.ngfx_metrics,
+               "--auto-export"]
 with open(log, "w") as f:
-    (run_hidden if args.nsys else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
+    (run_hidden if args.nsys or args.ngfx else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
 errors = [line for line in open(log, errors="replace") if "(Error)" in line or "Exception" in line or "Error when loading" in line or "RuntimeError" in line]
 if errors:
     print("".join(errors[:5]))

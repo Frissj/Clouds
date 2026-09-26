@@ -9,6 +9,7 @@ from pathlib import Path
 # program started through ShellExecute gets a console window whatever nShow says - Windows Terminal ignores SW_HIDE - and pythonw
 # has none), waits for it and exits; in the elevated copy it returns and everything the script starts inherits the elevation.
 NSYS = r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.5.1\target-windows-x64\nsys.exe"
+NGFX = r"C:\Program Files\NVIDIA Corporation\Nsight Graphics 2026.3.1\host\windows-desktop-nomad-x64\ngfx.exe"
 
 
 class _ShellExecuteInfo(ctypes.Structure):

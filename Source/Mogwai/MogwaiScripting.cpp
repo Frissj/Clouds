@@ -27,6 +27,8 @@
  **************************************************************************/
 #include "Falcor.h"
 #include "Mogwai.h"
+#include "Extensions/Profiler/GpuTrace.h"
+#include "Core/API/NativeHandleTraits.h"
 #include "RenderGraph/RenderGraphIR.h"
 #include "RenderGraph/RenderGraphImportExport.h"
 #include "Utils/Scripting/Scripting.h"
@@ -154,6 +156,16 @@ namespace Mogwai
         renderer.def_property_readonly(kActiveGraph.c_str(), &Renderer::getActiveGraph);
         renderer.def_property_readonly(kClock.c_str(), [] (Renderer* pRenderer) { return &pRenderer->getGlobalClock(); });
         renderer.def_property_readonly(kProfiler.c_str(), [] (Renderer* pRenderer) { return pRenderer->getDevice()->getProfiler(); });
+
+        // Nsight Graphics GPU Trace around chosen frames (Mogwai under ngfx --start-with-ngfx-sdk --stop-with-ngfx-sdk).
+        auto traceQueue = [](Renderer* pRenderer)
+        {
+            RenderContext* pContext = pRenderer->getDevice()->getRenderContext();
+            pContext->submit(true); // Earlier frames stay out of the trace; stop likewise sees every traced frame submitted.
+            return pContext->getLowLevelData()->getCommandQueueNativeHandle().as<ID3D12CommandQueue*>();
+        };
+        renderer.def("gpuTraceStart", [traceQueue](Renderer* pRenderer) { gpuTraceStart(traceQueue(pRenderer)); });
+        renderer.def("gpuTraceStop", [traceQueue](Renderer* pRenderer) { return gpuTraceStop(traceQueue(pRenderer)); });
 
         auto getUI = [](Renderer* pRenderer) { return pRenderer->isUiEnabled(); };
         auto setUI = [](Renderer* pRenderer, bool show) { pRenderer->toggleUI(show); };

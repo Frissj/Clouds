@@ -96,6 +96,12 @@ def nsys(verb, *options):
     subprocess.run([NSYS, verb, f"--session={os.environ['HSTR_NSYS_SESSION']}", *options], creationflags=subprocess.CREATE_NO_WINDOW)
 
 
+# run_sea.py --ngfx START STOP: an Nsight Graphics GPU Trace of flight frames [START, STOP) of each timed flight. Mogwai is launched
+# by ngfx with --start/--stop-with-ngfx-sdk; headless it never presents, so the frames are bracketed here (m.gpuTraceStart/Stop).
+# Each bracket drains the queue first, so the flight's wall and scope timings are not the shipping ones in such a run.
+NGFX = [int(v) for v in os.environ["HSTR_NGFX"].split()] if os.environ.get("HSTR_NGFX") else None
+
+
 def timed(frames, first, forward, yaw, sun=0.0, report=None):
     import time
     if NSYS and report:
@@ -111,7 +117,16 @@ def timed(frames, first, forward, yaw, sun=0.0, report=None):
     peak = {"unmapBacklog": 0, "mapBacklog": 0, "activeFades": 0, "undesiredFadingOut": 0}
     for i in range(frames):
         pose(first + i, forward, yaw, sun)
+        if NGFX and report and i == NGFX[0]:
+            m.gpuTraceStart()
         m.renderFrame()
+        if NGFX and report and i == NGFX[1] - 1:
+            from pathlib import Path
+            trace = Path(m.gpuTraceStop())
+            named = trace.with_name(f"{os.environ['HSTR_TAG']}_{report}_f{NGFX[0]}-{NGFX[1]}{trace.suffix}")
+            import shutil
+            shutil.copyfile(trace, named)  # A copy: ngfx opens the original for --auto-export after this (ngfx5 renamed it away).
+            log(f"ngfx: {report} flight frames {NGFX[0]}..{NGFX[1] - 1} -> {named}")
         if TRACE_SUN:  # Reads the counts back every frame: the timings are not the shipping ones.
             s = stats()
             for k in trace:
