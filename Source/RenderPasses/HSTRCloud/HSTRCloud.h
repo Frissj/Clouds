@@ -340,6 +340,9 @@ private:
     bool mBeamFusedUnits = true;
     /// DIAGNOSTIC (HSTR_FUSED_RAYS_ONLY): the fused kernel compiled as its ray loop alone - wrong images, for a trace's registers.
     bool mBeamFusedRaysOnly = false;
+    /// With beamDirtyFused: the separate dirty query (its own 96 registers) counts finished blocks, and runBeamDirtyFused, compiled
+    /// without its ray loop, tests their tiles in a dispatch right behind it with no barrier between - filling the query's tail.
+    bool mBeamFusedOverlap = false;
     uint32_t mBeamFusedTilesTested = 0;  ///< The compared frame's dirty tiles tested (either path) ...
     uint32_t mBeamFusedUnitsMarched = 0; ///< ... units the fused chain marched itself ...
     uint32_t mBeamFusedUnitsListed = 0;  ///< ... and units listed (hstrBeamDirtyCount[1]).

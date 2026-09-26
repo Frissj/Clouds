@@ -31,6 +31,12 @@ import HSTRCloudTypes;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_DIRTY_OVERLAP
+#define HSTR_DIRTY_OVERLAP 0 // beamFusedOverlap: the dirty query counts finished blocks into the fused queue for runBeamDirtyFused's tiles.
+#endif
+#ifndef HSTR_FUSED_TILES_ONLY
+#define HSTR_FUSED_TILES_ONLY 0 // beamFusedOverlap: runBeamDirtyFused without its ray loop, overlapping the separate query's tail.
+#endif
 #ifndef HSTR_FUSED_RAYS_ONLY
 #define HSTR_FUSED_RAYS_ONLY 0 // DIAGNOSTIC (beamFusedRaysOnly): runBeamDirtyFused compiled as its ray loop alone, for its registers.
 #endif
@@ -8262,7 +8268,7 @@ struct HSTRCloudRenderer
     }
 
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
-#if HSTR_DIRTY_FUSED
+#if HSTR_DIRTY_FUSED || HSTR_DIRTY_OVERLAP
     // The warp arguments stay in their indirect state for the resolve, so the fused chain reads its copy (setupBeamDirtyFused).
     float beamPolicyTolerance() { return params.beamPolicy != 0 ? asfloat(gFusedState[kFusedTolerance]) : params.beamTolerance; }
 #else
@@ -10461,6 +10467,35 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     bool centre;
     uint2 position = 0;
     const bool march = gHSTRCloud.beamDirtyRay(thread, point, centre) && gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position);
+#if HSTR_DIRTY_OVERLAP
+    // beamFusedOverlap: every listed ray, marched or not, counts towards its block; the lane that finishes a block queues it for
+    // runBeamDirtyFused's tiles (HSTR_FUSED_TILES_ONLY), dispatched right behind this pass without a barrier. This program keeps
+    // its own registers - one program for both costs the persistent loop a residency tier (ngfx18: 128 against 96).
+    if (march)
+    {
+        BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+        if (!(1.f - exp(-ray.depth) > 1e-4f))
+            ray.distance = 0.f;
+        gHSTRCloud.beamQueryMarched(position, ray);
+    }
+    const uint rb = max(gHSTRCloud.params.beamDirtyPointStride, 1u);
+    const uint per = rb * rb * (gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u);
+    const uint index = thread / per;
+    if (index < min(gHSTRCloud.hstrBeamDirtyCount[0], gHSTRCloud.params.beamDirtyCapacity))
+    {
+        // Its lattice point, carry and verification are written before the block can be seen to finish.
+        DeviceMemoryBarrier();
+        uint done;
+        InterlockedAdd(gFusedBlocks[index], 1u, done);
+        if (done + 1u == per)
+        {
+            uint slot, unused;
+            InterlockedAdd(gFusedState[kFusedBlocksReserved], 1u, slot);
+            InterlockedExchange(gFusedBlocks[gHSTRCloud.params.beamDirtyCapacity + slot], index + 1u, unused);
+        }
+    }
+    return;
+#endif
 #if HSTR_BEAM_REPAIR_PROBE
     // The probe reads its block's other lanes, so every lane has to reach it.
     BeamSample ray = {};
@@ -10624,6 +10659,7 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
     // a wave that finds none never comes back for more. Only this loop's own few values are live across the march - MEASURED
     // (ngfx16, 4K sprint): as one loop with the tile and unit phases, their state (params copy, block, item and unit counts,
     // claims) held the fused kernel at 128 registers, the peak inside marchBeam's brick lookup, where the separate query takes 96.
+#if !HSTR_FUSED_TILES_ONLY
     {
         const uint rb = max(gHSTRCloud.params.beamDirtyPointStride, 1u);
         const uint per = rb * rb * (gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u);
@@ -10678,6 +10714,7 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
             }
         }
     }
+#endif
 #if HSTR_FUSED_RAYS_ONLY
     // The tile and unit half is not in the binary: its registers are the persistent query's own. MEASURED (ngfx18 against
     // ngfx14, 4K sprint): this ray loop alone allocates 128 registers (117 live, 16 warps an SM) where buildBeamDirtyQueries, the
@@ -10774,7 +10811,21 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 continue;
             }
         }
-#if !HSTR_FUSED_UNITS
+#if HSTR_FUSED_TILES_ONLY
+        // The rays are the separate query's, another dispatch still running: until every tile item is claimed, a wave waits for
+        // blocks to finish rather than leaving. It waits only on query waves already running - the query's groups all launch
+        // before any of this dispatch's. Every unit is the units pass's.
+        if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) >= items)
+            break;
+        if (idle >= kFusedWaitLimit)
+        {
+            if (WaveIsFirstLane())
+                gHSTRCloud.fusedGiveUp(8u, uint4(WaveReadLaneFirst(gFusedState[kFusedBlocksReserved]), blocks, 0, 0), uint4(0, 0, 0, 0));
+            break;
+        }
+        sink += fusedBackoff(idle++);
+        continue;
+#elif !HSTR_FUSED_UNITS
         break; // Every unit is the units pass's.
 #endif
         const uint available = fusedWavePoll(kFusedUnitsPublished);

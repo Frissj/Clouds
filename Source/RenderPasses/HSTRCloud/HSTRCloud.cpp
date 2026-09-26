@@ -303,6 +303,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamFusedRaysOnly = bool(value);
             continue;
         }
+        if (key == "beamFusedOverlap")
+        {
+            mBeamFusedOverlap = bool(value);
+            continue;
+        }
         if (key == "beamFusedStage")
         {
             mParams.beamFusedStage = uint32_t(value);
@@ -1152,6 +1157,7 @@ Properties HSTRCloud::getProperties() const
     props["beamFusedStage"] = mParams.beamFusedStage;
     props["beamFusedUnits"] = mBeamFusedUnits;
     props["beamFusedRaysOnly"] = mBeamFusedRaysOnly;
+    props["beamFusedOverlap"] = mBeamFusedOverlap;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
@@ -5719,6 +5725,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0");
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "0");
                                     if (mParams.beamOrderProbe != 0)
                                     {
                                         if (!mpBeamOrderProbe)
@@ -6120,23 +6127,56 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         // The resolve dispatches from the warp arguments; left in their indirect state now, nothing between the
                         // unit march and the pixel pass has to transition them (beamOverlapResolve).
                         pRenderContext->resourceBarrier(mpBeamWarpArgs.get(), Resource::State::IndirectArg);
+                        // One binding for every program of the chain, so nothing transitions between them (beamFusedOverlap runs
+                        // two with no barrier between).
+                        auto bindChain = [&](const ref<ComputePass>& pPass)
+                        {
+                            bindDirty(pPass);
+                            ShaderVar chainVar = pPass->getRootVar()["CB"]["gHSTRCloud"];
+                            chainVar["hstrBeamWarpArgs"] = ref<Buffer>();
+                            chainVar["hstrBeamPixelPrev"] = ref<Texture>();
+                            // The query dispatches from the dirty arguments; bound here too they were transitioned back to a UAV
+                            // between the query and the tile dispatch, which serialised them (ngfx19: 0.98 then 1.09 ms, no
+                            // overlap). Nothing in the chain writes them.
+                            chainVar["hstrBeamDirtyArgs"] = ref<Buffer>();
+                            chainVar["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                            bindOutput(pPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                            bindOutput(pPass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                            // The same unit list and lattice again, through coherent views (gFusedUnits, gFusedLattice).
+                            pPass->getRootVar()["gFusedUnits"] = mpBeamDirtyUnits;
+                            pPass->getRootVar()["gFusedLattice"] = mpBeamLattice;
+                        };
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
-                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits ? "1" : "0");
+                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits && !mBeamFusedOverlap ? "1" : "0");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_RAYS_ONLY", mBeamFusedRaysOnly ? "1" : "0");
+                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_TILES_ONLY", mBeamFusedOverlap ? "1" : "0");
                         setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
-                        bindDirty(mpBeamDirtyFusedPass);
-                        ShaderVar fusedVar = mpBeamDirtyFusedPass->getRootVar()["CB"]["gHSTRCloud"];
-                        fusedVar["hstrBeamWarpArgs"] = ref<Buffer>();
-                        fusedVar["hstrBeamPixelPrev"] = ref<Texture>();
-                        fusedVar["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
-                        bindOutput(mpBeamDirtyFusedPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
-                        bindOutput(mpBeamDirtyFusedPass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
-                        // The same unit list and lattice again, through coherent views (gFusedUnits, gFusedLattice).
-                        mpBeamDirtyFusedPass->getRootVar()["gFusedUnits"] = mpBeamDirtyUnits;
-                        mpBeamDirtyFusedPass->getRootVar()["gFusedLattice"] = mpBeamLattice;
-                        // Persistent: about what fits at once (58 SMs x ~20 warps at the query's 96 registers is 580 groups of two
-                        // warps). More only adds waves polling for work; fused1 launched 1,024 groups.
-                        mpBeamDirtyFusedPass->execute(pRenderContext, uint3(640 * 64, 1, 1));
+                        if (mBeamFusedOverlap)
+                        {
+                            // The separate query, its own program and registers, counting finished blocks into the queue; the
+                            // tiles of those blocks tested by runBeamDirtyFused without its ray loop, launched right behind it.
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_PUSH_SHARE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_DIRTY_SLICES", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "1");
+                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                            bindChain(mpBeamDirtyQueryPass);
+                            mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                            // No UAV barrier between them: the tile waves wait on the queue slots the query writes.
+                            pRenderContext->setAutoUavBarriers(false);
+                            bindChain(mpBeamDirtyFusedPass);
+                            // Waves wait for blocks rather than leave, so only as many as the query's tail leaves room for.
+                            mpBeamDirtyFusedPass->execute(pRenderContext, uint3(256 * 64, 1, 1));
+                            pRenderContext->setAutoUavBarriers(true);
+                        }
+                        else
+                        {
+                            bindChain(mpBeamDirtyFusedPass);
+                            // Persistent: about what fits at once (58 SMs x ~20 warps at the query's 96 registers is 580 groups of
+                            // two warps). More only adds waves polling for work; fused1 launched 1,024 groups.
+                            mpBeamDirtyFusedPass->execute(pRenderContext, uint3(640 * 64, 1, 1));
+                        }
                         mParams.beamDirtyFused = 1;
                         // After it, as their own dispatches: the coarse rebuild reads every verification the queries wrote, and
                         // the warp field the lattice and the guard cameras. Neither binds the warp arguments, which have to stay in
