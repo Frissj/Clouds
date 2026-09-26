@@ -308,6 +308,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamFusedOverlap = bool(value);
             continue;
         }
+        if (key == "beamFusedInline")
+        {
+            mBeamFusedInline = bool(value);
+            continue;
+        }
+        if (key == "beamDirtyTilesDense")
+        {
+            mBeamDirtyTilesDense = bool(value);
+            continue;
+        }
         if (key == "beamFusedStage")
         {
             mParams.beamFusedStage = uint32_t(value);
@@ -1158,7 +1168,8 @@ Properties HSTRCloud::getProperties() const
     props["beamFusedUnits"] = mBeamFusedUnits;
     props["beamFusedRaysOnly"] = mBeamFusedRaysOnly;
     props["beamFusedOverlap"] = mBeamFusedOverlap;
-    props["beamInvalidate"] = mBeamInvalidate;
+    props["beamFusedInline"] = mBeamFusedInline;
+    props["beamDirtyTilesDense"] = mBeamDirtyTilesDense;    props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
@@ -1528,6 +1539,7 @@ Properties HSTRCloud::getProperties() const
                 cloud["beamOrderProbe" + std::to_string(i)] = mBeamOrderProbeValues[i];
         cloud["beamWarpListed"] = mBeamWarpListed;
         cloud["beamFusedTilesTested"] = mBeamFusedTilesTested;
+        cloud["beamFusedTileGrid"] = mParams.beamTileDims.x * mParams.beamTileDims.y;
         cloud["beamFusedUnitsMarched"] = mBeamFusedUnitsMarched;
         cloud["beamFusedUnitsListed"] = mBeamFusedUnitsListed;
         for (uint32_t i = 0; i < kFusedDiagCount; ++i)
@@ -1770,6 +1782,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyFusedSetupPass = createPass("setupBeamDirtyFused");
     mpBeamDirtyFusedPass = createPass("runBeamDirtyFused");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
+    mpBeamDirtyTileDensePass = createPass("testBeamDirtyTilesDense");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramidTiles");
     mpBeamGuardPyramidTopPass = createPass("buildBeamGuardPyramidTop");
@@ -5840,12 +5853,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         // And the tiles of the blocks the guard listed, whose basis the dirty query just re-marched.
                         if (mBeamDirtyActive && !mBeamFusedBuild)
                         {
-                            bindRenderer(pRenderContext, mpBeamDirtyTilePass);
-                            bindOutput(mpBeamDirtyTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
-                            mpBeamDirtyTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                            FALCOR_PROFILE(pRenderContext, "dirtyTiles");
+                            const ref<ComputePass>& pTiles = mBeamDirtyTilesDense ? mpBeamDirtyTileDensePass : mpBeamDirtyTilePass;
+                            bindRenderer(pRenderContext, pTiles);
+                            bindOutput(pTiles, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                            pTiles->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
                             // A failing tile lists its units that need marching, which reads what each unit holds.
-                            mpBeamDirtyTilePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] = mpBeamPixels[0];
-                            mpBeamDirtyTilePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 48); // Bytes: twelve uints in.
+                            pTiles->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixelOutput"] = mpBeamPixels[0];
+                            // Dense: the whole oct tile grid (1.25M at 4K). MEASURED (dense2): launching only the screen box's tiles
+                            // gained nothing (walk/jog/sprint within 0.005 ms), the box at these views being most of the grid.
+                            if (mBeamDirtyTilesDense)
+                                pTiles->execute(pRenderContext, uint3(mParams.beamTileDims, 1));
+                            else
+                                pTiles->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 48); // Bytes: twelve uints in.
                         }
                     }
                     else if (level == 0)
@@ -6151,7 +6171,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_RAYS_ONLY", mBeamFusedRaysOnly ? "1" : "0");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_TILES_ONLY", mBeamFusedOverlap ? "1" : "0");
                         setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
-                        if (mBeamFusedOverlap)
+                        const uint32_t rb = std::max(mParams.beamDirtyPointStride, 1u);
+                        const uint32_t perBlock = rb * rb * (mParams.beamCentreless != 0 ? 1u : 2u);
+                        if (mBeamFusedInline && 32u % perBlock == 0)
+                        {
+                            // The separate query testing its own wave's tiles once past its march (HSTR_DIRTY_OVERLAP 2), reading
+                            // the lattice other waves write through the coherent view (HSTR_DIRTY_FUSED). Needs a block's rays in
+                            // one wave: 8 at the shipped stride of 2.
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_PUSH_SHARE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_DIRTY_SLICES", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", "0");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "2");
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
+                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                            bindChain(mpBeamDirtyQueryPass);
+                            mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                            mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "0");
+                        }
+                        else if (mBeamFusedOverlap)
                         {
                             // The separate query, its own program and registers, counting finished blocks into the queue; the
                             // tiles of those blocks tested by runBeamDirtyFused without its ray loop, launched right behind it.

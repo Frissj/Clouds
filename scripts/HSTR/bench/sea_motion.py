@@ -276,7 +276,7 @@ for motion, forward, yaw, *rest in MOTIONS:
                            "cell": {k: int(s.get("cellView" + k, 0)) for k in ("Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests",
                                                                                  "Built", "Steps")},
                            # beamPushProbe: the scored frame's cell x tile work count (absent with it off); spanProbe's too.
-                           "push": {k: s[k] for k in s if k.startswith(("push", "span", "beamOrderProbe", "beamFused")) or k == "beamFrameDim"}})
+                           "push": {k: s[k] for k in s if k.startswith(("push", "span", "beamOrderProbe", "beamFused")) or k in ("beamFrameDim", "beamDirtyBlocks")}})
         if not errors:  # HSTR_STEPS=0: timings and residency only.
             errors = [{"over02": 0.0, "p999": 0.0, "max": 0.0, "marched": 0.0, "carriedPoints": 0, "carriedPixels": 0, "marchTiles": 0,
                        "debug": 0, "marchedSteps": 0, "carriedSteps": 0}]

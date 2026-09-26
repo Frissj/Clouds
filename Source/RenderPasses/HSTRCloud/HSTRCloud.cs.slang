@@ -7923,9 +7923,22 @@ struct HSTRCloudRenderer
         uint2 tile = 0;
         bool failed = false;
         if (index < min(hstrBeamDirtyCount[0], params.beamDirtyCapacity) && beamDirtyPaddedTile(index, thread % (padded * padded), tile) &&
-            beamDirtyTileOwner(tile, side) == index)
+            beamDirtyTileOwner(tile, side) == index && params.beamFusedStage != 8u) // DIAGNOSTIC: stage 8 tests nothing.
             failed = testBeamDirtyTileNow(tile);
         listBeamFailedTileUnits(tile, failed); // Every lane, in uniform flow: see there.
+    }
+
+    /// testBeamDirtyTile over the tile grid instead of each listed block's padded square: a thread per tile, testing it when any
+    /// listed block's points are read by it. The same tiles as the owner rule (a tile with a listed reader is in that reader's
+    /// padded square), launched once each rather than once per padded square that holds it (36 items a block at side 2).
+    void testBeamDirtyTileDense(uint2 tile)
+    {
+        const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
+        bool failed = false;
+        if (all(tile < params.beamTileDims) && all(tile * beamTileEdge(0) < params.beamFrameDim) && beamTileOnScreen(0, tile) &&
+            beamDirtyTileOwner(tile, side) != 0xFFFFFFFFu && params.beamFusedStage != 8u)
+            failed = testBeamDirtyTileNow(tile);
+        listBeamFailedTileUnits(tile, failed);
     }
 
     /// Tile `local` of listed block `index`'s padded square (the block's tiles and its apron), if it exists and is on screen.
@@ -10335,6 +10348,12 @@ void testBeamDirtyTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Group
     gHSTRCloud.testBeamDirtyTile(foldedDirtyThread(groupId, groupThreadId.x));
 }
 
+[numthreads(8, 8, 1)]
+void testBeamDirtyTilesDense(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.testBeamDirtyTileDense(dispatchThreadId.xy);
+}
+
 [numthreads(64, 1, 1)]
 void testBeamTilesTemporal(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
@@ -10467,7 +10486,45 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     bool centre;
     uint2 position = 0;
     const bool march = gHSTRCloud.beamDirtyRay(thread, point, centre) && gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position);
-#if HSTR_DIRTY_OVERLAP
+#if HSTR_DIRTY_OVERLAP == 2
+    // beamFusedInline: no queue and no consumer. A block's rays are 8 aligned lanes of one wave (the host only selects this when
+    // the wave width is a multiple of them), so every block of the wave is finished once the wave is past its march. Its lanes
+    // then run the padded tiles of the wave's blocks through the fused chain's reader join (fusedTileItem), the lane completing a
+    // tile's readers testing it here. The waves that finish early test tiles while the longest rays are still marching, in the
+    // query's own program: the persistent loop, not the tile code, cost fusion its residency tier (ngfx18).
+    if (march)
+    {
+        BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+        if (!(1.f - exp(-ray.depth) > 1e-4f))
+            ray.distance = 0.f;
+        gHSTRCloud.beamQueryMarched(position, ray);
+    }
+    // The wave's lattice points, carries and verifications are written before any of its blocks counts as a reader.
+    DeviceMemoryBarrier();
+    {
+        const HSTRCloudParams p = gHSTRCloud.params;
+        const uint rb = max(p.beamDirtyPointStride, 1u);
+        const uint per = rb * rb * (p.beamCentreless != 0 ? 1u : 2u);
+        const uint lanes = WaveGetLaneCount();
+        const uint firstBlock = (thread - WaveGetLaneIndex()) / per;
+        const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], p.beamDirtyCapacity);
+        const uint side = max(p.beamDirtyBlockEdge / max(p.beamTileSize, 1u), 1u);
+        const uint padded = side + 2u * kBeamDirtyApron;
+        // DIAGNOSTIC: beamFusedStage 7 compiles the tile half but runs none of it (nothing tested, nothing listed).
+        const uint items = p.beamFusedStage == 7u ? 0u : (lanes / per) * padded * padded;
+        for (uint base = 0; base < items; base += lanes) // Uniform: listBeamFailedTileUnits needs every lane.
+        {
+            const uint item = base + WaveGetLaneIndex();
+            const uint index = firstBlock + item / (padded * padded);
+            uint2 tile = 0;
+            bool failed = false;
+            if (item < items && index < blocks && gHSTRCloud.beamDirtyPaddedTile(index, item % (padded * padded), tile))
+                failed = fusedTileItem(index, tile, side);
+            gHSTRCloud.listBeamFailedTileUnits(tile, failed);
+        }
+    }
+    return;
+#elif HSTR_DIRTY_OVERLAP
     // beamFusedOverlap: every listed ray, marched or not, counts towards its block; the lane that finishes a block queues it for
     // runBeamDirtyFused's tiles (HSTR_FUSED_TILES_ONLY), dispatched right behind this pass without a barrier. This program keeps
     // its own registers - one program for both costs the persistent loop a residency tier (ngfx18: 128 against 96).

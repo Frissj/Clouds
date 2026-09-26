@@ -343,6 +343,17 @@ private:
     /// With beamDirtyFused: the separate dirty query (its own 96 registers) counts finished blocks, and runBeamDirtyFused, compiled
     /// without its ray loop, tests their tiles in a dispatch right behind it with no barrier between - filling the query's tail.
     bool mBeamFusedOverlap = false;
+    /// With beamDirtyFused: the separate dirty query tests the tiles of its own wave's blocks once past its march, through the
+    /// fused chain's per-tile reader join - no queue, no consumer, no dirty tile pass (HSTR_DIRTY_OVERLAP 2). MEASURED and off
+    /// (inline1/2, 4K, tiles/units/errors identical): walk 1.91 -> 2.12, jog 2.41 -> 2.75, sprint 2.33 -> 2.54 ms. At sprint the
+    /// program alone (tiles skipped) cost +0.05 over query + rebuild, and its tile work 0.45 ms against the padded-square pass's
+    /// 0.32: the join hid nothing. A native Work Graph keeps the same join, so it cannot beat the dense tile pass's 0.115 either.
+    bool mBeamFusedInline = false;
+    /// The dirty tile test as a thread per tile of the grid (testBeamDirtyTilesDense) instead of a thread per padded tile of each
+    /// listed block. MEASURED (dense2, 4K, tiles/units/errors identical): walk 1.94 -> 1.85, jog 2.49 -> 2.30, sprint 2.37 -> 2.17
+    /// ms - the padded squares launched 36 threads a block for ~1 test each (0.31 ms of tile pass at sprint, 0.115 dense), and the
+    /// units, now listed in tile order, march 0.02-0.06 ms faster.
+    bool mBeamDirtyTilesDense = true;
     uint32_t mBeamFusedTilesTested = 0;  ///< The compared frame's dirty tiles tested (either path) ...
     uint32_t mBeamFusedUnitsMarched = 0; ///< ... units the fused chain marched itself ...
     uint32_t mBeamFusedUnitsListed = 0;  ///< ... and units listed (hstrBeamDirtyCount[1]).
@@ -447,6 +458,7 @@ private:
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.
     void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
     ref<ComputePass> mpBeamDirtyTilePass;
+    ref<ComputePass> mpBeamDirtyTileDensePass;
     ref<ComputePass> mpBeamRefreshListPass;
     ref<ComputePass> mpBeamGuardPyramidPass;    ///< Levels 0 - 5 per 32 x 32 tile (buildBeamGuardPyramidTiles) ...
     ref<ComputePass> mpBeamGuardPyramidTopPass; ///< ... and the levels above, in one group (buildBeamGuardPyramidTop).
