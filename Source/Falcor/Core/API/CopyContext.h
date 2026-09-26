@@ -146,6 +146,14 @@ public:
     virtual void uavBarrier(const Resource* pResource);
 
     /**
+     * Skip the UAV barriers dispatches insert automatically for every bound UAV already in UnorderedAccess state (state transitions
+     * are still recorded). Lets a dispatch overlap the one before it on the GPU; the caller guarantees the two share no UAV
+     * read-after-write or write-after-write hazard. Explicit uavBarrier() calls are unaffected.
+     */
+    void setAutoUavBarriers(bool enabled) { mAutoUavBarriers = enabled; }
+    bool getAutoUavBarriers() const { return mAutoUavBarriers; }
+
+    /**
      * Copy an entire resource
      */
     void copyResource(const Resource* pDst, const Resource* pSrc);
@@ -272,5 +280,6 @@ protected:
     Device* mpDevice;
     std::unique_ptr<LowLevelContextData> mpLowLevelData;
     bool mCommandsPending = false;
+    bool mAutoUavBarriers = true;
 };
 } // namespace Falcor

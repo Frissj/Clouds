@@ -36,6 +36,7 @@ parser.add_argument("--ngfx", nargs=2, type=int, metavar=("START", "STOP"),
                     help="Nsight Graphics GPU Trace of flight frames [START, STOP) (0..47) of each timed flight (motion harness); "
                          "reports at HSTR_results/ngfx/TAG_<motion>_<arm>_f<START>-<STOP>.ngfx-gputrace")
 parser.add_argument("--ngfx-metrics", default="Throughput Metrics", help="--ngfx: the Ada metric set name")
+parser.add_argument("--ngfx-source", action="store_true", help="--ngfx: shader debug info for source-line correlation (~10 min compile)")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
@@ -79,12 +80,16 @@ if args.ngfx:
     # Nsight Graphics GPU Trace: ngfx launches Mogwai with the trace injected and idle; sea_motion.py starts it before flight frame
     # START and stops it after frame STOP-1 through the SDK (Mogwai's gpuTraceStart/Stop), so only those frames are traced.
     # No --platform: ngfx is a Qt program and Qt takes --platform as its own option ("no Qt platform plugin could be initialized").
+    # --real-time-shader-profiler gives the per-shader columns (# Reg, occupancy limiter, stall reasons), which ngfx6 lacked
+    # ("D3D12 - 0 Samples"). ngfx7 asked for it through --per-arch-config-path with "real-time-shader-profiler": "true", as ngfx's
+    # help shows: the metric set was applied but the profiler stayed "Disabled" (Trace Information). --ngfx-source adds Mogwai's
+    # --debug-shaders for source-line correlation (debug info only, shaders stay optimised), at ~10 minutes of extra compile.
     (RESULTS / "ngfx").mkdir(exist_ok=True)
     env["HSTR_NGFX"] = f"{args.ngfx[0]} {args.ngfx[1]}"
     command = [NGFX, "--activity", "GPU Trace Profiler", "--exe", str(MOGWAI), "--dir", str(ROOT),
-               "--args", subprocess.list2cmdline(command[1:]), "--output-dir", str(RESULTS / "ngfx"), "--no-timeout",
-               "--start-with-ngfx-sdk", "--stop-with-ngfx-sdk", "--architecture", "Ada", "--metric-set-name", args.ngfx_metrics,
-               "--auto-export"]
+               "--args", subprocess.list2cmdline(command[1:] + (["--debug-shaders"] if args.ngfx_source else [])),
+               "--output-dir", str(RESULTS / "ngfx"), "--no-timeout", "--start-with-ngfx-sdk", "--stop-with-ngfx-sdk",
+               "--architecture", "Ada", "--metric-set-name", args.ngfx_metrics, "--real-time-shader-profiler", "--auto-export"]
 with open(log, "w") as f:
     (run_hidden if args.nsys or args.ngfx else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
 errors = [line for line in open(log, errors="replace") if "(Error)" in line or "Exception" in line or "Error when loading" in line or "RuntimeError" in line]

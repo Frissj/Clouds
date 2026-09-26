@@ -437,6 +437,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamWarp = bool(value);
             continue;
         }
+        if (key == "beamOverlapResolve")
+        {
+            mBeamOverlapResolve = bool(value);
+            continue;
+        }
         if (key == "beamWarpAuto")
         {
             mBeamWarpAuto = value;
@@ -1107,6 +1112,7 @@ Properties HSTRCloud::getProperties() const
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamWarp"] = mBeamWarp;
+    props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
     props["beamPolicy"] = mBeamPolicy;
     props["beamPolicyTolerance"] = mBeamPolicyTolerance;
@@ -5795,9 +5801,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // Reconstruction of every accepted pixel in a light kernel, then the compacted per-pixel march of failed finest tiles. In
         // the reference frame the order reverses: the refinement writes the beam image and the resolve reads it, so that every
         // pixel is produced by one pass over the frame whichever way its tile went.
-        auto resolve = [&]()
+        // beamOverlapResolve (see the member): only where the dirty unit march runs, from the list the dirty tile pass compacted.
+        const bool overlapResolve = mBeamOverlapResolve && mParams.beamRefFrame != 0 && mBeamOct && !mBeamScreenResidual &&
+                                    !mBeamSparseBuilt && mBeamDirtyActive && (!mBeamGridRegions.empty() || mBeamGuardDriven);
+        // early: the warp field and the residual queue's clear; late: the pixel and residual passes. Overlapped, the early part runs
+        // before the unit march, since the pixel pass must follow the march with nothing between them.
+        auto resolve = [&](bool early, bool late)
         {
-            FALCOR_PROFILE(pRenderContext, "resolve");
+            FALCOR_PROFILE(pRenderContext, late ? "resolve" : "resolveEarly");
             const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : mpBeamResolvePass;
             // A define, not a branch on a parameter: compiled in, the warp cost the resolve 0.45 -> 0.74 ms at 4K whether it was
             // on or off (budgetwarp2) - registers, as with the residual below.
@@ -5808,7 +5819,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mParams.beamWarpAuto = warpAuto ? mBeamWarpAuto : 0.f;
             pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
-            if (warp)
+            if (warp && early)
             {
                 const uint2 latticeDims = mParams.beamLatticeDims;
                 if (!mpBeamWarpField || mpBeamWarpField->getWidth() != latticeDims.x || mpBeamWarpField->getHeight() != latticeDims.y)
@@ -5817,7 +5828,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
                     );
             }
-            if (warpAuto)
+            if (warpAuto && early)
             {
                 FALCOR_PROFILE(pRenderContext, "warp");
                 bindRenderer(pRenderContext, mpBeamWarpArgsPass);
@@ -5826,7 +5837,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
                 mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
             }
-            else if (warp)
+            else if (warp && early)
             {
                 // The warp field over the on-screen lattice box (beamWarpFieldBox computes the same box in the shader).
                 FALCOR_PROFILE(pRenderContext, "warp");
@@ -5850,7 +5861,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             const bool residual = mParams.beamRefFrame != 0 && mParams.beamScreenResidual == 0 && !mBeamSparseBuilt;
             // Only this configuration's resolve ever queues a group (the screen residual returns before it can), so only it
             // allocates the queue: 1.5 MiB at 4K.
-            if (residual)
+            if (residual && early)
             {
                 const uint32_t groups = ((mParams.frameDim.x + 7u) / 8u) * ((mParams.frameDim.y + 7u) / 8u);
                 if (!mpBeamResidualList || mpBeamResidualList->getElementCount() < 3u * groups)
@@ -5863,25 +5874,44 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 }
                 pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             }
+            if (!late)
+                return;
             {
                 FALCOR_PROFILE(pRenderContext, "pixels");
+                // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
+                // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
+                // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
+                // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
+                auto bindPixels = [&](const ref<ComputePass>& pPass)
+                {
+                    bindRenderer(pRenderContext, pPass);
+                    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+                    var["color"] = color;
+                    if (overlapResolve)
+                    {
+                        var["hstrBeamPixels"] = ref<Texture>();
+                        var["hstrBeamPixelPrev"] = ref<Texture>();
+                        var["hstrBeamDirtyArgs"] = ref<Buffer>();
+                        var["hstrBeamWarpArgs"] = ref<Buffer>();
+                    }
+                };
+                if (overlapResolve)
+                    pRenderContext->setAutoUavBarriers(false);
                 if (warpAuto)
                 {
                     // Bytes: the warped resolve's arguments at [3..5], the plain one's at [6..8].
                     mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
-                    bindRenderer(pRenderContext, mpBeamResolveWarpPass);
-                    mpBeamResolveWarpPass->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    bindPixels(mpBeamResolveWarpPass);
                     mpBeamResolveWarpPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 12);
-                    bindRenderer(pRenderContext, pResolve);
-                    pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    bindPixels(pResolve);
                     pResolve->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 24);
                 }
                 else
                 {
-                    bindRenderer(pRenderContext, pResolve);
-                    pResolve->getRootVar()["CB"]["gHSTRCloud"]["color"] = color;
+                    bindPixels(pResolve);
                     pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
                 }
+                pRenderContext->setAutoUavBarriers(true);
             }
             if (residual)
             {
@@ -5901,7 +5931,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             }
         };
         if (mParams.beamRefFrame == 0)
-            resolve();
+            resolve(true, true);
+        else if (overlapResolve)
+            resolve(true, false);
         {
         FALCOR_PROFILE(pRenderContext, "march");
         // The beam's per-pixel refinement runs the same camera march, so it drops the live sun march with it.
@@ -5977,6 +6009,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         dirtyVar["color"] = color;
                         dirtyVar["hstrBeamPixelOutput"] = mpBeamPixels[0];
                         dirtyVar["hstrBeamPixels"] = ref<Texture>();
+                        // Overlapped, the warp arguments stay in their indirect state from the early resolve to the pixel pass.
+                        if (overlapResolve)
+                            dirtyVar["hstrBeamWarpArgs"] = ref<Buffer>();
                     };
                     mpBeamDirtyMarchPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
                     setBeamDirtyMarchDefines(mpBeamDirtyMarchPass);
@@ -6029,7 +6064,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         }
         }
         if (mParams.beamRefFrame != 0)
-            resolve();
+            resolve(!overlapResolve, true);
     }
     else
     {

@@ -243,7 +243,7 @@ void ParameterBlock::prepareResource(CopyContext* pContext, Resource* pResource,
 
     // Insert UAV barrier automatically if the resource is an UAV that is already in UnorderedAccess state.
     // Otherwise the user would have to insert barriers explicitly between passes accessing UAVs, which is easily forgotten.
-    if (insertBarrier && isUav)
+    if (insertBarrier && isUav && pContext->getAutoUavBarriers())
         pContext->uavBarrier(pResource);
 }
 

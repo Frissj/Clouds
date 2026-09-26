@@ -290,6 +290,15 @@ private:
     bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
     float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
     bool mBeamWarp = true;        ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
+    /// beamOverlapResolve: the resolve's pixel pass runs without barriers behind the dirty unit march, filling that march's tail
+    /// (ngfx8: the dirty passes fill the SMs at launch and then only drain, the last third on a few long rays). The pixel pass reads
+    /// none of what the unit march writes (beam pixels, guard depth, coarse certificate); the warp field, which reads the guard
+    /// depth, is built before the unit march instead, from the depths the query left.
+    /// MEASURED (overlap2, 4K, default / overlap / default again, ms): walk 2.08 / 1.89 / 2.03, jog 2.52 / 2.34 / 2.55, sprint
+    /// 2.40 / 2.21 / 2.39, every error statistic identical (walk 0.886%, jog 0.829%, sprint 0.473% over 0.02). overlap1 had measured
+    /// nothing: one UAV -> SRV transition was left (hstrBeamPixelPrev, the beam pixels again in the reference frame), found in ngfx9.
+    /// With it on, the units scope's time includes the pixel pass running inside it: compare HSTRCloud totals, not these two scopes.
+    bool mBeamOverlapResolve = true;
     ref<ComputePass> mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     /// beamWarpAuto: the warp runs only while at least this share of the on-screen guard blocks this build classified are held
