@@ -12,6 +12,8 @@ REFERENCE = {
     "beamEdgeContrast": 0.05, "beamGuide": 0, "beamOracle": 0, "beamOracleBar": 0.02, "beamCentreless": False,
     "beamAdaptiveRoot": False, "beamGridDispatch": False, "cloudCameraKernel": False, "beamRefresh": 0,
     "beamShip": False,
+    # The sun field marched per voxel, not per sun ray: the exact frame keeps the reference far field (sunColumns rebuilds on change).
+    "sunColumns": False, "sunOctavesHalf": False, "sunInvalidateAngle": 0.0,
     # Sweeps vary the lighting rate; the exact frame must not inherit an arm's.
     "lightingStride": 1,
 }
@@ -38,6 +40,14 @@ BEAM = {
     "beamPolicy": True, "beamPolicyTolerance": 0.05, "beamPolicyHeldLow": 0.05, "beamPolicyHeldHigh": 0.25,
     # RGBA16Float output: the tone mapper 0.39 -> 0.07 ms, errors identical (colorfmt1).
     "colorFormat": 1,
+    # The sea's sun field by sun ray, whole every refresh (sunpages3): parked under a 0.57 deg/frame sun 3.44 -> 3.04 ms at
+    # 0.501 -> 0.363%, static sprint 2.06 -> 1.96. Half-precision octaves -0.04 ms, errors identical. REFERENCE sets them off, so
+    # they are set here or an arm inherits the exact frame's. A moving sun re-marches a tile's beams once it has turned 4 deg
+    # (suninval3): parked 3.10 -> 2.46 ms, walk 3.00 -> 2.92, quality equal or better; 8 deg is past the edge.
+    "sunColumns": True, "sunOctavesHalf": True, "sunInvalidateAngle": 0.07,
+    # Octaves rebuilt every 4 deg of sun, and a frozen cache baked rather than decayed (sunoct2): parked moving sun 2.16 -> 1.57 ms,
+    # walk 2.69 -> 2.20, errors equal.
+    "sunOctaveAngle": 0.07, "worldCacheFrozenBake": True,
     # The persistent octahedral beam image (a3d4d427): world-fixed, guarded against translation, residual resolved from the best
     # value of every unit. 4K, GPU ms park / look / flick / walk / sprint 0.49 / 0.51 / 0.72 / 0.92 / 0.56, 0.137% of pixels
     # over 0.02 against the exact march - better than beamScreenResidual's 0.156% at 3.4-7.6 ms. Before it this was the anchored

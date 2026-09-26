@@ -161,7 +161,7 @@ def timed(frames, first, forward, yaw, sun=0.0, report=None):
                                                "cutOrdered", "cutTotalMs", "cutMargin")}
     t["residency"]["cuts"] = s.get("cuts", 0) - cuts  # Cuts run during the timed frames.
     # Page table edits during the timed frames (per frame), and what waited at the end.
-    for k in ("maps", "unmaps", "fadeStarts", "fadeEnds", "fadeVoid"):
+    for k in ("maps", "unmaps", "fadeStarts", "fadeEnds", "fadeVoid", "sunPageTiles", "sunPageChanged", "sunPageQueued"):
         t["residency"][k] = round((s.get(k, 0) - before.get(k, 0)) / frames, 3)
     for k in ("mapBacklog", "undesiredFadingOut", "undesiredHeld", "undesiredIdle", "staleFades"):
         t["residency"][k] = s.get(k, 0)

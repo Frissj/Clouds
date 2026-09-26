@@ -96,6 +96,8 @@ private:
     void uploadDomainExtinction(const std::vector<uint32_t>& slots);
     void updateCloudDomain(RenderContext* pRenderContext);
     void updateSunVoxelDirection();
+    std::vector<uint32_t> seaTilesNearestFirst() const; ///< Sea slots by torus distance from the camera's slot.
+    bool sunColumnsActive() const;                      ///< The sea's sun field is built by sun ray (sunColumns) this frame.
     void onLightingChanged(const HSTRCloudParams& previous);
     void createSamplers();
     void updateHierarchy();
@@ -125,6 +127,7 @@ private:
     ref<ComputePass> mpQueryPass;
     ref<ComputePass> mpTileBasisPass;
     ref<ComputePass> mpFineSunPass;
+    ref<ComputePass> mpSunColumnsPass;
     ref<ComputePass> mpResidualMaskPass;
     ref<ComputePass> mpGatherOctavesPass;
     ref<ComputePass> mpBlurOctavesPass;
@@ -153,6 +156,13 @@ private:
     bool mWorldCacheBakeDirty = true;
     uint32_t mWorldCacheBakeInterval = 8; ///< Batches between bakes of the camera textures while updating.
     uint32_t mWorldCacheUpdates = 1;      ///< Cache gather passes per frame in the world cache view.
+    /// Photon updates only while some sea tile holds fewer batches than this (0: every frame): the converged state the benchmarks
+    /// score, which the shipped scene (CloudSea.py, worldCacheUpdates 1) otherwise kept paying for every frame.
+    uint32_t mWorldCacheTarget = 64;
+    /// A sun move with no photon updates to follow bakes the world cache without decaying it (the decay alone leaves the means).
+    /// MEASURED (sunoct2, 4K, 0.57 deg/frame sun, cache frozen): worldCache 0.29 -> 0.04 ms, parked 1.84 -> 1.57 and walk 2.45 ->
+    /// 2.20 ms, errors identical. Only a frozen cache (the benchmarks) takes this; a live one decays as before.
+    bool mWorldCacheFrozenBake = true;
     float mWorldCacheModulation = -1.f;   ///< Cache modulation b; negative: the medium's diffusion attenuation.
     ref<ComputePass> mpBeamQueryPass;
     ref<ComputePass> mpBeamTilePass;
@@ -535,6 +545,38 @@ private:
     ref<Buffer> mpTileBasis;
     ref<Buffer> mpTileState;
     ref<Texture> mpFineSun;
+    ref<Texture> mpSunShear; ///< Sun optical depth per sun ray and layer (sunColumns).
+    /// The sea's sun field by sun ray (computeSunColumns + resampleFineSun), the whole domain at once, instead of a march per voxel
+    /// of the stale tiles.
+    /// MEASURED (sunpages3, 4K, against a fresh per-voxel exact frame): parked under a 0.57 deg/frame sun 3.44 -> 3.09 ms at 0.501 ->
+    /// 0.363% of pixels over 0.02 (the whole field is current every frame instead of 8 tiles lagging), walk the same 3.33 -> 2.99,
+    /// static-sun sprint 2.06 -> 1.96 at 0.358 -> 0.363%. A refresh is 0.23 ms (a march per voxel of 8 tiles was 0.57).
+    bool mSunColumns = true;
+    /// The sun octaves' gather and blur textures in RGBA16F instead of RGBA32F. MEASURED (sunpages3): errors identical, parked and
+    /// walk under a moving sun -0.04 to -0.05 ms (gather 0.18 -> 0.14; the blur 0.31 -> 0.30 is not bandwidth bound).
+    bool mSunOctavesHalf = true;
+    /// With sunColumns, a moving sun re-marches the beam columns of a tile only once the sun has turned this far (radians) since
+    /// its last refresh, nearest first, at most mCloudSunTilesPerFrame a frame. 0: every frame the sun moves, which re-marched the
+    /// same nearest tiles every frame and never reached the far ones. MEASURED (suninval3, 4K, 0.57 deg/frame sun, two steps, % of
+    /// pixels over 0.02 mean / worst): parked 0 -> 4 deg 3.10 -> 2.46 ms at 0.367/0.373 -> 0.368/0.373 (query + units 1.40 ->
+    /// 0.53); walk 3.00 -> 2.92 at 0.369/0.375 -> 0.311/0.320. 8 deg is past the edge: parked 2.11 ms at 0.434/0.445, walk
+    /// 0.436/0.596.
+    float mSunInvalidateAngle = 0.07f;
+    std::vector<float3> mTileSun; ///< Per sea slot: the sun its beam columns were last marched under.
+    float3 mFieldSun = float3(0.f); ///< The sun the sunColumns field was last built for.
+    /// With sunColumns, a moving sun rebuilds the field and the octaves only once it has turned this far (radians) from the sun they
+    /// were built for, and once more when it stops. 0: every frame it moves. MEASURED and off (suncost1, 4K, parked under a 0.57
+    /// deg/frame sun): 1 deg 2.03 -> 1.54 ms but 1.78 -> 4.81% of pixels over 0.02, 2 deg 1.43 ms at 6.86% - single scattering
+    /// shows any lag. sunOctaveAngle lags the octaves alone.
+    float mSunFieldAngle = 0.f;
+    float3 mPreviousSun = float3(0.f); ///< Last frame's sun, to tell a sun that has stopped.
+    bool mSunStill = true;             ///< This frame's sun is last frame's.
+    /// With sunColumns, the sun octaves (multiple scattering) follow a moving sun only once it has turned this far (radians) from
+    /// their build, and once more when it stops. 0: every frame it moves. MEASURED (sunoct2, 4K, 0.57 deg/frame sun, scored against
+    /// octaves rebuilt at the exact frame's own sun, % over 0.02 mean / worst): parked 0 -> 4 deg 2.16 -> 1.84 ms at 0.374/0.376 ->
+    /// 0.368/0.373, walk 2.69 -> 2.45 at 0.312/0.320 both. The field cannot lag like this (suncost1: 1 deg, parked 1.78 -> 4.81%).
+    float mSunOctaveAngle = 0.07f;
+    float3 mOctaveSun = float3(0.f); ///< The sun the octaves were last built for.
     ref<Buffer> mpLeafResidual;
     std::array<ref<Texture>, 2> mpSunOctaves; ///< Ping-pong storage for the octave spread.
     ref<Texture> mpSunOctaveField;            ///< The spread octave field the renderer samples.
@@ -577,6 +619,9 @@ private:
     float mCloudCacheKeep = 1.f;         ///< Pending decay of the world cache after sun changes.
     std::vector<uint32_t> mSunPageQueue; ///< Sea tiles whose sun pages refresh over the next frames, nearest first.
     uint32_t mCloudSunTilesPerFrame = 8; ///< Sea tiles whose sun pages are recomputed per frame after a sun change.
+    uint64_t mSunPageTilesTotal = 0;     ///< Stats, cumulative: sea tiles whose sun pages were recomputed ...
+    uint64_t mSunPageChangedTotal = 0;   ///< ... tiles whose cloud changed (each re-suns the tiles it shadows too) ...
+    uint64_t mSunPageQueuedTotal = 0;    ///< ... and tiles the sun-move queue released.
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
     ref<ComputePass> mpBakeCloudSunPass;
     // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).

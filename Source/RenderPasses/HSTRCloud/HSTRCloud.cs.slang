@@ -140,6 +140,7 @@ static const uint kBeamCoarseQueued = 1u << 16;
 static const uint kBeamCoarseDropped = 1u << 17;
 /// Root tiles around a dirty block whose test reads its basis (beamTransmittanceRange reaches two tiles), see testBeamDirtyTile.
 static const uint kBeamDirtyApron = 2;
+static const float kSunColumnStep = 0.5f; ///< computeSunColumn's longest sample, in domain voxels along the sun.
 
 /// Reference averages of a set of components over the even-frame half, the odd-frame half, and both.
 struct ReferenceHalves
@@ -386,6 +387,8 @@ struct HSTRCloudRenderer
     // World-space residual pages: sun optical depth at every voxel, resident per leaf.
     Texture3D<float> hstrFineSun;
     RWTexture3D<float> hstrFineSunOutput;
+    Texture3D<float> hstrSunShear; ///< Sun optical depth per sun ray and layer (computeSunColumn), read by fineSunAt.
+    RWTexture3D<float> hstrSunShearOutput;
     RWStructuredBuffer<uint> hstrLeafResidual;
     // Scatterer-weighted sun arrival for octaves 1-3 (rgb numerators, a weight), spread laterally.
     Texture3D<float4> hstrSunOctaves;
@@ -1275,12 +1278,24 @@ struct HSTRCloudRenderer
     /// Sun depth of a camera sample that read the proxy (no fine brick there at its footprint): the proxy is the density the
     /// voxel-resolution sun field integrates, so a near march over it would only re-integrate that field. Half a voxel of proxy
     /// extinction towards the sun, then the field.
+    /// The voxel-resolution sun field at voxel position v (unwrapped is fine). Under sunColumns it is read straight from the sun
+    /// rays (computeSunColumn): v's ray crosses the top of the layer sunShear * (top - y) away, and the filter's third axis then
+    /// interpolates along that ray, between its layers.
+    float fineSunAt(float3 v)
+    {
+        if (params.sunColumns != 0)
+        {
+            v.xz += params.sunShear * (float(params.hstrFineDims.y) - 0.5f - v.y);
+            return hstrSunShear.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
+        }
+        return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
+    }
+
     float sunDepthProxy(float3 v)
     {
         v = seaVoxel(v);
         const float3 direction = params.sunVoxelDirection;
-        return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + direction) + 0.5f) / float3(params.hstrFineDims), 0.f) +
-               extinctionAtVoxel(v + 0.5f * direction) * params.sunVoxelWorldLength;
+        return fineSunAt(v + direction) + extinctionAtVoxel(v + 0.5f * direction) * params.sunVoxelWorldLength;
     }
 
     float sunDepthAt(float3 v, float footprint = -1.f)
@@ -1330,15 +1345,14 @@ struct HSTRCloudRenderer
                 const float depth = cloudBrickSun(bakedEntry, sunSlot, sample.x) * instance.sourceVoxelWorld;
                 if (depth > kSunDepthOpaque)
                     return depth;
-                return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + near * direction) + 0.5f) / float3(params.hstrFineDims), 0.f);
+                return depth + fineSunAt(v + near * direction);
             }
         }
         if (near <= 0.f)
         {
             const float3 midpoint = v + 0.5f * direction;
             const float sigma = footprint >= 0.f ? cameraExtinctionAtVoxel(midpoint, footprint) : extinctionAtVoxel(midpoint);
-            return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + direction) + 0.5f) / float3(params.hstrFineDims), 0.f) +
-                   sigma * params.sunVoxelWorldLength;
+            return fineSunAt(v + direction) + sigma * params.sunVoxelWorldLength;
         }
 #if !HSTR_SUN_LIVE
         // Compiled without the live march (the camera program): a sample with no bake of its own or of an ancestor - a brick whose
@@ -1365,7 +1379,7 @@ struct HSTRCloudRenderer
             if (depth > kSunDepthOpaque)
                 return depth;
         }
-        return depth + hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v + t * direction) + 0.5f) / float3(params.hstrFineDims), 0.f);
+        return depth + fineSunAt(v + t * direction);
 #endif
     }
 
@@ -1410,7 +1424,7 @@ struct HSTRCloudRenderer
                     if (any(voxel >= params.hstrFineDims))
                         continue;
                     const float extinction = hstrExtinction.Load(int4(voxel, 0));
-                    const float depth = hstrFineSun[voxel];
+                    const float depth = params.sunColumns != 0 ? fineSunAt(float3(voxel)) : hstrFineSun[voxel];
                     sum += extinction * float4(exp(-depth * float3(b, b * b, b * b * b)), 1.f);
                 }
         hstrSunOctavesOutput[cell] = sum;
@@ -1422,21 +1436,23 @@ struct HSTRCloudRenderer
         if (any(cell >= params.hstrOctaveDims))
             return;
         const int radius = int(ceil(2.5f * params.octaveBlurSigma));
-        int3 axis = 0;
-        axis[params.octaveBlurAxis] = 1;
+        const uint axisIndex = params.octaveBlurAxis;
+        const int size = int(params.hstrOctaveDims[axisIndex]);
+        // The sea wraps X and Z. The taps reach at most `radius` past an edge, so one add or subtract wraps them: the integer
+        // modulos this replaced (two per wrapped axis per tap) are emulated.
+        const bool wraps = params.seaMode != 0 && axisIndex != 1u;
+        const float falloff = -0.5f / (params.octaveBlurSigma * params.octaveBlurSigma);
         float4 sum = 0.f;
         for (int i = -radius; i <= radius; ++i)
         {
-            int3 p = int3(cell) + i * axis;
-            if (params.seaMode != 0)
-            {
-                const int3 dims = int3(params.hstrOctaveDims);
-                p.x = (p.x % dims.x + dims.x) % dims.x;
-                p.z = (p.z % dims.z + dims.z) % dims.z;
-            }
-            if (any(p < 0) || any(p >= int3(params.hstrOctaveDims)))
+            int p = int(cell[axisIndex]) + i;
+            if (wraps)
+                p += p < 0 ? size : (p >= size ? -size : 0);
+            else if (p < 0 || p >= size)
                 continue;
-            sum += exp(-0.5f * float(i * i) / (params.octaveBlurSigma * params.octaveBlurSigma)) * hstrSunOctaves[uint3(p)];
+            uint3 tap = cell;
+            tap[axisIndex] = uint(p);
+            sum += exp(falloff * float(i * i)) * hstrSunOctaves[tap];
         }
         hstrSunOctavesOutput[cell] = sum;
     }
@@ -1976,7 +1992,7 @@ struct HSTRCloudRenderer
         if (withSource)
         {
             if (params.worldCacheModulation > 0.f)
-                s.sunCache = min(hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f),
+                s.sunCache = min(fineSunAt(v),
                                  params.worldCacheModulationDepth);
             if (withCache)
                 s.cache = worldCacheRadianceStored(v, ray.viewDirection);
@@ -2815,6 +2831,44 @@ struct HSTRCloudRenderer
         const float opacity = 1.f - exp(-extinctionAtVoxel(origin) * voxelWorldLength(volume));
         const uint3 leaf = min(voxel / params.hstrCellWidth, params.hstrLeafDims - 1u);
         InterlockedMax(hstrLeafResidual[leafIndex(leaf)], asuint(opacity * exp(-bb * bb * bb * opticalDepth)));
+    }
+
+    /// The sea's sun field by sun ray instead of by voxel (beamSunColumns). computeFineSun marches every voxel to the top of the
+    /// layer, ~40 voxels at a time, so voxels on one sun ray integrate the same density again and again: a full refresh of the
+    /// 512 x 32 x 512 domain was ~4.5 ms, which is why a moving sun refreshed 8 tiles a frame and lagged. Here one thread per sun
+    /// ray - labelled by where it crosses the top of the layer, (u, w) - walks down the layers once, writing the optical depth it
+    /// has accumulated at each layer's centre plane. A lookup (fineSunAt) interpolates between the neighbouring sun rays and along
+    /// its own ray between layers - never compounded from layer to layer. No leaf activation: the residual mask is the HST camera
+    /// path's, which the sea does not use. The sun must be above the horizon (the host keeps computeFineSun otherwise).
+    void computeSunColumn(uint2 column)
+    {
+        const uint3 dims = params.hstrFineDims;
+        if (any(column >= dims.xz))
+            return;
+        const float3 sunIndex = voxelDirection(normalize(params.sunDirection));
+        const float voxelsPerWorld = length(sunIndex);
+        const float3 direction = sunIndex / voxelsPerWorld;
+        const float2 shear = params.sunShear; // Horizontal voxels per voxel of height, going sunwards; fineSunAt reads with the same.
+        const float top = float(dims.y) - 0.5f;
+        float opticalDepth = 0.f;
+        float above = top;
+        for (int j = int(dims.y) - 1; j >= 0; --j)
+        {
+            const float y = float(j);
+            // The segment from the plane above down to this layer's centre plane, in index-space length, at most kSunColumnStep
+            // voxels a sample (midpoints, as computeFineSun's steps).
+            const float length = (above - y) / direction.y;
+            const uint samples = max(1u, uint(ceil(length / kSunColumnStep)));
+            const float step = length / float(samples);
+            for (uint k = 0; k < samples; ++k)
+            {
+                const float h = above - (float(k) + 0.5f) * step * direction.y;
+                const float3 p = float3(float(column.x) - shear.x * (top - h), h, float(column.y) - shear.y * (top - h));
+                opticalDepth += extinctionAtVoxel(p) * step / voxelsPerWorld;
+            }
+            hstrSunShearOutput[uint3(column.x, j, column.y)] = min(opticalDepth, 60.f);
+            above = y;
+        }
     }
 
     /// Pages below the activation tolerance are not resident: their cells contribute nothing.
@@ -3722,7 +3776,7 @@ struct HSTRCloudRenderer
     {
         if (params.worldCacheModulation <= 0.f)
             return 1.f;
-        const float depth = hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
+        const float depth = fineSunAt(v);
         return exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
     }
 
@@ -6354,7 +6408,7 @@ struct HSTRCloudRenderer
                 // opaque early-out did, which put one more memory round trip in series on every lit sample. Exact.
                 // MEASURED (leanchain1, 4K, errors identical): walk 6.02 / 6.02 -> 5.97 ms, sprint 7.50 / 7.51 -> 7.46.
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
-                const float farDepth = hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+                const float farDepth = fineSunAt(far);
                 const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x) * sourceVoxelWorld;
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
@@ -6699,7 +6753,7 @@ struct HSTRCloudRenderer
                     {
                         const float bakedDepth = cloudBrickSunAt(resolved.y >> 24, resolved.x, x) * instance.sourceVoxelWorld;
                         const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
-                        const float farDepth = hstrFineSun.SampleLevel(hstrLinearSampler, (far + 0.5f) / float3(params.hstrFineDims), 0.f);
+                        const float farDepth = fineSunAt(far);
                         depth = bakedDepth > kCloudSunDepthOpaque ? bakedDepth : bakedDepth + farDepth;
                         ++baked;
                     }
@@ -10119,7 +10173,7 @@ struct HSTRCloudRenderer
                 T *= exp(-cameraExtinctionAtVoxel(v, rayFootprint(ray, t + 0.5f * dt)) * dt * ray.worldLength);
                 if (T <= 0.5f)
                 {
-                    debug = exp(-hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f));
+                    debug = exp(-fineSunAt(v));
                 }
                 t += dt;
             }
@@ -11530,6 +11584,12 @@ void sortTileCuts(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThread
     }
     for (uint i = lane; i < count; i += kSortGroupSize)
         gHSTRCloud.hstrTileNodes[base + i] = gSortIDs[i];
+}
+
+[numthreads(8, 8, 1)]
+void computeSunColumns(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.computeSunColumn(dispatchThreadId.xy);
 }
 
 [numthreads(4, 4, 4)]

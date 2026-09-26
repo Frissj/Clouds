@@ -313,6 +313,46 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamFusedInline = bool(value);
             continue;
         }
+        if (key == "sunColumns")
+        {
+            // The field is world state: a switch rebuilds it, so a frame never reads the other method's field.
+            if (mSunColumns != bool(value))
+                mResidualDirty = true;
+            mSunColumns = bool(value);
+            continue;
+        }
+        if (key == "sunInvalidateAngle")
+        {
+            mSunInvalidateAngle = std::max(0.f, float(value));
+            continue;
+        }
+        if (key == "sunOctaveAngle")
+        {
+            mSunOctaveAngle = std::max(0.f, float(value));
+            continue;
+        }
+        if (key == "sunFieldAngle")
+        {
+            mSunFieldAngle = std::max(0.f, float(value));
+            continue;
+        }
+        if (key == "worldCacheTarget")
+        {
+            mWorldCacheTarget = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheFrozenBake")
+        {
+            mWorldCacheFrozenBake = bool(value);
+            continue;
+        }
+        if (key == "sunOctavesHalf")
+        {
+            if (mSunOctavesHalf != bool(value))
+                mResidualDirty = true; // The octaves are rebuilt with the field.
+            mSunOctavesHalf = bool(value);
+            continue;
+        }
         if (key == "beamDirtyTilesDense")
         {
             mBeamDirtyTilesDense = bool(value);
@@ -1169,7 +1209,14 @@ Properties HSTRCloud::getProperties() const
     props["beamFusedRaysOnly"] = mBeamFusedRaysOnly;
     props["beamFusedOverlap"] = mBeamFusedOverlap;
     props["beamFusedInline"] = mBeamFusedInline;
-    props["beamDirtyTilesDense"] = mBeamDirtyTilesDense;    props["beamInvalidate"] = mBeamInvalidate;
+    props["beamDirtyTilesDense"] = mBeamDirtyTilesDense;
+    props["sunColumns"] = mSunColumns;
+    props["sunOctavesHalf"] = mSunOctavesHalf;
+    props["sunInvalidateAngle"] = mSunInvalidateAngle;
+    props["sunFieldAngle"] = mSunFieldAngle;
+    props["sunOctaveAngle"] = mSunOctaveAngle;
+    props["worldCacheTarget"] = mWorldCacheTarget;
+    props["worldCacheFrozenBake"] = mWorldCacheFrozenBake;    props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
@@ -1275,6 +1322,11 @@ Properties HSTRCloud::getProperties() const
         cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
         cloud["maps"] = stats.maps;
+        // Cumulative sun page work (the harness diffs them over a flight): tiles re-sunned, tiles whose cloud changed (each
+        // re-suns itself and the tiles it shadows), and tiles the sun-move queue released.
+        cloud["sunPageTiles"] = mSunPageTilesTotal;
+        cloud["sunPageChanged"] = mSunPageChangedTotal;
+        cloud["sunPageQueued"] = mSunPageQueuedTotal;
         cloud["unmaps"] = stats.unmaps;
         cloud["mapBacklog"] = stats.mapBacklog;
         cloud["activeFades"] = stats.activeFades;
@@ -1717,6 +1769,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpQueryPass = createPass("buildCameraQueries");
     mpTileBasisPass = createPass("buildTileBases");
     mpFineSunPass = createPass("computeFineSun");
+    mpSunColumnsPass = createPass("computeSunColumns");
     mpResidualMaskPass = createPass("maskResidual");
     mpGatherOctavesPass = createPass("gatherSunOctaves");
     mpCompareReferencePass = createPass("compareReference");
@@ -2712,6 +2765,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         std::vector<uint8_t> stale(mCloudTileBatches.size(), 0);
         for (uint32_t slot : mSunPageSlots)
             stale[slot] = 1;
+        mSunPageChangedTotal += changed.size();
         for (uint32_t slot : changed)
             for (int32_t k = 0; k <= steps; ++k)
                 for (int32_t side = -1; side <= 1; ++side)
@@ -3526,6 +3580,7 @@ void HSTRCloud::updateSunVoxelDirection()
     const float3 sunVoxels = normalize(mParams.sunDirection) / mVoxelSize;
     mParams.sunVoxelDirection = sunVoxels / length(sunVoxels);
     mParams.sunVoxelWorldLength = 1.f / length(sunVoxels);
+    mParams.sunShear = std::abs(sunVoxels.y) > 1e-6f ? float2(sunVoxels.x, sunVoxels.z) / sunVoxels.y : float2(0.f);
 }
 
 void HSTRCloud::onLightingChanged(const HSTRCloudParams& previous)
@@ -3544,6 +3599,11 @@ void HSTRCloud::onLightingChanged(const HSTRCloudParams& previous)
         return;
     const float angle = std::acos(std::clamp(cosine, -1.f, 1.f));
     mCloudCacheKeep = std::min(mCloudCacheKeep, std::exp(-angle / 0.05f));
+    mSunPageQueue = seaTilesNearestFirst();
+}
+
+std::vector<uint32_t> HSTRCloud::seaTilesNearestFirst() const
+{
     const auto& desc = mpCloudSea->getDesc();
     const int32_t n = int32_t(desc.tiles);
     const float3 camera = mpScene->getCamera()->getPosition();
@@ -3551,15 +3611,21 @@ void HSTRCloud::onLightingChanged(const HSTRCloudParams& previous)
         ((int32_t(std::floor((camera.x - desc.origin.x) / desc.tileWorld)) % n) + n) % n,
         ((int32_t(std::floor((camera.z - desc.origin.z) / desc.tileWorld)) % n) + n) % n
     );
-    mSunPageQueue.resize(size_t(n) * n);
-    std::iota(mSunPageQueue.begin(), mSunPageQueue.end(), 0u);
+    std::vector<uint32_t> order(size_t(n) * n);
+    std::iota(order.begin(), order.end(), 0u);
     auto torusDistance = [&](uint32_t slot)
     {
         const int32_t dx = std::abs(int32_t(slot % n) - cameraSlot.x);
         const int32_t dz = std::abs(int32_t(slot / n) - cameraSlot.y);
         return std::max(std::min(dx, n - dx), std::min(dz, n - dz));
     };
-    std::stable_sort(mSunPageQueue.begin(), mSunPageQueue.end(), [&](uint32_t a, uint32_t b) { return torusDistance(a) < torusDistance(b); });
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return torusDistance(a) < torusDistance(b); });
+    return order;
+}
+
+bool HSTRCloud::sunColumnsActive() const
+{
+    return mSunColumns && mParams.cloudDomain != 0 && mParams.seaMode != 0 && normalize(mParams.sunDirection).y > 0.05f;
 }
 
 void HSTRCloud::solveLighting()
@@ -3696,6 +3762,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     }
     var["hstrCameraLighting"] = mpCameraLighting;
     var["hstrFineSun"] = mpFineSun;
+    var["hstrSunShear"] = mpSunShear;
     var["hstrLeafResidual"] = mpLeafResidual;
     var["hstrSunOctaves"] = mpSunOctaveField;
     var["hstrCameraQueries"] = mpCameraQueries;
@@ -3820,11 +3887,45 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
         mpLeafResidual = mpDevice->createStructuredBuffer(sizeof(uint32_t), leafCount, flags, MemoryType::DeviceLocal, nullptr, false);
 
     FALCOR_PROFILE(pRenderContext, "fineSun");
-    if (mParams.cloudDomain != 0 && !mResidualDirty)
+    // sunColumns: the sea's whole field in one pass of a thread per sun ray (computeSunColumn), read in place (fineSunAt), instead
+    // of a march per voxel of the stale tiles. The tiles' beam columns are still invalidated on the same schedule.
+    const bool columns = sunColumnsActive();
+    mParams.sunColumns = columns ? 1u : 0u;
+    if (columns)
+    {
+        if (!mpSunShear || mpSunShear->getWidth() != fineDims.x || mpSunShear->getHeight() != fineDims.y || mpSunShear->getDepth() != fineDims.z)
+            mpSunShear = mpDevice->createTexture3D(fineDims.x, fineDims.y, fineDims.z, ResourceFormat::R16Float, 1, nullptr, flags);
+        mFieldSun = normalize(mParams.sunDirection);
+        // The tiles whose cloud changed and those they shadow (the sun-move re-marches were chosen and invalidated in execute).
+        if (!mResidualDirty && mpCloudSea)
+            for (uint32_t slot : mSunPageSlots)
+                if (slot < mpCloudSea->getTiles().size())
+                {
+                    invalidateBeamColumn(mpCloudSea->getTiles()[slot].world);
+                    if (slot < mTileSun.size())
+                        mTileSun[slot] = mFieldSun;
+                }
+        if (mResidualDirty)
+        {
+            mBeamInvalidateAll = true;
+            std::fill(mTileSun.begin(), mTileSun.end(), mFieldSun);
+        }
+        mSunPageTilesTotal += mSunPageSlots.size();
+        {
+            FALCOR_PROFILE(pRenderContext, "sunColumns");
+            bindRenderer(pRenderContext, mpSunColumnsPass);
+            bindOutput(mpSunColumnsPass, "hstrSunShearOutput", mpSunShear, "hstrSunShear");
+            mpSunColumnsPass->execute(pRenderContext, uint3(fineDims.x, fineDims.z, 1));
+        }
+        // MEASURED (sunscopes1, 4K, a refresh): resampled into hstrFineSun instead of read in place, that pass cost 0.22 ms beside
+        // the columns' 0.28.
+    }
+    else if (mParams.cloudDomain != 0 && !mResidualDirty)
     {
         // Sea tiles whose cloud changed, and the tiles in their shadow, recompute their sun pages; the rest stays valid. The residual
         // mask is an optimisation of the HST camera path, which the sea does not use.
         const uint32_t r = mParams.cloudTileVoxels;
+        mSunPageTilesTotal += mSunPageSlots.size();
         for (uint32_t slot : mSunPageSlots)
         {
             // Its light changes, and so does the radiance the beam image holds for every direction through it.
@@ -3854,7 +3955,15 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
             mpResidualMaskPass->execute(pRenderContext, fineDims);
         }
     }
+    const bool cloudChanged = !mSunPageSlots.empty();
     mSunPageSlots.clear();
+
+    // sunOctaveAngle: under sunColumns the multiply scattered octaves follow a moving sun only once it has turned this far from
+    // their build (and whenever the cloud changed, or the sun stops); the single-scattered field above stays exact every frame.
+    const float3 sun = normalize(mParams.sunDirection);
+    if (columns && !mResidualDirty && !cloudChanged && !mSunStill && mpSunOctaveField && dot(sun, mOctaveSun) >= std::cos(mSunOctaveAngle))
+        return;
+    mOctaveSun = sun;
 
     // Octaves 1-3: scatterer-weighted sun arrival on a 2-voxel grid, spread by a separable Gaussian. This runs over the WHOLE
     // volume however few tiles were dirty, so throttling the fine-sun tiles above does not reduce it - which is why the sea's
@@ -3862,12 +3971,19 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     FALCOR_PROFILE(pRenderContext, "sunOctaves");
     const uint3 octaveDims = (fineDims + 1u) / 2u;
     mParams.hstrOctaveDims = octaveDims;
+    // sunOctavesHalf: the gather and blur are bandwidth passes over the whole volume (sunscopes1, 4K: 0.19 + 0.31 ms a refresh).
+    const ResourceFormat octaveFormat = mSunOctavesHalf ? ResourceFormat::RGBA16Float : ResourceFormat::RGBA32Float;
     for (auto& texture : mpSunOctaves)
-        if (!texture || texture->getWidth() != octaveDims.x || texture->getHeight() != octaveDims.y || texture->getDepth() != octaveDims.z)
-            texture = mpDevice->createTexture3D(octaveDims.x, octaveDims.y, octaveDims.z, ResourceFormat::RGBA32Float, 1, nullptr, flags);
-    bindRenderer(pRenderContext, mpGatherOctavesPass);
-    bindOutput(mpGatherOctavesPass, "hstrSunOctavesOutput", mpSunOctaves[0], "hstrSunOctaves");
-    mpGatherOctavesPass->execute(pRenderContext, octaveDims);
+        if (!texture || texture->getWidth() != octaveDims.x || texture->getHeight() != octaveDims.y || texture->getDepth() != octaveDims.z ||
+            texture->getFormat() != octaveFormat)
+            texture = mpDevice->createTexture3D(octaveDims.x, octaveDims.y, octaveDims.z, octaveFormat, 1, nullptr, flags);
+    {
+        FALCOR_PROFILE(pRenderContext, "octGather");
+        bindRenderer(pRenderContext, mpGatherOctavesPass);
+        bindOutput(mpGatherOctavesPass, "hstrSunOctavesOutput", mpSunOctaves[0], "hstrSunOctaves");
+        mpGatherOctavesPass->execute(pRenderContext, octaveDims);
+    }
+    FALCOR_PROFILE(pRenderContext, "octBlur");
     uint32_t current = 0;
     for (uint32_t axis = 0; axis < 3; ++axis)
     {
@@ -4617,9 +4733,43 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
 
     // World space: residual pages depend on the sun and density only. The world cache's modulation reads them, so they come first.
-    if (mParams.cloudDomain != 0 && !mSunPageQueue.empty() && !mResidualDirty)
+    if (sunColumnsActive() && mpCloudSea && !mResidualDirty)
+    {
+        // The field is whole every refresh, so the queue only chooses beam columns to re-march: the nearest tiles whose beams were
+        // marched under a sun more than mSunInvalidateAngle from this one while it moves; once it stops, every tile left behind,
+        // so the image settles. The field is refreshed only when the sun has moved since it was built (or the cloud changed).
+        const float3 sun = normalize(mParams.sunDirection);
+        const size_t tiles = mpCloudSea->getTiles().size();
+        if (mTileSun.size() != tiles)
+            mTileSun.assign(tiles, sun);
+        const bool moving = dot(sun, mFieldSun) < 0.999999f;
+        const float cosine = std::cos(moving ? mSunInvalidateAngle : 1e-3f);
+        uint32_t invalidated = 0;
+        for (uint32_t slot : seaTilesNearestFirst())
+        {
+            if (invalidated >= mCloudSunTilesPerFrame)
+                break;
+            if (dot(mTileSun[slot], sun) < cosine)
+            {
+                invalidateBeamColumn(mpCloudSea->getTiles()[slot].world);
+                mTileSun[slot] = sun;
+                ++invalidated;
+            }
+        }
+        mSunPageQueuedTotal += invalidated;
+        mSunPageQueue.clear();
+        mSunStill = dot(sun, mPreviousSun) >= 0.999999f;
+        if (moving && (mSunStill || dot(sun, mFieldSun) < std::cos(mSunFieldAngle)))
+            mSunPagesDirty = true;
+        // Octaves left behind by sunOctaveAngle: one last build once the sun stops.
+        if (mSunStill && dot(sun, mOctaveSun) < 0.999999f)
+            mSunPagesDirty = true;
+        mPreviousSun = sun;
+    }
+    else if (mParams.cloudDomain != 0 && !mSunPageQueue.empty() && !mResidualDirty)
     {
         const size_t count = std::min<size_t>(mCloudSunTilesPerFrame, mSunPageQueue.size());
+        mSunPageQueuedTotal += count;
         for (size_t i = 0; i < count; ++i)
             if (std::find(mSunPageSlots.begin(), mSunPageSlots.end(), mSunPageQueue[i]) == mSunPageSlots.end())
                 mSunPageSlots.push_back(mSunPageQueue[i]);
@@ -4696,6 +4846,16 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
         // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
         FALCOR_PROFILE(pRenderContext, "worldCache");
+        // MEASURED and REVERTED (cachereg2, 4K, parked under a 0.57 deg/frame sun, the cache frozen): skipping this decay while no
+        // photon updates follow saved its 0.26 ms but took the score 0.364 -> 1.753% of pixels over 0.02. It is not a no-op: the
+        // bake it triggers keeps the camera's baked cache in step with what the exact frame reads.
+        // worldCacheFrozenBake: so with no updates to follow, only that bake - the decay scales every sum and every tile's batch
+        // count alike, which leaves the means where they were.
+        if (mCloudCacheKeep < 1.f && mWorldCacheUpdates == 0 && mWorldCacheFrozenBake)
+        {
+            mCloudCacheKeep = 1.f;
+            mWorldCacheBakeDirty = true;
+        }
         if (mCloudCacheKeep < 1.f && mpWorldCacheDeposit && mParams.worldCacheSamples > 0)
         {
             mParams.worldCacheKeep = mCloudCacheKeep;
@@ -4708,7 +4868,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mWorldCacheBakeDirty = true;
         }
         mCloudCacheKeep = 1.f;
-        for (uint32_t i = 0; i < mWorldCacheUpdates; ++i)
+        // worldCacheTarget: photon updates only while some tile holds fewer batches than this - the state every benchmark scores
+        // (sea_motion.py settles to 64 samples, then freezes the cache). A tile whose cloud changed restarts at 0 and a sun move
+        // decays every tile's count, so either resumes them. 0: every frame, as before.
+        const bool converged = mWorldCacheTarget > 0 && !mCloudTileBatches.empty() &&
+                               *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end()) >= float(mWorldCacheTarget);
+        for (uint32_t i = 0; i < (converged ? 0u : mWorldCacheUpdates); ++i)
         {
             if (mParams.worldCacheEstimator == 0)
             {

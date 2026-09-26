@@ -487,9 +487,8 @@ struct HSTRCloudParams
     uint3 hstrOctaveDims = { 0, 0, 0 }; ///< 2-voxel grid of scatterer-weighted sun arrival for octaves 1-3.
     uint octaveBlurAxis = 0;
     float octaveBlurSigma = 1.f; ///< Lateral spread of multiply scattered sun light, in 2-voxel cells.
-    float padHSTR10 = 0.f;
-    float padHSTR11 = 0.f;
-    float padHSTR12 = 0.f;
+    float2 sunShear = float2(0.f); ///< Horizontal domain voxels per voxel of height towards the sun (sunVoxelDirection.xz / .y).
+    uint sunColumns = 0;           ///< The sun field is hstrSunShear, per sun ray (fineSunAt), not hstrFineSun.
 
     // World-space radiance cache experiment (debugView kWorldCacheView).
     uint3 worldCacheDims = { 0, 0, 0 };
