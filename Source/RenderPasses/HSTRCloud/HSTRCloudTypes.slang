@@ -12,7 +12,7 @@ static const uint kComponentSunMultiple = 4; ///< Sun light scattered two or mor
 static const uint kComponentSkyScattered = 8; ///< Sky light scattered one or more times.
 static const uint kComponentCount = 4;
 
-static const uint kWorldCacheView = 8;     ///< debugView of the world-space radiance cache experiment.
+static const uint kWorldCacheView = 8;    ///< debugView of the world-space radiance cache experiment.
 static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: unit sun SH 0-8, unit sky SH 9-17, sun extension 18-24.
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
@@ -1273,6 +1273,10 @@ struct HSTRCloudParams
     /// bound, and slicing also costs quality: the per-slice restarts are not negligible there. A per-build adaptive count (the most
     /// slices keeping rays x slices within a thread budget of 32k-256k) chose 1 in every one of those cases and was removed.
     uint beamDirtySegments = 1;
+    /// PROBE (0 = off, compiled into the dirty query only as HSTR_ORDER_PROBE): counts over the rays the dirty query marches - steps,
+    /// the longest ray, a log2 histogram, and how well the stored step count (lattice slice 2 .x) predicted them, with this many
+    /// steps as the "long" threshold. See hstrBeamOrderProbe.
+    uint beamOrderProbe = 0;
     /// Nonzero for the build that anchors the octahedral image when beamPrebuild is on: every block is built, not just the ones
     /// the screen touches (beamBoxOnScreen answers yes everywhere). See beamPrebuild on the host.
     uint beamBuildAll = 0;

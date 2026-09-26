@@ -288,6 +288,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamOrderProbe")
+        {
+            mParams.beamOrderProbe = uint32_t(value);
+            continue;
+        }
         if (key == "beamDirtySegments")
         {
             // Threads per ray must divide the 64-thread group, or a ray's slices would straddle two groups' shared memory.
@@ -1121,6 +1126,7 @@ Properties HSTRCloud::getProperties() const
     props["colorFormat"] = mColorFormat;
     props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
+    props["beamOrderProbe"] = mParams.beamOrderProbe;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
@@ -1486,6 +1492,9 @@ Properties HSTRCloud::getProperties() const
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
         cloud["beamWarpHeld"] = mBeamWarpHeld;
+        if (mParams.beamOrderProbe != 0)
+            for (uint32_t i = 0; i < 21; ++i)
+                cloud["beamOrderProbe" + std::to_string(i)] = mBeamOrderProbeValues[i];
         cloud["beamWarpListed"] = mBeamWarpListed;
         cloud["beamWarpOn"] = mBeamWarpOn;
         cloud["beamPolicyToleranceNow"] = mBeamPolicyToleranceNow;
@@ -3697,6 +3706,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
+    var["hstrBeamOrderProbe"] = mpBeamOrderProbe;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
     var["hstrBeamWarpArgs"] = mpBeamWarpArgs;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
@@ -4943,7 +4953,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3); // Blocks listed, units to march, blocks held.
+                // Blocks listed, units to march, blocks held.
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3);
                 if (!mpBeamWarpArgs)
                 {
                     // Warp on, step scale 1, the set tolerance, until a translating build decides (decideBeamPolicy).
@@ -5659,6 +5670,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     mpBeamDirtyQueryPass->getProgram()->addDefine(
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0");
+                                    if (mParams.beamOrderProbe != 0)
+                                    {
+                                        if (!mpBeamOrderProbe)
+                                            mpBeamOrderProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 21);
+                                        pRenderContext->clearUAV(mpBeamOrderProbe->getUAV().get(), uint4(0));
+                                    }
                                     setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
                                     if (mBeamRepairProbe)
                                     {
@@ -6120,6 +6138,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             {
                 mBeamWarpListed = mpBeamDirtyCount->getElement<uint32_t>(0);
                 mBeamWarpHeld = mpBeamDirtyCount->getElement<uint32_t>(2);
+            }
+            if (mParams.beamOrderProbe != 0 && mpBeamOrderProbe)
+            {
+                for (uint32_t i = 0; i < 21; ++i)
+                    mBeamOrderProbeValues[i] = mpBeamOrderProbe->getElement<uint32_t>(i);
             }
             mBeamWarpOn = mpBeamWarpArgs && mBeamWarpAuto > 0.f ? mpBeamWarpArgs->getElement<uint32_t>(9) : uint32_t(mBeamWarp);
             mBeamPolicyToleranceNow =

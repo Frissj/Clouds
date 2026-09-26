@@ -330,6 +330,8 @@ private:
     uint32_t mBeamWarpOn = 0;     ///< ... and whether its resolve was warped (stats, read with the comparison).
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
+    ref<Buffer> mpBeamOrderProbe;   ///< beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe), 21 uints.
+    uint32_t mBeamOrderProbeValues[21] = {}; ///< The scored frame's counters.
     ref<Buffer> mpBeamDirtyCount;
     ref<Buffer> mpBeamDirtyArgs;    ///< Two indirect dispatches: the query over those blocks, then the residual over them.
     ref<ComputePass> mpBeamClassifyGuardPass;

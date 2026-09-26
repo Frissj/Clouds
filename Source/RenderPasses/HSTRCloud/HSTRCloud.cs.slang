@@ -28,6 +28,9 @@ import HSTRCloudTypes;
 /// beamWarp: the resolve reads a held guard block where its capture camera saw the content (beamWarpPosition).
 /// PROBE (mBeamStripProbe): the dirty query and unit passes' timing copies. 1 returns after the ray setup, 2 marches one step,
 /// 3 the full march; each computes and never writes (beamStripSink). 0: the real passes.
+#ifndef HSTR_ORDER_PROBE
+#define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
+#endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
@@ -395,6 +398,10 @@ struct HSTRCloudRenderer
     RWTexture2D<float4> hstrBeamGuardCamera;
     /// The blocks whose certificate failed this build, compacted, with the count and the indirect arguments that dispatch them.
     RWStructuredBuffer<uint> hstrBeamDirty;
+    /// beamOrderProbe, over the rays the dirty query marched this build: [0] rays, [1] steps, [2] longest ray's steps, [3] rays with
+    /// no stored step count, [4] sum |stored - actual| and [5] sum actual over the others, [6..17] rays by log2(steps) (1, 2-3, 4-7,
+    /// ..., 2048+), [18] rays at least the threshold, [19] rays predicted at least it, [20] both.
+    RWStructuredBuffer<uint> hstrBeamOrderProbe;
     RWStructuredBuffer<uint> hstrBeamDirtyCount;
     RWStructuredBuffer<uint> hstrBeamDirtyArgs;
     /// Per guard block: the first dirty-list slot it was listed in this build, ~0 when not listed (cleared every build). Lets
@@ -8887,6 +8894,30 @@ struct HSTRCloudRenderer
     /// What a marched query writes: the point itself, and the guard entry it is now entitled to vouch for.
     void beamQueryMarched(uint2 position, BeamSample q)
     {
+#if HSTR_ORDER_PROBE
+        {
+            // The step count stored by this point's last march, read before this march replaces it.
+            const float4 stored = beamLatticeHeldAt(position, 2);
+            const uint actual = uint(q.steps);
+            const uint threshold = params.beamOrderProbe;
+            InterlockedAdd(hstrBeamOrderProbe[0], 1u);
+            InterlockedAdd(hstrBeamOrderProbe[1], actual);
+            InterlockedMax(hstrBeamOrderProbe[2], actual);
+            InterlockedAdd(hstrBeamOrderProbe[6 + (actual == 0u ? 0u : min(firstbithigh(actual), 11u))], 1u);
+            const bool longActual = actual >= threshold;
+            InterlockedAdd(hstrBeamOrderProbe[18], longActual ? 1u : 0u);
+            if (stored.y <= 0.f)
+                InterlockedAdd(hstrBeamOrderProbe[3], 1u);
+            else
+            {
+                const uint predicted = uint(stored.x);
+                InterlockedAdd(hstrBeamOrderProbe[4], predicted > actual ? predicted - actual : actual - predicted);
+                InterlockedAdd(hstrBeamOrderProbe[5], actual);
+                InterlockedAdd(hstrBeamOrderProbe[19], predicted >= threshold ? 1u : 0u);
+                InterlockedAdd(hstrBeamOrderProbe[20], predicted >= threshold && longActual ? 1u : 0u);
+            }
+        }
+#endif
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
         beamGuardVerified(position, q.distance);
 #if HSTR_PUSH_SHARE
@@ -10232,6 +10263,18 @@ void writeBeamDirtyArgs()
     const uint side = max(edge / max(gHSTRCloud.params.beamTileSize, 1u), 1u) + 2u * kBeamDirtyApron;
     writeFoldedDirtyArgs(12, blocks * side * side);
 }
+
+// MEASURED and REMOVED, longest-first dirty query (4K, errors identical in every arm): the listed blocks reordered by the steps
+// their longest ray took when last marched (lattice slice 2 .x), so the query's long rays start in its first wave instead of
+// trailing (ngfx8: ~2.5 waves at walk, ending on a few long rays).
+//   order1, two classes at a fixed step threshold: walk 1.87 -> 1.81 ms at 50, jog and sprint +0.02-0.04; 150+ reordered nothing.
+//   oprobe1 (order_probe.py): rays are short (mean 10-15 steps, longest 90-99), the stored count finds the long ones 66% of the
+//   time at walk but 35-50% at jog and sprint.
+//   order2, a GPU counting sort into 2-32 classes spread over 0 .. the build's longest block (no threshold), ms wall listed /
+//   2 / 4 / 8 / 16 / 32 / listed: walk 1.93 / 1.92 / 1.91 / 1.90 / 1.91 / 1.90 / 1.89 (drift); jog 2.43 / 2.62 / 2.55 / 2.49 /
+//   2.46 / 2.45 / 2.41; sprint 2.26 / 2.55 / 2.50 / 2.40 / 2.36 / 2.36 / 2.26.
+// The finer the sort the less it costs, and it never beats the listed order: the tail is not long blocks started late, or the
+// prediction under motion is too weak to find them, and moving blocks away from their listed neighbours costs more than it saves.
 
 #ifndef HSTR_BEAM_DIRTY_SLICES
 #define HSTR_BEAM_DIRTY_SLICES 0 // Nonzero: beamDirtySegments > 1 (set by the host), the sliced query below.
