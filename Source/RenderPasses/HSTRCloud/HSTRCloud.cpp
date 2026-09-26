@@ -5001,8 +5001,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // Every unit of every block: each tile is tested once (beamDirtyTileOwner) and lists its own units, so it cannot overflow.
                 const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
                 mpBeamDirtyUnits = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells * blockEdge * blockEdge);
-                // beamDirtyFused: per block its finished rays and then the finished-block queue. The counters reset themselves
-                // as they complete, so they start at zero once.
+                // beamDirtyFused: per block its finished rays and then the finished-block queue, cleared before each fused build.
                 mpBeamFusedState = mpDevice->createStructuredBuffer(sizeof(uint32_t), kFusedStateCount);
                 mpBeamFusedBlocks = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2 * cells);
                 pRenderContext->clearUAV(mpBeamFusedBlocks->getUAV().get(), uint4(0));
@@ -6109,6 +6108,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
                         mParams.beamFusedWarp = warp && !(mBeamWarpAuto > 0.f) && mpBeamWarpField ? 1u : 0u;
                         mParams.beamWarpAuto = warp && mBeamWarpAuto > 0.f ? mBeamWarpAuto : 0.f;
+                        // The finished-block queue's slots are waited on until written (index + 1), so it starts empty each build.
+                        pRenderContext->clearUAV(mpBeamFusedBlocks->getUAV().get(), uint4(0));
                         bindRenderer(pRenderContext, mpBeamDirtyFusedSetupPass);
                         mpBeamDirtyFusedSetupPass->execute(pRenderContext, uint3(1));
                         // The resolve dispatches from the warp arguments; left in their indirect state now, nothing between the

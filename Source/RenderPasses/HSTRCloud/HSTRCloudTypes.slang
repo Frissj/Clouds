@@ -23,7 +23,7 @@ static const uint kFusedItemNext = 3 * kFusedStride;       ///< Tile items (a fi
 static const uint kFusedItemsDone = 4 * kFusedStride;      ///< Tile items finished.
 static const uint kFusedUnitsPublished = 5 * kFusedStride; ///< Listed units written and published, in order.
 static const uint kFusedUnitNext = 6 * kFusedStride;       ///< Units claimed by the fused kernel; the units pass marches the rest.
-static const uint kFusedTailNext = 7 * kFusedStride;       ///< Rebuilt coarse cells and warp-field texels claimed.
+static const uint kFusedUnitHandBack = 7 * kFusedStride;   ///< The lowest unit claimed past what was ever listed (~0: none).
 static const uint kFusedWarp = 8 * kFusedStride;           ///< The warp field is built this build.
 static const uint kFusedTolerance = 8 * kFusedStride + 1;  ///< beamPolicy's tile tolerance (asuint), copied out of hstrBeamWarpArgs[11].
 static const uint kFusedTilesTested = 9 * kFusedStride;    ///< Stats: tiles the fused chain tested.
@@ -33,7 +33,9 @@ static const uint kFusedUnitsMarched = 9 * kFusedStride + 1; ///< Stats: units i
 // waited for (idle loop: blocks published, blocks reserved, blocks, rays claimed, rays, items done, items, units published).
 // 9, 10: block and unit publishes in progress (their counts at the first give-up in 15, 16); 11: publishes an abort broke out of,
 // 12-14 the first one's counter value, awaited value, and bit << 24 | polls.
-static const uint kFusedDiagCount = 17;
+// 17: item waits an abort broke; 18-22 the first one's claim start, count << 24 | polls, lanes still waiting, the first waiting
+// lane's queue position, and what its slot held then.
+static const uint kFusedDiagCount = 23;
 static const uint kFusedAbort = 9 * kFusedStride + 2;      ///< Diagnostic: a wait gave up; every wave leaves.
 static const uint kFusedWaitLimit = 20000;                 ///< Polls before a wait gives up instead of hanging the GPU.
 static const uint kFusedStateCount = 10 * kFusedStride;

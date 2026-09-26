@@ -10524,9 +10524,13 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 /// The first listed unit the units pass marches: after the fused chain, the ones it did not take.
 uint beamDirtyUnitStart()
 {
-    if (gHSTRCloud.params.beamFusedStage == 6u)
-        return 0u; // DIAGNOSTIC: the units pass marches every unit again.
-    return gHSTRCloud.params.beamDirtyFused != 0 ? min(gFusedState[kFusedUnitNext], gHSTRCloud.hstrBeamDirtyCount[1]) : 0u;
+    // DIAGNOSTIC: stage 6, or a fused kernel that gave up, leaves every unit to the units pass (units a wave claimed and did not
+    // march otherwise stay unmarched - stage 5 removed the device that way).
+    if (gHSTRCloud.params.beamFusedStage == 6u || gFusedState[kFusedAbort] != 0)
+        return 0u;
+    // A unit handed back may lie below units other waves marched; those are marched again, to the same values.
+    const uint taken = min(gFusedState[kFusedUnitNext], gFusedState[kFusedUnitHandBack]);
+    return gHSTRCloud.params.beamDirtyFused != 0 ? min(taken, gHSTRCloud.hstrBeamDirtyCount[1]) : 0u;
 }
 
 /// Dispatch arguments for the compacted units, hstrBeamDirtyArgs[15..17].
@@ -10550,7 +10554,8 @@ void setupBeamDirtyFused()
     for (uint i = 0; i < kFusedStateCount; ++i)
         gFusedState[i] = 0u;
     const HSTRCloudParams p = gHSTRCloud.params;
-    gFusedState[kFusedWarp] = p.beamWarpAuto > 0.f ? (gHSTRCloud.hstrBeamWarpArgs[9] != 0 ? 1u : 0u) : p.beamFusedWarp;
+    gFusedState[kFusedUnitHandBack] = 0xFFFFFFFFu;
+    gFusedState[kFusedWarp] =p.beamWarpAuto > 0.f ? (gHSTRCloud.hstrBeamWarpArgs[9] != 0 ? 1u : 0u) : p.beamFusedWarp;
     gFusedState[kFusedTolerance] = gHSTRCloud.hstrBeamWarpArgs[11];
 }
 
@@ -10594,8 +10599,9 @@ uint fusedBackoff(uint idle)
 /// Every wave loops: query rays first, in listed order; then the padded tiles of blocks whose rays have all finished; otherwise
 /// units already listed. A tile is tested once, by the lane whose block completes the set of listed blocks it reads (the dirty
 /// tile pass's owner rule picks one of the same set, and the answer does not depend on which). A wave only ever waits on work
-/// another RUNNING wave has claimed, so the loop cannot deadlock however many groups are resident. It returns once every tile is
-/// tested, leaving the units no wave has taken to the units pass, which the pixel resolve still overlaps.
+/// another RUNNING wave has claimed, so the loop cannot deadlock however many groups are resident. A wave returns as soon as it
+/// finds nothing to take; the waves still working take what their work makes claimable. The units no wave has taken (from the
+/// lowest of kFusedUnitNext and kFusedUnitHandBack) are the units pass's, which the pixel resolve still overlaps.
 [numthreads(64, 1, 1)]
 void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
 {
@@ -10652,7 +10658,11 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 if (completed)
                     gFusedBlocks[index] = 0u; // For the next build; nobody else adds to it now.
             }
-            // Finished blocks go into the queue, published in reservation order.
+            // Finished blocks go into the queue: a slot each, holding index + 1 once written (the host clears the queue each build),
+            // which the waves testing its tiles wait on. MEASURED (ngfx11, 4K sprint): published in reservation order instead - each
+            // wave spinning until the ones that reserved before it had published - thousands of blocks queued one atomic round trip
+            // at a time behind the spinning waves' polls: 52% of the fused kernel's samples on that spin, 4.18 ms against the separate
+            // passes' ~1.3.
             const uint finished = WaveActiveCountBits(completed);
             if (finished != 0)
             {
@@ -10661,38 +10671,64 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                     InterlockedAdd(gFusedState[kFusedBlocksReserved], finished, base);
                 base = WaveReadLaneFirst(base);
                 if (completed)
-                    gFusedBlocks[p.beamDirtyCapacity + base + WavePrefixCountBits(completed)] = index;
-                DeviceMemoryBarrier();
-                if (WaveIsFirstLane())
-                    gHSTRCloud.fusedPublish(kFusedBlocksDone, base, finished, 1u);
+                {
+                    uint unused;
+                    InterlockedExchange(gFusedBlocks[p.beamDirtyCapacity + base + WavePrefixCountBits(completed)], index + 1u, unused);
+                }
             }
             continue;
         }
         if (stage == 2u)
             break;
         // Items and units are claimed with one add each, like the rays, once a read shows some are there: a claim may run past what
-        // is published, and then waits for it. MEASURED (ngfx10, 4K sprint): claimed by compare-exchange instead, ~1,300 waves
+        // is written, and then waits for it. MEASURED (ngfx10, 4K sprint): claimed by compare-exchange instead, ~1,300 waves
         // retried one counter for ~1.1M tile items and the units - 84% of the kernel's samples on the retry's compare, 15 ms.
-        // Waiting cannot deadlock: rays run out before any wave looks here, so every block is being marched by a running wave.
+        // Waiting cannot deadlock: a reserved slot is written by the wave that reserved it, right after, waiting on nothing.
         // Tiles of finished blocks.
-        const uint published = WaveReadLaneFirst(gFusedState[kFusedBlocksDone]);
-        if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) < min(published * padded * padded, items))
+        const uint reserved = WaveReadLaneFirst(gFusedState[kFusedBlocksReserved]);
+        if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) < min(reserved * padded * padded, items))
         {
             claim = fusedTake(kFusedItemNext, items);
             if (claim.y != 0)
             {
-                const uint end = claim.x + claim.y;
+                const uint item = claim.x + lane;
+                const bool mine = lane < claim.y;
+                const uint slot = p.beamDirtyCapacity + (mine ? item / (padded * padded) : 0u);
+                uint written = 0;
                 for (uint wait = 0;; ++wait)
                 {
-                    const uint done = fusedWavePoll(kFusedBlocksDone);
-                    if (done * padded * padded >= end)
+                    if (mine && written == 0)
+                        InterlockedOr(gFusedBlocks[slot], 0u, written);
+                    if (!WaveActiveAnyTrue(mine && written == 0))
                         break;
                     if (fusedWavePoll(kFusedAbort) != 0)
+                    {
+                        // Diagnostic: the first item wait an abort broke - its claim, how long it waited, the lanes still
+                        // waiting, and the first such lane's queue slot and what that slot holds now.
+                        const uint waiting = WaveActiveCountBits(mine && written == 0);
+                        const uint first = WaveActiveMin(mine && written == 0 ? slot : 0xFFFFFFFFu);
+                        if (WaveIsFirstLane())
+                        {
+                            const uint diag = p.beamTileDims.x * p.beamTileDims.y;
+                            uint before;
+                            InterlockedAdd(gFusedTiles[diag + 17], 1u, before);
+                            if (before == 0)
+                            {
+                                uint now;
+                                InterlockedOr(gFusedBlocks[first], 0u, now);
+                                gFusedTiles[diag + 18] = claim.x;
+                                gFusedTiles[diag + 19] = (claim.y << 24) | min(wait, 0xFFFFFFu);
+                                gFusedTiles[diag + 20] = waiting;
+                                gFusedTiles[diag + 21] = first - p.beamDirtyCapacity;
+                                gFusedTiles[diag + 22] = now;
+                            }
+                        }
                         return;
+                    }
                     if (wait >= kFusedWaitLimit)
                     {
                         if (WaveIsFirstLane())
-                            gHSTRCloud.fusedGiveUp(4u, uint4(done, end, blocks, items), uint4(0, 0, 0, 0));
+                            gHSTRCloud.fusedGiveUp(4u, uint4(reserved, claim.x, blocks, items), uint4(0, 0, 0, 0));
                         break;
                     }
                     sink += fusedBackoff(wait);
@@ -10700,10 +10736,9 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 DeviceMemoryBarrier();
                 uint2 tile = 0;
                 bool failed = false;
-                if (lane < claim.y)
+                if (mine && written != 0)
                 {
-                    const uint item = claim.x + lane;
-                    const uint index = gFusedBlocks[p.beamDirtyCapacity + item / (padded * padded)];
+                    const uint index = written - 1u;
                     if (gHSTRCloud.beamDirtyPaddedTile(index, item % (padded * padded), tile) && stage != 3u)
                         failed = fusedTileItem(index, tile, side);
                 }
@@ -10715,24 +10750,9 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 continue;
             }
         }
-        // Every tile tested means every unit listed and published (a tile's units are published before its item counts as done),
-        // so `available` read after it is final.
-        const bool finished = published == blocks && fusedWavePoll(kFusedItemsDone) == items;
         const uint available = fusedWavePoll(kFusedUnitsPublished);
-        if ((stage == 3u || stage == 4u) && finished)
-            break;
         if (stage == 3u || stage == 4u)
-        {
-            if (idle >= kFusedWaitLimit)
-            {
-                if (WaveIsFirstLane())
-                    gHSTRCloud.fusedGiveUp(8u, uint4(published, gHSTRCloud.fusedPoll(kFusedBlocksReserved), blocks, gHSTRCloud.fusedPoll(kFusedRayNext)),
-                                          uint4(rays, gHSTRCloud.fusedPoll(kFusedItemsDone), items, available));
-                break;
-            }
-            sink += fusedBackoff(idle++);
-            continue;
-        }
+            break;
         // The wave's claimed units, as far as they are published. MEASURED (fused5, fused6: device removed): waiting on them in
         // place deadlocked - hundreds of waves claimed ahead of the few units published so far and all waited, leaving no wave to
         // test the tiles that list the rest.
@@ -10750,13 +10770,29 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 idle = 0;
                 continue;
             }
-            if (finished)
-                pending = pendingEnd; // Past the last unit listed: nothing there.
+            // Listed but not yet published: the wave that listed them publishes them within its own publish (in listing order,
+            // after the lists before it, all by running waves). Past what is listed, nothing may ever come: the claim goes back to
+            // the units pass, which starts at the lowest unit handed back.
+            uint listed = 0;
+            if (WaveIsFirstLane())
+                InterlockedOr(gHSTRCloud.hstrBeamDirtyCount[1], 0u, listed);
+            if (pending < WaveReadLaneFirst(listed))
+            {
+                if (idle >= kFusedWaitLimit)
+                {
+                    if (WaveIsFirstLane())
+                        gHSTRCloud.fusedGiveUp(8u, uint4(reserved, blocks, pending, available), uint4(listed, 0, 0, 0));
+                    break;
+                }
+                sink += fusedBackoff(idle++);
+                continue;
+            }
+            if (WaveIsFirstLane())
+                InterlockedMin(gFusedState[kFusedUnitHandBack], pending);
+            pending = pendingEnd;
         }
-        if (finished && pending >= pendingEnd)
-            break; // What no wave has claimed is the units pass's.
-        // More units, while there is still something to wait for.
-        if (pending >= pendingEnd && WaveReadLaneFirst(gFusedState[kFusedUnitNext]) < available)
+        // More units, while there are some to take.
+        if (WaveReadLaneFirst(gFusedState[kFusedUnitNext]) < available)
         {
             uint first = 0;
             if (WaveIsFirstLane())
@@ -10766,14 +10802,11 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
             idle = 0;
             continue;
         }
-        if (idle >= kFusedWaitLimit)
-        {
-            if (WaveIsFirstLane())
-                gHSTRCloud.fusedGiveUp(8u, uint4(published, gHSTRCloud.fusedPoll(kFusedBlocksReserved), blocks, gHSTRCloud.fusedPoll(kFusedRayNext)),
-                                          uint4(rays, gHSTRCloud.fusedPoll(kFusedItemsDone), items, available));
-            break;
-        }
-        sink += fusedBackoff(idle++);
+        // Nothing to take now. Leaving instead of polling for more: MEASURED (fstage3-5, 4K walk) idle waves polling the counters'
+        // lines slowed the waves still working to a crawl, the last tile items taking longer than 20k polls. Whatever is claimable
+        // later - the tiles of blocks whose rays are still being marched, units still being listed - is claimed by the waves that
+        // make it claimable, which are still running and loop back here.
+        break;
     }
     // Never true; keeps the backoff's arithmetic from being optimised away.
     if (sink == 0x7FFFFFFFu && lane == 32u)
