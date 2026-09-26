@@ -12,7 +12,33 @@ static const uint kComponentSunMultiple = 4; ///< Sun light scattered two or mor
 static const uint kComponentSkyScattered = 8; ///< Sky light scattered one or more times.
 static const uint kComponentCount = 4;
 
-static const uint kWorldCacheView = 8;    ///< debugView of the world-space radiance cache experiment.
+// hstrBeamFusedState (runBeamDirtyFused): claim counters of the fused dirty chain, then the build's decisions it reads. One per
+// 128-byte line (kFusedStride uints apart): all in one line, every idle wave's poll queued behind every working wave's atomic at
+// one L2 slice - fused1, 4K: the kernel took 10-49 ms against ~1.4 for the passes it replaces.
+static const uint kFusedStride = 32;
+static const uint kFusedRayNext = 0 * kFusedStride;        ///< Query rays claimed.
+static const uint kFusedBlocksDone = 1 * kFusedStride;     ///< Blocks whose rays all finished, published in order into the block queue.
+static const uint kFusedBlocksReserved = 2 * kFusedStride; ///< Block queue slots reserved.
+static const uint kFusedItemNext = 3 * kFusedStride;       ///< Tile items (a finished block's padded tiles) claimed.
+static const uint kFusedItemsDone = 4 * kFusedStride;      ///< Tile items finished.
+static const uint kFusedUnitsPublished = 5 * kFusedStride; ///< Listed units written and published, in order.
+static const uint kFusedUnitNext = 6 * kFusedStride;       ///< Units claimed by the fused kernel; the units pass marches the rest.
+static const uint kFusedTailNext = 7 * kFusedStride;       ///< Rebuilt coarse cells and warp-field texels claimed.
+static const uint kFusedWarp = 8 * kFusedStride;           ///< The warp field is built this build.
+static const uint kFusedTolerance = 8 * kFusedStride + 1;  ///< beamPolicy's tile tolerance (asuint), copied out of hstrBeamWarpArgs[11].
+static const uint kFusedTilesTested = 9 * kFusedStride;    ///< Stats: tiles the fused chain tested.
+static const uint kFusedUnitsMarched = 9 * kFusedStride + 1; ///< Stats: units it marched itself.
+// Diagnostic, after gFusedTiles' tile counters (never cleared, so it survives to the stats readback): bits of the waits that hit
+// kFusedWaitLimit (1 block publish, 2 unit publish, 4 item wait, 8 idle loop), then the last give-up's counter value and what it
+// waited for (idle loop: blocks published, blocks reserved, blocks, rays claimed, rays, items done, items, units published).
+// 9, 10: block and unit publishes in progress (their counts at the first give-up in 15, 16); 11: publishes an abort broke out of,
+// 12-14 the first one's counter value, awaited value, and bit << 24 | polls.
+static const uint kFusedDiagCount = 17;
+static const uint kFusedAbort = 9 * kFusedStride + 2;      ///< Diagnostic: a wait gave up; every wave leaves.
+static const uint kFusedWaitLimit = 20000;                 ///< Polls before a wait gives up instead of hanging the GPU.
+static const uint kFusedStateCount = 10 * kFusedStride;
+
+static const uint kWorldCacheView = 8;   ///< debugView of the world-space radiance cache experiment.
 static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: unit sun SH 0-8, unit sky SH 9-17, sun extension 18-24.
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
@@ -1273,6 +1299,14 @@ struct HSTRCloudParams
     /// bound, and slicing also costs quality: the per-slice restarts are not negligible there. A per-build adaptive count (the most
     /// slices keeping rays x slices within a thread budget of 32k-256k) chose 1 in every one of those cases and was removed.
     uint beamDirtySegments = 1;
+    /// Set by the host for the build that runs the fused dirty chain (runBeamDirtyFused): the units pass then marches only the
+    /// units the fused kernel left (from hstrBeamFusedState[kFusedUnitNext]).
+    uint beamDirtyFused = 0;
+    /// The fused kernel builds the warp field (beamWarp without beamWarpAuto; under beamWarpAuto the GPU's decision says).
+    uint beamFusedWarp = 0;
+    /// DIAGNOSTIC (device-removed bisection): where runBeamDirtyFused stops - 0 all of it, 1 at once, 2 after the rays, 3 tile
+    /// items without their tile tests, 4 everything but the units it marches itself.
+    uint beamFusedStage = 0;
     /// PROBE (0 = off, compiled into the dirty query only as HSTR_ORDER_PROBE): counts over the rays the dirty query marches - steps,
     /// the longest ray, a log2 histogram, and how well the stored step count (lattice slice 2 .x) predicted them, with this many
     /// steps as the "long" threshold. See hstrBeamOrderProbe.

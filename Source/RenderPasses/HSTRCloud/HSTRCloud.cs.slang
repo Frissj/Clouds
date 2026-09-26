@@ -31,6 +31,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_DIRTY_FUSED
+#define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
+#endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
@@ -121,6 +124,8 @@ static const uint kPhotonAlive = 1u << 17;
 /// hstrBeamCoarseState: one bit per child of a 4 x 4 coarse cell (beamCoarseShift 2 is the most sixteen bits hold), and a flag.
 static const uint kBeamCoarseChildren = 0xFFFF;
 static const uint kBeamCoarseQueued = 1u << 16;
+/// A unit of the fused dirty chain dropped the certificate (beamGuardDropCoarse); readers mask with kBeamCoarseChildren.
+static const uint kBeamCoarseDropped = 1u << 17;
 /// Root tiles around a dirty block whose test reads its basis (beamTransmittanceRange reaches two tiles), see testBeamDirtyTile.
 static const uint kBeamDirtyApron = 2;
 
@@ -238,6 +243,21 @@ float cloudCellBound(uint code)
 {
     return code >= 15u ? 1e30f : pow(2.f, 2.f * float(code) - 30.f);
 }
+
+// The fused dirty chain's shared state (runBeamDirtyFused), as globals: `globallycoherent` on a field of the gHSTRCloud block is
+// dropped when Slang legalises the block (fused2's dumped HLSL declared every one of them plain), and without it a wave reads
+// what other SMs published from a stale L1 line - fused1 tested tiles against half-written neighbours (sprint 0.476 -> 1.277% of
+// pixels over 0.02) and fused2's spin on the publication counter never saw it move (device removed). Bound by name at the root
+// (bindRenderer). Its claim counters and decisions (kFused*); per listed block its finished rays and then the finished-block
+// queue; per root tile the listed blocks that have finished of those it reads.
+globallycoherent RWStructuredBuffer<uint> gFusedState;
+globallycoherent RWStructuredBuffer<uint> gFusedBlocks;
+globallycoherent RWStructuredBuffer<uint> gFusedTiles;
+// The same resources as hstrBeamDirtyUnits and hstrBeamLatticeOutput, read coherently under HSTR_DIRTY_FUSED: units other waves
+// listed, and lattice points other SMs' queries wrote (the writes go through the block's plain views; stores are not cached in
+// L1). Declared in every variant, since the pass binds by the names its first compile reflected.
+globallycoherent RWStructuredBuffer<uint> gFusedUnits;
+globallycoherent RWTexture2DArray<float4> gFusedLattice;
 
 struct HSTRCloudRenderer
 {
@@ -6837,7 +6857,12 @@ struct HSTRCloudRenderer
     }
 
     /// Lattice query at a pixel-corner position (a multiple of beamLatticeStep).
+#if HSTR_DIRTY_FUSED
+    // The fused chain writes the lattice as it reads it, so it reads the output (bound in place of the input), coherently.
+    float4 beamLatticeAt(uint2 position, uint slice) { return gFusedLattice[beamLatticeTexel(position, slice)]; }
+#else
     float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[beamLatticeTexel(position, slice)]; }
+#endif
 
     /// Pixel-corner position of query q. Per level: the current pass level, over the lists refined this frame. Temporal: every
     /// level in one dispatch, level 0 first, then each finer level over the tiles refined last frame.
@@ -7883,28 +7908,43 @@ struct HSTRCloudRenderer
         const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
         const uint padded = side + 2u * kBeamDirtyApron;
         const uint index = thread / (padded * padded);
-        if (index >= min(hstrBeamDirtyCount[0], params.beamDirtyCapacity))
-            return;
+        uint2 tile = 0;
+        bool failed = false;
+        if (index < min(hstrBeamDirtyCount[0], params.beamDirtyCapacity) && beamDirtyPaddedTile(index, thread % (padded * padded), tile) &&
+            beamDirtyTileOwner(tile, side) == index)
+            failed = testBeamDirtyTileNow(tile);
+        listBeamFailedTileUnits(tile, failed); // Every lane, in uniform flow: see there.
+    }
+
+    /// Tile `local` of listed block `index`'s padded square (the block's tiles and its apron), if it exists and is on screen.
+    bool beamDirtyPaddedTile(uint index, uint local, out uint2 tile)
+    {
+        const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
+        const uint padded = side + 2u * kBeamDirtyApron;
         const uint packed = hstrBeamDirty[index];
-        const uint local = thread % (padded * padded);
         const int2 signedTile = int2(uint2(packed & 0xFFFFu, packed >> 16) * side + uint2(local % padded, local / padded)) -
                                 int(kBeamDirtyApron);
+        tile = uint2(max(signedTile, 0));
         if (any(signedTile < 0))
-            return;
-        const uint2 tile = uint2(signedTile);
-        if (any(tile >= params.beamTileDims) || any(tile * beamTileEdge(0) >= params.beamFrameDim) || !beamTileOnScreen(0, tile))
-            return;
-        if (beamDirtyTileOwner(tile, side) != index)
-            return;
+            return false;
+        return all(tile < params.beamTileDims) && all(tile * beamTileEdge(0) < params.beamFrameDim) && beamTileOnScreen(0, tile);
+    }
+
+    /// The dirty tile test itself, once it is decided that this thread tests `tile`: whether it failed, and its units have to be
+    /// listed (listBeamFailedTileUnits, which the caller runs from uniform flow).
+    bool testBeamDirtyTileNow(uint2 tile)
+    {
+        // Stats, in both the separate pass and the fused chain: the two must test the same tiles.
+        InterlockedAdd(gFusedState[kFusedTilesTested], 1u);
         if (!beamTileRefines(0, tile, false))
         {
             writeBeamLevel(0, tile, 0);
-            return;
+            return false;
         }
         recordBeamRefinement(0, tile);
         if (params.beamLevels <= 1)
             writeBeamLevel(0, tile, params.beamLevels);
-        listBeamFailedTileUnits(tile);
+        return true;
     }
 
     /// The listed block that tests this tile: the one with the lowest dirty-list slot among the blocks whose re-marched points the
@@ -7927,15 +7967,21 @@ struct HSTRCloudRenderer
     /// otherwise only those its certificate does not keep. A tile's units go in together, and a wave's tiles are neighbours, so a
     /// wave of the unit march marches neighbouring directions: appended a unit at a time across the wave instead - unit k of 64
     /// tiles, then unit k + 1 - the same 295k units took the 4K walk's unit march from ~4 to ~12 ms.
-    void listBeamFailedTileUnits(uint2 tile)
+    ///
+    /// Called by every lane of the wave from uniform flow, `failed` saying whether this lane's tile lists: the fused chain publishes
+    /// what the wave reserves in reservation order, spinning on one lane until the reservations before it are published. Called from
+    /// divergent flow (only the failed tiles' lanes), a wave's lanes could run it as two groups that each reserve, the second then
+    /// spinning on the first while it waits behind the second in the same warp. MEASURED (fused5-9, fstage4): the device was removed,
+    /// and with the waits bounded, frames gave up with two waves' tile items (64) never finished.
+    void listBeamFailedTileUnits(uint2 tile, bool failed)
     {
         const uint ts = max(params.beamTileSize, 1u);
         const uint2 block = tile * ts / max(params.beamDirtyBlockEdge, 1u); // A tile lies in one block.
         const bool own = all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] != 0xFFFFFFFFu;
         // The block's certificate, once for the tile rather than once per unit: it walks the depth pyramid.
-        const bool certified = !own && beamCellCertified(block);
+        const bool certified = failed && !own && beamCellCertified(block);
         uint mask = 0;
-        for (uint k = 0; k < ts * ts; ++k)
+        for (uint k = 0; failed && k < ts * ts; ++k)
             if (beamFailedUnitNeedsMarch(tile * ts + uint2(k % ts, k / ts), own, true, certified))
                 mask |= 1u << k;
         const uint count = countbits(mask);
@@ -7953,13 +7999,83 @@ struct HSTRCloudRenderer
             if (total != owned)
                 InterlockedAdd(hstrBeamCounts[kBeamDirtyApronMarched], total - owned, unused);
         }
-        uint at = WaveReadLaneFirst(base) + WavePrefixSum(count);
+        const uint first = WaveReadLaneFirst(base);
+        uint at = first + WavePrefixSum(count);
         for (uint bits = mask; bits != 0; bits &= bits - 1u)
         {
             const uint k = firstbitlow(bits);
             const uint2 unit = tile * ts + uint2(k % ts, k / ts);
             hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
         }
+#if HSTR_DIRTY_FUSED
+        // Published in reservation order, so every unit below the published count is written: the waves that reserved before this
+        // one are running (they reserved), and publish within a few instructions of it.
+        DeviceMemoryBarrier();
+        if (WaveIsFirstLane())
+            fusedPublish(kFusedUnitsPublished, first, total, 2u);
+#endif
+    }
+
+    /// Adds n to gFusedState[counter] once it has reached `from`: in-order publication of a range reserved elsewhere.
+    void fusedPublish(uint counter, uint from, uint n, uint bit)
+    {
+        // Waits for its turn, then one add: nobody else can move the counter past `from` before this publishes.
+        const uint diag = params.beamTileDims.x * params.beamTileDims.y;
+        InterlockedAdd(gFusedTiles[diag + 9 + (bit >> 1)], 1u); // Diagnostic: publishes in progress (9 blocks, 10 units).
+        for (uint polls = 0;; ++polls)
+        {
+            const uint seen = fusedPoll(counter);
+            if (seen == from)
+                break;
+            if ((polls & 255u) == 255u && fusedPoll(kFusedAbort) != 0)
+            {
+                // Diagnostic: a publish still waiting when another wait gave up - what it waited for, and how long.
+                uint before;
+                InterlockedAdd(gFusedTiles[diag + 11], 1u, before);
+                if (before == 0)
+                {
+                    gFusedTiles[diag + 12] = seen;
+                    gFusedTiles[diag + 13] = from;
+                    gFusedTiles[diag + 14] = (bit << 24) | min(polls, 0xFFFFFFu);
+                }
+                break;
+            }
+            if (polls >= kFusedWaitLimit)
+            {
+                fusedGiveUp(bit, uint4(seen, from, counter, n), uint4(0, 0, 0, 0));
+                break;
+            }
+        }
+        InterlockedAdd(gFusedState[counter], n);
+        InterlockedAdd(gFusedTiles[diag + 9 + (bit >> 1)], 0xFFFFFFFFu);
+    }
+
+    /// Diagnostic: records a wait that gave up (kFusedGaveUp) instead of hanging the GPU.
+    void fusedGiveUp(uint bit, uint4 seen, uint4 more)
+    {
+        const uint diag = params.beamTileDims.x * params.beamTileDims.y;
+        uint before;
+        InterlockedOr(gFusedTiles[diag], bit, before);
+        InterlockedOr(gFusedState[kFusedAbort], bit);
+        if (before != 0)
+            return; // The arm's first give-up is the one recorded.
+        gFusedTiles[diag + 15] = gFusedTiles[diag + 9]; // Publishes in progress as it gave up.
+        gFusedTiles[diag + 16] = gFusedTiles[diag + 10];
+        for (uint i = 0; i < 4; ++i)
+        {
+            gFusedTiles[diag + 1 + i] = seen[i];
+            gFusedTiles[diag + 5 + i] = more[i];
+        }
+    }
+
+    /// A read of gFusedState[counter] for a loop that waits on it. An atomic: a plain load is loop-invariant as far as the compiler
+    /// knows (globallycoherent says where it is read from, not that it may change), so it may be hoisted out of the loop - fused5's
+    /// waits hung the GPU that way (device removed).
+    uint fusedPoll(uint counter)
+    {
+        uint value;
+        InterlockedOr(gFusedState[counter], 0u, value);
+        return value;
     }
 
     /// Temporal tile tests: one thread walks one coarsest tile down through the levels whose queries exist this frame (children
@@ -8140,7 +8256,12 @@ struct HSTRCloudRenderer
     }
 
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
+#if HSTR_DIRTY_FUSED
+    // The warp arguments stay in their indirect state for the resolve, so the fused chain reads its copy (setupBeamDirtyFused).
+    float beamPolicyTolerance() { return params.beamPolicy != 0 ? asfloat(gFusedState[kFusedTolerance]) : params.beamTolerance; }
+#else
     float beamPolicyTolerance() { return params.beamPolicy != 0 ? asfloat(hstrBeamWarpArgs[11]) : params.beamTolerance; }
+#endif
 
     /// Where the resolve reads a beam-image position under beamWarp: the field's offset, interpolated between lattice points.
     float2 beamWarpedPosition(float2 position)
@@ -8834,7 +8955,13 @@ struct HSTRCloudRenderer
             uint previous;
             InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
             if (depth < previous)
+            {
+#if HSTR_DIRTY_FUSED
+                beamGuardDropCoarse(cell, true);
+#else
                 beamGuardDropCoarse(cell);
+#endif
+            }
         }
     }
 
@@ -9310,8 +9437,11 @@ struct HSTRCloudRenderer
             else
                 radius = min(radius, reach);
         }
-        hstrBeamCoarse[coarse] = float4(anchor, radius);
-        hstrBeamCoarseState[coarse] = uncovered; // Also clears the queued bit for the next build.
+        // A unit the fused chain marched before this rebuild may have dropped the certificate (kBeamCoarseDropped), where the unit
+        // pass it replaces always ran after it: the drop wins. The new state also clears the queued bit for the next build.
+        uint previous;
+        InterlockedExchange(hstrBeamCoarseState[coarse], uncovered, previous);
+        hstrBeamCoarse[coarse] = (previous & kBeamCoarseDropped) != 0 ? float4(0.f) : float4(anchor, radius);
     }
 
     /// Lists the block if translation could have invalidated anything in it, and says whether it did.
@@ -9386,7 +9516,11 @@ struct HSTRCloudRenderer
     {
         if (thread >= hstrBeamDirtyCount[1])
             return;
+#if HSTR_DIRTY_FUSED
+        const uint packed = gFusedUnits[thread]; // Listed by another wave, possibly on another SM, a moment ago.
+#else
         const uint packed = hstrBeamDirtyUnits[thread];
+#endif
         marchBeamUnitExact(uint2(packed & 0xFFFFu, packed >> 16));
     }
 
@@ -9468,7 +9602,9 @@ struct HSTRCloudRenderer
 
     /// Zeroes the coarse certificates that may have been derived from this block's depth: its own cell's, and - because a
     /// block's certificate reads its neighbours' depths (beamCellReachDepth) - the cells of the eight around it.
-    void beamGuardDropCoarse(uint2 cell)
+    /// flag: the fused chain's unit march, which runs before its cell's rebuild (updateBeamCoarseCell), where the unit pass it
+    /// replaces always ran after it. The mark makes the rebuild drop the certificate too.
+    void beamGuardDropCoarse(uint2 cell, bool flag = false)
     {
         if (params.beamCoarseShift == 0)
             return;
@@ -9477,7 +9613,15 @@ struct HSTRCloudRenderer
             {
                 const int2 n = int2(cell) + int2(x, y);
                 if (all(n >= 0) && all(n < int2(params.beamGuardDims)))
-                    hstrBeamCoarse[uint2(n) >> params.beamCoarseShift] = float4(0.f);
+                {
+                    const uint2 coarse = uint2(n) >> params.beamCoarseShift;
+                    if (flag)
+                    {
+                        uint unused;
+                        InterlockedOr(hstrBeamCoarseState[coarse], kBeamCoarseDropped, unused);
+                    }
+                    hstrBeamCoarse[coarse] = float4(0.f);
+                }
             }
     }
 
@@ -10377,17 +10521,289 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #endif
 }
 
+/// The first listed unit the units pass marches: after the fused chain, the ones it did not take.
+uint beamDirtyUnitStart()
+{
+    if (gHSTRCloud.params.beamFusedStage == 6u)
+        return 0u; // DIAGNOSTIC: the units pass marches every unit again.
+    return gHSTRCloud.params.beamDirtyFused != 0 ? min(gFusedState[kFusedUnitNext], gHSTRCloud.hstrBeamDirtyCount[1]) : 0u;
+}
+
 /// Dispatch arguments for the compacted units, hstrBeamDirtyArgs[15..17].
 [numthreads(1, 1, 1)]
 void writeBeamDirtyUnitArgs()
 {
-    writeFoldedDirtyArgs(15, gHSTRCloud.hstrBeamDirtyCount[1]);
+    writeFoldedDirtyArgs(15, gHSTRCloud.hstrBeamDirtyCount[1] - beamDirtyUnitStart());
 }
 
 [numthreads(64, 1, 1)]
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
-    gHSTRCloud.marchBeamDirtyListedUnit(foldedDirtyThread(groupId, groupThreadId.x));
+    gHSTRCloud.marchBeamDirtyListedUnit(beamDirtyUnitStart() + foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// Before the fused chain: its counters, and the build's GPU decisions it reads (the warp arguments stay unbound in it, in their
+/// indirect state for the resolve that follows).
+[numthreads(1, 1, 1)]
+void setupBeamDirtyFused()
+{
+    for (uint i = 0; i < kFusedStateCount; ++i)
+        gFusedState[i] = 0u;
+    const HSTRCloudParams p = gHSTRCloud.params;
+    gFusedState[kFusedWarp] = p.beamWarpAuto > 0.f ? (gHSTRCloud.hstrBeamWarpArgs[9] != 0 ? 1u : 0u) : p.beamFusedWarp;
+    gFusedState[kFusedTolerance] = gHSTRCloud.hstrBeamWarpArgs[11];
+}
+
+/// gHSTRCloud.fusedPoll by the wave's first lane, for all of it.
+uint fusedWavePoll(uint counter)
+{
+    uint value = 0;
+    if (WaveIsFirstLane())
+        value = gHSTRCloud.fusedPoll(counter);
+    return WaveReadLaneFirst(value);
+}
+
+/// Claims the wave's width of gFusedState[counter] with one add (a claim past `limit` finds nothing); returns the first and count.
+uint2 fusedTake(uint counter, uint limit)
+{
+    uint first = 0;
+    if (WaveIsFirstLane())
+        InterlockedAdd(gFusedState[counter], WaveGetLaneCount(), first);
+    first = WaveReadLaneFirst(first);
+    return uint2(first, first < limit ? min(limit - first, WaveGetLaneCount()) : 0u);
+}
+
+/// An idle wave's pause before it polls again, growing while there is nothing to do: a few hundred dependent ALU cycles that keep
+/// it off the counters' L2 lines, which the waves doing the work are publishing through.
+uint fusedBackoff(uint idle)
+{
+    uint x = idle;
+    const uint spins = min(32u << min(idle, 5u), 1024u);
+    for (uint i = 0; i < spins; ++i)
+        x = x * 1664525u + 1013904223u;
+    return x;
+}
+
+/// The dirty chain - query, tile test, unit list, and as many units as there is time for - in one persistent dispatch, each piece
+/// of work claimed as soon as what it reads is final instead of after a barrier behind the whole pass before it. ngfx9 (4K
+/// sprint): the query spent its last 0.29 of 0.92 ms on a few warps finishing the longest rays, and 0.38 ms more went to the
+/// rebuild, tile test and argument passes between it and the unit march, all of it with the GPU mostly idle. Here the units of
+/// tiles already tested fill that time. The coarse rebuild and the warp field follow as their own small dispatches: they read
+/// guard cameras the queries wrote, which inside the dispatch would need coherent views of those too.
+///
+/// Every wave loops: query rays first, in listed order; then the padded tiles of blocks whose rays have all finished; otherwise
+/// units already listed. A tile is tested once, by the lane whose block completes the set of listed blocks it reads (the dirty
+/// tile pass's owner rule picks one of the same set, and the answer does not depend on which). A wave only ever waits on work
+/// another RUNNING wave has claimed, so the loop cannot deadlock however many groups are resident. It returns once every tile is
+/// tested, leaving the units no wave has taken to the units pass, which the pixel resolve still overlaps.
+[numthreads(64, 1, 1)]
+void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
+{
+    const HSTRCloudParams p = gHSTRCloud.params;
+    const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], p.beamDirtyCapacity);
+    const uint rb = max(p.beamDirtyPointStride, 1u);
+    const uint per = rb * rb * (p.beamCentreless != 0 ? 1u : 2u);
+    const uint rays = blocks * per;
+    const uint side = max(p.beamDirtyBlockEdge / max(p.beamTileSize, 1u), 1u);
+    const uint padded = side + 2u * kBeamDirtyApron;
+    const uint items = blocks * padded * padded;
+    const uint lane = WaveGetLaneIndex();
+    uint idle = 0;
+    uint sink = 0;
+    // Once the rays run out, waves stop asking for them: the counter's line is left to the block and unit publications.
+    bool raysLeft = true;
+    // Units this wave has claimed and not yet marched, [pending, pendingEnd): a claim may run past what is published, and the
+    // wave goes on testing tiles while it waits rather than waiting on units that only tile tests can list.
+    uint pending = 0;
+    uint pendingEnd = 0;
+    const uint stage = p.beamFusedStage;
+    if (stage == 1u)
+        return;
+    for (;;)
+    {
+        if (fusedWavePoll(kFusedAbort) != 0)
+            return; // Diagnostic: a wait gave up.
+        // Query rays, a wave's width at a time (4 blocks of 8 at 32 lanes, as the query pass's groups held them).
+        uint2 claim = raysLeft ? fusedTake(kFusedRayNext, rays) : uint2(0, 0);
+        raysLeft = claim.y != 0;
+        if (claim.y != 0)
+        {
+            const uint ray = claim.x + lane;
+            bool completed = false;
+            uint index = 0;
+            if (lane < claim.y)
+            {
+                uint2 point;
+                bool centre;
+                uint2 position = 0;
+                index = ray / per;
+                if (gHSTRCloud.beamDirtyRay(ray, point, centre) && gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position))
+                {
+                    BeamSample q = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+                    if (!(1.f - exp(-q.depth) > 1e-4f))
+                        q.distance = 0.f;
+                    gHSTRCloud.beamQueryMarched(position, q);
+                }
+                // Its lattice point, carry and verification are written before the block can be seen to finish.
+                DeviceMemoryBarrier();
+                uint done;
+                InterlockedAdd(gFusedBlocks[index], 1u, done);
+                completed = done + 1u == per;
+                if (completed)
+                    gFusedBlocks[index] = 0u; // For the next build; nobody else adds to it now.
+            }
+            // Finished blocks go into the queue, published in reservation order.
+            const uint finished = WaveActiveCountBits(completed);
+            if (finished != 0)
+            {
+                uint base = 0;
+                if (WaveIsFirstLane())
+                    InterlockedAdd(gFusedState[kFusedBlocksReserved], finished, base);
+                base = WaveReadLaneFirst(base);
+                if (completed)
+                    gFusedBlocks[p.beamDirtyCapacity + base + WavePrefixCountBits(completed)] = index;
+                DeviceMemoryBarrier();
+                if (WaveIsFirstLane())
+                    gHSTRCloud.fusedPublish(kFusedBlocksDone, base, finished, 1u);
+            }
+            continue;
+        }
+        if (stage == 2u)
+            break;
+        // Items and units are claimed with one add each, like the rays, once a read shows some are there: a claim may run past what
+        // is published, and then waits for it. MEASURED (ngfx10, 4K sprint): claimed by compare-exchange instead, ~1,300 waves
+        // retried one counter for ~1.1M tile items and the units - 84% of the kernel's samples on the retry's compare, 15 ms.
+        // Waiting cannot deadlock: rays run out before any wave looks here, so every block is being marched by a running wave.
+        // Tiles of finished blocks.
+        const uint published = WaveReadLaneFirst(gFusedState[kFusedBlocksDone]);
+        if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) < min(published * padded * padded, items))
+        {
+            claim = fusedTake(kFusedItemNext, items);
+            if (claim.y != 0)
+            {
+                const uint end = claim.x + claim.y;
+                for (uint wait = 0;; ++wait)
+                {
+                    const uint done = fusedWavePoll(kFusedBlocksDone);
+                    if (done * padded * padded >= end)
+                        break;
+                    if (fusedWavePoll(kFusedAbort) != 0)
+                        return;
+                    if (wait >= kFusedWaitLimit)
+                    {
+                        if (WaveIsFirstLane())
+                            gHSTRCloud.fusedGiveUp(4u, uint4(done, end, blocks, items), uint4(0, 0, 0, 0));
+                        break;
+                    }
+                    sink += fusedBackoff(wait);
+                }
+                DeviceMemoryBarrier();
+                uint2 tile = 0;
+                bool failed = false;
+                if (lane < claim.y)
+                {
+                    const uint item = claim.x + lane;
+                    const uint index = gFusedBlocks[p.beamDirtyCapacity + item / (padded * padded)];
+                    if (gHSTRCloud.beamDirtyPaddedTile(index, item % (padded * padded), tile) && stage != 3u)
+                        failed = fusedTileItem(index, tile, side);
+                }
+                gHSTRCloud.listBeamFailedTileUnits(tile, failed); // Every lane, in uniform flow: see there.
+                DeviceMemoryBarrier();
+                if (WaveIsFirstLane())
+                    InterlockedAdd(gFusedState[kFusedItemsDone], claim.y);
+                idle = 0;
+                continue;
+            }
+        }
+        // Every tile tested means every unit listed and published (a tile's units are published before its item counts as done),
+        // so `available` read after it is final.
+        const bool finished = published == blocks && fusedWavePoll(kFusedItemsDone) == items;
+        const uint available = fusedWavePoll(kFusedUnitsPublished);
+        if ((stage == 3u || stage == 4u) && finished)
+            break;
+        if (stage == 3u || stage == 4u)
+        {
+            if (idle >= kFusedWaitLimit)
+            {
+                if (WaveIsFirstLane())
+                    gHSTRCloud.fusedGiveUp(8u, uint4(published, gHSTRCloud.fusedPoll(kFusedBlocksReserved), blocks, gHSTRCloud.fusedPoll(kFusedRayNext)),
+                                          uint4(rays, gHSTRCloud.fusedPoll(kFusedItemsDone), items, available));
+                break;
+            }
+            sink += fusedBackoff(idle++);
+            continue;
+        }
+        // The wave's claimed units, as far as they are published. MEASURED (fused5, fused6: device removed): waiting on them in
+        // place deadlocked - hundreds of waves claimed ahead of the few units published so far and all waited, leaving no wave to
+        // test the tiles that list the rest.
+        if (pending < pendingEnd)
+        {
+            const uint end = min(pendingEnd, available);
+            if (end > pending)
+            {
+                DeviceMemoryBarrier();
+                if (pending + lane < end && stage != 5u)
+                    gHSTRCloud.marchBeamDirtyListedUnit(pending + lane);
+                if (WaveIsFirstLane())
+                    InterlockedAdd(gFusedState[kFusedUnitsMarched], end - pending);
+                pending = end;
+                idle = 0;
+                continue;
+            }
+            if (finished)
+                pending = pendingEnd; // Past the last unit listed: nothing there.
+        }
+        if (finished && pending >= pendingEnd)
+            break; // What no wave has claimed is the units pass's.
+        // More units, while there is still something to wait for.
+        if (pending >= pendingEnd && WaveReadLaneFirst(gFusedState[kFusedUnitNext]) < available)
+        {
+            uint first = 0;
+            if (WaveIsFirstLane())
+                InterlockedAdd(gFusedState[kFusedUnitNext], WaveGetLaneCount(), first);
+            pending = WaveReadLaneFirst(first);
+            pendingEnd = pending + WaveGetLaneCount();
+            idle = 0;
+            continue;
+        }
+        if (idle >= kFusedWaitLimit)
+        {
+            if (WaveIsFirstLane())
+                gHSTRCloud.fusedGiveUp(8u, uint4(published, gHSTRCloud.fusedPoll(kFusedBlocksReserved), blocks, gHSTRCloud.fusedPoll(kFusedRayNext)),
+                                          uint4(rays, gHSTRCloud.fusedPoll(kFusedItemsDone), items, available));
+            break;
+        }
+        sink += fusedBackoff(idle++);
+    }
+    // Never true; keeps the backoff's arithmetic from being optimised away.
+    if (sink == 0x7FFFFFFFu && lane == 32u)
+        gFusedState[kFusedStateCount - 1] = sink;
+}
+
+/// One padded tile of a finished block: counted towards the tile's listed readers, and tested by the lane that completes them.
+/// Whether it was tested and failed (its units to be listed).
+bool fusedTileItem(uint index, uint2 tile, uint side)
+{
+    // The listed blocks whose points the tile's test reads, as beamDirtyTileOwner takes them.
+    const int2 t = int2(tile);
+    const int2 lo = max((t + int(side) - 1) / int(side) - 1, 0);
+    const int2 hi = min((t + 2) / int(side), int2(gHSTRCloud.params.beamGuardDims) - 1);
+    const uint packed = gHSTRCloud.hstrBeamDirty[index];
+    const int2 block = int2(packed & 0xFFFFu, packed >> 16);
+    if (any(block < lo) || any(block > hi))
+        return false; // In the apron but not read by the tile: not one of its readers.
+    uint readers = 0;
+    for (int y = lo.y; y <= hi.y; ++y)
+        for (int x = lo.x; x <= hi.x; ++x)
+            readers += gHSTRCloud.hstrBeamDirtyMark[uint2(x, y)] != 0xFFFFFFFFu ? 1u : 0u;
+    const uint slot = tile.y * gHSTRCloud.params.beamTileDims.x + tile.x;
+    uint before;
+    InterlockedAdd(gFusedTiles[slot], 1u, before);
+    if (before + 1u != readers)
+        return false;
+    gFusedTiles[slot] = 0u; // For the next build: every reader has counted.
+    DeviceMemoryBarrier();
+    return gHSTRCloud.testBeamDirtyTileNow(tile);
 }
 
 /// Span probe: the evaluator's dispatch, one thread per recorded ray (in rows, as the dirty passes'), from the recorded count.

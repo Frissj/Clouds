@@ -331,6 +331,19 @@ private:
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
     ref<Buffer> mpBeamOrderProbe;   ///< beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe), 21 uints.
+    /// beamDirtyFused: the query, tile test, rebuild, warp field and the units there is time for in one persistent dispatch
+    /// (runBeamDirtyFused). Its claim counters, per-block ray counts and finished-block queue, and per-tile reader counts.
+    bool mBeamDirtyFused = false;
+    bool mBeamFusedBuild = false; ///< This build runs the fused chain (mBeamDirtyFused and nothing it does not cover).
+    uint32_t mBeamFusedTilesTested = 0;  ///< The compared frame's dirty tiles tested (either path) ...
+    uint32_t mBeamFusedUnitsMarched = 0; ///< ... units the fused chain marched itself ...
+    uint32_t mBeamFusedUnitsListed = 0;  ///< ... and units listed (hstrBeamDirtyCount[1]).
+    uint32_t mBeamFusedDiag[kFusedDiagCount] = {}; ///< Diagnostic: waits that gave up, sticky (see kFusedDiagCount).
+    ref<Buffer> mpBeamFusedState;
+    ref<Buffer> mpBeamFusedBlocks;
+    ref<Buffer> mpBeamFusedTiles;
+    ref<ComputePass> mpBeamDirtyFusedSetupPass;
+    ref<ComputePass> mpBeamDirtyFusedPass;
     uint32_t mBeamOrderProbeValues[21] = {}; ///< The scored frame's counters.
     ref<Buffer> mpBeamDirtyCount;
     ref<Buffer> mpBeamDirtyArgs;    ///< Two indirect dispatches: the query over those blocks, then the residual over them.

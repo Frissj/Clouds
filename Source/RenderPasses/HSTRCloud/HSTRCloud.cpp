@@ -288,6 +288,17 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamOct = bool(value);
             continue;
         }
+        if (key == "beamDirtyFused")
+        {
+            mBeamDirtyFused = bool(value);
+            continue;
+        }
+        if (key == "beamFusedStage")
+        {
+            mParams.beamFusedStage = uint32_t(value);
+            mpBeamFusedTiles = nullptr; // Recreated cleared: each arm's diagnostics are its own.
+            continue;
+        }
         if (key == "beamOrderProbe")
         {
             mParams.beamOrderProbe = uint32_t(value);
@@ -1127,6 +1138,8 @@ Properties HSTRCloud::getProperties() const
     props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamOrderProbe"] = mParams.beamOrderProbe;
+    props["beamDirtyFused"] = mBeamDirtyFused;
+    props["beamFusedStage"] = mParams.beamFusedStage;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
@@ -1496,6 +1509,11 @@ Properties HSTRCloud::getProperties() const
             for (uint32_t i = 0; i < 21; ++i)
                 cloud["beamOrderProbe" + std::to_string(i)] = mBeamOrderProbeValues[i];
         cloud["beamWarpListed"] = mBeamWarpListed;
+        cloud["beamFusedTilesTested"] = mBeamFusedTilesTested;
+        cloud["beamFusedUnitsMarched"] = mBeamFusedUnitsMarched;
+        cloud["beamFusedUnitsListed"] = mBeamFusedUnitsListed;
+        for (uint32_t i = 0; i < kFusedDiagCount; ++i)
+            cloud["beamFusedDiag" + std::to_string(i)] = mBeamFusedDiag[i];
         cloud["beamWarpOn"] = mBeamWarpOn;
         cloud["beamPolicyToleranceNow"] = mBeamPolicyToleranceNow;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
@@ -1731,6 +1749,16 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpPushScatterPass = createPass("scatterPushPieces");
     mpPushSortPass = createPass("sortPushTiles");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
+    mpBeamDirtyFusedSetupPass = createPass("setupBeamDirtyFused");
+    {
+        // TEMPORARY: the generated HLSL, to check the coherence qualifiers survive the parameter block's legalisation.
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kShaderFile).csEntry("runBeamDirtyFused");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        desc.compilerFlags = SlangCompilerFlags::DumpIntermediates;
+        mpBeamDirtyFusedPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
+    }
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
     mpBeamRefreshListPass = createPass("listBeamRefreshBlocks");
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramidTiles");
@@ -3712,6 +3740,10 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
     var["hstrBeamDirtyMark"] = mpBeamDirtyMark;
     var["hstrBeamDirtyUnits"] = mpBeamDirtyUnits;
+    // Globals, not block fields, so that they keep globallycoherent (see gFusedState).
+    pPass->getRootVar()["gFusedState"] = mpBeamFusedState;
+    pPass->getRootVar()["gFusedBlocks"] = mpBeamFusedBlocks;
+    pPass->getRootVar()["gFusedTiles"] = mpBeamFusedTiles;
     var["hstrBeamCoarse"] = mpBeamCoarse;
     var["hstrBeamCoarseState"] = mpBeamCoarseState;
     var["hstrBeamDescend"] = mpBeamDescend;
@@ -4969,6 +5001,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // Every unit of every block: each tile is tested once (beamDirtyTileOwner) and lists its own units, so it cannot overflow.
                 const uint32_t blockEdge = std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u);
                 mpBeamDirtyUnits = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells * blockEdge * blockEdge);
+                // beamDirtyFused: per block its finished rays and then the finished-block queue. The counters reset themselves
+                // as they complete, so they start at zero once.
+                mpBeamFusedState = mpDevice->createStructuredBuffer(sizeof(uint32_t), kFusedStateCount);
+                mpBeamFusedBlocks = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2 * cells);
+                pRenderContext->clearUAV(mpBeamFusedBlocks->getUAV().get(), uint4(0));
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
                     sizeof(uint32_t), 18, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                               ResourceBindFlags::IndirectArg
@@ -5489,6 +5526,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
                                 pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
+                                pRenderContext->clearUAV(mpBeamFusedState->getUAV().get(), uint4(0)); // Its stats, either way.
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
                                 // Cell views are requested and built by pushEval (runPushProbe); this path only unmaps changed ones.
                                 const bool cellViews = mCellViews && mParams.seaMode != 0;
@@ -5658,6 +5696,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     }
                                     pRenderContext->clearUAV(mpSpanCounts->getUAV().get(), uint4(0));
                                 }
+                                // beamDirtyFused: the query, the rebuild and the tile test below run in the fused chain instead,
+                                // dispatched where the unit march is (runBeamDirtyFused). Only the plain shipped variants.
+                                mBeamFusedBuild = mBeamDirtyFused && mParams.debugView == kBeamView && mBeamOct && !mBeamScreenResidual &&
+                                                  mParams.beamRefFrame != 0 && !mBeamRepairProbe && mBeamStripProbe == 0 &&
+                                                  mParams.beamDirtySegments <= 1 && mParams.beamOrderProbe == 0 &&
+                                                  !(mPushProbe && mPushShare) && !mSpanProbe && mParams.beamQueue == 0;
+                                if (!mBeamFusedBuild)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "query");
                                     // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
@@ -5717,6 +5762,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                                 }
+                                if (!mBeamFusedBuild)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "rebuild");
                                     bindRenderer(pRenderContext, mpBeamCoarseUpdatePass);
@@ -5782,7 +5828,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         mParams.beamGridBlocks = 0;
                         mParams.beamGridOrigin = uint2(0);
                         // And the tiles of the blocks the guard listed, whose basis the dirty query just re-marched.
-                        if (mBeamDirtyActive)
+                        if (mBeamDirtyActive && !mBeamFusedBuild)
                         {
                             bindRenderer(pRenderContext, mpBeamDirtyTilePass);
                             bindOutput(mpBeamDirtyTilePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
@@ -5822,6 +5868,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // beamOverlapResolve (see the member): only where the dirty unit march runs, from the list the dirty tile pass compacted.
         const bool overlapResolve = mBeamOverlapResolve && mParams.beamRefFrame != 0 && mBeamOct && !mBeamScreenResidual &&
                                     !mBeamSparseBuilt && mBeamDirtyActive && (!mBeamGridRegions.empty() || mBeamGuardDriven);
+        // beamDirtyFused: this build's query, tile test and rebuild were left to the fused chain, which also builds the warp field.
+        const bool fusedChain = mBeamFusedBuild && mBeamDirtyActive && mBeamGuardDriven && !mBeamSparseBuilt;
         // early: the warp field and the residual queue's clear; late: the pixel and residual passes. Overlapped, the early part runs
         // before the unit march, since the pixel pass must follow the march with nothing between them.
         auto resolve = [&](bool early, bool late)
@@ -5851,11 +5899,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 FALCOR_PROFILE(pRenderContext, "warp");
                 bindRenderer(pRenderContext, mpBeamWarpArgsPass);
                 mpBeamWarpArgsPass->execute(pRenderContext, uint3(1));
-                bindRenderer(pRenderContext, mpBeamWarpFieldPass);
-                bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
-                mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
+                if (!fusedChain)
+                {
+                    bindRenderer(pRenderContext, mpBeamWarpFieldPass);
+                    bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
+                    mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
+                }
             }
-            else if (warp && early)
+            else if (warp && early && !fusedChain)
             {
                 // The warp field over the on-screen lattice box (beamWarpFieldBox computes the same box in the shader).
                 FALCOR_PROFILE(pRenderContext, "warp");
@@ -6046,6 +6097,73 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         }
                         pRenderContext->copyResource(mpBeamPixelsSnapshot.get(), pPixels.get());
                     }
+                    if (fusedChain)
+                    {
+                        FALCOR_PROFILE(pRenderContext, "fused");
+                        const uint32_t tiles = mParams.beamTileDims.x * mParams.beamTileDims.y;
+                        if (!mpBeamFusedTiles || mpBeamFusedTiles->getElementCount() != tiles + kFusedDiagCount)
+                        {
+                            mpBeamFusedTiles = mpDevice->createStructuredBuffer(sizeof(uint32_t), tiles + kFusedDiagCount);
+                            pRenderContext->clearUAV(mpBeamFusedTiles->getUAV().get(), uint4(0));
+                        }
+                        const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
+                        mParams.beamFusedWarp = warp && !(mBeamWarpAuto > 0.f) && mpBeamWarpField ? 1u : 0u;
+                        mParams.beamWarpAuto = warp && mBeamWarpAuto > 0.f ? mBeamWarpAuto : 0.f;
+                        bindRenderer(pRenderContext, mpBeamDirtyFusedSetupPass);
+                        mpBeamDirtyFusedSetupPass->execute(pRenderContext, uint3(1));
+                        // The resolve dispatches from the warp arguments; left in their indirect state now, nothing between the
+                        // unit march and the pixel pass has to transition them (beamOverlapResolve).
+                        pRenderContext->resourceBarrier(mpBeamWarpArgs.get(), Resource::State::IndirectArg);
+                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
+                        setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
+                        bindDirty(mpBeamDirtyFusedPass);
+                        ShaderVar fusedVar = mpBeamDirtyFusedPass->getRootVar()["CB"]["gHSTRCloud"];
+                        fusedVar["hstrBeamWarpArgs"] = ref<Buffer>();
+                        fusedVar["hstrBeamPixelPrev"] = ref<Texture>();
+                        fusedVar["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
+                        bindOutput(mpBeamDirtyFusedPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                        bindOutput(mpBeamDirtyFusedPass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                        // The same unit list and lattice again, through coherent views (gFusedUnits, gFusedLattice).
+                        mpBeamDirtyFusedPass->getRootVar()["gFusedUnits"] = mpBeamDirtyUnits;
+                        mpBeamDirtyFusedPass->getRootVar()["gFusedLattice"] = mpBeamLattice;
+                        // Persistent: about what fits at once (58 SMs x ~20 warps at the query's 96 registers is 580 groups of two
+                        // warps). More only adds waves polling for work; fused1 launched 1,024 groups.
+                        mpBeamDirtyFusedPass->execute(pRenderContext, uint3(640 * 64, 1, 1));
+                        mParams.beamDirtyFused = 1;
+                        // After it, as their own dispatches: the coarse rebuild reads every verification the queries wrote, and
+                        // the warp field the lattice and the guard cameras. Neither binds the warp arguments, which have to stay in
+                        // their indirect state; the field's indirect dispatch (beamWarpAuto) leaves them there anyway.
+                        {
+                            FALCOR_PROFILE(pRenderContext, "rebuild");
+                            bindRenderer(pRenderContext, mpBeamCoarseUpdatePass);
+                            mpBeamCoarseUpdatePass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamWarpArgs"] = ref<Buffer>();
+                            mpBeamCoarseUpdatePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 36);
+                        }
+                        if (warp && mpBeamWarpField)
+                        {
+                            FALCOR_PROFILE(pRenderContext, "warp");
+                            bindRenderer(pRenderContext, mpBeamWarpFieldPass);
+                            bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
+                            mpBeamWarpFieldPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamWarpArgs"] = ref<Buffer>();
+                            if (mBeamWarpAuto > 0.f)
+                                mpBeamWarpFieldPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 0);
+                            else
+                            {
+                                const float step = float(std::max(mParams.beamLatticeStep, 1u));
+                                const float4 bounds = mParams.beamScreenBounds;
+                                const uint2 latticeDims = mParams.beamLatticeDims;
+                                const uint2 origin(
+                                    uint32_t(std::max(std::floor(bounds.x / step) - 2.f, 0.f)), uint32_t(std::max(std::floor(bounds.y / step) - 2.f, 0.f))
+                                );
+                                const uint2 end(
+                                    std::min(uint32_t(std::ceil(bounds.z / step) + 2.f), latticeDims.x),
+                                    std::min(uint32_t(std::ceil(bounds.w / step) + 2.f), latticeDims.y)
+                                );
+                                if (end.x > origin.x && end.y > origin.y)
+                                    mpBeamWarpFieldPass->execute(pRenderContext, uint3(end - origin, 1));
+                            }
+                        }
+                    }
                     // The units to march were listed by the dirty tile pass (listBeamFailedTileUnits).
                     bindDirty(mpBeamDirtyUnitArgsPass);
                     mpBeamDirtyUnitArgsPass->execute(pRenderContext, uint3(1));
@@ -6064,6 +6182,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         bindDirty(mpBeamDirtyMarchPass);
                         mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                     }
+                    mParams.beamDirtyFused = 0;
                     if (mPushProbe && mPushShare && mpPushShareRays)
                         runPushShare(pRenderContext);
                     if (mSpanProbe && mpSpanRays)
@@ -6143,6 +6262,18 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             {
                 for (uint32_t i = 0; i < 21; ++i)
                     mBeamOrderProbeValues[i] = mpBeamOrderProbe->getElement<uint32_t>(i);
+            }
+            if (mpBeamFusedState)
+            {
+                mBeamFusedTilesTested = mpBeamFusedState->getElement<uint32_t>(kFusedTilesTested);
+                mBeamFusedUnitsMarched = mpBeamFusedState->getElement<uint32_t>(kFusedUnitsMarched);
+                mBeamFusedUnitsListed = mpBeamDirtyCount ? mpBeamDirtyCount->getElement<uint32_t>(1) : 0u;
+            }
+            if (mpBeamFusedTiles)
+            {
+                const uint32_t diag = mpBeamFusedTiles->getElementCount() - kFusedDiagCount;
+                for (uint32_t i = 0; i < kFusedDiagCount; ++i)
+                    mBeamFusedDiag[i] = mpBeamFusedTiles->getElement<uint32_t>(diag + i);
             }
             mBeamWarpOn = mpBeamWarpArgs && mBeamWarpAuto > 0.f ? mpBeamWarpArgs->getElement<uint32_t>(9) : uint32_t(mBeamWarp);
             mBeamPolicyToleranceNow =
