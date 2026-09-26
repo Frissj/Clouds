@@ -298,6 +298,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamFusedUnits = bool(value);
             continue;
         }
+        if (key == "beamFusedRaysOnly")
+        {
+            mBeamFusedRaysOnly = bool(value);
+            continue;
+        }
         if (key == "beamFusedStage")
         {
             mParams.beamFusedStage = uint32_t(value);
@@ -1146,6 +1151,7 @@ Properties HSTRCloud::getProperties() const
     props["beamDirtyFused"] = mBeamDirtyFused;
     props["beamFusedStage"] = mParams.beamFusedStage;
     props["beamFusedUnits"] = mBeamFusedUnits;
+    props["beamFusedRaysOnly"] = mBeamFusedRaysOnly;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
@@ -6116,6 +6122,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         pRenderContext->resourceBarrier(mpBeamWarpArgs.get(), Resource::State::IndirectArg);
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits ? "1" : "0");
+                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_RAYS_ONLY", mBeamFusedRaysOnly ? "1" : "0");
                         setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
                         bindDirty(mpBeamDirtyFusedPass);
                         ShaderVar fusedVar = mpBeamDirtyFusedPass->getRootVar()["CB"]["gHSTRCloud"];

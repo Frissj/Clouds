@@ -31,6 +31,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_FUSED_RAYS_ONLY
+#define HSTR_FUSED_RAYS_ONLY 0 // DIAGNOSTIC (beamFusedRaysOnly): runBeamDirtyFused compiled as its ray loop alone, for its registers.
+#endif
 #ifndef HSTR_FUSED_UNITS
 #define HSTR_FUSED_UNITS 1 // The fused kernel marches units itself (mBeamFusedUnits); otherwise the units pass marches all of them.
 #endif
@@ -10675,6 +10678,14 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
             }
         }
     }
+#if HSTR_FUSED_RAYS_ONLY
+    // The tile and unit half is not in the binary: its registers are the persistent query's own. MEASURED (ngfx18 against
+    // ngfx14, 4K sprint): this ray loop alone allocates 128 registers (117 live, 16 warps an SM) where buildBeamDirtyQueries, the
+    // same beamDirtyRay / beamQueryNeedsMarch / marchBeam / beamQueryMarched, takes 96 (94 live, 20 warps) and the tile test 64.
+    // The persistent loop itself costs the residency tier, not the tile/unit half - so fusing in one program cannot win back the
+    // query's tail (fused 1.61 ms against the separate query and tile passes' 1.58, ngfx13/14). Fusion is settled.
+    return;
+#endif
     const HSTRCloudParams p = gHSTRCloud.params;
     const uint stage = p.beamFusedStage;
     if (stage == 2u)

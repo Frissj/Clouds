@@ -338,6 +338,8 @@ private:
     /// The fused kernel marches units itself (HSTR_FUSED_UNITS). ngfx12 (4K sprint): with them it takes 168 registers, 12 warps
     /// an SM, where the separate query takes 96; without, every unit is the units pass's.
     bool mBeamFusedUnits = true;
+    /// DIAGNOSTIC (HSTR_FUSED_RAYS_ONLY): the fused kernel compiled as its ray loop alone - wrong images, for a trace's registers.
+    bool mBeamFusedRaysOnly = false;
     uint32_t mBeamFusedTilesTested = 0;  ///< The compared frame's dirty tiles tested (either path) ...
     uint32_t mBeamFusedUnitsMarched = 0; ///< ... units the fused chain marched itself ...
     uint32_t mBeamFusedUnitsListed = 0;  ///< ... and units listed (hstrBeamDirtyCount[1]).
