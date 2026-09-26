@@ -335,6 +335,9 @@ private:
     /// (runBeamDirtyFused). Its claim counters, per-block ray counts and finished-block queue, and per-tile reader counts.
     bool mBeamDirtyFused = false;
     bool mBeamFusedBuild = false; ///< This build runs the fused chain (mBeamDirtyFused and nothing it does not cover).
+    /// The fused kernel marches units itself (HSTR_FUSED_UNITS). ngfx12 (4K sprint): with them it takes 168 registers, 12 warps
+    /// an SM, where the separate query takes 96; without, every unit is the units pass's.
+    bool mBeamFusedUnits = true;
     uint32_t mBeamFusedTilesTested = 0;  ///< The compared frame's dirty tiles tested (either path) ...
     uint32_t mBeamFusedUnitsMarched = 0; ///< ... units the fused chain marched itself ...
     uint32_t mBeamFusedUnitsListed = 0;  ///< ... and units listed (hstrBeamDirtyCount[1]).

@@ -31,6 +31,9 @@ import HSTRCloudTypes;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_FUSED_UNITS
+#define HSTR_FUSED_UNITS 1 // The fused kernel marches units itself (mBeamFusedUnits); otherwise the units pass marches all of them.
+#endif
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
@@ -8007,7 +8010,7 @@ struct HSTRCloudRenderer
             const uint2 unit = tile * ts + uint2(k % ts, k / ts);
             hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
         }
-#if HSTR_DIRTY_FUSED
+#if HSTR_DIRTY_FUSED && HSTR_FUSED_UNITS
         // Published in reservation order, so every unit below the published count is written: the waves that reserved before this
         // one are running (they reserved), and publish within a few instructions of it.
         DeviceMemoryBarrier();
@@ -10750,6 +10753,9 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 continue;
             }
         }
+#if !HSTR_FUSED_UNITS
+        break; // Every unit is the units pass's.
+#endif
         const uint available = fusedWavePoll(kFusedUnitsPublished);
         if (stage == 3u || stage == 4u)
             break;
@@ -10833,8 +10839,7 @@ bool fusedTileItem(uint index, uint2 tile, uint side)
     uint before;
     InterlockedAdd(gFusedTiles[slot], 1u, before);
     if (before + 1u != readers)
-        return false;
-    gFusedTiles[slot] = 0u; // For the next build: every reader has counted.
+        return false; // The host clears the counts before each build.
     DeviceMemoryBarrier();
     return gHSTRCloud.testBeamDirtyTileNow(tile);
 }

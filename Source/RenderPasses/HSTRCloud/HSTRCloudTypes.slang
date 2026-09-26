@@ -28,7 +28,7 @@ static const uint kFusedWarp = 8 * kFusedStride;           ///< The warp field i
 static const uint kFusedTolerance = 8 * kFusedStride + 1;  ///< beamPolicy's tile tolerance (asuint), copied out of hstrBeamWarpArgs[11].
 static const uint kFusedTilesTested = 9 * kFusedStride;    ///< Stats: tiles the fused chain tested.
 static const uint kFusedUnitsMarched = 9 * kFusedStride + 1; ///< Stats: units it marched itself.
-// Diagnostic, after gFusedTiles' tile counters (never cleared, so it survives to the stats readback): bits of the waits that hit
+// Diagnostic, after gFusedTiles' tile counters (cleared each fused build, so it is the read-back build's): bits of the waits that hit
 // kFusedWaitLimit (1 block publish, 2 unit publish, 4 item wait, 8 idle loop), then the last give-up's counter value and what it
 // waited for (idle loop: blocks published, blocks reserved, blocks, rays claimed, rays, items done, items, units published).
 // 9, 10: block and unit publishes in progress (their counts at the first give-up in 15, 16); 11: publishes an abort broke out of,

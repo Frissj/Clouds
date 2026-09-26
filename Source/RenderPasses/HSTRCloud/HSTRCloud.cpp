@@ -293,6 +293,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamDirtyFused = bool(value);
             continue;
         }
+        if (key == "beamFusedUnits")
+        {
+            mBeamFusedUnits = bool(value);
+            continue;
+        }
         if (key == "beamFusedStage")
         {
             mParams.beamFusedStage = uint32_t(value);
@@ -1140,6 +1145,7 @@ Properties HSTRCloud::getProperties() const
     props["beamOrderProbe"] = mParams.beamOrderProbe;
     props["beamDirtyFused"] = mBeamDirtyFused;
     props["beamFusedStage"] = mParams.beamFusedStage;
+    props["beamFusedUnits"] = mBeamFusedUnits;
     props["beamInvalidate"] = mBeamInvalidate;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
@@ -6101,10 +6107,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         FALCOR_PROFILE(pRenderContext, "fused");
                         const uint32_t tiles = mParams.beamTileDims.x * mParams.beamTileDims.y;
                         if (!mpBeamFusedTiles || mpBeamFusedTiles->getElementCount() != tiles + kFusedDiagCount)
-                        {
                             mpBeamFusedTiles = mpDevice->createStructuredBuffer(sizeof(uint32_t), tiles + kFusedDiagCount);
-                            pRenderContext->clearUAV(mpBeamFusedTiles->getUAV().get(), uint4(0));
-                        }
+                        // Each build's tile reader counts start at zero. MEASURED (fused14, 4K): left to reset themselves, one count
+                        // left over (first seen after the kernel's recompile for beamFusedUnits) kept 21-26 tiles a build untested
+                        // in every fused arm after it - 0.937 -> 0.947% at walk, 0.476 -> 0.489% at sprint.
+                        pRenderContext->clearUAV(mpBeamFusedTiles->getUAV().get(), uint4(0));
                         const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
                         mParams.beamFusedWarp = warp && !(mBeamWarpAuto > 0.f) && mpBeamWarpField ? 1u : 0u;
                         mParams.beamWarpAuto = warp && mBeamWarpAuto > 0.f ? mBeamWarpAuto : 0.f;
@@ -6116,6 +6123,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         // unit march and the pixel pass has to transition them (beamOverlapResolve).
                         pRenderContext->resourceBarrier(mpBeamWarpArgs.get(), Resource::State::IndirectArg);
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
+                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits ? "1" : "0");
                         setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
                         bindDirty(mpBeamDirtyFusedPass);
                         ShaderVar fusedVar = mpBeamDirtyFusedPass->getRootVar()["CB"]["gHSTRCloud"];
