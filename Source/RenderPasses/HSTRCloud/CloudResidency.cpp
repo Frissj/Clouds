@@ -1372,6 +1372,7 @@ bool CloudResidency::commit(uint64_t handle)
     if (parent)
         ++brick(b.parent).loadedChildren;
     ++storeOf(handle).loaded;
+    b.loadedIndex = uint32_t(mLoadedList.size());
     mLoadedList.push_back(handle);
     return true;
 }
@@ -1379,18 +1380,16 @@ bool CloudResidency::commit(uint64_t handle)
 bool CloudResidency::evict(uint32_t slotsNeeded, uint32_t metasNeeded)
 {
     // Loaded, unmapped, undesired leaves of the loaded set, least recently desired first.
+    // mLoadedList holds exactly the loaded bricks (unload removes them). It used to be compacted here, lazily, which left handles of
+    // unloaded bricks behind; a store released meanwhile emptied (or reused) their brick vector, and the first eviction after the
+    // atlas filled read through them and crashed (Intel sea, 16^2 tiles, 270k-brick atlas).
     std::vector<uint64_t> candidates;
-    size_t kept = 0;
     for (uint64_t handle : mLoadedList)
     {
         const Brick& b = brick(handle);
-        if (!(b.flags & kLoaded))
-            continue;
-        mLoadedList[kept++] = handle;
         if (!b.mapped && !desired(b) && b.loadedChildren == 0)
             candidates.push_back(handle);
     }
-    mLoadedList.resize(kept);
     std::sort(candidates.begin(), candidates.end(), [&](uint64_t a, uint64_t c) { return lastDesired(brick(a)) < lastDesired(brick(c)); });
     uint32_t freedSlots = 0;
     uint32_t freedMetas = 0;
@@ -1438,6 +1437,11 @@ void CloudResidency::unload(uint64_t handle)
         mSunTableBlocksDirty[b.gpu / kBrickBlock] = 1;
     }
     mFreeBricks.push_back(b.gpu);
+    const uint64_t last = mLoadedList.back();
+    mLoadedList[b.loadedIndex] = last;
+    brick(last).loadedIndex = b.loadedIndex;
+    mLoadedList.pop_back();
+    b.loadedIndex = kNone;
     b.slot = kNone;
     b.gpu = kNone;
     b.flags &= ~kLoaded;

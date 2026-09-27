@@ -219,6 +219,7 @@ private:
         uint32_t gpu = kNone;      ///< Brick index on the GPU while loaded.
         uint32_t slot = kNone;     ///< Atlas slot while loaded.
         uint32_t mappedIndex = kNone; ///< Position in mMappedList while mapped.
+        uint32_t loadedIndex = kNone; ///< Position in mLoadedList while loaded.
         /// The current cut's state is cut[mCutSlot]; the walk of the next one writes the other slot, so taking it on is a flip.
         CutState cut[2];
         uint32_t fadeSerial = 0; ///< Bumped by every fade change (a FadeEnd of an older one is void).
