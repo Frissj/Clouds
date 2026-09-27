@@ -57,7 +57,9 @@ CloudSea::CloudSea(std::vector<CloudAsset> assets, const CloudSeaDesc& desc) : m
         const float3 extent = float3(mContentMax.back() - mContentMin.back() + 1u) * asset.voxelWorld;
         mFitScale = std::min(mFitScale, 0.98f * std::min(mDesc.tileWorld / std::max(extent.x, extent.z), mDesc.layerHeight / extent.y));
     }
+    mDesc.layers = std::clamp(mDesc.layers, 1u, kCloudSeaLayers);
     mTiles.resize(mDesc.tiles * mDesc.tiles);
+    mInstanceTiles.resize(mDesc.layers * mTiles.size());
     mVolumes.resize(mTiles.size());
     for (TileVolume& volume : mVolumes)
     {
@@ -97,17 +99,30 @@ uint32_t CloudSea::slotIndex(int2 worldTile) const
     return uint32_t(slot.x + n * slot.y);
 }
 
+std::vector<uint32_t> CloudSea::instanceSlots(const std::vector<uint32_t>& domainSlots) const
+{
+    std::vector<uint32_t> slots;
+    slots.reserve(domainSlots.size() * mDesc.layers);
+    for (uint32_t layer = 0; layer < mDesc.layers; ++layer)
+        for (uint32_t slot : domainSlots)
+            slots.push_back(layer * uint32_t(mTiles.size()) + slot);
+    return slots;
+}
+
 uint32_t CloudSea::pendingTiles() const
 {
     std::lock_guard lock(mMutex);
     return uint32_t(mJobs.size() + mResults.size()) + mBusy;
 }
 
-CloudSea::Tile CloudSea::makeTile(int2 world) const
+CloudSea::Tile CloudSea::makeTile(int2 world, uint32_t layer) const
 {
     Tile tile;
     tile.world = world;
-    TileRng rng{hashUint(uint32_t(world.x) * 73856093u ^ hashUint(uint32_t(world.y) * 19349663u ^ hashUint(mDesc.seed)))};
+    tile.layer = layer;
+    tile.corner = mDesc.origin + (float3(float(world.x), 0.f, float(world.y)) + float3(0.5f, 0.f, 0.5f) * float(layer)) * mDesc.tileWorld;
+    // Layer 0 draws exactly what the one-layer sea drew.
+    TileRng rng{hashUint(uint32_t(world.x) * 73856093u ^ hashUint(uint32_t(world.y) * 19349663u ^ hashUint(mDesc.seed + 0x9E3779B9u * layer)))};
     tile.occupied = rng.next() < mDesc.coverage;
     const uint32_t assetID = std::min(uint32_t(rng.next() * float(mAssets.size())), uint32_t(mAssets.size()) - 1);
     const CloudAsset& asset = mAssets[assetID];
@@ -120,7 +135,8 @@ CloudSea::Tile CloudSea::makeTile(int2 world) const
     const float3 footprint = (turns & 1u) ? float3(extent.z, extent.y, extent.x) : extent;
     const float3 offset(
         rng.next() * std::max(0.f, mDesc.tileWorld - footprint.x),
-        0.3f * rng.next() * std::max(0.f, mDesc.layerHeight - footprint.y),
+        // Layered, the bases spread over the whole layer height: with one layer they sat within 30% of it, a flat line of bases.
+        (mDesc.layers > 1 ? 1.f : 0.3f) * rng.next() * std::max(0.f, mDesc.layerHeight - footprint.y),
         rng.next() * std::max(0.f, mDesc.tileWorld - footprint.z)
     );
 
@@ -145,9 +161,8 @@ CloudSea::Tile CloudSea::makeTile(int2 world) const
     tile.instance.sourceVoxelWorld = sourceVoxelWorld;
     tile.instance.proxyLevel = std::log2(mVoxelWorld / sourceVoxelWorld);
     tile.instance.scale = tile.occupied ? scale : 0.f;
-    const float3 tileCorner = mDesc.origin + float3(float(world.x), 0.f, float(world.y)) * mDesc.tileWorld;
-    tile.worldMin = tileCorner + offset;
-    tile.worldMax = tileCorner + offset + footprint;
+    tile.worldMin = tile.corner + offset;
+    tile.worldMax = tile.corner + offset + footprint;
     return tile;
 }
 
@@ -155,13 +170,28 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
 {
     Result result;
     result.slot = job.slot;
-    result.tile = makeTile(job.world);
+    result.tile = makeTile(job.world, 0);
+    for (uint32_t layer = 0; layer < mDesc.layers; ++layer)
+        result.instances.push_back(layer == 0 ? result.tile : makeTile(job.world, layer));
     const uint32_t r = mDesc.tileVoxels;
     const size_t voxels = size_t(r) * mDims.y * r;
     TileVolume& volume = result.volume;
     volume.mean.assign(voxels, 0.f);
     volume.upload = TileVolume::Upload::Zero;
-    if (!result.tile.occupied)
+    // The clouds over this tile's square: its layer-0 cloud, and of each further layer the four tiles whose squares (shifted half a
+    // tile along x and z) overlap it - the one of this world coordinate and those one tile back along x, z and both.
+    std::vector<Tile> clouds;
+    if (result.tile.occupied)
+        clouds.push_back(result.tile);
+    for (uint32_t layer = 1; layer < mDesc.layers; ++layer)
+        for (int32_t dz = -1; dz <= 0; ++dz)
+            for (int32_t dx = -1; dx <= 0; ++dx)
+            {
+                const Tile tile = dx == 0 && dz == 0 ? result.instances[layer] : makeTile(job.world + int2(dx, dz), layer);
+                if (tile.occupied)
+                    clouds.push_back(tile);
+            }
+    if (clouds.empty())
         return result;
     // The GPU upload is written where the main thread only has to record a copy: a staging buffer, or host memory if none is free.
     uint32_t* packed = nullptr;
@@ -177,12 +207,40 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
         volume.packed.assign(voxels, 0u);
         packed = volume.packed.data();
     }
-    const HSTRCloudInstance& instance = result.tile.instance;
+    // Summed over the clouds: the means, and the conservative maxima (a sum of bounds bounds the sum).
+    std::vector<float> maxima(voxels, 0.f);
+    const float3 squareCorner = mDesc.origin + float3(float(job.world.x), 0.f, float(job.world.y)) * mDesc.tileWorld;
+    for (const Tile& cloud : clouds)
+        accumulate(cloud, squareCorner, volume.mean, maxima);
+    for (size_t index = 0; index < voxels; ++index)
+    {
+        const float maximum = maxima[index];
+        if (!(maximum > 0.f))
+            continue;
+        volume.mean[index] = std::min(volume.mean[index], maximum);
+        // The maximum rounds up: the majorants built from it must still bound the density.
+        float16_t maximum16(maximum);
+        if (float(maximum16) < maximum)
+            maximum16 = float16_t(maximum * (1.f + 1.f / 1024.f));
+        packed[index] = uint32_t(float16_t(volume.mean[index]).toBits()) | uint32_t(maximum16.toBits()) << 16;
+        const int32_t y = int32_t((index / r) % mDims.y);
+        result.tile.contentLow = result.tile.contentLow < 0 ? y : std::min(result.tile.contentLow, y);
+        result.tile.contentHigh = std::max(result.tile.contentHigh, y);
+    }
+    return result;
+}
+
+void CloudSea::accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima) const
+{
+    const uint32_t r = mDesc.tileVoxels;
+    const HSTRCloudInstance& instance = tile.instance;
     const CloudAsset& asset = mAssets[instance.asset];
     const float3x3 a{
         instance.row0.x, instance.row0.y, instance.row0.z, instance.row1.x, instance.row1.y, instance.row1.z, instance.row2.x,
         instance.row2.y, instance.row2.z};
     const float3 b(instance.row0.w, instance.row1.w, instance.row2.w);
+    // The square's voxels in the instance's tile-local voxels: a whole number of voxels apart (half a tile is, tileVoxels being even).
+    const float3 shift = round((squareCorner - tile.corner) / mVoxelWorld);
     const float proxyScale = float(1u << asset.proxyLevel);
     const float3 halfBox =
         0.5f * float3(
@@ -209,14 +267,14 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
         return value;
     };
 
-    const float3 tileCorner = mDesc.origin + float3(float(job.world.x), 0.f, float(job.world.y)) * mDesc.tileWorld;
-    const int3 lo = max(int3(floor((result.tile.worldMin - tileCorner) / mVoxelWorld)) - 2, int3(0));
-    const int3 hi = min(int3(ceil((result.tile.worldMax - tileCorner) / mVoxelWorld)) + 2, int3(r, mDims.y, r) - 1);
+    // The instance's bounds with the trilinear margin, clipped to the square (in the square's voxels).
+    const int3 lo = max(int3(floor((tile.worldMin - squareCorner) / mVoxelWorld)) - 2, int3(0));
+    const int3 hi = min(int3(ceil((tile.worldMax - squareCorner) / mVoxelWorld)) + 2, int3(r, mDims.y, r) - 1);
     for (int32_t z = lo.z; z <= hi.z; ++z)
         for (int32_t y = lo.y; y <= hi.y; ++y)
             for (int32_t x = lo.x; x <= hi.x; ++x)
             {
-                const float3 p{float(x), float(y), float(z)};
+                const float3 p = float3(float(x), float(y), float(z)) + shift;
                 float mean = 0.f;
                 for (uint32_t sz = 0; sz < subsamples; ++sz)
                     for (uint32_t sy = 0; sy < subsamples; ++sy)
@@ -240,19 +298,9 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
                         for (uint32_t qx = plo.x; qx <= phi.x; ++qx)
                             maximum = std::max(maximum, asset.proxyMax[proxyIndex(uint3(qx, qy, qz))]);
                 const size_t index = size_t(x) + r * (size_t(y) + size_t(mDims.y) * size_t(z));
-                volume.mean[index] = std::min(mean, maximum);
-                // The maximum rounds up: the majorants built from it must still bound the density.
-                float16_t maximum16(maximum);
-                if (float(maximum16) < maximum)
-                    maximum16 = float16_t(maximum * (1.f + 1.f / 1024.f));
-                packed[index] = uint32_t(float16_t(volume.mean[index]).toBits()) | uint32_t(maximum16.toBits()) << 16;
-                if (maximum > 0.f)
-                {
-                    result.tile.contentLow = result.tile.contentLow < 0 ? y : std::min(result.tile.contentLow, y);
-                    result.tile.contentHigh = std::max(result.tile.contentHigh, y);
-                }
+                means[index] += std::min(mean, maximum);
+                maxima[index] += maximum;
             }
-    return result;
 }
 
 void CloudSea::apply(Result& result)
@@ -261,6 +309,8 @@ void CloudSea::apply(Result& result)
     std::swap(mVolumes[result.slot], result.volume);
     discard(result.volume);
     mTiles[result.slot] = result.tile;
+    for (uint32_t layer = 0; layer < mDesc.layers; ++layer)
+        mInstanceTiles[layer * mTiles.size() + result.slot] = result.instances[layer];
 }
 
 void CloudSea::discard(TileVolume& volume)

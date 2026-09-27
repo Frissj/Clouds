@@ -7,6 +7,7 @@
 #include "RenderGraph/RenderPass.h"
 #include "HSTRCloudTypes.slang"
 #include "CloudResidency.h"
+#include "Atmosphere.h"
 
 #include <array>
 #include <functional>
@@ -660,6 +661,7 @@ private:
     uint32_t mCloudSeaTiles = 8;
     uint32_t mCloudSeaSeed = 1;
     float mCloudSeaCoverage = 0.85f;
+    uint32_t mCloudSeaLayers = 1; ///< Staggered cloud layers (CloudSeaDesc::layers).
     float mCloudLodPixels = 1.f;
     uint32_t mCloudFadeFrames = 8;
     bool mCloudVirtual = true;
@@ -668,6 +670,13 @@ private:
     std::unique_ptr<DomainStaging> mpDomainStaging; ///< Before the sea: its workers write into it until the sea is gone.
     std::unique_ptr<hstrcloud::CloudSea> mpCloudSea;
     std::unique_ptr<hstrcloud::CloudResidency> mpCloudResidency;
+    /// skyModel 2: pl-sky's atmosphere (Atmosphere.h). Its sun radiance outside the atmosphere is atmosphereSunColor times
+    /// atmosphereSunIntensity; the clouds' sunRadiance and skyRadiance are then derived from it (updateAtmosphere), not set.
+    std::unique_ptr<hstrcloud::Atmosphere> mpAtmosphere;
+    AtmosphereParams mAtmosphere;
+    float3 mAtmosphereSunColor = float3(1.f, 0.95f, 0.85f);
+    float mAtmosphereSunIntensity = 3.f;
+    void updateAtmosphere(RenderContext* pRenderContext);
     bool mCloudInstancesUploaded = false;
     uint32_t mCloudFrames = 0;
     /// What invalidated the carried beam basis on the LAST frame, and how often each has since the view settled. A fixed refresh

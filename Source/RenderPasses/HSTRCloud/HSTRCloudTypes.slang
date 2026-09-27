@@ -131,6 +131,7 @@ static const uint kCloudLevelEmpty = 0x40000000;
 static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
 static const uint kCloudTransformHaar = 1;     ///< HSTRCloudStaging.transform: CloudFormat.h kTransformHaar.
 static const float kCloudSeaMinScale = 0.65f;  ///< Smallest instance scale of the sea (CloudSea::makeTile draws 0.65-1).
+static const uint kCloudSeaLayers = 2;         ///< Most staggered cloud layers the sea holds (CloudSeaDesc::layers, cloudLayers).
 static const float kCloudSunDepthOpaque = 12.f; ///< Sun optical depth past which nothing is lit (sunDepthAt stops).
 
 /// One tile of the cloud sea domain: a library asset placed with a quarter-turn rotation, mirror, scale and offset.
@@ -1399,6 +1400,14 @@ struct HSTRCloudParams
     float pushShareMotionY = 0.f;
     float pushShareMotionZ = 0.f;
     uint pushEvalExactDepth = 0;     ///< pushEval modes 2-4: the chord's exact transmittance under the operator's source (see pushOperatorChord).
+    /// 0: the flat two-tone sky (skyRadiance). 2: pl-sky's atmosphere (Atmosphere.h): its sky, sun disk and aerial perspective,
+    /// and sunRadiance and skyRadiance derived from it. The path-traced reference has no air, so quality gates run with 0.
+    uint skyModel = 0;
+    /// The sea's staggered cloud layers (CloudSeaDesc::layers): instance slot layer * cloudTiles^2 + tile slot, layer k's grid shifted
+    /// k / 2 of a tile along x and z; camera samples sum the layers' densities.
+    uint cloudLayers = 1;
+    float skyPad1 = 0.f;
+    float skyPad2 = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

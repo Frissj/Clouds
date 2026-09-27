@@ -21,6 +21,10 @@ struct CloudSeaDesc
     uint32_t tiles = 8;          ///< Tiles per window axis (the domain is a torus of tiles x tiles).
     uint32_t seed = 1;
     float coverage = 0.85f; ///< Probability that a tile holds a cloud.
+    /// Staggered layers of clouds (1 or kCloudSeaLayers). Layer k's tiles are the grid shifted by k / 2 of a tile in x and z, so a
+    /// layer-1 cloud straddles four layer-0 tiles and neighbouring clouds overlap and merge instead of standing in rows. A domain
+    /// voxel is covered by one tile of each layer; its density is their sum (the proxy here, the bricks in cameraExtinction).
+    uint32_t layers = 1;
 };
 
 /// Where the sea's workers write a tile's GPU upload: host-visible staging buffers of one tile's packed volume each (HSTRCloud).
@@ -43,6 +47,8 @@ public:
     struct Tile
     {
         int2 world = int2(std::numeric_limits<int32_t>::min());
+        uint32_t layer = 0;
+        float3 corner = float3(0.f); ///< World corner of the tile's square (its layer's grid): the instance's tile-local origin.
         bool occupied = false;
         HSTRCloudInstance instance = {};
         float3 worldMin = float3(0.f); ///< World bounds of the instance.
@@ -100,7 +106,13 @@ public:
         std::lock_guard lock(mMutex);
         mpStaging = pStaging;
     }
+    /// Per domain slot: its layer-0 tile, with the content layers of every layer's clouds over it (the domain's view of the sea).
     const std::vector<Tile>& getTiles() const { return mTiles; }
+    /// Per instance slot (layer * tiles^2 + domain slot): the cloud instances, as hstrCloudInstances holds them. Domain slot s holds
+    /// the layer-k tile of the same world coordinate, whose square starts k / 2 of a tile further along x and z.
+    const std::vector<Tile>& getInstanceTiles() const { return mInstanceTiles; }
+    /// The instance slots of domain slots.
+    std::vector<uint32_t> instanceSlots(const std::vector<uint32_t>& domainSlots) const;
     uint32_t slotIndex(int2 worldTile) const;
     uint32_t pendingTiles() const;
 
@@ -113,12 +125,15 @@ private:
     struct Result
     {
         Tile tile;
+        std::vector<Tile> instances; ///< The slot's tile of each layer.
         uint32_t slot = 0;
         TileVolume volume;
     };
 
-    Tile makeTile(int2 world) const;
+    Tile makeTile(int2 world, uint32_t layer) const;
     Result rasterize(const Job& job, TileStaging* pStaging) const;
+    /// Adds a cloud's proxy density over the square at squareCorner (a domain slot's) to its voxels' means and maxima.
+    void accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima) const;
     void apply(Result& result);
     void discard(TileVolume& volume);
     void worker();
@@ -132,6 +147,7 @@ private:
     std::vector<uint3> mContentMax;
     std::vector<TileVolume> mVolumes;     ///< Per slot (a finished tile's volume is swapped in).
     std::vector<Tile> mTiles;             ///< Per slot.
+    std::vector<Tile> mInstanceTiles;     ///< Per instance slot.
     std::vector<int2> mRequested;         ///< Per slot: world tile queued or applied.
     int2 mCenter = int2(std::numeric_limits<int32_t>::min());
 

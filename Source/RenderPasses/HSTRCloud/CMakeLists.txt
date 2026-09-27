@@ -1,6 +1,11 @@
 add_plugin(HSTRCloud)
 
 target_sources(HSTRCloud PRIVATE
+    Atmosphere.cpp
+    Atmosphere.cs.slang
+    Atmosphere.h
+    Atmosphere.slang
+    AtmosphereTypes.slang
     CloudFormat.cpp
     CloudFormat.h
     CloudLibrary.cpp

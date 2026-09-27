@@ -278,6 +278,28 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
+        if (key == "skyModel" || key == "cloudSeaLayers" || key.rfind("atmosphere", 0) == 0)
+        {
+            if (key == "skyModel")
+                mParams.skyModel = value;
+            else if (key == "cloudSeaLayers")
+                mCloudSeaLayers = std::clamp(uint32_t(value), 1u, kCloudSeaLayers);
+            else if (key == "atmosphereSunColor")
+                mAtmosphereSunColor = value;
+            else if (key == "atmosphereSunIntensity")
+                mAtmosphereSunIntensity = value;
+            else if (key == "atmosphereWorldToKm")
+                mAtmosphere.worldToKm = value;
+            else if (key == "atmosphereGroundY")
+                mAtmosphere.groundY = value;
+            else if (key == "atmosphereAerialDistance")
+                mAtmosphere.aerialDistance = value;
+            else if (key == "atmosphereMieG")
+                mAtmosphere.mieScatteringExponent = value;
+            else
+                logWarning("HSTRCloud: unknown property '{}'.", key);
+            continue;
+        }
         if (key == "beamRefPrebuild")
         {
             mBeamRefPrebuild = bool(value);
@@ -1068,7 +1090,7 @@ void HSTRCloud::setProperties(const Properties& props)
     auto cloudSettings = [&]()
     {
         return fmt::format(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             mCloudLibraryPath,
             mCloudProxyResolution,
             mCloudBrickPoolMB,
@@ -1076,6 +1098,7 @@ void HSTRCloud::setProperties(const Properties& props)
             mCloudSeaTiles,
             mCloudSeaSeed,
             mCloudSeaCoverage,
+            mCloudSeaLayers,
             mCloudLodPixels,
             mCloudFadeFrames,
             mCloudVirtual
@@ -1106,6 +1129,7 @@ void HSTRCloud::setProperties(const Properties& props)
                                  p.operatorDictionaryTolerance != q.operatorDictionaryTolerance;
     const bool lightingChanged =
         any(p.sunDirection != q.sunDirection) || any(p.sunRadiance != q.sunRadiance) || any(p.skyRadiance != q.skyRadiance) ||
+        p.skyModel != q.skyModel ||
         any(p.localSourceRadiance != q.localSourceRadiance) || p.activeRank != q.activeRank || p.activeThreshold != q.activeThreshold ||
         p.correctionBudget != q.correctionBudget || p.schurWindowRadius != q.schurWindowRadius || p.hstSunFraction != q.hstSunFraction;
     if (operatorChanged)
@@ -1143,6 +1167,13 @@ Properties HSTRCloud::getProperties() const
     props[kSunDirection] = mParams.sunDirection;
     props[kSunRadiance] = mParams.sunRadiance;
     props[kSkyRadiance] = mParams.skyRadiance;
+    props["skyModel"] = mParams.skyModel;
+    props["atmosphereSunColor"] = mAtmosphereSunColor;
+    props["atmosphereSunIntensity"] = mAtmosphereSunIntensity;
+    props["atmosphereWorldToKm"] = mAtmosphere.worldToKm;
+    props["atmosphereGroundY"] = mAtmosphere.groundY;
+    props["atmosphereAerialDistance"] = mAtmosphere.aerialDistance;
+    props["atmosphereMieG"] = mAtmosphere.mieScatteringExponent;
     props[kAnisotropy] = mParams.anisotropy;
     props[kActiveRank] = mParams.activeRank;
     props[kActiveThreshold] = mParams.activeThreshold;
@@ -1260,6 +1291,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSeaTiles] = mCloudSeaTiles;
     props[kCloudSeaSeed] = mCloudSeaSeed;
     props[kCloudSeaCoverage] = mCloudSeaCoverage;
+    props["cloudSeaLayers"] = mCloudSeaLayers;
     props[kCloudLodPixels] = mCloudLodPixels;
     props[kCloudLodBias] = mParams.cloudLodBias;
     props[kCloudFadeFrames] = mCloudFadeFrames;
@@ -2394,11 +2426,12 @@ void HSTRCloud::buildCloudDomain()
     const AABB bounds = volume->getBounds();
     const float3 cameraPosition = mpScene->getCamera()->getPosition();
     const std::string seaKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         mCloudLibraryPath,
         mCloudSeaTiles,
         mCloudSeaSeed,
         mCloudSeaCoverage,
+        mCloudSeaLayers,
         mCloudProxyResolution,
         bounds.minPoint,
         bounds.extent()
@@ -2418,6 +2451,7 @@ void HSTRCloud::buildCloudDomain()
         seaDesc.tiles = mCloudSeaTiles;
         seaDesc.seed = mCloudSeaSeed;
         seaDesc.coverage = mCloudSeaCoverage;
+        seaDesc.layers = mCloudSeaLayers;
         mpCloudSea = std::make_unique<hstrcloud::CloudSea>(std::move(library.assets), seaDesc);
         // Staging for three rows of tiles: a flight takes on at most a row and a column at a time. The load's full window
         // overflows it into host memory, which uploads from the main thread.
@@ -2468,6 +2502,7 @@ void HSTRCloud::buildCloudDomain()
     mParams.seaOrigin = desc.origin;
     mParams.seaVoxelSize = float3(voxel);
     mParams.cloudTiles = uint2(desc.tiles);
+    mParams.cloudLayers = desc.layers;
     // The shader wraps a possibly negative tile coordinate into the instance grid. Where an axis' count is a power of two that wrap
     // is exactly an AND, which replaces two emulated integer modulos on the hottest path there is; ~0u keeps the general path.
     const uint32_t n = mParams.cloudTiles.x;
@@ -2971,7 +3006,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     if (!mCloudResidencyFrozen)
     {
         FALCOR_PROFILE(pRenderContext, "residency");
-        densityChanged = mpCloudResidency->update(*mpCloudSea, view, changed);
+        densityChanged = mpCloudResidency->update(*mpCloudSea, view, mpCloudSea->instanceSlots(changed));
         if (mpCloudResidency->fadesRunning())
         {
             FALCOR_PROFILE(pRenderContext, "fades");
@@ -4058,6 +4093,13 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrExtinctionSampler"] = mpExtinctionSampler;
     var["hstrLinearSampler"] = mpLinearSampler;
     var["hstrLinearClampSampler"] = mpLinearClampSampler;
+    if (mpAtmosphere)
+    {
+        var["hstrAtmosphere"].setBlob(mAtmosphere);
+        var["hstrAtmosphereTransmission"] = mpAtmosphere->transmission();
+        var["hstrAtmosphereSky"] = mpAtmosphere->skyView();
+        var["hstrAtmosphereAerial"] = mpAtmosphere->aerial();
+    }
 }
 
 namespace
@@ -4795,6 +4837,35 @@ void HSTRCloud::dispatchLightingSolve()
     mCameraLightingDirty = true;
 }
 
+void HSTRCloud::updateAtmosphere(RenderContext* pRenderContext)
+{
+    if (mParams.skyModel != 2)
+        return;
+    if (!mpAtmosphere)
+        mpAtmosphere = std::make_unique<hstrcloud::Atmosphere>(mpDevice);
+    mAtmosphere.sunDirection = normalize(mParams.sunDirection);
+    mAtmosphere.sunRadiance = mAtmosphereSunColor * mAtmosphereSunIntensity;
+    mAtmosphere.viewRadius = mAtmosphere.planetRadius +
+                             std::max((mpScene->getCamera()->getPosition().y - mAtmosphere.groundY) * mAtmosphere.worldToKm, 0.f);
+    // The clouds are lit as at the middle of the carrier grid's height: one sun and one sky for the layer, as the renderer has.
+    float cloudRadius = mAtmosphere.viewRadius;
+    if (!mpScene->getGridVolumes().empty())
+    {
+        const AABB bounds = mpScene->getGridVolume(0)->getBounds();
+        const float middle = 0.5f * (bounds.minPoint.y + bounds.maxPoint.y);
+        cloudRadius = mAtmosphere.planetRadius + std::max((middle - mAtmosphere.groundY) * mAtmosphere.worldToKm, 0.f);
+    }
+    float3 sun, sky;
+    if (mpAtmosphere->update(pRenderContext, mAtmosphere, cloudRadius, sun, sky))
+    {
+        logInfo("HSTRCloud: atmosphere lights the clouds with sun {} and sky {}.", sun, sky);
+        Properties props;
+        props[kSunRadiance] = sun;
+        props[kSkyRadiance] = sky;
+        setProperties(props);
+    }
+}
+
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     ++mExecuteFrames;
@@ -4855,6 +4926,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
     if (mpCloudSea)
         updateCloudDomain(pRenderContext);
+    updateAtmosphere(pRenderContext);
 
     // Unbiased reference on the same medium and lights; accumulated over frames by the graph.
     if (!mpReferenceSum || mpReferenceSum->getWidth() != frameDim.x || mpReferenceSum->getHeight() != frameDim.y)

@@ -114,8 +114,8 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     }
     if (mDirectory.empty())
         mDirectory.push_back(kCloudRefNone);
-    mInstances.resize(sea.getTiles().size());
-    mTileForward.resize(sea.getTiles().size(), float3x3::identity());
+    mInstances.resize(sea.getInstanceTiles().size());
+    mTileForward.resize(sea.getInstanceTiles().size(), float3x3::identity());
 
     const auto shaderResource = ResourceBindFlags::ShaderResource;
     mpAssets = mpDevice->createStructuredBuffer(
@@ -248,12 +248,12 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
             }
             mSunFieldBlockSize = std::max(mSunFieldBlockSize, size);
         }
-        const uint32_t blocks = uint32_t(std::min(sea.getTiles().size(), mAssets.size() * kCloudSunClasses));
+        const uint32_t blocks = uint32_t(std::min(sea.getInstanceTiles().size(), mAssets.size() * kCloudSunClasses));
         for (uint32_t block = blocks; block-- > 0;)
             mFreeSunFieldBlocks.push_back(block);
         mSunFieldBlocks.assign(mAssets.size() * kCloudSunClasses, kNone);
         mSunFieldUsers.assign(mSunFieldBlocks.size(), 0);
-        mSlotSunPair.assign(sea.getTiles().size(), kNone);
+        mSlotSunPair.assign(sea.getInstanceTiles().size(), kNone);
         mSunChangeCapacity = brickCapacity;
         mSunFineBase = mSunFieldBlockSize * blocks;
         const uint64_t entries = uint64_t(mSunFineBase) + uint64_t(nodeCapacity) * kCloudSunFineEntries;
@@ -585,8 +585,7 @@ float CloudResidency::transmittance(const CloudSea& sea, const CloudView& view, 
 float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t handle, const CloudView& view, float& visibility)
 {
     const Brick& b = brick(handle);
-    const CloudSea::Tile& tile = sea.getTiles()[slot];
-    const CloudSeaDesc& desc = sea.getDesc();
+    const CloudSea::Tile& tile = sea.getInstanceTiles()[slot];
     const HSTRCloudInstance& instance = tile.instance;
     const uint32_t level = b.record.level;
     const float scale = float(1u << level);
@@ -597,7 +596,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
     const float3x3& forward = mTileForward[slot];
     const float3 p0 = mul(forward, sourceLo - offset);
     const float3 p1 = mul(forward, sourceHi - offset);
-    const float3 tileCorner = desc.origin + float3(float(tile.world.x), 0.f, float(tile.world.y)) * desc.tileWorld;
+    const float3 tileCorner = tile.corner;
     const float voxel = sea.getVoxelWorld();
     const float3 lo = tileCorner + (min(p0, p1) + 0.5f) * voxel;
     const float3 hi = tileCorner + (max(p0, p1) + 0.5f) * voxel;
@@ -647,7 +646,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
 
 bool CloudResidency::cutSeed(const CloudSea& sea, const CloudView& view, uint32_t slot, CutEntry& entry)
 {
-    const CloudSea::Tile& tile = sea.getTiles()[slot];
+    const CloudSea::Tile& tile = sea.getInstanceTiles()[slot];
     if (!tile.occupied || mAssets[tile.instance.asset].top == kNoHandle)
         return false;
     // Instances whose proxy already projects below the pixel threshold need no fine bricks.
@@ -734,7 +733,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     mDirtyPageRegions.clear();
     mDirtyPageWorkCount = 0;
     bool changed = false;
-    const auto& tiles = sea.getTiles();
+    const auto& tiles = sea.getInstanceTiles();
     auto* pRenderContext = mpDevice->getRenderContext();
     // A cut on the worker (view.cutAsync) reads the stores, the loaded bricks, the visibility caches and the sea's tiles. Until it
     // returns, nothing here that changes those runs - no pages, loads or releases - and the frame keeps the last cut; HSTRCloud holds
@@ -1141,7 +1140,7 @@ void CloudResidency::beginCut(const CloudSea& sea, const CloudView& view)
     mCutViewProjection = view.viewProjection;
     mCutFrame = mFrame;
     mCutMarginWorld = view.cutMargin * mCutMarginScale * sea.getVoxelWorld();
-    mVisibility.resize(sea.getTiles().size());
+    mVisibility.resize(sea.getInstanceTiles().size());
     // What the walk reads of the mapped bricks, as of now (a copy of a byte per GPU brick).
     std::copy(mMappedState.begin(), mMappedState.end(), mMappedSnapshot.begin());
     mWalkTouched.clear();
@@ -1150,7 +1149,7 @@ void CloudResidency::beginCut(const CloudSea& sea, const CloudView& view)
 CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const CloudView& view)
 {
     const auto start = std::chrono::steady_clock::now();
-    const auto& tiles = sea.getTiles();
+    const auto& tiles = sea.getInstanceTiles();
     // The spare scheduler state table catches up with the live one: the entries the last cut changed.
     std::vector<uint32_t>& spareState = mSunState[mSunStateLive ^ 1u];
     for (uint32_t gpu : mSunStateSync)

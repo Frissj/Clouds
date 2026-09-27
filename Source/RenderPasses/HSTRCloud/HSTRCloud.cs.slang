@@ -5,6 +5,7 @@ import Utils.Geometry.IntersectionHelpers;
 import Utils.Math.Ray;
 import Scene.Scene;
 import HSTRCloudTypes;
+import Atmosphere;
 
 /// 0 compiles sunDepthAt's live near march out (cloudSunLiveMarch): the camera program is the one the frame waits for, and every
 /// register its fallback path needs costs the march occupancy. MEASURED (4K c15, settled): near 46.2 -> 38.8 ms, sea 31.3 -> 33.4 ms,
@@ -201,6 +202,11 @@ struct CutRay
     float4 sunOctaves;    ///< Per-octave sun weight a^n p(theta; c^n g) for this ray's direction.
     float3 viewDirection; ///< Unit world-space direction of the camera ray.
 };
+
+/// cloudLayerSample: what one cloud layer holds at a sample.
+static const uint kCloudLayerNone = 0;  ///< No density: no cloud in the layer's square there, or outside its asset.
+static const uint kCloudLayerProxy = 1; ///< The proxy answers (footprint as coarse as the proxy, or no brick mapped).
+static const uint kCloudLayerBrick = 2; ///< A brick answers.
 
 /// Where a cloud density sample at asset source position x read: brick is set when it read the fine bricks of instance (entry at
 /// level, for the footprint level desired). empty is set when the density there is exactly zero within the source-voxel box [lo, hi).
@@ -564,6 +570,11 @@ struct HSTRCloudRenderer
     SamplerState hstrExtinctionSampler;
     SamplerState hstrLinearSampler;
     SamplerState hstrLinearClampSampler;
+    /// skyModel 2: pl-sky's atmosphere (Atmosphere.slang), its transmittance, sky-view and aerial perspective LUTs.
+    AtmosphereParams hstrAtmosphere;
+    Texture2D<float4> hstrAtmosphereTransmission;
+    Texture2D<float4> hstrAtmosphereSky;
+    Texture3D<float4> hstrAtmosphereAerial;
     RWTexture2D<float4> color;
     RWTexture2D<float> transportError;
     RWTexture2D<float4> cutStats;
@@ -937,7 +948,7 @@ struct HSTRCloudRenderer
     /// cloudInstanceAt that also hands back the instance it loaded. Callers that go on to read the instance - which is every camera
     /// density sample that finds a brick - would otherwise fetch the same 64 bytes a second time on the next line.
     bool cloudInstanceAt(float3 v, float footprint, out uint instanceIndex, out float3 x, out float footprintLevel,
-                         out HSTRCloudInstance instanceOut)
+                         out HSTRCloudInstance instanceOut, uint layer = 0)
     {
         instanceIndex = 0;
         x = 0.f;
@@ -946,13 +957,15 @@ struct HSTRCloudRenderer
         if (params.cloudVirtual == 0)
             return false;
         const float tileVoxels = float(params.cloudTileVoxels);
-        const float2 worldTile = floor((v.xz + 0.5f) / tileVoxels);
+        // Layer k's squares start k / 2 of a tile further along x and z (cloudLayers; a whole number of voxels).
+        const float shift = 0.5f * tileVoxels * float(layer);
+        const float2 worldTile = floor((v.xz + 0.5f - shift) / tileVoxels);
         const int2 tiles = int2(params.cloudTiles);
         // Euclidean wrap into the instance grid. For a power-of-two count the mask is exact for negative coordinates too, which is
         // what the general form below costs two emulated integer divisions to reproduce (cloudTileMask).
         const int2 slot = params.cloudTileMask != ~0u ? (int2(worldTile) & int2(int(params.cloudTileMask)))
                                                      : (int2(worldTile) % tiles + tiles) % tiles;
-        instanceIndex = slot.x + tiles.x * slot.y;
+        instanceIndex = slot.x + tiles.x * slot.y + layer * uint(tiles.x * tiles.y);
         const HSTRCloudInstance instance = hstrCloudInstances[instanceIndex];
         instanceOut = instance;
         if (!(instance.scale > 0.f)) // An empty tile.
@@ -960,9 +973,88 @@ struct HSTRCloudRenderer
         footprintLevel = log2(max(footprint / instance.sourceVoxelWorld, 1.f)) + params.cloudLodBias;
         if (footprintLevel >= instance.proxyLevel)
             return false;
-        const float3 p = float3(v.x - worldTile.x * tileVoxels, v.y, v.z - worldTile.y * tileVoxels);
+        const float3 p = float3(v.x - worldTile.x * tileVoxels - shift, v.y, v.z - worldTile.y * tileVoxels - shift);
         x = float3(dot(instance.row0.xyz, p) + instance.row0.w, dot(instance.row1.xyz, p) + instance.row1.w, dot(instance.row2.xyz, p) + instance.row2.w);
         return true;
+    }
+
+    /// One layer's part of a camera sample at domain position v (cloudLayers): what cloudInstanceAt and cloudAssetBrickAt find there.
+    /// kCloudLayerNone: the layer has no density at v (no cloud in its square, or v outside the asset); kCloudLayerProxy: the proxy
+    /// answers (a footprint as coarse as the proxy, or no brick mapped yet); kCloudLayerBrick: sample holds the brick lookup.
+    uint cloudLayerSample(float3 v, float footprint, uint layer, float densityScale, out CloudSample sample, out HSTRCloudInstance instance)
+    {
+        sample = {};
+        uint instanceIndex;
+        float3 x;
+        float footprintLevel;
+        if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel, instance, layer))
+            return instance.scale > 0.f && params.cloudVirtual != 0 ? kCloudLayerProxy : kCloudLayerNone;
+        const HSTRCloudAsset asset = hstrCloudAssets[instance.asset];
+        const int3 i = int3(floor(x + 0.5f));
+        if (any(i < 0) || any(i >= int3(asset.dims)))
+            return kCloudLayerNone;
+        // Thin cells: the optical depth along a level-0 cell's diagonal (2 sqrt(3) source voxels) at the bound is cloudThinDepth.
+        const float thinDensity = params.cloudThinDepth / max(densityScale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
+        const bool found = cloudAssetBrickAt(asset, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+        sample.instance = instanceIndex;
+        return found ? kCloudLayerBrick : kCloudLayerProxy;
+    }
+
+    /// A brick sample's density: blended against its parent (or the proxy) while it fades in.
+    float cloudSampleDensity(CloudSample sample, float proxy, float densityScale)
+    {
+        const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
+        const int3 i = int3(floor(sample.x + 0.5f));
+        float density = cloudBrickDensity(sample.entry, sample.x, i) * densityScale;
+        if (brick.fade < 1.f)
+            density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, sample.x, i) * densityScale : proxy, density, brick.fade);
+        return density;
+    }
+
+    /// Where a march at v standing in layers that read nothing there may skip to, for a layer that has no density at v
+    /// (kCloudLayerNone): the ray's exit from the layer's square at v, or its entry into the asset of the square's cloud if sooner.
+    float cloudLayerNoneExit(CutRay ray, float t, float3 v, uint layer, HSTRCloudInstance instance)
+    {
+        const float tileVoxels = float(params.cloudTileVoxels);
+        const float shift = 0.5f * tileVoxels * float(layer);
+        const float2 worldTile = floor((v.xz + 0.5f - shift) / tileVoxels);
+        const float3 dv = ray.direction * float(params.hstrCellWidth);
+        const float2 lo = worldTile * tileVoxels + shift - 0.5f;
+        float exit = 1e30f;
+        [unroll]
+        for (uint a = 0; a < 2; ++a)
+        {
+            const float d = a == 0 ? dv.x : dv.z;
+            const float p = a == 0 ? v.x : v.z;
+            if (abs(d) > 1e-12f)
+                exit = min(exit, ((d > 0.f ? lo[a] + tileVoxels : lo[a]) - p) / d);
+        }
+        if (instance.scale > 0.f)
+        {
+            // The asset's source box [-0.5, dims - 0.5] along the ray, in the instance's source voxels.
+            const float3 p = float3(v.x - worldTile.x * tileVoxels - shift, v.y, v.z - worldTile.y * tileVoxels - shift);
+            const float3 x = float3(dot(instance.row0.xyz, p) + instance.row0.w, dot(instance.row1.xyz, p) + instance.row1.w, dot(instance.row2.xyz, p) + instance.row2.w);
+            const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
+            const float3 dims = float3(hstrCloudAssets[instance.asset].dims);
+            float enter = 0.f;
+            float leave = 1e30f;
+            [unroll]
+            for (uint a = 0; a < 3; ++a)
+            {
+                if (abs(dx[a]) > 1e-12f)
+                {
+                    const float t0 = (-0.5f - x[a]) / dx[a];
+                    const float t1 = (dims[a] - 0.5f - x[a]) / dx[a];
+                    enter = max(enter, min(t0, t1));
+                    leave = min(leave, max(t0, t1));
+                }
+                else if (x[a] < -0.5f || x[a] > dims[a] - 0.5f)
+                    leave = -1.f;
+            }
+            if (enter <= leave)
+                exit = min(exit, enter);
+        }
+        return t + max(exit, 0.f);
     }
 
     /// The brick a sample of asset at source position x with footprint level desired reads: the finest mapped brick no finer than
@@ -1118,6 +1210,56 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// cameraExtinctionUnfaded over the sea's layers (cloudLayers > 1): the sum of what each layer's brick reads, or the proxy (which
+    /// holds every layer) where any layer resolves to it or none has a cloud there. sample is the densest layer's brick, which the
+    /// sun lookup reuses. Empty-box skipping is left to the lean march (leanExtinction), which knows the ray: an empty box of one
+    /// layer says nothing about the others, so here sample.empty only survives where every layer read an empty box - and even then
+    /// is cleared, since the box's exit is one layer's (a march through empty space steps instead of skipping).
+    float cameraExtinctionLayered(float3 v, float footprint, float proxy, inout float fineVoxels, out CloudSample sample)
+    {
+        sample = {};
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        float density = 0.f;
+        float densest = -1.f;
+        bool resolved = false;
+        [unroll]
+        for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
+        {
+            if (layer >= params.cloudLayers)
+                break;
+            CloudSample s;
+            HSTRCloudInstance instance;
+            const uint state = cloudLayerSample(v, footprint, layer, scale, s, instance);
+            if (state == kCloudLayerProxy)
+            {
+                sample = {};
+                fineVoxels = 1.f;
+                return proxy;
+            }
+            if (state == kCloudLayerNone)
+                continue;
+            fineVoxels = resolved ? min(fineVoxels, float(1u << s.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x)
+                             : float(1u << s.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x;
+            resolved = true;
+            if (s.empty)
+                continue;
+            const float d = cloudSampleDensity(s, proxy, scale);
+            density += d;
+            if (d > densest)
+            {
+                densest = d;
+                sample = s;
+            }
+        }
+        if (!resolved)
+        {
+            fineVoxels = 1.f;
+            return proxy;
+        }
+        sample.empty = false;
+        return density;
+    }
+
     float cameraExtinctionUnfaded(float3 v, float footprint, inout float fineVoxels, out CloudSample sample)
     {
         sample = {};
@@ -1130,6 +1272,8 @@ struct HSTRCloudRenderer
         // decompose a sample into proxy fetch, virtual lookup and atlas filtering, which the all-sample cost fit cannot.
         if (SHIP(cloudCostProbe, 0u) == 1)
             return proxy;
+        if (params.cloudLayers > 1)
+            return cameraExtinctionLayered(v, footprint, proxy, fineVoxels, sample);
         uint instanceIndex;
         float3 x;
         float footprintLevel;
@@ -1314,11 +1458,13 @@ struct HSTRCloudRenderer
         float3 x;
         float footprintLevel;
         HSTRCloudInstance instance;
-        if (footprint >= 0.f && cloudInstanceAt(seaVoxel(v), footprint, instanceIndex, x, footprintLevel, instance))
-        {
-            cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, sample);
-            sample.instance = instanceIndex;
-        }
+        // The first layer whose brick holds density at v (cloudLayers): its bake answers for the sun there.
+        for (uint layer = 0; layer < params.cloudLayers && footprint >= 0.f && !(sample.brick && !sample.empty); ++layer)
+            if (cloudInstanceAt(seaVoxel(v), footprint, instanceIndex, x, footprintLevel, instance, layer))
+            {
+                cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, sample);
+                sample.instance = instanceIndex;
+            }
         return sunDepthAt(v, footprint, sample);
     }
 
@@ -2930,7 +3076,7 @@ struct HSTRCloudRenderer
     float4 integrateVolume(Ray ray, GridVolume volume, uint stepCount, uint2 pixel, out float residualError)
     {
         residualError = 0.f;
-        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * ray.dir.y));
+        const float3 sky = skyRadianceAt(ray.dir);
         float2 interval;
         AABB bounds = volume.getBounds();
         if (!intersectRayAABB(ray.origin, ray.dir, bounds.minPoint, bounds.maxPoint, interval))
@@ -2973,7 +3119,27 @@ struct HSTRCloudRenderer
     // ---------------------------------------------------------------------------------------------
     // Reference: unbiased volumetric path tracer on the same extinction field, sun and sky.
 
-    float3 skyRadianceAt(float3 direction) { return params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y)); }
+    float3 skyRadianceAt(float3 direction)
+    {
+        if (params.skyModel == 0)
+            return params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y));
+        // skyModel 2: pl-sky's atmosphere (Atmosphere.slang).
+        return atmosphereSky(hstrAtmosphere, hstrAtmosphereSky, hstrAtmosphereTransmission, hstrLinearClampSampler, direction);
+    }
+
+    /// A pixel's radiance with aerial perspective (skyModel 2): the air between the camera and the cloud dims it and scatters light
+    /// in over its opacity, at the beam's opacity-weighted distance to it (BeamSample::distance). The background part (exp(-depth)
+    /// sky) already is the sky, atmosphere included. A display effect only: the path-traced reference has no air, so quality gates
+    /// run with skyModel 0.
+    float3 hazedBeamRadiance(float3 cache, float3 single, float depth, float distance, float3 w, float3 albedo)
+    {
+        const float3 radiance = beamRadiance(cache, single, depth, w, albedo);
+        if (params.skyModel != 2 || !(distance > 0.f))
+            return radiance;
+        const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
+        const float4 aerial = atmosphereAerial(hstrAtmosphere, hstrAtmosphereAerial, hstrLinearClampSampler, w, distance);
+        return radiance - cloud * (1.f - aerial.a) + aerial.rgb * (1.f - exp(-depth));
+    }
 
     /// Distance (world units along the ray) to the exit of v's majorant block (edge 4 voxels, or 16 for the occupancy
     /// blocks); d is the voxel displacement per world unit.
@@ -6357,6 +6523,94 @@ struct HSTRCloudRenderer
     /// only where it answers, 6.04 -> 6.16 / 7.52 -> 7.68 ms (the up-front fetch is independent and overlaps the chain), and the
     /// sea tile instance cached in registers along the ray, reloaded only on a tile change, 6.04 -> 6.53 / 7.52 -> 8.12 ms (its ~20
     /// registers cost more occupancy than its L1-hit loads cost latency). Registers are the currency here, not load counts.
+    /// leanExtinction over the sea's layers (cloudLayers > 1), unfaded: the sum of the layers' bricks, or the proxy (which holds every
+    /// layer) where any layer resolves to it or none has a cloud there; hit is the densest layer's brick. Where every layer is empty
+    /// at v the march skips to the nearest of their exits: an empty box's (cloudEmptyExitOf), and for a layer with no cloud there
+    /// its square's exit or its cloud's entry (cloudLayerNoneExit), so no skip passes over another layer's density.
+    float leanExtinctionLayered(CutRay ray, float3 v, float footprint, float tSample, float proxy, inout float fineVoxels, out LeanHit hit,
+                                out float skipTo)
+    {
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        float density = 0.f;
+        float densest = -1.f;
+        float exit = 1e30f;
+        bool resolved = false;
+        [unroll]
+        for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
+        {
+            if (layer >= params.cloudLayers)
+                break;
+            uint instanceIndex;
+            float3 x;
+            float footprintLevel;
+            HSTRCloudInstance instance;
+            if (!cloudInstanceAt(v, footprint, instanceIndex, x, footprintLevel, instance, layer))
+            {
+                if (instance.scale > 0.f)
+                {
+                    // The proxy answers for this layer, and so for the sample.
+                    skipTo = -1.f;
+                    hit.entry = kCloudRefNone;
+                    fineVoxels = 1.f;
+                    return proxy;
+                }
+                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
+                continue;
+            }
+            const uint3 dims = hstrCloudAssets[instance.asset].dims;
+            const int3 i = int3(floor(x + 0.5f));
+            if (any(i < 0) || any(i >= int3(dims)))
+            {
+                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
+                continue;
+            }
+            const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
+            CloudSample sample;
+#if (HSTR_SHIP & 2048) != 0
+            const bool found = cloudAssetBrickAtFlat(instance, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+#else
+            const bool found = cloudAssetBrickAt(hstrCloudAssets[instance.asset], x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
+#endif
+            if (!found)
+            {
+                skipTo = -1.f;
+                hit.entry = kCloudRefNone;
+                fineVoxels = 1.f;
+                return proxy;
+            }
+            const float voxels = float(1u << sample.level) * instance.sourceVoxelWorld / params.seaVoxelSize.x;
+            fineVoxels = resolved ? min(fineVoxels, voxels) : voxels;
+            resolved = true;
+            if (sample.empty)
+            {
+                exit = min(exit, cloudEmptyExitOf(ray, tSample, sample, instance));
+                continue;
+            }
+            exit = -1.f; // Density here: no skip.
+            const float d = cloudSampleDensity(sample, proxy, scale);
+            density += d;
+            if (d > densest)
+            {
+                densest = d;
+                hit.entry = sample.entry;
+                hit.instance = instanceIndex;
+                hit.levels = sample.level | (sample.desired << 8) | (instance.sunClass << 16);
+                hit.x = x;
+                hit.scale = instance.sourceVoxelWorld;
+                hit.near = instance.scale;
+            }
+        }
+        if (!resolved)
+        {
+            // No layer has a cloud here: the proxy, as the one-layer sea answers outside its clouds.
+            skipTo = -1.f;
+            fineVoxels = 1.f;
+            return proxy;
+        }
+        skipTo = densest < 0.f && exit < 1e29f ? exit : -1.f;
+        return density;
+    }
+
     float leanExtinction(CutRay ray, float3 v, float footprint, float tSample, inout float fineVoxels, out LeanHit hit, out float skipTo)
     {
         hit.entry = kCloudRefNone;
@@ -6371,6 +6625,8 @@ struct HSTRCloudRenderer
                                ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
                                : 1.f;
         const float proxy = extinctionAtVoxel(v);
+        if (params.cloudLayers > 1)
+            return fade * leanExtinctionLayered(ray, v, footprint, tSample, proxy, fineVoxels, hit, skipTo);
         uint instanceIndex;
         float3 x;
         float footprintLevel;
@@ -7542,7 +7798,7 @@ struct HSTRCloudRenderer
         const float bubble = 16.f * f.x * (1.f - f.x) * f.y * (1.f - f.y);
         a += (ac - 0.25f * (a00 + a10 + a01 + a11)) * bubble;
         b += (bc - 0.25f * (b00 + b10 + b01 + b11)) * bubble;
-        return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
+        return hazedBeamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), b.a, w, gScene.getGridVolume(0).data.albedo);
     }
 
     void resolveBeamSparsePixel(uint2 pixel)
@@ -7786,7 +8042,7 @@ struct HSTRCloudRenderer
         }
         // The phase and the background belong to the pixel's own ray, which the caller knows exactly; only the basis is read in
         // the beam image.
-        return beamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), w, gScene.getGridVolume(0).data.albedo);
+        return hazedBeamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), b.a, w, gScene.getGridVolume(0).data.albedo);
     }
 
     /// Oracle tile test (beamOracle): the tile's own reconstruction against the stored exact frame, in the compare metric.
@@ -9095,7 +9351,7 @@ struct HSTRCloudRenderer
         beamStripSink(exact);
         return;
 #endif
-        hstrBeamPixelOutput[unit] = float4(beamRadiance(exact.cache, exact.single, exact.depth, w, albedo), exact.distance);
+        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
 #endif
@@ -9772,6 +10028,14 @@ struct HSTRCloudRenderer
     /// near the camera. This marks the brick's cells in the slot, or flags the slot's whole tile when it covers more than 64 of them.
     void markBeamChange(uint change, uint slot)
     {
+        for (uint layer = 0; layer < params.cloudLayers; ++layer)
+            markBeamChangeLayer(change, slot, layer);
+    }
+
+    /// markBeamChange for the slot's cloud of one layer. A layer-k square starts k / 2 of a tile along x and z, so it covers parts
+    /// of four domain tiles: those are flagged whole rather than by cell.
+    void markBeamChangeLayer(uint change, uint slot, uint layer)
+    {
         if (slot >= params.cloudTiles.x * params.cloudTiles.y || change >= params.beamChangeInputs + params.beamChangeBakes)
             return;
         uint asset;
@@ -9793,7 +10057,7 @@ struct HSTRCloudRenderer
             level = job.level;
             origin = job.origin;
         }
-        const HSTRCloudInstance instance = hstrCloudInstances[slot];
+        const HSTRCloudInstance instance = hstrCloudInstances[slot + layer * params.cloudTiles.x * params.cloudTiles.y];
         if (!(instance.scale > 0.f) || instance.asset != asset || float(level) >= instance.proxyLevel)
             return;
         // Source voxel bounds (voxel i centred at i) to the slot's domain voxels, through the inverse of the instance's rows.
@@ -9828,7 +10092,8 @@ struct HSTRCloudRenderer
         if (any(plo > phi))
             return;
         const uint2 tileIndex = uint2(slot % params.cloudTiles.x, slot / params.cloudTiles.x);
-        const float3 base = float3(float(tileIndex.x) * tile, 0.f, float(tileIndex.y) * tile);
+        const float layerShift = 0.5f * tile * float(layer);
+        const float3 base = float3(float(tileIndex.x) * tile + layerShift, 0.f, float(tileIndex.y) * tile + layerShift);
         float3 wlo = params.seaOrigin + (base + plo + 0.5f) * params.seaVoxelSize;
         float3 whi = params.seaOrigin + (base + phi + 0.5f) * params.seaVoxelSize;
         const float3 camera = gScene.camera.data.posW;
@@ -9840,13 +10105,33 @@ struct HSTRCloudRenderer
         const float distance = length(max(max(wlo - camera, camera - whi), 0.f));
         if (distance * params.cloudPixelAngle >= instance.sourceVoxelWorld * exp2(float(level) + 2.f - params.cloudLodBias))
             return;
+        // The box in each domain tile it overlaps: one for layer 0, up to four for a layer whose squares straddle the tiles.
+        const int2 first = int2(floor((base.xz + plo.xz + 0.5f) / tile));
+        const int2 last = int2(floor((base.xz + phi.xz + 0.5f) / tile));
+        for (int z = first.y; z <= last.y; ++z)
+            for (int x = first.x; x <= last.x; ++x)
+            {
+                const float3 origin = float3(float(x) * tile, 0.f, float(z) * tile);
+                const float3 lo = max(base + plo - origin, float3(-0.5f));
+                const float3 hi = min(base + phi - origin, float3(tile, height, tile) - 0.5f);
+                if (any(lo > hi))
+                    continue;
+                const uint2 wrapped = uint2((int2(x, z) % int2(params.cloudTiles) + int2(params.cloudTiles)) % int2(params.cloudTiles));
+                markBeamChangeCells(wrapped.x + params.cloudTiles.x * wrapped.y, lo, hi);
+            }
+    }
+
+    /// Marks the change cells of a domain tile's voxel box [plo, phi] (tile-local voxels), or flags the whole tile when the box covers
+    /// more than 64 of them.
+    void markBeamChangeCells(uint slot, float3 plo, float3 phi)
+    {
+        const uint words = beamChangeWordsPerSlot();
+        uint unused;
         const uint edge = params.beamChangeCellVoxels;
         const uint3 cells = beamChangeCells();
         const uint3 lo = uint3(clamp(int3(floor((plo + 0.5f) / float(edge))), int3(0), int3(cells) - 1));
         const uint3 hi = uint3(clamp(int3(floor((phi + 0.5f) / float(edge))), int3(0), int3(cells) - 1));
         const uint3 span = hi - lo + 1u;
-        const uint words = beamChangeWordsPerSlot();
-        uint unused;
         if (span.x * span.y * span.z > 64u)
         {
             // The slot's whole tile, one flag after every slot's cells (compactBeamChanges lists it as one sphere).
@@ -10333,7 +10618,7 @@ struct HSTRCloudRenderer
         if (any(pixel >= params.frameDim))
             return;
         const float3 direction = cameraRayDirection(float2(pixel) + 0.5f);
-        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y));
+        const float3 sky = skyRadianceAt(direction);
         const GridVolume volume = gScene.getGridVolume(0);
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, volume, ray))
@@ -10358,7 +10643,7 @@ struct HSTRCloudRenderer
         if (any(pixel >= params.frameDim))
             return;
         const float3 direction = cameraRayDirection(float2(pixel) + 0.5f);
-        const float3 sky = params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y));
+        const float3 sky = skyRadianceAt(direction);
         if (gScene.getGridVolumeCount() == 0)
         {
             color[pixel] = float4(sky, 1.f);
