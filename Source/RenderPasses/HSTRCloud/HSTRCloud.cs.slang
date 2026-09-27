@@ -6436,6 +6436,18 @@ struct HSTRCloudRenderer
     /// took walk 6.68 -> 9.06 / 22.2 / 70.1 ms and sprint 8.25 -> 11.2 / 27.5 / 87.4. Unrolling this 8-10-load branchy lookup
     /// chain multiplies the code and the live state, and occupancy was already the limit. The offline gather's win
     /// (gather_path_rate.py) needs its two-load branch-free lookup first; batch only after the chain is flat.
+    /// MEASURED and REMOVED (occ1, 4K, one settle, against ship / ship again): occupied-cell chords only - a step with a nonzero
+    /// majorant starting in a domain cell hstrCellOccupancy marks empty jumped to that cell's exit instead of sampling, i.e. what
+    /// marching only the push lists' chords would march, with no list to build or walk (share2: 43% of dirty-ray steps lie outside
+    /// the listed cells). Walk 1.87 / 1.83 -> 2.03 ms and 1.109% -> 1.317% over 0.02; sprint 2.03 / 2.02 -> 2.35 ms, 0.470% ->
+    /// 0.479%. The zero-majorant and empty-box skips already take most of that space in longer jumps than a one-voxel cell, the
+    /// test costs a load and registers on every step of an occupancy-bound loop, and restarting at cell faces moves the samples
+    /// (share5). A list-driven chord march would pay the lists (~0.45 ms) on top: not worth building.
+    /// MEASURED and REMOVED (atlas1, 4K, one settle, errors bit-identical): the atlas slot stored beside each resolved level page
+    /// word (hstrCloudLevelPages as uint2, written by resolveDirtyCloudPages), so leanExtinction fetched the atlas texel straight
+    /// from the page, before the empty-cell test, and the brick record only decoded it - one dependent round trip off every
+    /// density sample. Walk 1.88 / 1.85 -> 1.98 ms, sprint 2.06 / 2.06 -> 2.16. The texel held live across the cell test and the
+    /// wasted fetches of empty samples cost more than the latency saved: the chain is occupancy-bound, not latency-bound.
     void marchBeamLean(
         CutRay ray,
         float2 segment,

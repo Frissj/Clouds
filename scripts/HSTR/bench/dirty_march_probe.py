@@ -15,8 +15,15 @@ TAG = os.environ.get("HSTR_TAG", "dirty_march_probe")
 os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/Users/Friss/Downloads/clouds_hr/codec/v6_default")
 FRAMES = int(os.environ.get("HSTR_FRAMES", "16"))
 WARM = int(os.environ.get("HSTR_WARM", "16"))
-ARM = dict(runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweeps", "persistent_residual.py"))["OCT_T001"],
-           beamGuardParallax=1.0, beamRepairProbe=True, beamShadowCarry=int(os.environ.get("HSTR_SHADOW", "0")))
+# The shipped frame (sea_config.mk: guard parallax 8 with the warp field, 2x steps, oct scale 0.5). The 09-22 numbers were taken on
+# OCT_T001 at guard parallax 1 (persistent_residual.py); HSTR_OLD_ARM=1 restores that arm.
+from sea_config import mk  # noqa: E402
+
+if os.environ.get("HSTR_OLD_ARM", "0") == "1":
+    ARM = dict(runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweeps", "persistent_residual.py"))["OCT_T001"],
+               beamGuardParallax=1.0, beamRepairProbe=True, beamShadowCarry=int(os.environ.get("HSTR_SHADOW", "0")))
+else:
+    ARM = mk(beamRepairProbe=True, beamShadowCarry=int(os.environ.get("HSTR_SHADOW", "0")))
 
 m.script("scripts/HSTR/CloudSea.py")
 W, H = [int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")]

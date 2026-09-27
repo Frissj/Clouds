@@ -65,6 +65,15 @@ Run from the Falcor root with PowerShell:
 cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul 2>nul && "C:\packman-repo\chk\cmake\3.24.1+nv3-windows-x86_64\bin\cmake.exe" --build "C:\Users\Friss\Documents\Falcor\build\windows-ninja-msvc" --config Release --target HSTRCloud 2>&1' | Select-String -Pattern "error|FAILED|Linking" | Select-Object -First 10
 ```
 
+## Nsight Graphics GPU Trace: ONE trace per launch
+
+- `run_sea.py --ngfx START STOP` produces exactly ONE trace per Mogwai launch. Pass ONE motion and a sweep with ONE arm. NEVER
+  launch a run that would take two or more traces (several `--motions`, or several TESTS arms).
+- Why: with `--auto-export`, ngfx exports the first report, prints "Terminating process..." and kills Mogwai; the kill hangs
+  (Mogwai frozen at 0% CPU, elevated, needing a UAC taskkill) and no later trace is ever taken (shipgfx1: walk traced, sprint
+  never, ~30 minutes lost).
+- A second motion or arm is a second launch, after the first has exited.
+
 ## Nsight Systems (GPU metrics) - the ONLY way to do it
 
 ```bash
