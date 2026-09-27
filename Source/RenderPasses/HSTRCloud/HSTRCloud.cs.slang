@@ -447,6 +447,15 @@ struct HSTRCloudRenderer
     /// World regions whose content (density or lighting) changed since the last build, as bounding spheres (xyz centre, w radius),
     /// params.beamInvalidateCount of them. See invalidateBeamGuardBlock.
     StructuredBuffer<float4> hstrBeamInvalidations;
+    /// The GPU change list (params.beamChangeCellVoxels != 0): regions where resident bricks settled, unmapped or had their sun baked,
+    /// for the slots whose samples read them (markBeamChanges). hstrBeamChangeCount[0] is the number listed, capped at
+    /// kBeamChangeCapacity (more: every block); both accumulate until a build's invalidation consumes them.
+    StructuredBuffer<float4> hstrBeamChangeSpheres;
+    StructuredBuffer<uint> hstrBeamChangeCount;
+    RWStructuredBuffer<float4> hstrBeamChangeSpheresOutput;
+    RWStructuredBuffer<uint> hstrBeamChangeCountOutput;
+    StructuredBuffer<uint4> hstrBeamChangeInput;         ///< Residency changes: asset, level, packed brick coordinates.
+    RWStructuredBuffer<uint> hstrBeamChangeCellsOutput;  ///< Per slot, a bit per change cell (compactBeamChanges clears them).
     /// beamRepairProbe: the residual units and the lattice as they stood before this build re-marched them.
     Texture2D<float4> hstrBeamPixelsSnapshot;
     Texture2DArray<float4> hstrBeamLatticeSnapshot;
@@ -4682,6 +4691,16 @@ struct HSTRCloudRenderer
         {
             const float4 sphere = hstrBeamInvalidations[k];
             hit = hit || length(world - sphere.xyz) <= sphere.w + reach;
+        }
+        if (params.beamChangeCellVoxels != 0 && !hit && params.beamChangeSlice == 0) // Once per listing, not once per slice.
+        {
+            const uint count = hstrBeamChangeCount[0];
+            hit = count > kBeamChangeCapacity;
+            for (uint k = 0; k < count && !hit; ++k)
+            {
+                const float4 sphere = hstrBeamChangeSpheres[k];
+                hit = length(world - sphere.xyz) <= sphere.w + reach;
+            }
         }
         if (!hit)
             return;
@@ -9670,25 +9689,207 @@ struct HSTRCloudRenderer
         for (uint k = 0; k < 4; ++k)
             cosCone = min(cosCone, dot(axis, normalize(beamRayDirection(lo + edge * float2(k & 1u, k >> 1)))));
         const float cone = acos(clamp(cosCone, -1.f, 1.f));
-        // From the camera its values were marched from, and from the current one: the query that re-verifies it marches from here.
         bool hit = false;
         for (uint i = 0; i < params.beamInvalidateCount && !hit; ++i)
+            hit = beamConeCrosses(hstrBeamInvalidations[i], verified.xyz, axis, cone);
+        // The GPU change list is applied to one interleaved slice of the blocks a build, so its re-marching is spread over the frames
+        // of a listing rather than landing on one.
+        const uint slices = max(params.beamChangeSlices, 1u);
+        if (params.beamChangeCellVoxels != 0 && !hit && (cell.x + 3u * cell.y) % slices == params.beamChangeSlice)
         {
-            const float4 sphere = hstrBeamInvalidations[i];
-            for (uint from = 0; from < 2 && !hit; ++from)
-            {
-                const float3 v = sphere.xyz - (from == 0 ? verified.xyz : gScene.camera.data.posW);
-                const float d = length(v);
-                if (d <= sphere.w)
-                    hit = true;
-                else
-                    hit = acos(clamp(dot(axis, v / d), -1.f, 1.f)) <= cone + asin(sphere.w / d);
-            }
+            const uint count = hstrBeamChangeCount[0];
+            hit = count > kBeamChangeCapacity;
+            for (uint i = 0; i < count && !hit; ++i)
+                hit = beamConeCrosses(hstrBeamChangeSpheres[i], verified.xyz, axis, cone);
         }
         if (!hit)
             return;
         hstrBeamGuardCamera[cell] = float4(verified.xyz, 0.f);
         beamGuardDropCoarse(cell);
+    }
+
+    /// Whether a guard block's cone of directions (axis, half-angle cone), from the camera its values were marched from or from the
+    /// current one (the query that re-verifies it marches from there), can pass through the sphere.
+    bool beamConeCrosses(float4 sphere, float3 verifiedFrom, float3 axis, float cone)
+    {
+        for (uint from = 0; from < 2; ++from)
+        {
+            const float3 v = sphere.xyz - (from == 0 ? verifiedFrom : gScene.camera.data.posW);
+            const float d = length(v);
+            if (d <= sphere.w || acos(clamp(dot(axis, v / d), -1.f, 1.f)) <= cone + asin(sphere.w / d))
+                return true;
+        }
+        return false;
+    }
+
+    /// A brick changed what samples of its asset read: its fade in ended, it unmapped (change < beamChangeInputs, from
+    /// hstrBeamChangeInput), or its sun bake landed this frame (the rest, hstrCloudSunBakes). The page table is per asset, so every
+    /// slot holding the asset reads it - but only where the camera's footprint level is under the brick's level + 1
+    /// (cloudInstanceAt picks the level, cloudAssetBrickAt the finest mapped brick no finer), so a fine brick reaches only the slots
+    /// near the camera. This marks the brick's cells in the slot, or flags the slot's whole tile when it covers more than 64 of them.
+    void markBeamChange(uint change, uint slot)
+    {
+        if (slot >= params.cloudTiles.x * params.cloudTiles.y || change >= params.beamChangeInputs + params.beamChangeBakes)
+            return;
+        uint asset;
+        uint level;
+        float3 origin; // Level voxels of the brick's first core voxel.
+        if (change < params.beamChangeInputs)
+        {
+            const uint4 c = hstrBeamChangeInput[change];
+            asset = c.x;
+            level = c.y;
+            origin = float3(uint3(c.z & 1023u, (c.z >> 10) & 1023u, c.z >> 20) * kCloudBrickCore);
+        }
+        else
+        {
+            const HSTRCloudSunBake job = hstrCloudSunBakes[change - params.beamChangeInputs];
+            if (job.slot == kCloudRefNone)
+                return; // Staged no bake.
+            asset = job.asset;
+            level = job.level;
+            origin = job.origin;
+        }
+        const HSTRCloudInstance instance = hstrCloudInstances[slot];
+        if (!(instance.scale > 0.f) || instance.asset != asset || float(level) >= instance.proxyLevel)
+            return;
+        // Source voxel bounds (voxel i centred at i) to the slot's domain voxels, through the inverse of the instance's rows.
+        const float size = float(1u << level);
+        const float3 xlo = origin * size - 0.5f;
+        const float3 xhi = (origin + float(kCloudBrickCore)) * size - 0.5f;
+        const float3 r0 = instance.row0.xyz;
+        const float3 r1 = instance.row1.xyz;
+        const float3 r2 = instance.row2.xyz;
+        const float3 c0 = cross(r1, r2);
+        const float3 c1 = cross(r2, r0);
+        const float3 c2 = cross(r0, r1);
+        const float det = dot(r0, c0);
+        if (abs(det) < 1e-12f)
+            return;
+        const float3 t = float3(instance.row0.w, instance.row1.w, instance.row2.w);
+        float3 plo = float3(1e30f);
+        float3 phi = float3(-1e30f);
+        for (uint k = 0; k < 8; ++k)
+        {
+            const float3 d = float3((k & 1u) ? xhi.x : xlo.x, (k & 2u) ? xhi.y : xlo.y, (k & 4u) ? xhi.z : xlo.z) - t;
+            // The inverse of the matrix with rows r0, r1, r2 has columns c0, c1, c2 over the determinant.
+            const float3 p = (d.x * c0 + d.y * c1 + d.z * c2) / det;
+            plo = min(plo, p);
+            phi = max(phi, p);
+        }
+        // The slot reads only its own tile (cloudInstanceAt), and the domain's height.
+        const float tile = float(params.cloudTileVoxels);
+        const float height = float(params.hstrExtinctionDims.y);
+        plo = max(plo, float3(-0.5f));
+        phi = min(phi, float3(tile, height, tile) - 0.5f);
+        if (any(plo > phi))
+            return;
+        const uint2 tileIndex = uint2(slot % params.cloudTiles.x, slot / params.cloudTiles.x);
+        const float3 base = float3(float(tileIndex.x) * tile, 0.f, float(tileIndex.y) * tile);
+        float3 wlo = params.seaOrigin + (base + plo + 0.5f) * params.seaVoxelSize;
+        float3 whi = params.seaOrigin + (base + phi + 0.5f) * params.seaVoxelSize;
+        const float3 camera = gScene.camera.data.posW;
+        const float2 shift = beamChangeShift(0.5f * (wlo.xz + whi.xz));
+        wlo.xz += shift;
+        whi.xz += shift;
+        // Samples read the brick where their footprint level is under level + 1; one more level of margin covers the camera a block
+        // was marched from having been nearer than this one.
+        const float distance = length(max(max(wlo - camera, camera - whi), 0.f));
+        if (distance * params.cloudPixelAngle >= instance.sourceVoxelWorld * exp2(float(level) + 2.f - params.cloudLodBias))
+            return;
+        const uint edge = params.beamChangeCellVoxels;
+        const uint3 cells = beamChangeCells();
+        const uint3 lo = uint3(clamp(int3(floor((plo + 0.5f) / float(edge))), int3(0), int3(cells) - 1));
+        const uint3 hi = uint3(clamp(int3(floor((phi + 0.5f) / float(edge))), int3(0), int3(cells) - 1));
+        const uint3 span = hi - lo + 1u;
+        const uint words = beamChangeWordsPerSlot();
+        uint unused;
+        if (span.x * span.y * span.z > 64u)
+        {
+            // The slot's whole tile, one flag after every slot's cells (compactBeamChanges lists it as one sphere).
+            const uint flags = params.cloudTiles.x * params.cloudTiles.y * words;
+            InterlockedOr(hstrBeamChangeCellsOutput[flags + slot / 32u], 1u << (slot % 32u), unused);
+            return;
+        }
+        for (uint z = lo.z; z <= hi.z; ++z)
+            for (uint y = lo.y; y <= hi.y; ++y)
+                for (uint x = lo.x; x <= hi.x; ++x)
+                {
+                    const uint c = x + cells.x * (y + cells.y * z);
+                    InterlockedOr(hstrBeamChangeCellsOutput[slot * words + c / 32u], 1u << (c % 32u), unused);
+                }
+    }
+
+    /// One word of marked change cells to spheres (the periodic copy nearest the camera), clearing it. Past every slot's cells, the
+    /// whole-tile flags (one bit a slot).
+    void compactBeamChanges(uint word)
+    {
+        const uint words = beamChangeWordsPerSlot();
+        const uint slots = params.cloudTiles.x * params.cloudTiles.y;
+        if (word >= slots * words + (slots + 31u) / 32u)
+            return;
+        uint bits = hstrBeamChangeCellsOutput[word];
+        if (bits == 0u)
+            return;
+        hstrBeamChangeCellsOutput[word] = 0u;
+        if (word >= slots * words)
+        {
+            const float tile = float(params.cloudTileVoxels);
+            const float3 extent = float3(tile, float(params.hstrExtinctionDims.y), tile) * params.seaVoxelSize;
+            while (bits != 0u)
+            {
+                const uint slot = (word - slots * words) * 32u + firstbitlow(bits);
+                bits &= bits - 1u;
+                const float3 lo = params.seaOrigin + float3(float(slot % params.cloudTiles.x) * tile, 0.f,
+                                                            float(slot / params.cloudTiles.x) * tile) * params.seaVoxelSize;
+                float3 centre = lo + 0.5f * extent;
+                centre.xz += beamChangeShift(centre.xz);
+                appendBeamChange(float4(centre, 0.5f * length(extent)));
+            }
+            return;
+        }
+        const uint slot = word / words;
+        const uint3 cells = beamChangeCells();
+        const float edge = float(params.beamChangeCellVoxels);
+        const float tile = float(params.cloudTileVoxels);
+        const float3 base = float3(float(slot % params.cloudTiles.x) * tile, 0.f, float(slot / params.cloudTiles.x) * tile);
+        const float radius = 0.5f * edge * length(params.seaVoxelSize);
+        while (bits != 0u)
+        {
+            const uint c = (word % words) * 32u + firstbitlow(bits);
+            bits &= bits - 1u;
+            const uint3 cell = uint3(c % cells.x, (c / cells.x) % cells.y, c / (cells.x * cells.y));
+            float3 centre = params.seaOrigin + (base + (float3(cell) + 0.5f) * edge) * params.seaVoxelSize;
+            centre.xz += beamChangeShift(centre.xz);
+            appendBeamChange(float4(centre, radius));
+        }
+    }
+
+    uint3 beamChangeCells()
+    {
+        const uint edge = max(params.beamChangeCellVoxels, 1u);
+        return uint3(params.cloudTileVoxels / edge, (params.hstrExtinctionDims.y + edge - 1u) / edge, params.cloudTileVoxels / edge);
+    }
+
+    uint beamChangeWordsPerSlot()
+    {
+        const uint3 cells = beamChangeCells();
+        return (cells.x * cells.y * cells.z + 31u) / 32u;
+    }
+
+    /// The periodic sea's shift (world X/Z) that takes a domain position to its copy nearest the camera.
+    float2 beamChangeShift(float2 world)
+    {
+        const float2 period = float2(params.hstrExtinctionDims.xz) * params.seaVoxelSize.xz;
+        return round((gScene.camera.data.posW.xz - world) / period) * period;
+    }
+
+    void appendBeamChange(float4 sphere)
+    {
+        uint index;
+        InterlockedAdd(hstrBeamChangeCountOutput[0], 1u, index);
+        if (index < kBeamChangeCapacity)
+            hstrBeamChangeSpheresOutput[index] = sphere;
     }
 
     /// Zeroes the coarse certificates that may have been derived from this block's depth: its own cell's, and - because a
@@ -10310,6 +10511,19 @@ void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 void invalidateBeamGuardBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.invalidateBeamGuardBlock(dispatchThreadId.xy);
+}
+
+/// x: the change (residency changes, then sun bake jobs), y: the sea slot.
+[numthreads(64, 1, 1)]
+void markBeamChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.markBeamChange(dispatchThreadId.x, dispatchThreadId.y);
+}
+
+[numthreads(64, 1, 1)]
+void compactBeamChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.compactBeamChanges(dispatchThreadId.x);
 }
 
 groupshared float gPyramid[16 * 16]; ///< buildBeamGuardPyramidTiles: one level of the group's tile at a time.

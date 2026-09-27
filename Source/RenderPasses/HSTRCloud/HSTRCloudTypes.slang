@@ -119,6 +119,11 @@ static const uint kCloudBrickCore = 8;
 static const uint kCloudBrickEdge = 10;        ///< Stored edge: core plus apron.
 static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 bricks (128 source voxels).
 static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
+/// Changed-content spheres markBeamChanges and compactBeamChanges may list for one build of the beam image; past it every guard
+/// block is unverified. Each guard block tests every listed sphere, so this bounds invalidateBeamGuardBlock's cost.
+static const uint kBeamChangeCapacity = 512;
+/// Residency changes (fade-in ends, unmaps) one frame may pass to markBeamChanges; past it the host invalidates everything.
+static const uint kBeamChangeInputCapacity = 16384;
 static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
 /// Resolved level page word (hstrCloudLevelPages): kCloudRefNone (the proxy), a brick (index in bits 0-23, its level in bits
 /// 24-27), or kCloudLevelEmpty with the mapped brick's level in bits 0-3 (the asked-for level lies in a missing child octant).
@@ -653,8 +658,10 @@ struct HSTRCloudParams
     uint cloudCommitOffset = 0;
     uint cloudStagedCount = 0; ///< Staged bricks whose residuals decodeCloudResiduals decodes this frame.
     uint cloudPageRegionCount = 0; ///< Canonical hierarchy regions expanded into the unique dirty-page queue this frame.
-    uint padCloudPage0 = 0;
-    uint padCloudPage1 = 0;
+    /// invalidateBeamGuardBlock applies the GPU change list to the guard blocks (x, y) with (x + 3 y) % beamChangeSlices ==
+    /// beamChangeSlice, one slice a build (these two filled padding).
+    uint beamChangeSlices = 1;
+    uint beamChangeSlice = 0;
     uint padCloudPage2 = 0;
 
     uint3 fineSunOffset = { 0, 0, 0 }; ///< First voxel of the sun page region computeFineSun updates.
@@ -1335,9 +1342,12 @@ struct HSTRCloudParams
     float beamPolicyTolerance = 0.f;
     float beamPolicyHeldLow = 0.f;
     float beamPolicyHeldHigh = 1.f;
-    uint beamPolicyPad0 = 0; ///< With beamPolicyPad1 and 2, keeps the fields after these on their 16-byte alignment.
-    uint beamPolicyPad1 = 0;
-    uint beamPolicyPad2 = 0;
+    /// markBeamChanges: residency changes in hstrBeamChangeInput, then this frame's sun bake jobs (hstrCloudSunBakes). These three
+    /// fill what were beamPolicy's padding, so the fields after them keep their 16-byte alignment.
+    uint beamChangeInputs = 0;
+    uint beamChangeBakes = 0;
+    /// Edge of the per-slot change cells in domain voxels; 0: the GPU change list is not in use (not bound, not read).
+    uint beamChangeCellVoxels = 0;
     /// Levels a sample of an unbaked brick climbs for a baked ancestor before sunDepthAt's live march (cloudSunSlotUp).
     uint cloudSunAncestors = kCloudSunAncestors;
     /// PROBE (beamRepairProbe only): 1 + signature * kBeamProbePolicies + policy makes the dirty query keep the OLD lattice values of

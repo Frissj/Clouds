@@ -383,6 +383,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamInvalidate = bool(value);
             continue;
         }
+        if (key == "beamChangeCellVoxels")
+        {
+            mBeamChangeCellVoxels = uint32_t(value);
+            continue;
+        }
+        if (key == "beamChangeInterval")
+        {
+            mBeamChangeInterval = std::max(uint32_t(value), 1u);
+            continue;
+        }
         if (key == "beamRepairProbe")
         {
             mBeamRepairProbe = bool(value);
@@ -1217,6 +1227,8 @@ Properties HSTRCloud::getProperties() const
     props["sunOctaveAngle"] = mSunOctaveAngle;
     props["worldCacheTarget"] = mWorldCacheTarget;
     props["worldCacheFrozenBake"] = mWorldCacheFrozenBake;    props["beamInvalidate"] = mBeamInvalidate;
+    props["beamChangeCellVoxels"] = mBeamChangeCellVoxels;
+    props["beamChangeInterval"] = mBeamChangeInterval;
     props["beamRepairProbe"] = mBeamRepairProbe;
     props["beamOctScale"] = mBeamOctScale;
     props["beamOctDim"] = mBeamOct ? mParams.beamFrameDim.x : 0u;
@@ -1750,13 +1762,21 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
         logInfo("HSTRCloud: first grid-volume bounds are {} to {}.", bounds.minPoint, bounds.maxPoint);
     }
 
+    std::vector<std::pair<const char*, ref<ComputePass>>> created;
+    double createSeconds = 0.0;
     auto createPass = [&](const char* entry)
     {
+        const auto start = std::chrono::steady_clock::now();
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
         desc.addShaderLibrary(kShaderFile).csEntry(entry);
         desc.addTypeConformances(mpScene->getTypeConformances());
-        return ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
+        // All 114 passes compile from one module: parsing it for each cost 296 s of every launch, shared 2.2 s (ProgramManager).
+        desc.shareFrontEnd = true;
+        auto pPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
+        createSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        created.emplace_back(entry, pPass);
+        return pPass;
     };
     mpPass = createPass("main");
     mpCameraPass = createPass("renderCloudCamera");
@@ -1840,6 +1860,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamGuardPyramidPass = createPass("buildBeamGuardPyramidTiles");
     mpBeamGuardPyramidTopPass = createPass("buildBeamGuardPyramidTop");
     mpBeamInvalidatePass = createPass("invalidateBeamGuardBlocks");
+    mpBeamMarkChangesPass = createPass("markBeamChanges");
+    mpBeamCompactChangesPass = createPass("compactBeamChanges");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
     mpBeamQueuePixelPass = createPass("marchBeamQueuePixels");
@@ -1871,6 +1893,22 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpAdvanceFadesPass = createPass("advanceCloudFades");
     mpDecayWorldCachePass = createPass("decayWorldCache");
+    // HSTR_SHADER_TIMING=1: where load time goes. Creating a pass runs the Slang front end (its reflection needs it); the kernels
+    // (DXC) compile at first dispatch, or here, each timed.
+    if (const char* timing = std::getenv("HSTR_SHADER_TIMING"); timing && timing[0] == '1')
+    {
+        logInfo("HSTRCloud: {} passes created (front end) in {:.1f} s.", created.size(), createSeconds);
+        double total = 0.0;
+        for (const auto& [entry, pPass] : created)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            pPass->getProgram()->getActiveVersion()->getKernels(mpDevice.get(), pPass->getVars().get());
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            total += seconds;
+            logInfo("HSTRCloud: kernel {} {:.2f} s.", entry, seconds);
+        }
+        logInfo("HSTRCloud: {} kernels in {:.1f} s.", created.size(), total);
+    }
     buildHierarchy();
 }
 
@@ -2517,6 +2555,113 @@ void HSTRCloud::invalidateBeamColumn(int2 worldTile)
     mBeamInvalidations.push_back(float4(0.5f * (lo + hi), 0.5f * length(hi - lo) + margin));
 }
 
+void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
+{
+    std::vector<uint4>& changes = mpCloudResidency->getBeamChanges();
+    // Only the guard-driven octahedral image keeps what it marched from frame to frame, and only its builds consume the list.
+    const bool active = mBeamChangeCellVoxels != 0 && mBeamInvalidate && mParams.beamOct != 0 && mParams.beamGuard != 0 && mBeamRefFrame;
+    if (!active)
+    {
+        changes.clear();
+        mParams.beamChangeCellVoxels = 0;
+        mBeamChangesPending = false;
+        return;
+    }
+    if (changes.empty() && bakes == 0 && !mBeamChangeCellsMarked && mBeamChangeApplying == 0)
+    {
+        mParams.beamChangeSlice = ~0u; // No slice: a build the tile columns invalidate leaves the GPU list alone.
+        return;
+    }
+    FALCOR_PROFILE(pRenderContext, "markBeamChanges");
+    const uint32_t edge = mBeamChangeCellVoxels;
+    const uint32_t slots = mParams.cloudTiles.x * mParams.cloudTiles.y;
+    const uint3 cells(mParams.cloudTileVoxels / edge, (mParams.hstrExtinctionDims.y + edge - 1) / edge, mParams.cloudTileVoxels / edge);
+    const uint32_t words = slots * ((cells.x * cells.y * cells.z + 31) / 32) + (slots + 31) / 32; // Cells, then whole-tile flags.
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    if (!mpBeamChangeCount)
+    {
+        mpBeamChangeCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 1, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpBeamChangeSpheres = mpDevice->createStructuredBuffer(sizeof(float4), kBeamChangeCapacity, flags, MemoryType::DeviceLocal, nullptr, false);
+        mpBeamChangeInput = mpDevice->createStructuredBuffer(sizeof(uint4), kBeamChangeInputCapacity, ResourceBindFlags::ShaderResource);
+        pRenderContext->clearUAV(mpBeamChangeCount->getUAV().get(), uint4(0));
+    }
+    if (!mpBeamChangeCells || mpBeamChangeCells->getElementCount() != words)
+    {
+        mpBeamChangeCells = mpDevice->createStructuredBuffer(sizeof(uint32_t), words, flags, MemoryType::DeviceLocal, nullptr, false);
+        pRenderContext->clearUAV(mpBeamChangeCells->getUAV().get(), uint4(0));
+    }
+    if (changes.size() > kBeamChangeInputCapacity)
+    {
+        mBeamInvalidateAll = true; // A frame that settled this much re-verifies everything anyway.
+        changes.clear();
+    }
+    else if (!changes.empty())
+        mpBeamChangeInput->setBlob(changes.data(), 0, changes.size() * sizeof(uint4));
+    mParams.beamChangeCellVoxels = edge;
+    mParams.beamChangeInputs = uint32_t(changes.size());
+    mParams.beamChangeBakes = bakes;
+    auto bind = [&](const ref<ComputePass>& pPass)
+    {
+        bindResidencyPass(pRenderContext, pPass, true);
+        ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+        var["hstrBeamChangeInput"] = mpBeamChangeInput;
+        var["hstrBeamChangeCellsOutput"] = mpBeamChangeCells;
+        var["hstrBeamChangeSpheresOutput"] = mpBeamChangeSpheres;
+        var["hstrBeamChangeCountOutput"] = mpBeamChangeCount;
+    };
+    if (mParams.beamChangeInputs + bakes > 0)
+    {
+        bind(mpBeamMarkChangesPass);
+        mpBeamMarkChangesPass->execute(pRenderContext, uint3(mParams.beamChangeInputs + bakes, slots, 1));
+        mBeamChangeCellsMarked = true;
+    }
+    mParams.beamChangeInputs = 0;
+    mParams.beamChangeBakes = 0;
+    changes.clear();
+    // The cells accumulate for mBeamChangeInterval frames and are then listed at once; over the next as many frames the list is
+    // applied to one interleaved slice of the guard blocks each (invalidateBeamGuardBlock), so each block is re-marched at most once
+    // a cycle and the work is spread over its frames. The sun scheduler bakes 256 bricks every frame, parked or not, largely over
+    // the same cells.
+    // MEASURED (4K, Intel half sea). Every cell listed every frame, against no list (arms alternating every 20 frames on one path):
+    // parked 4.49 -> 7.32 ms, sprint 8.21 -> 9.50, walk 7.10 -> 7.16, turn 4.48 -> 4.47 - it re-marched the same blocks every frame.
+    // All cells listed every 8th frame, parked while a 180 degree turn's view streams in (intel_load_probe.py phase 3): +0.25 ms a
+    // frame over its first 80 frames, but as 9.29 ms spikes on the 5 listing frames against 5.34 on the rest; nothing listed over the
+    // next 80 (3.86 ms). Moving arms (24-frame chunks) differed by chunk more than by arm (+-0.6 to 2 ms). REJECTED: slicing the
+    // world cells instead of the blocks (a slice of the cells listed each frame): 12.3 ms mean, 61.5 max over the same window - a
+    // block's directions cross cells of every slice, so it was re-marched up to once a frame. Sliced by block (this), same window: the
+    // frames applying a slice average 6.196 ms against 6.183 for those that do not; the window's worst frames (56, 35, 23 ms, the
+    // first frames after the turn) apply none.
+    const uint32_t phase = mBeamChangeFrames++ % mBeamChangeInterval;
+    if (phase == 0)
+    {
+        mBeamChangeApplying = 0;
+        if (mBeamChangeCellsMarked)
+        {
+            pRenderContext->clearUAV(mpBeamChangeCount->getUAV().get(), uint4(0)); // The last cycle's list is fully applied.
+            bind(mpBeamCompactChangesPass);
+            mpBeamCompactChangesPass->execute(pRenderContext, uint3(words, 1, 1));
+            mBeamChangeCellsMarked = false;
+            mBeamChangeApplying = mBeamChangeInterval;
+        }
+    }
+    if (mBeamChangeApplying == 0)
+    {
+        mParams.beamChangeSlice = ~0u;
+        return;
+    }
+    --mBeamChangeApplying;
+    mParams.beamChangeSlices = mBeamChangeInterval;
+    mParams.beamChangeSlice = phase;
+    mBeamChangesPending = true;
+}
+
+void HSTRCloud::bindBeamChanges(const ref<ComputePass>& pPass)
+{
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["hstrBeamChangeSpheres"] = mpBeamChangeSpheres;
+    var["hstrBeamChangeCount"] = mpBeamChangeCount;
+}
+
 void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
 {
     // The domain proxy of the changed slots: their float16 volumes (converted on the sea's workers, straight into staging buffers)
@@ -2919,6 +3064,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mParams.cloudCommitCount = 0;
         mBeamReusable = false;
     }
+    // What the frame settled and baked, for the beam image to re-verify (the bake jobs are still in hstrCloudSunBakes).
+    markBeamChanges(
+        pRenderContext,
+        mCloudGpuSun ? (sunSlotsChanged ? mpCloudResidency->getGpuSunFrame().info.bakeMax : 0u) : mpCloudResidency->getSunBakeCount()
+    );
     // After every slot change and bake of the frame: the sun bake each brick's samples read, per orientation class. Only when
     // something it reads changed - the sun slot table (a scheduling run's evictions and assignments, or CPU bakes), the brick table
     // (maps, commits, fades) or the generations and ancestor reach it selects with. Every frame it cost ~0.3 ms at 4K walk (Nsight,
@@ -5727,12 +5877,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     mBeamInvalidations.clear(); // A/B only: the image keeps what it marched through old content.
                                     mBeamInvalidateAll = false;
                                 }
-                                const bool invalidated = !mBeamInvalidations.empty() || mBeamInvalidateAll;
+                                const bool invalidated = !mBeamInvalidations.empty() || mBeamInvalidateAll || mBeamChangesPending;
                                 if (invalidated)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "invalidate");
-                                    // The domain may hold new density: the cell occupancy is rebuilt before anything reads it.
-                                    if (cellViews)
+                                    // The domain may hold new density (the sea's tiles): the cell occupancy is rebuilt before anything
+                                    // reads it. Bricks settling and sun bakes (the GPU change list) leave the domain proxy as it was.
+                                    if (cellViews && (!mBeamInvalidations.empty() || mBeamInvalidateAll))
                                     {
                                         mCellOccupancyDirty = true;
                                         ensureCellViews(pRenderContext);
@@ -5756,20 +5907,26 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                                 sizeof(float4), kCapacity, ResourceBindFlags::ShaderResource
                                             );
                                         }
-                                        mpBeamInvalidations->setBlob(
-                                            mBeamInvalidations.data(), 0, mBeamInvalidations.size() * sizeof(float4)
-                                        );
+                                        if (!mBeamInvalidations.empty())
+                                            mpBeamInvalidations->setBlob(
+                                                mBeamInvalidations.data(), 0, mBeamInvalidations.size() * sizeof(float4)
+                                            );
                                         mParams.beamInvalidateCount = uint32_t(mBeamInvalidations.size());
                                         bindRenderer(pRenderContext, mpBeamInvalidatePass);
+                                        bindBeamChanges(mpBeamInvalidatePass);
                                         mpBeamInvalidatePass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
                                         // The same regions unmap the cell views of the content that changed.
                                         if (cellViews)
                                         {
                                             bindRenderer(pRenderContext, mpCellInvalidatePass);
+                                            bindBeamChanges(mpCellInvalidatePass);
                                             mpCellInvalidatePass->execute(pRenderContext, uint3(mParams.cellViewCapacity, 1, 1));
                                         }
                                         mParams.beamInvalidateCount = 0;
                                     }
+                                    // This build applied its slice of the GPU change list (markBeamChanges clears the list when
+                                    // the next cycle lists).
+                                    mBeamChangesPending = false;
                                     mBeamInvalidations.clear();
                                     mBeamInvalidateAll = false;
                                     ++mBeamInvalidatedBuilds;

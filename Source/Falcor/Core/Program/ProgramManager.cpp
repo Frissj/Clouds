@@ -121,20 +121,72 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     CpuTimer timer;
     timer.update();
 
-    auto pSlangRequest = createSlangCompileRequest(program);
-    if (pSlangRequest == nullptr)
-        return nullptr;
-
-    SlangResult slangResult = spCompile(pSlangRequest);
-    log += spGetDiagnosticOutput(pSlangRequest);
-    if (SLANG_FAILED(slangResult))
+    // Opted-in compute programs that differ only in their entry points share one checked front end (see FrontEnd): compiled once
+    // without entry points, then each program's are found and checked in its modules. Other programs compile as they always did.
+    bool shared = program.mDesc.shareFrontEnd;
+    for (const auto& entryPointGroup : program.mDesc.entryPointGroups)
+        for (const auto& entryPoint : entryPointGroup.entryPoints)
+            shared &= entryPoint.type == ShaderType::Compute;
+    const std::string frontEndKey = shared ? getFrontEndKey(program) : std::string();
+    auto cached = shared ? mFrontEnds.find(frontEndKey) : mFrontEnds.end();
+    if (shared && cached == mFrontEnds.end())
     {
-        spDestroyCompileRequest(pSlangRequest);
-        return nullptr;
+        SlangCompileRequest* pRequest = createSlangCompileRequest(program, false);
+        if (pRequest == nullptr)
+            return nullptr;
+        SlangResult slangResult = spCompile(pRequest);
+        log += spGetDiagnosticOutput(pRequest);
+        if (SLANG_FAILED(slangResult))
+        {
+            spDestroyCompileRequest(pRequest);
+            return nullptr;
+        }
+        FrontEnd frontEnd;
+        frontEnd.pRequest = pRequest;
+        spCompileRequest_getProgram(pRequest, frontEnd.pGlobalScope.writeRef());
+        for (size_t i = 0; i < program.mDesc.shaderModules.size(); ++i)
+        {
+            Slang::ComPtr<slang::IModule> pModule;
+            if (SLANG_FAILED(spCompileRequest_getModule(pRequest, SlangInt(i), pModule.writeRef())) || !pModule)
+            {
+                log += fmt::format("Slang returned no module for translation unit {}.\n", i);
+                return nullptr;
+            }
+            frontEnd.modules.push_back(pModule);
+        }
+        const int depFileCount = spGetDependencyFileCount(pRequest);
+        for (int ii = 0; ii < depFileCount; ++ii)
+        {
+            std::string depFilePath = spGetDependencyFilePath(pRequest, ii);
+            if (std::filesystem::exists(depFilePath))
+                frontEnd.fileTimes[depFilePath] = getFileModifiedTime(depFilePath);
+        }
+        cached = mFrontEnds.emplace(frontEndKey, std::move(frontEnd)).first;
     }
 
+    SlangCompileRequest* pSlangRequest = nullptr;
     Slang::ComPtr<slang::IComponentType> pSlangGlobalScope;
-    spCompileRequest_getProgram(pSlangRequest, pSlangGlobalScope.writeRef());
+    if (shared)
+    {
+        pSlangRequest = cached->second.pRequest;
+        pSlangGlobalScope = cached->second.pGlobalScope;
+    }
+    else
+    {
+        pSlangRequest = createSlangCompileRequest(program, true);
+        if (pSlangRequest == nullptr)
+            return nullptr;
+
+        SlangResult slangResult = spCompile(pSlangRequest);
+        log += spGetDiagnosticOutput(pSlangRequest);
+        if (SLANG_FAILED(slangResult))
+        {
+            spDestroyCompileRequest(pSlangRequest);
+            return nullptr;
+        }
+
+        spCompileRequest_getProgram(pSlangRequest, pSlangGlobalScope.writeRef());
+    }
 
     Slang::ComPtr<slang::ISession> pSlangSession(pSlangGlobalScope->getSession());
 
@@ -145,7 +197,20 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
         for (const auto& entryPoint : entryPointGroup.entryPoints)
         {
             Slang::ComPtr<slang::IComponentType> pSlangEntryPoint;
-            spCompileRequest_getEntryPoint(pSlangRequest, entryPoint.globalIndex, pSlangEntryPoint.writeRef());
+            if (shared)
+            {
+                Slang::ComPtr<slang::IEntryPoint> pFound;
+                Slang::ComPtr<ISlangBlob> pDiagnostics;
+                const auto& module = cached->second.modules.at(entryPointGroup.shaderModuleIndex);
+                module->findAndCheckEntryPoint(entryPoint.name.c_str(), getSlangStage(entryPoint.type), pFound.writeRef(), pDiagnostics.writeRef());
+                if (pDiagnostics && pDiagnostics->getBufferSize() > 0)
+                    log += (const char*)pDiagnostics->getBufferPointer();
+                if (!pFound)
+                    return nullptr;
+                pSlangEntryPoint = pFound;
+            }
+            else
+                spCompileRequest_getEntryPoint(pSlangRequest, entryPoint.globalIndex, pSlangEntryPoint.writeRef());
 
             // Rename entry point in the generated code if the exported name differs from the source name.
             // This makes it possible to generate different specializations of the same source entry point,
@@ -164,12 +229,17 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     }
 
     // Extract list of files referenced, for dependency-tracking purposes.
-    int depFileCount = spGetDependencyFileCount(pSlangRequest);
-    for (int ii = 0; ii < depFileCount; ++ii)
+    if (shared)
+        program.mFileTimeMap = cached->second.fileTimes;
+    else
     {
-        std::string depFilePath = spGetDependencyFilePath(pSlangRequest, ii);
-        if (std::filesystem::exists(depFilePath))
-            program.mFileTimeMap[depFilePath] = getFileModifiedTime(depFilePath);
+        int depFileCount = spGetDependencyFileCount(pSlangRequest);
+        for (int ii = 0; ii < depFileCount; ++ii)
+        {
+            std::string depFilePath = spGetDependencyFilePath(pSlangRequest, ii);
+            if (std::filesystem::exists(depFilePath))
+                program.mFileTimeMap[depFilePath] = getFileModifiedTime(depFilePath);
+        }
     }
 
     // Note: the `ProgramReflection` needs to be able to refer back to the
@@ -212,7 +282,10 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     mCompilationStats.programVersionCount++;
     mCompilationStats.programVersionTotalTime += time;
     mCompilationStats.programVersionMaxTime = std::max(mCompilationStats.programVersionMaxTime, time);
-    logDebug("Created program version in {:.3f} s: {}", timer.delta(), descStr);
+    if (timer.delta() > 0.5)
+        logInfo("Created program version in {:.3f} s ({}): {}", timer.delta(), shared ? "shared front end" : "own front end", descStr);
+    else
+        logDebug("Created program version in {:.3f} s: {}", timer.delta(), descStr);
 
     return pVersion;
 }
@@ -503,7 +576,10 @@ ref<const ProgramKernels> ProgramManager::createProgramKernels(
     mCompilationStats.programKernelsCount++;
     mCompilationStats.programKernelsTotalTime += time;
     mCompilationStats.programKernelsMaxTime = std::max(mCompilationStats.programKernelsMaxTime, time);
-    logDebug("Created program kernels in {:.3f} s: {}", time, descStr);
+    if (time > 0.5)
+        logInfo("Created program kernels in {:.3f} s: {}", time, descStr);
+    else
+        logDebug("Created program kernels in {:.3f} s: {}", time, descStr);
 
     return pProgramKernels;
 }
@@ -582,8 +658,43 @@ bool ProgramManager::reloadAllPrograms(bool forceReload)
             hasReloaded = true;
         }
     }
+    // A changed file invalidates every front end that read it; they are few, so all go.
+    if (hasReloaded || forceReload)
+        mFrontEnds.clear();
 
     return hasReloaded;
+}
+
+std::string ProgramManager::getFrontEndKey(const Program& program) const
+{
+    const ProgramDesc& desc = program.mDesc;
+    SlangCompilerFlags flags = desc.compilerFlags;
+    flags &= ~mForcedCompilerFlags.disabled;
+    flags |= mForcedCompilerFlags.enabled;
+    std::string key = fmt::format(
+        "sm {} flags {} debug {} spirv {}{}\n",
+        uint32_t(desc.shaderModel),
+        uint32_t(flags),
+        mGenerateDebugInfo,
+        desc.useSPIRVBackend,
+        getEnvironmentVariable("FALCOR_USE_SLANG_SPIRV_BACKEND").value_or("")
+    );
+    for (const auto& [name, value] : mGlobalDefineList)
+        key += fmt::format("g {}={}\n", name, value);
+    for (const auto& [name, value] : program.getDefineList())
+        key += fmt::format("d {}={}\n", name, value);
+    for (const auto& arg : mGlobalCompilerArguments)
+        key += "ga " + arg + "\n";
+    for (const auto& arg : desc.compilerArguments)
+        key += "a " + arg + "\n";
+    for (const auto& module : desc.shaderModules)
+    {
+        key += "m " + module.name + "\n";
+        for (const auto& source : module.sources)
+            key += source.type == ProgramDesc::ShaderSource::Type::File ? "f " + source.path.string() + "\n"
+                                                                        : "s " + source.path.string() + "\n" + source.string + "\n";
+    }
+    return key;
 }
 
 void ProgramManager::addGlobalDefines(const DefineList& defineList)
@@ -619,7 +730,7 @@ ProgramManager::ForcedCompilerFlags ProgramManager::getForcedCompilerFlags()
     return mForcedCompilerFlags;
 }
 
-SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& program) const
+SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& program, bool withEntryPoints) const
 {
     slang::IGlobalSession* pSlangGlobalSession = mpDevice->getSlangGlobalSession();
     FALCOR_ASSERT(pSlangGlobalSession);
@@ -854,7 +965,8 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
     {
         for (const auto& entryPoint : entryPointGroup.entryPoints)
         {
-            spAddEntryPoint(pSlangRequest, entryPointGroup.shaderModuleIndex, entryPoint.name.c_str(), getSlangStage(entryPoint.type));
+            if (withEntryPoints)
+                spAddEntryPoint(pSlangRequest, entryPointGroup.shaderModuleIndex, entryPoint.name.c_str(), getSlangStage(entryPoint.type));
         }
     }
 

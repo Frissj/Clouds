@@ -273,6 +273,26 @@ private:
     uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
     ref<ComputePass> mpBeamInvalidatePass;
     ref<Buffer> mpBeamInvalidations;
+    /// The GPU change list (markBeamChanges): the residency's settled bricks and the sun bakes, per slot that reads them. The
+    /// tile columns above only cover the sea replacing tiles and the sun pages; streaming and baking left the image stale.
+    uint32_t mBeamChangeCellVoxels = 4; ///< beamChangeCellVoxels: the change cells' edge in domain voxels; 0: off.
+    bool mBeamChangesPending = false;   ///< Marked changes the next build's invalidation has not consumed.
+    /// beamChangeInterval: the marked cells are listed every this many frames, and each list is applied to this many interleaved
+    /// slices of the guard blocks, one a frame, so the re-marching is spread over the cycle.
+    uint32_t mBeamChangeInterval = 8;
+    uint32_t mBeamChangeFrames = 0;
+    bool mBeamChangeCellsMarked = false; ///< Cells marked since the last listing.
+    uint32_t mBeamChangeApplying = 0;    ///< Slices of the current list still to apply.
+    ref<ComputePass> mpBeamMarkChangesPass;
+    ref<ComputePass> mpBeamCompactChangesPass;
+    ref<Buffer> mpBeamChangeInput;
+    ref<Buffer> mpBeamChangeCells;
+    ref<Buffer> mpBeamChangeSpheres;
+    ref<Buffer> mpBeamChangeCount;
+    /// After the frame's residency update and sun bakes: marks what changed (bakes: this frame's bake jobs) for the next build.
+    void markBeamChanges(RenderContext* pRenderContext, uint32_t bakes);
+    /// Binds the change list for reading (the invalidation passes).
+    void bindBeamChanges(const ref<ComputePass>& pPass);
     /// Queues the column of the cloud layer over a world tile, and what its change reaches, for invalidateBeamGuardBlock.
     void invalidateBeamColumn(int2 worldTile);
     float mCloudCutMargin = 8.f;        ///< CloudView::cutMargin (voxels; 0: off).

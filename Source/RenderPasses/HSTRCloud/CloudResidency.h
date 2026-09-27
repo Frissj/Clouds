@@ -142,6 +142,9 @@ public:
     const ref<Buffer>& getPages() const { return mpPages; }
     const ref<Buffer>& getLevelPages() const { return mpLevelPages; }
     const ref<Buffer>& getSunResolved() const { return mpSunResolved; }
+    /// Bricks whose density settled since the caller last cleared this (fade-in ends, unmaps), as asset, level, packed coordinates,
+    /// 0: what the persistent beam image invalidates (markBeamChanges). The caller clears it every frame.
+    std::vector<uint4>& getBeamChanges() { return mBeamChanges; }
     const ref<Buffer>& getDirtyPageRegions() const { return mpDirtyPageRegions; }
     const ref<Buffer>& getDirtyPageBits() const { return mpDirtyPageBits; }
     const ref<Buffer>& getDirtyPages() const { return mpDirtyPages; }
@@ -329,6 +332,7 @@ private:
     std::vector<uint32_t> mFreeStores;
     std::vector<uint64_t> mMappedList;
     std::vector<uint64_t> mLoadedList;
+    std::vector<uint4> mBeamChanges; ///< See getBeamChanges.
     // The apply step touches only what can change (the cut merge rebuilds these; the rest is events):
     size_t mToLoadNext = 0;          ///< mToLoad before it is loaded.
     std::vector<uint64_t> mToMap;    ///< Desired bricks not yet mapped, parents first (kToMap).

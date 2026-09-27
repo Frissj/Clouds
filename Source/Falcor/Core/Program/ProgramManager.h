@@ -30,7 +30,11 @@
 #include "Core/Macros.h"
 #include "Core/API/fwd.h"
 
+#include <slang.h>
+#include <slang-com-ptr.h>
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 namespace Falcor
 {
@@ -145,7 +149,24 @@ public:
     void resetCompilationStats() { mCompilationStats = {}; }
 
 private:
-    SlangCompileRequest* createSlangCompileRequest(const Program& program) const;
+    /// withEntryPoints false: the program's modules only (a shared FrontEnd, whose programs find their entry points themselves).
+    SlangCompileRequest* createSlangCompileRequest(const Program& program, bool withEntryPoints) const;
+
+    /// A checked Slang front end, shared by every program compiled from the same modules with the same defines and options: they
+    /// differ only in their entry points, which are then found in the cached modules instead of parsing and checking them again.
+    /// HSTRCloud creates 114 compute passes from one 12.5k-line module; parsing it once per pass cost 296 s of every launch
+    /// (2.6 s each; their DXIL came from the shader cache in 0.0 s).
+    struct FrontEnd
+    {
+        SlangCompileRequest* pRequest = nullptr;
+        /// The request's program, compiled without entry points: one that held the first program's entry point linked it ahead of
+        /// each sharing program's own ("dxc: missing entry point definition").
+        Slang::ComPtr<slang::IComponentType> pGlobalScope;
+        std::vector<Slang::ComPtr<slang::IModule>> modules; ///< Per translation unit (the program's shader modules).
+        std::unordered_map<std::string, time_t> fileTimes;  ///< The dependencies, for reload checks of the programs sharing it.
+    };
+    /// Everything createSlangCompileRequest reads except the entry points.
+    std::string getFrontEndKey(const Program& program) const;
 
     Device* mpDevice;
 
@@ -158,6 +179,7 @@ private:
     ForcedCompilerFlags mForcedCompilerFlags;
 
     mutable uint32_t mHitGroupID = 0;
+    mutable std::unordered_map<std::string, FrontEnd> mFrontEnds; ///< Last, so the members before it keep their offsets.
 };
 
 } // namespace Falcor

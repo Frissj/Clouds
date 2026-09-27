@@ -1,5 +1,8 @@
-# Why the Intel sea takes minutes to settle: the interactive launcher's graph, headless, with GPU/CPU scope timings over the first
-# frames. Usage: Mogwai.exe --headless --script=scripts/HSTR/bench/intel_load_probe.py   (HSTR_INTEL_SET=half|full, HSTR_RES=WxH)
+# The Intel sea's interactive start and turns: the launcher's graph, headless, with residency live (as the launcher runs it, unlike
+# sea_motion.py, which freezes it). Phase 1 flies startup, park, walk, a 180 degree turn and park with the defaults and captures the
+# frame after each (the stale beam image showed there as black blocks and holes). Phase 2 continues the flight alternating
+# beamChangeCellVoxels 4 / 0 (the GPU change list on / off) every 20 frames, for their cost on one path and residency state.
+# Usage: Mogwai.exe --headless --script=scripts/HSTR/bench/intel_load_probe.py   (HSTR_INTEL_SET=half|full, HSTR_RES=WxH)
 import math
 import os
 import time
@@ -9,20 +12,19 @@ from falcor import *
 root = Path(__file__).resolve().parents[3]
 launcher = root / "scripts" / "HSTR" / f"IntelCloudSea{os.environ.get('HSTR_INTEL_SET', 'half').capitalize()}.py"
 exec(launcher.read_text(), {**globals(), "__file__": str(launcher)})
-m.resizeFrameBuffer(*[int(v) for v in os.environ.get("HSTR_RES", "1920x1080").split("x")])
+m.resizeFrameBuffer(*[int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")])
 hstr = m.activeGraph.getPass("HSTRCloud")
-
+OUT = os.environ.get("TEMP", ".")
 
 cam = m.scene.camera
 START_POSITION = float3(cam.position.x, cam.position.y, cam.position.z)  # A copy: cam.position is a live reference.
 START_VIEW = float3(cam.target.x, cam.target.y, cam.target.z) - START_POSITION
 travel = [0.0, 0.0]  # Distance flown along +z and yaw turned so far: each window continues from the last.
+SCOPES = ("/onFrameRender/gpu_time", "markBeamChanges/gpu_time", "invalidate/gpu_time", "beamQueries/gpu_time", "march/gpu_time",
+          "resolve/gpu_time")
 
 
-def window(label, frames, forward=0.0, yaw=0.0):
-    m.profiler.enabled = True
-    m.profiler.start_capture()
-    wall = time.perf_counter()
+def fly(frames, forward, yaw):
     for _ in range(frames):
         travel[0] += forward
         travel[1] += yaw
@@ -30,33 +32,99 @@ def window(label, frames, forward=0.0, yaw=0.0):
         cam.position = START_POSITION + float3(0, 0, travel[0])
         cam.target = cam.position + float3(START_VIEW.x * c - START_VIEW.z * s, START_VIEW.y, START_VIEW.x * s + START_VIEW.z * c)
         m.renderFrame()
+
+
+def timed(frames, forward=0.0, yaw=0.0):
+    """Per-frame ms of SCOPES (summed over the frames a scope ran, divided by all frames) and wall ms."""
+    m.profiler.enabled = True
+    m.profiler.start_capture()
+    wall = time.perf_counter()
+    fly(frames, forward, yaw)
     wall = (time.perf_counter() - wall) / frames * 1000.0
     capture = m.profiler.end_capture()
     m.profiler.enabled = False
-    lanes = []
-    for name, lane in capture["events"].items():
-        if not (name.endswith("gpu_time") or name.endswith("cpu_time")):
-            continue
-        total = sum(v for v in lane["records"] if isinstance(v, (int, float)) and math.isfinite(v)) / frames
-        lanes.append((total, name))
-    lanes.sort(reverse=True)
+    t = {"wall": wall}
+    for scope in SCOPES:
+        t[scope] = sum(sum(v for v in lane["records"] if isinstance(v, (int, float)) and math.isfinite(v))
+                       for name, lane in capture["events"].items() if name.endswith(scope)) / frames
+    return t
+
+
+def stats_line():
     s = hstr.properties.get("cloudStats", {})
-    print(f"PROBE {label}: wall {wall:.1f} ms/frame; desired {s.get('desired')} loaded {s.get('loaded')} mapped {s.get('mapped')} "
-          f"pending {s.get('pending')} committed {s.get('committed')} sunBakes {s.get('sunBakesFrame')}", flush=True)
-    for total, name in lanes[:6]:
-        print(f"PROBE   {total:9.2f} ms  {name}", flush=True)
-    keys = ("desired", "loaded", "mapped", "pending", "mapBacklog", "unmaps", "cuts", "cutTotalMs", "pendingTiles", "residentMB",
-            "sunBaked", "sunWaiting", "activeFades")
-    print(f"PROBE   camera {cam.position} -> {cam.target}; {({k: s.get(k) for k in keys})}", flush=True)
-    m.frameCapture.outputDir = os.environ.get("TEMP", ".")
-    m.frameCapture.baseFilename = "intel_probe_" + label.split()[0] + "_" + str(int(travel[0]))
+    keys = ("desired", "mapped", "pending", "mapBacklog", "activeFades", "sunBaked", "sunWaiting", "sunBakesFrame", "beamInvalidatedBuilds")
+    return str({k: s.get(k) for k in keys})
+
+
+def capture(label):
+    m.frameCapture.outputDir = OUT
+    m.frameCapture.baseFilename = f"intel_ab_{label}"
     m.frameCapture.capture()
 
 
-window("startup 60", 60)
-window("parked 240", 240)
-window("walk 2/frame 120", 120, forward=2.0)
-window("parked after walk 120", 120)
-window("turn 180 over 60", 60, yaw=math.pi / 60)
-window("parked after turn 120", 120)
+PHASES = os.environ.get("HSTR_PHASES", "12")
+
+if "3" in PHASES:
+    # Phase 3: the change list's cost parked while a turn's new view streams in, within one window: the frames that listed changes
+    # (the invalidate scope ran) against those that did not. Park, turn 180 degrees in 20 frames, park 240 frames while it streams.
+    fly(300, 0.0, 0.0)
+    fly(20, 0.0, math.pi / 20)
+    m.profiler.enabled = True
+    m.profiler.start_capture()
+    fly(240, 0.0, 0.0)
+    capture3 = m.profiler.end_capture()
+    m.profiler.enabled = False
+    def records(suffix):
+        lane = next((lane for name, lane in capture3["events"].items() if name.endswith(suffix)), None)
+        return lane["records"] if lane else []
+    frame = records("/onFrameRender/gpu_time")
+    listed = records("invalidate/gpu_time")
+    ok = lambda v: isinstance(v, (int, float)) and math.isfinite(v)
+    marks = [ok(v) and v > 0.0 for v in listed] + [False] * (len(frame) - len(listed))
+    for lo, hi in ((0, 80), (80, 160), (160, 240)):
+        hi = min(hi, len(frame))  # The capture may hold fewer records than frames flown.
+        on =[frame[i] for i in range(lo, hi) if marks[i] and ok(frame[i])]
+        off = [frame[i] for i in range(lo, hi) if not marks[i] and ok(frame[i])]
+        allv = sorted(on + off)
+        mean = lambda v: sum(v) / len(v) if v else float("nan")
+        p95 = allv[min(len(allv) - 1, int(0.95 * len(allv)))] if allv else float("nan")
+        print(f"PROBE phase3 frames {lo}-{hi}: mean {mean(allv):.3f} ms, p95 {p95:.3f}, max {max(allv, default=float('nan')):.3f}; "
+              f"listing frames {mean(on):.3f} (n {len(on)}), others {mean(off):.3f} (n {len(off)})", flush=True)
+    # Where the worst frames go: their largest GPU scopes.
+    ok_frames = [i for i in range(len(frame)) if ok(frame[i])]
+    for i in sorted(ok_frames, key=lambda i: frame[i], reverse=True)[:4]:
+        scopes = sorted(((lane["records"][i], name.split("/")[-2]) for name, lane in capture3["events"].items()
+                         if name.endswith("gpu_time") and i < len(lane["records"]) and ok(lane["records"][i])
+                         and "onFrameRender" not in name.split("/")[-2] and "execute()" not in name and not name.endswith("HSTRCloud/gpu_time")),
+                        reverse=True)[:6]
+        print(f"PROBE   worst frame {i}: {frame[i]:.2f} ms listing {marks[i]}: " + ", ".join(f"{n} {v:.2f}" for v, n in scopes), flush=True)
+    print(f"PROBE   {stats_line()}", flush=True)
+
+# Phase 1: defaults (the change list on), captures.
+for label, frames, forward, yaw in ([] if "1" not in PHASES else (("startup", 60, 0.0, 0.0), ("parked", 240, 0.0, 0.0), ("walk", 120, 2.0, 0.0),
+                                     ("turn", 60, 0.0, math.pi / 60), ("parkedAfterTurn", 120, 0.0, 0.0))):
+    t = timed(frames, forward, yaw)
+    print(f"PROBE phase1 {label}: " + " ".join(f"{k.split('/')[-2] if '/' in k else k} {v:.2f}" for k, v in t.items()), flush=True)
+    print(f"PROBE   {stats_line()}", flush=True)
+    capture(label)
+
+# Phase 2: arms alternating every 20 frames on one path.
+CHUNK = 24
+ARMS = {"batched8": {"beamChangeCellVoxels": 4, "beamChangeInterval": 8}, "off": {"beamChangeCellVoxels": 0},
+        "everyFrame": {"beamChangeCellVoxels": 4, "beamChangeInterval": 1}}
+for label, frames, forward, yaw in ([] if "2" not in PHASES else (("parked", 216, 0.0, 0.0), ("walk", 216, 2.0, 0.0),
+                                     ("turn", 216, 0.0, math.pi / 108), ("sprint", 216, 20.0, 0.0))):
+    sums = {arm: {} for arm in ARMS}
+    chunks = frames // CHUNK
+    for chunk in range(chunks):
+        arm = list(ARMS)[chunk % len(ARMS)]
+        hstr.set_properties(ARMS[arm])
+        t = timed(CHUNK, forward, yaw)
+        for k, v in t.items():
+            sums[arm][k] = sums[arm].get(k, 0.0) + v / (chunks // len(ARMS))
+    for arm in ARMS:
+        print(f"PROBE phase2 {label} {arm}: " + " ".join(f"{k.split('/')[-2] if '/' in k else k} {v:.3f}" for k, v in sums[arm].items()),
+              flush=True)
+    print(f"PROBE   {stats_line()}", flush=True)
+hstr.set_properties(ARMS["batched8"])
 exit()

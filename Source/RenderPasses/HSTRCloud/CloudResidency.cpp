@@ -1626,6 +1626,8 @@ void CloudResidency::processFadeEnds(bool& changed)
                 setFade(end.handle, 0);
                 gpu.fade = gpu.fadeBase = 1.f;
                 noteMapped(end.handle);
+                const Brick& b = brick(end.handle);
+                mBeamChanges.push_back(uint4(storeOf(end.handle).asset, b.record.level, b.record.coord, 0));
             }
             else
             {
@@ -1683,6 +1685,7 @@ void CloudResidency::unmap(uint64_t handle)
     replace(storeOf(handle).asset, b.record, b.gpu, replacement);
     ++mStats.unmaps;
     markChanged(storeOf(handle).asset, b.record);
+    mBeamChanges.push_back(uint4(storeOf(handle).asset, b.record.level, b.record.coord, 0));
     if (fadeDirection(mBricks[b.gpu]) != 0)
         setFade(handle, 0);
     b.mapped = false;

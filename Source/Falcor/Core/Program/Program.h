@@ -317,6 +317,11 @@ struct ProgramDesc
     /// Use SPIR-V backend when compiling for Vulkan.
     bool useSPIRVBackend = false;
 
+    /// Compute programs only: share one parsed and checked Slang front end with every other opted-in program of the same modules,
+    /// defines and options, finding this program's entry points in it (ProgramManager::FrontEnd). Opt-in: verified for HSTRCloud's
+    /// passes; Scene/Material/MaterialSystem.slang, compiled this way, failed to link ("dxc: missing entry point definition").
+    bool shareFrontEnd = false;
+
     /// Add a new empty shader module description.
     /// @param[in] name Optional name of the shader module.
     /// @return Returns a reference to the newly created shader module for adding sources.
