@@ -9,9 +9,49 @@
 #include "CloudResidency.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 
 using namespace Falcor;
+
+/// A compute pass created on first use (->, get() or conversion), not when the scene is set. HSTRCloud has 114 passes, most of
+/// them probes and measured-and-off variants that a configuration never dispatches; creating one compiles its kernel, which
+/// after a shader edit (a cold shader cache) costs 2-10 s, and 190 s for countPushShares alone - 350-430 s of every first load.
+class LazyComputePass
+{
+public:
+    LazyComputePass() = default;
+    /// Copies share the pass (and its creation).
+    LazyComputePass(std::function<ref<ComputePass>()> create) : mpSlot(std::make_shared<Slot>(Slot{nullptr, std::move(create)})) {}
+    LazyComputePass& operator=(std::nullptr_t)
+    {
+        mpSlot = nullptr;
+        return *this;
+    }
+    ComputePass* operator->() const { return get(); }
+    ComputePass* get() const { return resolve().get(); }
+    operator const ref<ComputePass>&() const { return resolve(); }
+    /// Whether there is a pass, created or not (does not create it).
+    explicit operator bool() const { return mpSlot != nullptr; }
+    bool isCreated() const { return mpSlot && mpSlot->pPass; }
+
+private:
+    struct Slot
+    {
+        ref<ComputePass> pPass;
+        std::function<ref<ComputePass>()> create;
+    };
+    const ref<ComputePass>& resolve() const
+    {
+        static const ref<ComputePass> kNone;
+        if (!mpSlot)
+            return kNone;
+        if (!mpSlot->pPass)
+            mpSlot->pPass = mpSlot->create();
+        return mpSlot->pPass;
+    }
+    std::shared_ptr<Slot> mpSlot;
+};
 
 /// The cloud sea's tile uploads: host-visible buffers of one packed tile volume each, kept mapped. A sea worker writes a tile
 /// straight into a free one, so taking the tile on costs the main thread one recorded copy. A buffer is free again once the GPU
@@ -117,22 +157,22 @@ private:
     hstr::DenseMatrix makeNestedLeafTransport(uint32_t leafIndex) const;
 
     ref<Scene> mpScene;
-    ref<ComputePass> mpPass;
-    ref<ComputePass> mpSolvePass;
-    ref<ComputePass> mpCameraLightingPass;
-    ref<ComputePass> mpProjectPass;
-    ref<ComputePass> mpCutPass;
-    ref<ComputePass> mpSortPass;
-    ref<ComputePass> mpDomainCutPass; ///< Builds the cloud-sea's regular 16^3-cell cut and trilinear pages on the GPU.
-    ref<ComputePass> mpQueryPass;
-    ref<ComputePass> mpTileBasisPass;
-    ref<ComputePass> mpFineSunPass;
-    ref<ComputePass> mpSunColumnsPass;
-    ref<ComputePass> mpResidualMaskPass;
-    ref<ComputePass> mpGatherOctavesPass;
-    ref<ComputePass> mpBlurOctavesPass;
-    ref<ComputePass> mpReferencePass;
-    ref<ComputePass> mpCompareReferencePass;
+    LazyComputePass mpPass;
+    LazyComputePass mpSolvePass;
+    LazyComputePass mpCameraLightingPass;
+    LazyComputePass mpProjectPass;
+    LazyComputePass mpCutPass;
+    LazyComputePass mpSortPass;
+    LazyComputePass mpDomainCutPass; ///< Builds the cloud-sea's regular 16^3-cell cut and trilinear pages on the GPU.
+    LazyComputePass mpQueryPass;
+    LazyComputePass mpTileBasisPass;
+    LazyComputePass mpFineSunPass;
+    LazyComputePass mpSunColumnsPass;
+    LazyComputePass mpResidualMaskPass;
+    LazyComputePass mpGatherOctavesPass;
+    LazyComputePass mpBlurOctavesPass;
+    LazyComputePass mpReferencePass;
+    LazyComputePass mpCompareReferencePass;
     ref<Texture> mpReferenceSum;     ///< Running sums of path-traced reference frames (rgb) and their count (a), per component and half.
     ref<Buffer> mpReferenceRowError; ///< Per-row mean error of the HST frame against the reference average.
     ref<Buffer> mpReferenceRowHistogram; ///< Exact comparisons: per-row log error histogram and maximum.
@@ -143,13 +183,13 @@ private:
     float mReferenceLogError = -1.f;      ///< Mean |log(1 + HST) - log(1 + reference)|.
     float mReferenceNoiseError = -1.f;    ///< Expected linear error of the reference average itself, from its two halves.
     float mReferenceNoiseLogError = -1.f; ///< Same in log(1 + radiance).
-    ref<ComputePass> mpWorldCachePass;
-    ref<ComputePass> mpWorldCachePhotonPass;
-    ref<ComputePass> mpWorldCacheResolvePass;
+    LazyComputePass mpWorldCachePass;
+    LazyComputePass mpWorldCachePhotonPass;
+    LazyComputePass mpWorldCacheResolvePass;
     ref<Buffer> mpWorldCache;        ///< World-space radiance cache experiment: SH running sums per cell.
     ref<Buffer> mpWorldCacheDeposit; ///< Fixed-point light-tracing deposits of the current batch.
-    ref<ComputePass> mpWorldCacheBakePass;
-    ref<ComputePass> mpWorldCacheAdvancePass;
+    LazyComputePass mpWorldCacheBakePass;
+    LazyComputePass mpWorldCacheAdvancePass;
     ref<Buffer> mpPhotonPool;                                           ///< Persistent light-tracing photons (48 bytes each).
     ref<Buffer> mpPhotonEmitted;                                        ///< Photons emitted by the pool since the last restart.
     std::array<ref<Texture>, kWorldCacheTextures> mpWorldCacheTextures; ///< Cache means packed for hardware-filtered lookups.
@@ -164,23 +204,23 @@ private:
     /// 2.20 ms, errors identical. Only a frozen cache (the benchmarks) takes this; a live one decays as before.
     bool mWorldCacheFrozenBake = true;
     float mWorldCacheModulation = -1.f;   ///< Cache modulation b; negative: the medium's diffusion attenuation.
-    ref<ComputePass> mpBeamQueryPass;
-    ref<ComputePass> mpBeamTilePass;
-    ref<ComputePass> mpBeamArgsPass;
-    ref<ComputePass> mpBeamResolvePass;
-    ref<ComputePass> mpBeamResidualResolvePass; ///< Reference frame: failed tiles' pixels, from the residual image.
-    ref<ComputePass> mpBeamResidualArgsPass;
+    LazyComputePass mpBeamQueryPass;
+    LazyComputePass mpBeamTilePass;
+    LazyComputePass mpBeamArgsPass;
+    LazyComputePass mpBeamResolvePass;
+    LazyComputePass mpBeamResidualResolvePass; ///< Reference frame: failed tiles' pixels, from the residual image.
+    LazyComputePass mpBeamResidualArgsPass;
     ref<Buffer> mpBeamResidualList;             ///< Pixels the resolve found in failed tiles, one frame's worth.
     ref<Buffer> mpBeamResidualArgs;             ///< [0] their count, [1..3] the residual resolve's indirect dispatch.
-    ref<ComputePass> mpBeamSparseResolvePass;
-    ref<ComputePass> mpBeamMarchPass;
-    ref<ComputePass> mpBeamClassifyPass;
-    ref<ComputePass> mpBeamSparseEmitPass;
-    ref<ComputePass> mpBeamSparseVerifyPass;
-    ref<ComputePass> mpBeamSparseArgsPass;
-    ref<ComputePass> mpBeamGridQueryPass;  ///< Root lattice queries as a 2D dispatch over the corner (or centre) grid.
-    ref<ComputePass> mpBeamGridMarchPass;  ///< Per-pixel refinement as a full-frame 2D dispatch that skips accepted tiles.
-    ref<ComputePass> mpBeamUnitMarchPass;  ///< The same refinement in the rotation-invariant beam image, where it carries (beamRefFrame).
+    LazyComputePass mpBeamSparseResolvePass;
+    LazyComputePass mpBeamMarchPass;
+    LazyComputePass mpBeamClassifyPass;
+    LazyComputePass mpBeamSparseEmitPass;
+    LazyComputePass mpBeamSparseVerifyPass;
+    LazyComputePass mpBeamSparseArgsPass;
+    LazyComputePass mpBeamGridQueryPass;  ///< Root lattice queries as a 2D dispatch over the corner (or centre) grid.
+    LazyComputePass mpBeamGridMarchPass;  ///< Per-pixel refinement as a full-frame 2D dispatch that skips accepted tiles.
+    LazyComputePass mpBeamUnitMarchPass;  ///< The same refinement in the rotation-invariant beam image, where it carries (beamRefFrame).
     bool mBeamGridDispatch = false;        ///< Whether the beam view uses the two passes above (beamSegments 1, per-level build).
     bool mBeamSparse = true;               ///< Metadata-led sparse query compiler; false keeps the legacy lattice generator for A/B.
     /// Evaluate sparse bases through the projected transport cut (traverseCut/integratePage) instead of full-volume marchBeam().
@@ -252,10 +292,10 @@ private:
     ref<Buffer> mpBeamQueue;
     ref<Buffer> mpBeamQueueCounts;
     ref<Buffer> mpBeamQueueArgs;
-    ref<ComputePass> mpBeamQueueMarchPass;
-    ref<ComputePass> mpBeamQueueArgsPass;
-    ref<ComputePass> mpBeamQueueTilePass;
-    ref<ComputePass> mpBeamQueuePixelPass;
+    LazyComputePass mpBeamQueueMarchPass;
+    LazyComputePass mpBeamQueueArgsPass;
+    LazyComputePass mpBeamQueueTilePass;
+    LazyComputePass mpBeamQueuePixelPass;
     /// Fills the queue's dispatch arguments for entries of threadsPerEntry threads.
     void writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry);
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
@@ -271,7 +311,7 @@ private:
     ref<Texture> mpBeamGuardCameraSnapshot; ///< beamRepairProbe: the guard cameras before the dirty query.
     ref<Texture> mpBeamProbeAccept;         ///< beamRepairProbe: per block, the witness policies that would have carried it.
     uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
-    ref<ComputePass> mpBeamInvalidatePass;
+    LazyComputePass mpBeamInvalidatePass;
     ref<Buffer> mpBeamInvalidations;
     /// The GPU change list (markBeamChanges): the residency's settled bricks and the sun bakes, per slot that reads them. The
     /// tile columns above only cover the sea replacing tiles and the sun pages; streaming and baking left the image stale.
@@ -283,8 +323,8 @@ private:
     uint32_t mBeamChangeFrames = 0;
     bool mBeamChangeCellsMarked = false; ///< Cells marked since the last listing.
     uint32_t mBeamChangeApplying = 0;    ///< Slices of the current list still to apply.
-    ref<ComputePass> mpBeamMarkChangesPass;
-    ref<ComputePass> mpBeamCompactChangesPass;
+    LazyComputePass mpBeamMarkChangesPass;
+    LazyComputePass mpBeamCompactChangesPass;
     ref<Buffer> mpBeamChangeInput;
     ref<Buffer> mpBeamChangeCells;
     ref<Buffer> mpBeamChangeSpheres;
@@ -329,7 +369,7 @@ private:
     /// nothing: one UAV -> SRV transition was left (hstrBeamPixelPrev, the beam pixels again in the reference frame), found in ngfx9.
     /// With it on, the units scope's time includes the pixel pass running inside it: compare HSTRCloud totals, not these two scopes.
     bool mBeamOverlapResolve = true;
-    ref<ComputePass> mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
+    LazyComputePass mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     /// beamWarpAuto: the warp runs only while at least this share of the on-screen guard blocks this build classified are held
     /// (certified, so read from an older camera). 0 = always, as beamWarp alone. Sprint expires every block, so the field and the
@@ -341,10 +381,10 @@ private:
     /// HSTR_STRIP = this: 1 returns after the ray setup, 2 marches one step, 3 the full march (the warm-cache calibration). The
     /// copies compute and never write, so the image and the next frame's work are the real passes'. 0: off.
     uint32_t mBeamStripProbe = 0;
-    ref<ComputePass> mpBeamDirtyQueryStripPass;
-    ref<ComputePass> mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
-    ref<ComputePass> mpBeamWarpArgsPass;
-    ref<ComputePass> mpBeamPolicyPass; ///< decideBeamPolicy: the warp decision and beamPolicy's step scale and tolerance.
+    LazyComputePass mpBeamDirtyQueryStripPass;
+    LazyComputePass mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
+    LazyComputePass mpBeamWarpArgsPass;
+    LazyComputePass mpBeamPolicyPass; ///< decideBeamPolicy: the warp decision and beamPolicy's step scale and tolerance.
     /// beamPolicy (see HSTRCloudParams): what a build holding few guard blocks spends on a looser tile test (and could on longer
     /// steps, which fail on harder content: policy3). Shipped tolerance-only, 0.01 -> 0.05 as the held share falls 0.25 -> 0.05.
     bool mBeamPolicy = true;
@@ -352,8 +392,8 @@ private:
     float mBeamPolicyHeldLow = 0.05f;
     float mBeamPolicyHeldHigh = 0.25f;
     float mBeamPolicyToleranceNow = 0.f; ///< The compared frame's tolerance (stats, read with the comparison).
-    ref<ComputePass> mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
-    ref<ComputePass> mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
+    LazyComputePass mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
+    LazyComputePass mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
     ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.
     uint32_t mBeamWarpHeld = 0;   ///< The compared frame's guard blocks held (hstrBeamDirtyCount[2]) ...
     uint32_t mBeamWarpListed = 0; ///< ... and listed dirty (hstrBeamDirtyCount[0]) ...
@@ -391,25 +431,25 @@ private:
     ref<Buffer> mpBeamFusedState;
     ref<Buffer> mpBeamFusedBlocks;
     ref<Buffer> mpBeamFusedTiles;
-    ref<ComputePass> mpBeamDirtyFusedSetupPass;
-    ref<ComputePass> mpBeamDirtyFusedPass;
+    LazyComputePass mpBeamDirtyFusedSetupPass;
+    LazyComputePass mpBeamDirtyFusedPass;
     uint32_t mBeamOrderProbeValues[21] = {}; ///< The scored frame's counters.
     ref<Buffer> mpBeamDirtyCount;
     ref<Buffer> mpBeamDirtyArgs;    ///< Two indirect dispatches: the query over those blocks, then the residual over them.
-    ref<ComputePass> mpBeamClassifyGuardPass;
+    LazyComputePass mpBeamClassifyGuardPass;
     ref<Texture> mpBeamCoarse;        ///< Coarse certificate: anchor camera and safe radius per cell of blocks.
     ref<Texture> mpBeamCoarseState;   ///< Per coarse cell: children its certificate does not cover, and a queued-for-rebuild bit.
     ref<Buffer> mpBeamDescend;        ///< Blocks the coarse level could not answer for, to classify one by one.
     ref<Buffer> mpBeamDescendCount;   ///< [0] blocks in mpBeamDescend, [1] cells in mpBeamRebuild.
     ref<Buffer> mpBeamRebuild;        ///< Coarse cells to rebuild after this build's query: expired, or a child re-verified.
-    ref<ComputePass> mpBeamCoarsePass;
-    ref<ComputePass> mpBeamLeafPass;
-    ref<ComputePass> mpBeamCoarseUpdatePass;
-    ref<ComputePass> mpBeamDescendArgsPass;
-    ref<ComputePass> mpBeamDirtyArgsPass;
-    ref<ComputePass> mpBeamDirtyQueryPass;
-    ref<ComputePass> mpBeamDirtyMarchPass;
-    ref<ComputePass> mpBeamDirtyUnitArgsPass;
+    LazyComputePass mpBeamCoarsePass;
+    LazyComputePass mpBeamLeafPass;
+    LazyComputePass mpBeamCoarseUpdatePass;
+    LazyComputePass mpBeamDescendArgsPass;
+    LazyComputePass mpBeamDirtyArgsPass;
+    LazyComputePass mpBeamDirtyQueryPass;
+    LazyComputePass mpBeamDirtyMarchPass;
+    LazyComputePass mpBeamDirtyUnitArgsPass;
     // Cell views (cellViews): cached per-cell views of the transfer. No reader since composeBeam's removal.
     bool mCellViews = false;
     bool mCellViewsClear = true;           ///< The map and the views must be emptied before the next use.
@@ -418,7 +458,7 @@ private:
     ref<Texture> mpCellRequest;            ///< Per domain cell: the frame + 1 it was last queued in.
     ref<Texture> mpCellOccupancy;          ///< Per domain cell: whether any sample in it can read density (R8Uint).
     bool mCellOccupancyDirty = true;       ///< The domain changed since the occupancy was built.
-    ref<ComputePass> mpCellOccupancyPass;
+    LazyComputePass mpCellOccupancyPass;
     ref<Buffer> mpCellViews;               ///< CellView per slot.
     ref<Texture> mpCellTexels;             ///< Atlas: cache rgb, transmittance.
     ref<Texture> mpCellTexelsSingle;       ///< Atlas: single rgb, opacity centroid.
@@ -426,9 +466,9 @@ private:
     ref<Buffer> mpCellCounters;            ///< [0] cells queued this frame.
     ref<Buffer> mpCellCursor;              ///< [0] the slot ring's cursor.
     ref<Buffer> mpCellArgs;                ///< The build dispatch's arguments.
-    ref<ComputePass> mpCellArgsPass;
-    ref<ComputePass> mpCellBuildPass;
-    ref<ComputePass> mpCellInvalidatePass;
+    LazyComputePass mpCellArgsPass;
+    LazyComputePass mpCellBuildPass;
+    LazyComputePass mpCellInvalidatePass;
     /// Creates (or re-creates, on a size change) the cell view resources, empties them when asked, and sets their parameters.
     void ensureCellViews(RenderContext* pRenderContext);
     /// Creates the cell occupancy, rebuilds it when the domain changed, and relists the occupied cells for beamPushProbe.
@@ -439,9 +479,9 @@ private:
     ref<Buffer> mpPushSamples;
     ref<Buffer> mpPushSlotKeys;    ///< Per visible cell: its packed key (the lists hold slots).
     ref<Buffer> mpPushOps;         ///< Per visible cell: its operator, 27 uint4 (buildPushOperator).
-    ref<ComputePass> mpPushOpsPass;
-    ref<ComputePass> mpPushEvalPass;
-    ref<ComputePass> mpPushComparePass;
+    LazyComputePass mpPushOpsPass;
+    LazyComputePass mpPushEvalPass;
+    LazyComputePass mpPushComparePass;
     /// pushShare: after the dirty passes, count what the push lists' cell x tile interactions could share (see countPushShare).
     bool mPushShare = false;
     /// spanProbe: the dirty march records its rays as spans (HSTR_SHIP bit 262144) and evaluateSpans integrates them alone.
@@ -450,9 +490,9 @@ private:
     ref<Buffer> mpSpanRecords;
     ref<Buffer> mpSpanCounts;
     ref<Buffer> mpSpanArgs;
-    ref<ComputePass> mpSpanArgsPass;
-    ref<ComputePass> mpSpanEvalPass;
-    ref<ComputePass> mpSpanCheckPass;
+    LazyComputePass mpSpanArgsPass;
+    LazyComputePass mpSpanEvalPass;
+    LazyComputePass mpSpanCheckPass;
     void runSpanProbe(RenderContext* pRenderContext);
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
@@ -460,8 +500,8 @@ private:
     ref<Buffer> mpPushBrickVisits;  ///< pushShareMode 8: per brick visit of a dirty chord, tile and entry | samples << 20.
     float3 mPushShareCamera = float3(0.f);
     float3 mPushShareMotion = float3(0.f);
-    ref<ComputePass> mpPushShareCountPass;
-    ref<ComputePass> mpPushShareHistogramPass;
+    LazyComputePass mpPushShareCountPass;
+    LazyComputePass mpPushShareHistogramPass;
     void runPushShare(RenderContext* pRenderContext);
     ref<Buffer> mpPushCandidates;  ///< Occupied domain cells, packed keys (hstrPushCandidates).
     ref<Buffer> mpPushCandidateCount; ///< [0] cells listed, [1] of them with density of their own.
@@ -472,13 +512,13 @@ private:
     ref<Buffer> mpPushList;        ///< The tiles' cell lists, compact.
     ref<Buffer> mpPushCounts;      ///< kPush* counters; [kPushCountSlots] pieces appended, [+1] list entries allocated.
     ref<Buffer> mpPushSortTiles;   ///< Tiles holding two or more cells, for the sort's dispatch.
-    ref<ComputePass> mpPushListPass;
-    ref<ComputePass> mpPushArgsPass;
-    ref<ComputePass> mpPushSortArgsPass;
-    ref<ComputePass> mpPushProjectPass;
-    ref<ComputePass> mpPushAllocatePass;
-    ref<ComputePass> mpPushScatterPass;
-    ref<ComputePass> mpPushSortPass;
+    LazyComputePass mpPushListPass;
+    LazyComputePass mpPushArgsPass;
+    LazyComputePass mpPushSortArgsPass;
+    LazyComputePass mpPushProjectPass;
+    LazyComputePass mpPushAllocatePass;
+    LazyComputePass mpPushScatterPass;
+    LazyComputePass mpPushSortPass;
     bool mPushCandidatesDirty = true;
     uint32_t mPushListings = 0;    ///< Candidate listings, cumulative (one per content change).
     /// Runs the probe for this frame's camera (beam view, octahedral image, cloud sea).
@@ -487,11 +527,11 @@ private:
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.
     void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
-    ref<ComputePass> mpBeamDirtyTilePass;
-    ref<ComputePass> mpBeamDirtyTileDensePass;
-    ref<ComputePass> mpBeamRefreshListPass;
-    ref<ComputePass> mpBeamGuardPyramidPass;    ///< Levels 0 - 5 per 32 x 32 tile (buildBeamGuardPyramidTiles) ...
-    ref<ComputePass> mpBeamGuardPyramidTopPass; ///< ... and the levels above, in one group (buildBeamGuardPyramidTop).
+    LazyComputePass mpBeamDirtyTilePass;
+    LazyComputePass mpBeamDirtyTileDensePass;
+    LazyComputePass mpBeamRefreshListPass;
+    LazyComputePass mpBeamGuardPyramidPass;    ///< Levels 0 - 5 per 32 x 32 tile (buildBeamGuardPyramidTiles) ...
+    LazyComputePass mpBeamGuardPyramidTopPass; ///< ... and the levels above, in one group (buildBeamGuardPyramidTop).
     ref<Buffer> mpBeamGuardPyramid;     ///< Min-depth pyramid over the guard blocks (beamCellRadius).
     uint32_t mBeamGuardPyramidLevels = 0;
     bool mBeamGuardDriven = false; ///< This build's blocks all came from the guard's dirty list: no grid regions, no sweeps.
@@ -504,9 +544,9 @@ private:
     ref<Buffer> mpBeamSparseArgs;
     ref<Buffer> mpBeamResults;
     ref<Buffer> mpBeamFinalTiles;
-    ref<ComputePass> mpBeamGuidePass;
+    LazyComputePass mpBeamGuidePass;
     ref<Texture> mpBeamGuide; ///< Full-resolution beam guide: optical depth, distance and sun depth where it reaches one.
-    ref<ComputePass> mpBeamTemporalTilePass;
+    LazyComputePass mpBeamTemporalTilePass;
     std::array<ref<Buffer>, 2> mpBeamLists;    ///< Refined tiles per level, this frame's and last frame's by parity.
     std::array<ref<Buffer>, 2> mpBeamCounts;   ///< Refined tile count per level, by parity.
     std::array<ref<Texture>, 2> mpBeamHistory; ///< Levels refined per finest cell, by parity.
@@ -643,22 +683,22 @@ private:
     uint64_t mSunPageChangedTotal = 0;   ///< ... tiles whose cloud changed (each re-suns the tiles it shadows too) ...
     uint64_t mSunPageQueuedTotal = 0;    ///< ... and tiles the sun-move queue released.
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
-    ref<ComputePass> mpBakeCloudSunPass;
+    LazyComputePass mpBakeCloudSunPass;
     // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).
     bool mCloudGpuSun = true;
-    ref<ComputePass> mpReleaseSunPass;
-    ref<ComputePass> mpScanSunPass;
-    ref<ComputePass> mpStampSunPass;
-    ref<ComputePass> mpResetSunBlocksPass;
-    ref<ComputePass> mpResetSunNodesPass;
-    ref<ComputePass> mpAgeSunPass;
+    LazyComputePass mpReleaseSunPass;
+    LazyComputePass mpScanSunPass;
+    LazyComputePass mpStampSunPass;
+    LazyComputePass mpResetSunBlocksPass;
+    LazyComputePass mpResetSunNodesPass;
+    LazyComputePass mpAgeSunPass;
     std::vector<const ComputePass*> mResidencyPassesBound; ///< Residency passes holding the current residency's bindings.
     /// Binds a residency pass (bindResidencyPass in the .cpp) and sets its params; true on its first bind.
     bool bindResidencyPass(RenderContext* pRenderContext, const ref<ComputePass>& pPass, bool scene);
-    ref<ComputePass> mpSelectSunPass;
-    ref<ComputePass> mpEmitSunPass;
-    ref<ComputePass> mpEvictSunPass;
-    ref<ComputePass> mpAssignSunPass;
+    LazyComputePass mpSelectSunPass;
+    LazyComputePass mpEmitSunPass;
+    LazyComputePass mpEvictSunPass;
+    LazyComputePass mpAssignSunPass;
     ref<Buffer> mpSunReadback; ///< The bake count of a run, read back without waiting.
     ref<Fence> mpSunFence;
     uint64_t mSunReadbackPending = 0;
@@ -673,8 +713,8 @@ private:
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
     bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
-    ref<ComputePass> mpCameraPass;            ///< That entry point.
-    ref<ComputePass> mpDecayWorldCachePass;
+    LazyComputePass mpCameraPass;            ///< That entry point.
+    LazyComputePass mpDecayWorldCachePass;
     // The sea's domain proxy on the GPU (uploadDomainExtinction).
     ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
     ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
@@ -683,10 +723,10 @@ private:
     ref<Buffer> mpDomainStaged;  ///< One batch of packed tile volumes, copied from the staging buffers.
     bool mDomainPassesBound = false;         ///< The domain passes and the world cache clear hold the current resources.
     ref<Buffer> mpClearBoundDeposit;         ///< The world cache the clear holds (a reference, so no new buffer reuses its address).
-    ref<ComputePass> mpDomainExtinctionPass;
-    ref<ComputePass> mpDomainBlocksPass;
-    ref<ComputePass> mpDomainMajorantPass;
-    ref<ComputePass> mpDomainOccupancyPass;
+    LazyComputePass mpDomainExtinctionPass;
+    LazyComputePass mpDomainBlocksPass;
+    LazyComputePass mpDomainMajorantPass;
+    LazyComputePass mpDomainOccupancyPass;
     /// World Y of the occupied band, from the majorant blocks, dilated by one. mParams.seaContentY carries this when cloudSlabClamp
     /// is on and an unbounded range when it is off, so the shader clamps without a branch.
     float2 mSeaContentBand = float2(-std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
@@ -694,16 +734,16 @@ private:
     std::vector<uint32_t> mCloudTileReset;
     ref<Buffer> mpCloudTileBatches;
     ref<Buffer> mpCloudTileReset;
-    ref<ComputePass> mpCommitCloudPass;
-    ref<ComputePass> mpDecodeCloudPass;
-    ref<ComputePass> mpOccupancyCloudPass;
-    ref<ComputePass> mpClearDirtyCloudPagesPass;
-    ref<ComputePass> mpMarkDirtyCloudPagesPass;
-    ref<ComputePass> mpCloudPageArgsPass;
-    ref<ComputePass> mpResolveDirtyCloudPagesPass;
-    ref<ComputePass> mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
-    ref<ComputePass> mpClearWorldCacheTilesPass;
-    ref<ComputePass> mpAdvanceFadesPass;
+    LazyComputePass mpCommitCloudPass;
+    LazyComputePass mpDecodeCloudPass;
+    LazyComputePass mpOccupancyCloudPass;
+    LazyComputePass mpClearDirtyCloudPagesPass;
+    LazyComputePass mpMarkDirtyCloudPagesPass;
+    LazyComputePass mpCloudPageArgsPass;
+    LazyComputePass mpResolveDirtyCloudPagesPass;
+    LazyComputePass mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
+    LazyComputePass mpClearWorldCacheTilesPass;
+    LazyComputePass mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;
     uint32_t mSamplerSeaMode = ~0u;
     std::vector<float> mHierarchyResidualBounds;

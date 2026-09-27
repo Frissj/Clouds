@@ -986,29 +986,48 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     phase.emplace(pRenderContext, "fades");
     processFadeEnds(changed);
 
-    // Page and chunk stores nothing has used for a while are released (pages before their chunks); at once when the payload pool
-    // filled, down to those used this frame.
+    // Page and chunk stores nothing has used for a while are released; at once when the payload pool filled, down to those used
+    // this frame. A chunk store is busy while any of its page stores lives, so pages go before their chunks.
     phase.reset();
     phase.emplace(pRenderContext, "release");
     const bool releaseNow = mReleaseStores;
     mReleaseStores = false;
-    if (mFrame % 60 == 0 || releaseNow)
+    auto tryRelease = [&](uint32_t s)
+    {
+        Store& store = *mStores[s];
+        if (store.kind == StoreKind::Coarse || store.bricks.empty() || store.loaded > 0 || store.lastUsedFrame + (releaseNow ? 1 : 120) > mFrame)
+            return;
+        // The merge used the store of every brick it desired, so a store unused since cannot hold one.
+        bool busy = false;
+        if (store.lastUsedFrame >= mMergeFrame)
+            for (const Brick& b : store.bricks)
+                busy |= desired(b);
+        for (uint32_t pageStore : store.pageStores)
+            busy |= pageStore != kNone;
+        if (!busy)
+            releaseStore(s);
+    };
+    if (releaseNow)
+    {
         for (StoreKind kind : {StoreKind::Page, StoreKind::Chunk})
             for (uint32_t s = 0; s < mStores.size(); ++s)
-            {
-                Store& store = *mStores[s];
-                if (store.kind != kind || store.bricks.empty() || store.loaded > 0 || store.lastUsedFrame + (releaseNow ? 1 : 120) > mFrame)
-                    continue;
-                // The merge used the store of every brick it desired, so a store unused since cannot hold one.
-                bool busy = false;
-                if (store.lastUsedFrame >= mMergeFrame)
-                    for (const Brick& b : store.bricks)
-                        busy |= desired(b);
-                for (uint32_t pageStore : store.pageStores)
-                    busy |= pageStore != kNone;
-                if (!busy)
-                    releaseStore(s);
-            }
+                if (mStores[s]->kind == kind)
+                    tryRelease(s);
+    }
+    else if (!mStores.empty())
+    {
+        // A sixtieth of the stores a frame, and at most 0.5 ms of it: the whole sweep every 60th frame released a turn's worth of
+        // stores at once. MEASURED (4K Intel half sea, parked after a 180 degree turn): 10.47 ms of CPU in one frame.
+        const auto sweepStart = std::chrono::steady_clock::now();
+        const size_t count = std::min(mStores.size(), (mStores.size() + 59) / 60);
+        for (size_t k = 0; k < count; ++k)
+        {
+            if (k % 16 == 15 && std::chrono::steady_clock::now() - sweepStart > std::chrono::microseconds(500))
+                break;
+            mReleaseCursor = mReleaseCursor + 1 < mStores.size() ? mReleaseCursor + 1 : 0;
+            tryRelease(uint32_t(mReleaseCursor));
+        }
+    }
 
     phase.reset();
     // The next cut starts once this one is applied, so the worker never overlaps the loads, maps and releases above.

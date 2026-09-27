@@ -516,6 +516,7 @@ private:
     std::vector<Completion> mCompletions;
     std::vector<Completion> mWaiting; ///< Pages whose meta arrived and whose payload DirectStorage is still loading.
     bool mReleaseStores = false;      ///< The payload pool filled: release unused stores now.
+    size_t mReleaseCursor = 0;        ///< The store the incremental release sweep examined last.
     uint32_t mInFlight = 0;
     bool mStop = false;
     std::vector<std::thread> mIoThreads;

@@ -1762,21 +1762,29 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
         logInfo("HSTRCloud: first grid-volume bounds are {} to {}.", bounds.minPoint, bounds.maxPoint);
     }
 
-    std::vector<std::pair<const char*, ref<ComputePass>>> created;
-    double createSeconds = 0.0;
+    // Every pass is created (and its kernel compiled) on first use: see LazyComputePass.
+    std::vector<std::pair<const char*, LazyComputePass>> created;
     auto createPass = [&](const char* entry)
     {
-        const auto start = std::chrono::steady_clock::now();
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
         desc.addShaderLibrary(kShaderFile).csEntry(entry);
-        desc.addTypeConformances(mpScene->getTypeConformances());
+        // No material type conformances: these passes read the scene's camera and grid volume, never a material, and the
+        // conformances made every kernel generate the dynamic dispatch of every material type.
         // All 114 passes compile from one module: parsing it for each cost 296 s of every launch, shared 2.2 s (ProgramManager).
         desc.shareFrontEnd = true;
-        auto pPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines());
-        createSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        created.emplace_back(entry, pPass);
-        return pPass;
+        LazyComputePass pass(
+            [pDevice = mpDevice, desc, defines = mpScene->getSceneDefines(), entry]()
+            {
+                const auto start = std::chrono::steady_clock::now();
+                auto pPass = ComputePass::create(pDevice, desc, defines);
+                logInfo("HSTRCloud: pass {} created in {:.2f} s.", entry,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+                return pPass;
+            }
+        );
+        created.emplace_back(entry, pass);
+        return pass;
     };
     mpPass = createPass("main");
     mpCameraPass = createPass("renderCloudCamera");
@@ -1893,21 +1901,15 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpClearWorldCacheTilesPass = createPass("clearWorldCacheTiles");
     mpAdvanceFadesPass = createPass("advanceCloudFades");
     mpDecayWorldCachePass = createPass("decayWorldCache");
-    // HSTR_SHADER_TIMING=1: where load time goes. Creating a pass runs the Slang front end (its reflection needs it); the kernels
-    // (DXC) compile at first dispatch, or here, each timed.
+    // HSTR_SHADER_TIMING=1: creates every pass now, each timed (creating a pass builds its program and, through its vars, its
+    // kernels), instead of on first use.
     if (const char* timing = std::getenv("HSTR_SHADER_TIMING"); timing && timing[0] == '1')
     {
-        logInfo("HSTRCloud: {} passes created (front end) in {:.1f} s.", created.size(), createSeconds);
-        double total = 0.0;
-        for (const auto& [entry, pPass] : created)
-        {
-            const auto start = std::chrono::steady_clock::now();
-            pPass->getProgram()->getActiveVersion()->getKernels(mpDevice.get(), pPass->getVars().get());
-            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            total += seconds;
-            logInfo("HSTRCloud: kernel {} {:.2f} s.", entry, seconds);
-        }
-        logInfo("HSTRCloud: {} kernels in {:.1f} s.", created.size(), total);
+        const auto start = std::chrono::steady_clock::now();
+        for (const auto& [entry, pass] : created)
+            pass.get();
+        logInfo("HSTRCloud: {} passes created in {:.1f} s.", created.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     }
     buildHierarchy();
 }

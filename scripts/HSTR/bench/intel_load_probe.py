@@ -67,10 +67,12 @@ PHASES = os.environ.get("HSTR_PHASES", "12")
 if "3" in PHASES:
     # Phase 3: the change list's cost parked while a turn's new view streams in, within one window: the frames that listed changes
     # (the invalidate scope ran) against those that did not. Park, turn 180 degrees in 20 frames, park 240 frames while it streams.
-    fly(300, 0.0, 0.0)
-    fly(20, 0.0, math.pi / 20)
+    # The capture opens 10 parked frames before the turn: its first frames spike whatever the camera does.
+    fly(290, 0.0, 0.0)
     m.profiler.enabled = True
     m.profiler.start_capture()
+    fly(10, 0.0, 0.0)
+    fly(20, 0.0, math.pi / 20)
     fly(240, 0.0, 0.0)
     capture3 = m.profiler.end_capture()
     m.profiler.enabled = False
@@ -81,7 +83,7 @@ if "3" in PHASES:
     listed = records("invalidate/gpu_time")
     ok = lambda v: isinstance(v, (int, float)) and math.isfinite(v)
     marks = [ok(v) and v > 0.0 for v in listed] + [False] * (len(frame) - len(listed))
-    for lo, hi in ((0, 80), (80, 160), (160, 240)):
+    for lo, hi in ((0, 10), (10, 30), (30, 110), (110, 190), (190, 270)):  # Parked, turning, then parked while it streams in.
         hi = min(hi, len(frame))  # The capture may hold fewer records than frames flown.
         on =[frame[i] for i in range(lo, hi) if marks[i] and ok(frame[i])]
         off = [frame[i] for i in range(lo, hi) if not marks[i] and ok(frame[i])]
@@ -90,14 +92,18 @@ if "3" in PHASES:
         p95 = allv[min(len(allv) - 1, int(0.95 * len(allv)))] if allv else float("nan")
         print(f"PROBE phase3 frames {lo}-{hi}: mean {mean(allv):.3f} ms, p95 {p95:.3f}, max {max(allv, default=float('nan')):.3f}; "
               f"listing frames {mean(on):.3f} (n {len(on)}), others {mean(off):.3f} (n {len(off)})", flush=True)
-    # Where the worst frames go: their largest GPU scopes.
+    # Where the worst frames go: their largest leaf scopes (no other scope nested under them), GPU and CPU.
+    paths = {name.rsplit("/", 1)[0] for name in capture3["events"]}
+    leaves = {p for p in paths if not any(q.startswith(p + "/") for q in paths)}
     ok_frames = [i for i in range(len(frame)) if ok(frame[i])]
     for i in sorted(ok_frames, key=lambda i: frame[i], reverse=True)[:4]:
-        scopes = sorted(((lane["records"][i], name.split("/")[-2]) for name, lane in capture3["events"].items()
-                         if name.endswith("gpu_time") and i < len(lane["records"]) and ok(lane["records"][i])
-                         and "onFrameRender" not in name.split("/")[-2] and "execute()" not in name and not name.endswith("HSTRCloud/gpu_time")),
-                        reverse=True)[:6]
-        print(f"PROBE   worst frame {i}: {frame[i]:.2f} ms listing {marks[i]}: " + ", ".join(f"{n} {v:.2f}" for v, n in scopes), flush=True)
+        print(f"PROBE   worst frame {i}: {frame[i]:.2f} ms listing {marks[i]}", flush=True)
+        for kind in ("gpu_time", "cpu_time"):
+            scopes = sorted(((lane["records"][i], name.rsplit("/", 1)[0].split("HSTRCloud/", 1)[-1])
+                             for name, lane in capture3["events"].items()
+                             if name.endswith(kind) and name.rsplit("/", 1)[0] in leaves and i < len(lane["records"])
+                             and ok(lane["records"][i])), reverse=True)[:6]
+            print(f"PROBE     {kind[:3]}: " + ", ".join(f"{n} {v:.2f}" for v, n in scopes), flush=True)
     print(f"PROBE   {stats_line()}", flush=True)
 
 # Phase 1: defaults (the change list on), captures.
