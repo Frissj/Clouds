@@ -10,6 +10,8 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace hstrcloud
@@ -121,7 +123,27 @@ public:
     /// Chooses the cut, streams pages and fills the staging buffers. Returns true when the density the camera sees changed.
     bool update(const CloudSea& sea, const CloudView& view, const std::vector<uint32_t>& changedSlots);
 
-    void bind(const ShaderVar& var) const;
+    /// Var: a ShaderVar, or anything indexed by field name like one (HSTRCloud's cached fields).
+    template<typename Var>
+    void bind(const Var& var) const
+    {
+        var["hstrCloudInstances"] = mpInstances;
+        var["hstrCloudAssets"] = mpAssets;
+        var["hstrCloudDirectory"] = mpDirectory;
+        var["hstrCloudNodes"] = mpNodes;
+        var["hstrCloudPages"] = mpPages;
+        var["hstrCloudLevelPages"] = mpLevelPages;
+        var["hstrCloudBricks"] = mpBricks;
+        var["hstrCloudAtlas"] = mpAtlas;
+        var["hstrCloudOccupancy"] = mpOccupancy;
+        var["hstrCloudSunAtlas"] = mpSunAtlas;
+        var["hstrCloudSunBakes"] = mpSunBakes;
+        var["hstrCloudSunSlots"] = mpSunSlotTable;
+        var["hstrCloudSunResolved"] = mpSunResolved;
+        var["hstrCloudPayload"] = mpPayload->getBuffer();
+        var["hstrCloudResiduals"] = mpResiduals;
+        var["hstrCloudStagingInfo"] = mpStagingInfo;
+    }
     void bindPageUpdates(const ShaderVar& var) const;
     ref<Texture> getAtlas() const { return mpAtlas; }
     ref<Buffer> getOccupancy() const { return mpOccupancy; }
@@ -515,7 +537,11 @@ private:
     std::vector<Request> mQueue; ///< Max-heap by priority.
     std::vector<Completion> mCompletions;
     std::vector<Completion> mWaiting; ///< Pages whose meta arrived and whose payload DirectStorage is still loading.
-    bool mReleaseStores = false;      ///< The payload pool filled: release unused stores now.
+    /// A request's target: a chunk page (asset, chunk) or a level-2 page (store, page, generation).
+    using LoadKey = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>;
+    static LoadKey loadKey(const Request& r) { return r.page == kNone ? LoadKey{0u, r.asset, r.chunk, 0u} : LoadKey{1u, r.store, r.page, r.generation}; }
+    std::set<LoadKey> mLoading; ///< Main thread: targets queued, in flight, or arrived and not yet stored.
+    bool mReleaseStores = false;     ///< The payload pool filled: release unused stores now.
     size_t mReleaseCursor = 0;        ///< The store the incremental release sweep examined last.
     uint32_t mInFlight = 0;
     bool mStop = false;

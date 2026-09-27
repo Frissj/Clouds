@@ -8347,6 +8347,48 @@ struct HSTRCloudRenderer
         end = min(uint2(ceil(params.beamScreenBounds.zw / step) + 2.f), params.beamLatticeDims);
     }
 
+    /// The octahedral image's edges are glued mirrored: along each edge (x, 0) is the direction (dim - x, 0) is, and so on. A
+    /// position just past an edge is the direction just inside the mirrored point, so an offset may cross an edge and be folded
+    /// back. beamOctUnfold is the inverse choice: of q and its four mirror images past the edges, the one nearest reference, so
+    /// the offset between two nearby directions stays small across the fold.
+    /// MEASURED (4K Intel half sea, parked after a 180 degree turn to -z, octAxis 0): the warp field held the raw difference, so a
+    /// lattice point whose warped direction crossed the fold stored an offset of ~0.1 of the image, and the resolve's bilinear read
+    /// between it and its neighbour sent a one-pixel column down the screen centre to sky (100,133,181 on every row).
+    float2 beamOctFold(float2 q)
+    {
+        const float2 dim = float2(params.beamFrameDim);
+        if (q.y < 0.f)
+            q = float2(dim.x - q.x, -q.y);
+        else if (q.y > dim.y)
+            q = float2(dim.x - q.x, 2.f * dim.y - q.y);
+        if (q.x < 0.f)
+            q = float2(-q.x, dim.y - q.y);
+        else if (q.x > dim.x)
+            q = float2(2.f * dim.x - q.x, dim.y - q.y);
+        return q;
+    }
+
+    float2 beamOctUnfold(float2 q, float2 reference)
+    {
+        const float2 dim = float2(params.beamFrameDim);
+        const float2 candidates[4] = {
+            float2(dim.x - q.x, -q.y), float2(dim.x - q.x, 2.f * dim.y - q.y), float2(-q.x, dim.y - q.y), float2(2.f * dim.x - q.x, dim.y - q.y)
+        };
+        float2 best = q;
+        float bestDistance = dot(q - reference, q - reference);
+        [unroll]
+        for (uint i = 0; i < 4; ++i)
+        {
+            const float distance = dot(candidates[i] - reference, candidates[i] - reference);
+            if (distance < bestDistance)
+            {
+                best = candidates[i];
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
     /// beamWarp's field: once per on-screen lattice point, the offset from its position to where beamWarpPosition finds its
     /// content was captured. The warp is a function of direction that changes at lattice scale - it reads the nearest query's
     /// depth and its block's capture camera - so the resolve interpolates it instead of running it: per 4K pixel it cost the
@@ -8362,7 +8404,7 @@ struct HSTRCloudRenderer
         float2 warped = position;
         float3 read;
         beamWarpPosition(beamRayDirection(position), warped, read);
-        hstrBeamWarpFieldOutput[texel] = warped - position;
+        hstrBeamWarpFieldOutput[texel] = (params.beamOct != 0 ? beamOctUnfold(warped, position) : warped) - position;
     }
 
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
@@ -8378,7 +8420,8 @@ struct HSTRCloudRenderer
     {
         const float step = float(max(params.beamLatticeStep, 1u));
         const float2 uv = (position / step + 0.5f) / float2(params.beamLatticeDims);
-        return position + hstrBeamWarpField.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+        const float2 warped = position + hstrBeamWarpField.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+        return params.beamOct != 0 ? beamOctFold(warped) : warped;
     }
 
     /// Beam view pixel reconstructed from the tile level that accepted it: bilinear corners plus the centre's bubble. No voxel

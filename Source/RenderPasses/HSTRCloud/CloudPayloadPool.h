@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,11 @@ public:
 private:
     ref<Device> mpDevice;
     ref<Buffer> mpBuffer;
-    std::map<uint32_t, uint32_t> mFreeRanges; ///< First word to length in words.
+    void addRange(uint32_t word, uint32_t words);
+    void removeRange(std::map<uint32_t, uint32_t>::iterator it);
+
+    std::map<uint32_t, uint32_t> mFreeRanges;             ///< First word to length in words.
+    std::set<std::pair<uint32_t, uint32_t>> mFreeBySize; ///< The same ranges as (length, first word), for best fit.
     uint32_t mUsedWords = 0;
 
     IDStorageFactory* mpFactory = nullptr;

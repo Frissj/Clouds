@@ -1316,6 +1316,9 @@ Properties HSTRCloud::getProperties() const
         Properties cloud;
         cloud["loaded"] = stats.loaded;
         cloud["mapped"] = stats.mapped;
+        cloud["bindCpuMs"] = mBindCpuMs;
+        cloud["bindCalls"] = mBindCalls;
+        cloud["executeFrames"] = mExecuteFrames;
         cloud["desired"] = stats.desired;
         cloud["pending"] = stats.pending;
         cloud["committed"] = stats.committed;
@@ -3871,8 +3874,48 @@ void HSTRCloud::solveLighting()
 /// the read view of the same resource so no texture is ever bound as SRV and UAV in one dispatch.
 void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass)
 {
-    mpScene->bindShaderDataForRaytracing(pRenderContext, pPass->getRootVar()["gScene"]);
-    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    const auto bindStart = std::chrono::steady_clock::now();
+    struct BindTimer
+    {
+        HSTRCloud& self;
+        std::chrono::steady_clock::time_point start;
+        ~BindTimer()
+        {
+            self.mBindCpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            ++self.mBindCalls;
+        }
+    } bindTimer{*this, bindStart};
+    // The scene's TLAS and camera go into its (shared) block once a frame, not on every bind: nothing in them changes within a frame.
+    if (mSceneBoundFrame != mExecuteFrames)
+    {
+        mSceneBoundFrame = mExecuteFrames;
+        mpScene->bindShaderDataForRaytracing(pRenderContext, pPass->getRootVar()["gScene"]);
+    }
+    else
+        mpScene->bindShaderData(pPass->getRootVar()["gScene"]);
+    // The fields resolved once per pass (and vars), not by name on every bind. MEASURED (4K Intel half sea, streaming after a turn,
+    // profiler off): ~120 fields by name, 21 binds a frame, cost 1.60 ms of CPU a frame after same-value binds became no-ops.
+    // (ShaderVar's assignment binds a value, so entries are constructed in place, never assigned.)
+    auto cacheIt = mBindCache.find(pPass.get());
+    if (cacheIt != mBindCache.end() && cacheIt->second.pVars != pPass->getVars())
+    {
+        mBindCache.erase(cacheIt);
+        cacheIt = mBindCache.end();
+    }
+    if (cacheIt == mBindCache.end())
+        cacheIt = mBindCache.emplace(pPass.get(), BindCache{pPass->getVars(), pPass->getRootVar()["CB"]["gHSTRCloud"], {}}).first;
+    BindCache& cache = cacheIt->second;
+    struct CachedFields
+    {
+        BindCache& cache;
+        const ShaderVar& operator[](const char* name) const
+        {
+            auto it = cache.fields.find(name);
+            if (it == cache.fields.end())
+                it = cache.fields.emplace(name, cache.root[name]).first;
+            return it->second;
+        }
+    } var{cache};
     static bool layoutChecked = false;
     if (!layoutChecked)
     {
@@ -4754,6 +4797,7 @@ void HSTRCloud::dispatchLightingSolve()
 
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    ++mExecuteFrames;
     if (mpScene)
     {
         const auto updates = mpScene->getUpdates();

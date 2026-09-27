@@ -33,7 +33,7 @@ CloudPayloadPool::CloudPayloadPool(ref<Device> pDevice, const std::vector<std::f
 {
     const uint32_t words = std::max(1u, poolMB) * (1024 * 1024 / 4);
     mpBuffer = mpDevice->createStructuredBuffer(sizeof(uint32_t), words, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nullptr, false);
-    mFreeRanges[0] = words;
+    addRange(0, words);
 
     if (!useDirectStorage)
     {
@@ -123,22 +123,33 @@ CloudPayloadPool::~CloudPayloadPool()
     release(mpFactory);
 }
 
+void CloudPayloadPool::addRange(uint32_t word, uint32_t words)
+{
+    mFreeRanges[word] = words;
+    mFreeBySize.emplace(words, word);
+}
+
+void CloudPayloadPool::removeRange(std::map<uint32_t, uint32_t>::iterator it)
+{
+    mFreeBySize.erase({it->second, it->first});
+    mFreeRanges.erase(it);
+}
+
 uint32_t CloudPayloadPool::allocate(uint32_t bytes)
 {
+    // Best fit through the size index. MEASURED before (4K Intel half sea, streaming after a 180 degree turn): a first-fit walk of
+    // the free ranges, fragmented by released stores, cost enqueue 1.94 ms of CPU in the worst frames (256 allocations a cut).
     const uint32_t words = (bytes + 3) / 4;
-    for (auto it = mFreeRanges.begin(); it != mFreeRanges.end(); ++it)
-    {
-        if (it->second < words)
-            continue;
-        const uint32_t word = it->first;
-        const uint32_t rest = it->second - words;
-        mFreeRanges.erase(it);
-        if (rest > 0)
-            mFreeRanges[word + words] = rest;
-        mUsedWords += words;
-        return word;
-    }
-    return kNone;
+    const auto fit = mFreeBySize.lower_bound({words, 0u});
+    if (fit == mFreeBySize.end())
+        return kNone;
+    const uint32_t word = fit->second;
+    const uint32_t rest = fit->first - words;
+    removeRange(mFreeRanges.find(word));
+    if (rest > 0)
+        addRange(word + words, rest);
+    mUsedWords += words;
+    return word;
 }
 
 void CloudPayloadPool::free(uint32_t word, uint32_t bytes)
@@ -151,18 +162,23 @@ void CloudPayloadPool::free(uint32_t word, uint32_t bytes)
     if (next != mFreeRanges.end() && word + words == next->first)
     {
         words += next->second;
-        next = mFreeRanges.erase(next);
+        auto after = std::next(next);
+        removeRange(next);
+        next = after;
     }
     if (next != mFreeRanges.begin())
     {
         auto previous = std::prev(next);
         if (previous->first + previous->second == word)
         {
-            previous->second += words;
+            const uint32_t start = previous->first;
+            words += previous->second;
+            removeRange(previous);
+            addRange(start, words);
             return;
         }
     }
-    mFreeRanges[word] = words;
+    addRange(word, words);
 }
 
 uint32_t CloudPayloadPool::beginLoad(uint32_t file, const BlobRef& blob, uint32_t word)

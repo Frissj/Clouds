@@ -475,19 +475,47 @@ void CloudResidency::resetPending(const Request& request)
 void CloudResidency::enqueue(std::vector<Request> requests)
 {
     std::lock_guard lock(mIoMutex);
-    // Requests not yet started are replaced by this frame's priorities.
-    for (const Request& old : mQueue)
-        resetPending(old);
+    // Requests not yet started are replaced by this frame's priorities. One the cut asks for again keeps its payload range; one
+    // already started (in flight, or arrived and not yet stored) is not loaded twice: the cut re-requests every pending target.
+    // MEASURED before (4K Intel half sea, streaming after a 180 degree turn): freeing and reallocating the whole queue every cut,
+    // and loading in-flight pages again, cost enqueue 1.94 ms of CPU in the worst frames.
+    std::map<LoadKey, size_t> queued;
+    for (size_t i = 0; i < mQueue.size(); ++i)
+        queued.emplace(loadKey(mQueue[i]), i);
+    std::vector<bool> kept(mQueue.size(), false);
     // A few frames of pages at most wait in memory.
     const size_t outstanding = mCompletions.size() + mInFlight;
     const size_t capacity = 256 > outstanding ? 256 - outstanding : 0;
-    // The cut sorted them, most important first.
-    if (requests.size() > capacity)
-        requests.resize(capacity);
     std::vector<Request> accepted;
-    accepted.reserve(requests.size());
+    std::vector<Request*> fresh;
+    // The cut sorted them, most important first.
     for (Request& request : requests)
     {
+        if (accepted.size() + fresh.size() >= capacity)
+            break;
+        const LoadKey key = loadKey(request);
+        if (const auto it = queued.find(key); it != queued.end())
+        {
+            if (!kept[it->second])
+            {
+                kept[it->second] = true;
+                request.payloadWord = mQueue[it->second].payloadWord;
+                accepted.push_back(request);
+            }
+        }
+        else if (!mLoading.count(key))
+            fresh.push_back(&request);
+    }
+    for (size_t i = 0; i < mQueue.size(); ++i)
+    {
+        if (kept[i])
+            continue;
+        resetPending(mQueue[i]);
+        mLoading.erase(loadKey(mQueue[i]));
+    }
+    for (Request* pRequest : fresh)
+    {
+        Request& request = *pRequest;
         // The payload's pool range is reserved now, so loading can write it; a full pool releases unused stores.
         if (request.blobs.payload.raw > 0)
         {
@@ -502,6 +530,7 @@ void CloudResidency::enqueue(std::vector<Request> requests)
             mAssets[request.asset].chunkStores[request.chunk] = kPendingStore;
         else
             mStores[request.store]->pageStores[request.page] = kPendingStore;
+        mLoading.insert(loadKey(request));
         accepted.push_back(request);
     }
     mQueue = std::move(accepted);
@@ -794,6 +823,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         for (Completion& completion : completions)
         {
             const Request& request = completion.request;
+            mLoading.erase(loadKey(request));
             const uint32_t payloadBytes = request.blobs.payload.raw;
             bool stored = false;
             if (request.page == kNone)
@@ -2489,26 +2519,6 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
     // Idle only if this pass staged nothing and left the slots as it found them (an eviction without a bake still moved them).
     mSunScheduleIdleValid = mSunBakes.empty() && mFreeSunSlots.size() == inputs.freeSlots;
     mSunScheduleIdle = inputs;
-}
-
-void CloudResidency::bind(const ShaderVar& var) const
-{
-    var["hstrCloudInstances"] = mpInstances;
-    var["hstrCloudAssets"] = mpAssets;
-    var["hstrCloudDirectory"] = mpDirectory;
-    var["hstrCloudNodes"] = mpNodes;
-    var["hstrCloudPages"] = mpPages;
-    var["hstrCloudLevelPages"] = mpLevelPages;
-    var["hstrCloudBricks"] = mpBricks;
-    var["hstrCloudAtlas"] = mpAtlas;
-    var["hstrCloudOccupancy"] = mpOccupancy;
-    var["hstrCloudSunAtlas"] = mpSunAtlas;
-    var["hstrCloudSunBakes"] = mpSunBakes;
-    var["hstrCloudSunSlots"] = mpSunSlotTable;
-    var["hstrCloudSunResolved"] = mpSunResolved;
-    var["hstrCloudPayload"] = mpPayload->getBuffer();
-    var["hstrCloudResiduals"] = mpResiduals;
-    var["hstrCloudStagingInfo"] = mpStagingInfo;
 }
 
 void CloudResidency::bindPageUpdates(const ShaderVar& var) const

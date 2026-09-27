@@ -471,6 +471,19 @@ FALCOR_API void ParameterBlock::setVariable(const BindLocation& bindLocation, co
     setVariableInternal(this, bindLocation, v, ReflectionBasicType::Type::Bool4);
 }
 
+namespace
+{
+// Whether view is what the slot at offset already holds (a slot never set holds null). Rebinding it is then a no-op: the maps and
+// the shader object already agree with it. MEASURED (HSTRCloud, 4K Intel sea): ~120 fields rebound per dispatch, mostly to the same
+// resources, cost bindRenderer 1.92 ms of CPU a frame.
+template<typename Map, typename View>
+bool isBound(const Map& map, const gfx::ShaderOffset& offset, const View& view)
+{
+    const auto it = map.find(offset);
+    return it != map.end() ? it->second == view : view == nullptr;
+}
+} // namespace
+
 //
 // Buffer
 //
@@ -488,6 +501,8 @@ void ParameterBlock::setBuffer(const BindLocation& bindLoc, const ref<Buffer>& p
         if (pBuffer && !is_set(pBuffer->getBindFlags(), ResourceBindFlags::UnorderedAccess))
             FALCOR_THROW("Trying to bind buffer '{}' created without UnorderedAccess flag as a UAV.", pBuffer->getName());
         auto pUAV = pBuffer ? pBuffer->getUAV() : nullptr;
+        if (isBound(mUAVs, gfxOffset, pUAV))
+            return;
         mpShaderObject->setResource(gfxOffset, pUAV ? pUAV->getGfxResourceView() : nullptr);
         mUAVs[gfxOffset] = pUAV;
         mResources[gfxOffset] = pBuffer;
@@ -497,6 +512,8 @@ void ParameterBlock::setBuffer(const BindLocation& bindLoc, const ref<Buffer>& p
         if (pBuffer && !is_set(pBuffer->getBindFlags(), ResourceBindFlags::ShaderResource))
             FALCOR_THROW("Trying to bind buffer '{}' created without ShaderResource flag as an SRV.", pBuffer->getName());
         auto pSRV = pBuffer ? pBuffer->getSRV() : nullptr;
+        if (isBound(mSRVs, gfxOffset, pSRV))
+            return;
         mpShaderObject->setResource(gfxOffset, pSRV ? pSRV->getGfxResourceView() : nullptr);
         mSRVs[gfxOffset] = pSRV;
         mResources[gfxOffset] = pBuffer;
@@ -554,6 +571,8 @@ void ParameterBlock::setTexture(const BindLocation& bindLocation, const ref<Text
         if (pTexture && !is_set(pTexture->getBindFlags(), ResourceBindFlags::UnorderedAccess))
             FALCOR_THROW("Trying to bind texture '{}' created without UnorderedAccess flag as a UAV.", pTexture->getName());
         auto pUAV = pTexture ? pTexture->getUAV() : nullptr;
+        if (isBound(mUAVs, gfxOffset, pUAV))
+            return;
         mpShaderObject->setResource(gfxOffset, pUAV ? pUAV->getGfxResourceView() : nullptr);
         mUAVs[gfxOffset] = pUAV;
         mResources[gfxOffset] = pTexture;
@@ -563,6 +582,8 @@ void ParameterBlock::setTexture(const BindLocation& bindLocation, const ref<Text
         if (pTexture && !is_set(pTexture->getBindFlags(), ResourceBindFlags::ShaderResource))
             FALCOR_THROW("Trying to bind texture '{}' created without ShaderResource flag as an SRV.", pTexture->getName());
         auto pSRV = pTexture ? pTexture->getSRV() : nullptr;
+        if (isBound(mSRVs, gfxOffset, pSRV))
+            return;
         mpShaderObject->setResource(gfxOffset, pSRV ? pSRV->getGfxResourceView() : nullptr);
         mSRVs[gfxOffset] = pSRV;
         mResources[gfxOffset] = pTexture;
@@ -716,6 +737,8 @@ void ParameterBlock::setSampler(const BindLocation& bindLocation, const ref<Samp
     {
         gfx::ShaderOffset gfxOffset = getGFXShaderOffset(bindLocation);
         const ref<Sampler>& pBoundSampler = pSampler ? pSampler : mpDevice->getDefaultSampler();
+        if (const auto it = mSamplers.find(gfxOffset); it != mSamplers.end() && it->second == pBoundSampler)
+            return;
         mSamplers[gfxOffset] = pBoundSampler;
         FALCOR_GFX_CALL(mpShaderObject->setSampler(gfxOffset, pBoundSampler->getGfxSamplerState()));
     }
@@ -807,9 +830,44 @@ bool ParameterBlock::prepareDescriptorSets(CopyContext* pCopyContext)
     {
         prepareResource(pCopyContext, srv.second ? srv.second->getResource() : nullptr, false);
     }
+    // As prepareResource for each UAV, but the automatic UAV barriers recorded in one batch per resource type rather than one call
+    // each. MEASURED (HSTRCloud, 4K Intel sea): ~80 UAVs bound per dispatch, so ~80 barrier calls per dispatch.
+    static thread_local std::vector<gfx::IBufferResource*> uavBuffers;
+    static thread_local std::vector<gfx::ITextureResource*> uavTextures;
+    uavBuffers.clear();
+    uavTextures.clear();
     for (auto& uav : mUAVs)
     {
-        prepareResource(pCopyContext, uav.second ? uav.second->getResource() : nullptr, true);
+        Resource* pResource = uav.second ? uav.second->getResource() : nullptr;
+        if (!pResource)
+            continue;
+        const Buffer* pBuffer = pResource->asBuffer().get();
+        if (pBuffer && pBuffer->getUAVCounter())
+        {
+            pCopyContext->resourceBarrier(pBuffer->getUAVCounter().get(), Resource::State::UnorderedAccess);
+            pCopyContext->uavBarrier(pBuffer->getUAVCounter().get());
+        }
+        if (is_set(pResource->getBindFlags(), ResourceBindFlags::AccelerationStructure))
+            continue;
+        if (pCopyContext->resourceBarrier(pResource, Resource::State::UnorderedAccess) || !pCopyContext->getAutoUavBarriers())
+            continue;
+        if (pResource->getType() == Resource::Type::Buffer)
+            uavBuffers.push_back(static_cast<gfx::IBufferResource*>(pResource->getGfxResource()));
+        else
+            uavTextures.push_back(static_cast<gfx::ITextureResource*>(pResource->getGfxResource()));
+    }
+    if (!uavBuffers.empty() || !uavTextures.empty())
+    {
+        auto resourceEncoder = pCopyContext->getLowLevelData()->getResourceCommandEncoder();
+        if (!uavBuffers.empty())
+            resourceEncoder->bufferBarrier(
+                gfx::GfxCount(uavBuffers.size()), uavBuffers.data(), gfx::ResourceState::UnorderedAccess, gfx::ResourceState::UnorderedAccess
+            );
+        if (!uavTextures.empty())
+            resourceEncoder->textureBarrier(
+                gfx::GfxCount(uavTextures.size()), uavTextures.data(), gfx::ResourceState::UnorderedAccess, gfx::ResourceState::UnorderedAccess
+            );
+        pCopyContext->setPendingCommands(true);
     }
     for (auto& subObj : this->mParameterBlocks)
     {

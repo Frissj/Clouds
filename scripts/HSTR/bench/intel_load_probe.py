@@ -64,6 +64,43 @@ def capture(label):
 
 PHASES = os.environ.get("HSTR_PHASES", "12")
 
+if "4" in PHASES:
+    # Phase 4: what a viewer sees, the wall time of each renderFrame with the profiler off (frames in flight overlap CPU and GPU,
+    # so this is about max(CPU, GPU) plus waits). Park, turn 180 degrees in 20 frames, park 240 frames while it streams in.
+    fly(290, 0.0, 0.0)
+    before = hstr.properties.get("cloudStats", {})
+    walls = []
+    for frames, yaw in ((10, 0.0), (20, math.pi / 20), (240, 0.0)):
+        for _ in range(frames):
+            t0 = time.perf_counter()
+            fly(1, 0.0, yaw)
+            walls.append((time.perf_counter() - t0) * 1000.0)
+    after = hstr.properties.get("cloudStats", {})
+    frames4 = max(1, after.get("executeFrames", 0) - before.get("executeFrames", 0))
+    print(f"PROBE phase4 bindRenderer: {(after.get('bindCpuMs', 0) - before.get('bindCpuMs', 0)) / frames4:.3f} ms a frame, "
+          f"{(after.get('bindCalls', 0) - before.get('bindCalls', 0)) / frames4:.1f} calls a frame", flush=True)
+    for lo, hi in ((0, 10), (10, 30), (30, 110), (110, 190), (190, 270)):
+        v = sorted(walls[lo:hi])
+        print(f"PROBE phase4 wall frames {lo}-{hi}: mean {sum(v) / len(v):.2f} ms, p50 {v[len(v) // 2]:.2f}, p95 {v[min(len(v) - 1, int(0.95 * len(v)))]:.2f}, "
+              f"max {v[-1]:.2f}, over 16.7 ms {sum(x > 16.7 for x in v)}, over 8.3 ms {sum(x > 8.3 for x in v)}", flush=True)
+    print(f"PROBE   {stats_line()}", flush=True)
+    capture("phase4End")
+
+if "5" in PHASES:
+    # Phase 5: the vertical line down the screen centre after a 180 degree turn (the octahedral fold: moving it with beamOctAxis
+    # removed the line). Captures with the camera where it is and moved 0.37 units in x: a line that goes is rays lying exactly
+    # in a plane (the fold's lattice points have an exact zero x component).
+    print(f"PROBE phase5 start position {START_POSITION.x:.4f} {START_POSITION.y:.4f} {START_POSITION.z:.4f}, "
+          f"view {START_VIEW.x:.4f} {START_VIEW.y:.4f} {START_VIEW.z:.4f}", flush=True)
+    fly(290, 0.0, 0.0)
+    fly(20, 0.0, math.pi / 20)
+    fly(120, 0.0, 0.0)
+    capture("seamX0")
+    START_POSITION.x += 0.37
+    fly(120, 0.0, 0.0)
+    capture("seamX037")
+    START_POSITION.x -= 0.37
+
 if "3" in PHASES:
     # Phase 3: the change list's cost parked while a turn's new view streams in, within one window: the frames that listed changes
     # (the invalidate scope ran) against those that did not. Park, turn 180 degrees in 20 frames, park 240 frames while it streams.
@@ -96,8 +133,35 @@ if "3" in PHASES:
     paths = {name.rsplit("/", 1)[0] for name in capture3["events"]}
     leaves = {p for p in paths if not any(q.startswith(p + "/") for q in paths)}
     ok_frames = [i for i in range(len(frame)) if ok(frame[i])]
+    frame_cpu = records("/onFrameRender/cpu_time")
+    def leaf_sum(kind, i):
+        return sum(lane["records"][i] for name, lane in capture3["events"].items()
+                   if name.endswith(kind) and name.rsplit("/", 1)[0] in leaves and i < len(lane["records"]) and ok(lane["records"][i]))
+    # Frame GPU time against the sum of its leaf GPU scopes: a large gap is the GPU idle inside the frame (waiting on the CPU).
+    for lo, hi in ((30, 110), (110, 190), (190, 270)):
+        idx = [i for i in range(lo, min(hi, len(frame))) if ok(frame[i])]
+        mean = lambda v: sum(v) / len(v) if v else float("nan")
+        print(f"PROBE phase3 frames {lo}-{hi}: frame gpu {mean([frame[i] for i in idx]):.2f}, gpu leaves {mean([leaf_sum('gpu_time', i) for i in idx]):.2f}, "
+              f"frame cpu {mean([frame_cpu[i] for i in idx if i < len(frame_cpu) and ok(frame_cpu[i])]):.2f}, "
+              f"cpu leaves {mean([leaf_sum('cpu_time', i) for i in idx]):.2f}", flush=True)
+    # Self time (a scope minus its direct children) averaged over the streaming frames, and over the 10 worst of them: work
+    # recorded directly in a parent scope, and the idle GPU inside a scope, land on that scope rather than vanishing.
+    def self_times(kind, idx):
+        total = {name.rsplit("/", 1)[0]: sum(lane["records"][i] for i in idx if i < len(lane["records"]) and ok(lane["records"][i])) / len(idx)
+                 for name, lane in capture3["events"].items() if name.endswith(kind)}
+        children = {}
+        for p in total:
+            parent = p.rsplit("/", 1)[0]
+            if parent in total:
+                children[parent] = children.get(parent, 0.0) + total[p]
+        return sorted(((total[p] - children.get(p, 0.0), p.split("HSTRCloud/", 1)[-1]) for p in total), reverse=True)
+    streaming = [i for i in range(30, len(frame)) if ok(frame[i])]
+    for label, idx in (("streaming mean", streaming), ("10 worst", sorted(streaming, key=lambda i: frame[i], reverse=True)[:10])):
+        for kind in ("gpu_time", "cpu_time"):
+            print(f"PROBE self {kind[:3]} {label}: " + ", ".join(f"{n} {v:.2f}" for v, n in self_times(kind, idx)[:30]), flush=True)
     for i in sorted(ok_frames, key=lambda i: frame[i], reverse=True)[:4]:
-        print(f"PROBE   worst frame {i}: {frame[i]:.2f} ms listing {marks[i]}", flush=True)
+        print(f"PROBE   worst frame {i}: {frame[i]:.2f} ms listing {marks[i]}, gpu leaves {leaf_sum('gpu_time', i):.2f}, "
+              f"frame cpu {frame_cpu[i] if i < len(frame_cpu) else float('nan'):.2f}, cpu leaves {leaf_sum('cpu_time', i):.2f}", flush=True)
         for kind in ("gpu_time", "cpu_time"):
             scopes = sorted(((lane["records"][i], name.rsplit("/", 1)[0].split("HSTRCloud/", 1)[-1])
                              for name, lane in capture3["events"].items()
