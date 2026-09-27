@@ -37,3 +37,14 @@
 *.bak
 *.swp
 Clouds-hstr.bundle
+
+# Intel cloud sources, intermediate caches and compiled release assets stay local.
+/IntelSea/cache*/
+/IntelSea/full/
+/IntelSea/half/
+/IntelSea/releases/
+/data/HSTR/IntelSea/
+*.hstrcloud
+*.hstrcloud.partial
+*.hstrlib
+*.hstrlib.partial

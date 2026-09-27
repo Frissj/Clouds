@@ -4,7 +4,7 @@
 /** Offline compiler of an OpenVDB cloud library into HSTR cloud packages, one file per cloud (see CloudFormat.h), in two stages so
     that everything after reading the source is repeatable without it.
 
-    HSTRCloudCompiler build <vdb directory> <cache directory>
+    HSTRCloudCompiler build <vdb directory> <cache directory> [--half-resolution]
         Once per source cloud (skipped while the VDB is unchanged): its canonical cache <cloud>.hstrcloud holds the source's true
         level-0 brick samples (lossless at the atlas's precision), the means of the coarse levels, the proxies and the density hash.
 
@@ -17,7 +17,8 @@
         outside the cloud (over 26 directions), at least --weight-floor (default 0.01; 1: unweighted). The floor also protects
         cloud interiors for cameras flying through. --max-error caps every brick's unweighted error regardless of cost. The
         cloud's lambda is chosen by one of:
-        --quality E (the default, kDefaultQuality): per cloud, the largest lambda whose close-up transmittance error meets E. The
+        Default: fixed CodecSettings::lambda (1e-4), without a quality search.
+        --quality E (opt-in): per cloud, the largest lambda whose close-up transmittance error meets E. The
            error is measured on the encoded density itself, without rendering: every voxel column of the chunks on each axis
            integrates the reconstruction a close view renders against the truth, and |e^-tau_true - e^-tau_coded| is attenuated
            by the proxy's optical depth in front of the chunk. Its 99th percentile over --sample of the chunks meets E, and its
@@ -782,8 +783,9 @@ public:
     uint64_t densityHash = 0;
     uint64_t sourceBytes = 0;
 
-    void load()
+    void load(bool halfResolution = false)
     {
+        mSourceStride = halfResolution ? 2 : 1;
         openvdb::initialize();
         openvdb::io::File vdb(source.string());
         vdb.open();
@@ -794,11 +796,12 @@ public:
         if (!mGrid)
             throw std::runtime_error("no float grid in " + source.string());
         vdb.close();
-        entry.voxelWorld = float(mGrid->voxelSize()[0]);
+        entry.voxelWorld = float(mGrid->voxelSize()[0]) * float(mSourceStride);
         const openvdb::CoordBBox bbox = mGrid->evalActiveVoxelBoundingBox();
         auto floorTo = [](int32_t v) { return v >= 0 ? v / 128 * 128 : -((-v + 127) / 128) * 128; };
-        const int3 lo(floorTo(bbox.min().x()), floorTo(bbox.min().y()), floorTo(bbox.min().z()));
-        const int3 hi(floorTo(bbox.max().x() + 128), floorTo(bbox.max().y() + 128), floorTo(bbox.max().z() + 128));
+        auto reduced = [&](int32_t v) { return int32_t(std::floor(double(v) / mSourceStride)); };
+        const int3 lo(floorTo(reduced(bbox.min().x())), floorTo(reduced(bbox.min().y())), floorTo(reduced(bbox.min().z())));
+        const int3 hi(floorTo(reduced(bbox.max().x()) + 128), floorTo(reduced(bbox.max().y()) + 128), floorTo(reduced(bbox.max().z()) + 128));
         mOrigin = lo;
         mDims = uint3(hi - lo);
         if (any(mDims > uint3(8192)))
@@ -828,7 +831,8 @@ public:
         const auto& tree = mGrid->tree();
         for (auto leaf = tree.cbeginLeaf(); leaf; ++leaf)
         {
-            const openvdb::Coord o = leaf->origin() - origin;
+            const auto p = leaf->origin();
+            const openvdb::Coord o = openvdb::Coord(reduced(p.x()), reduced(p.y()), reduced(p.z())) - origin;
             bricks.push_back(BrickHeader::pack(uint3(o.x(), o.y(), o.z()) / 8u));
         }
         auto tile = tree.cbeginValueOn();
@@ -838,8 +842,8 @@ public:
             if (!tile.isTileValue() || !(*tile > 0.f))
                 continue;
             const openvdb::CoordBBox box = tile.getBoundingBox();
-            const uint3 b0 = uint3(max(int3(box.min().x(), box.min().y(), box.min().z()) - lo, int3(0))) / 8u;
-            const uint3 b1 = min(uint3(max(int3(box.max().x(), box.max().y(), box.max().z()) - lo, int3(0))) / 8u, mDims / 8u - 1u);
+            const uint3 b0 = uint3(max(int3(reduced(box.min().x()), reduced(box.min().y()), reduced(box.min().z())) - lo, int3(0))) / 8u;
+            const uint3 b1 = min(uint3(max(int3(reduced(box.max().x()), reduced(box.max().y()), reduced(box.max().z())) - lo, int3(0))) / 8u, mDims / 8u - 1u);
             for (uint32_t z = b0.z; z <= b1.z; ++z)
                 for (uint32_t y = b0.y; y <= b1.y; ++y)
                     for (uint32_t x = b0.x; x <= b1.x; ++x)
@@ -1664,8 +1668,17 @@ public:
                 for (int y = 0; y < 10; ++y)
                     for (int x = 0; x < 10; ++x)
                     {
-                        const float v = accessor.getValue(base + openvdb::Coord(x, y, z));
-                        const float value = std::isfinite(v) && v > 0.f ? v : 0.f;
+                        const openvdb::Coord p((base.x() + x) * mSourceStride, (base.y() + y) * mSourceStride, (base.z() + z) * mSourceStride);
+                        float value = 0.f;
+                        // Box-filter source density; doubling voxel size preserves the cloud's physical extent.
+                        for (int dz = 0; dz < mSourceStride; ++dz)
+                            for (int dy = 0; dy < mSourceStride; ++dy)
+                                for (int dx = 0; dx < mSourceStride; ++dx)
+                                {
+                                    const float v = accessor.getValue(p + openvdb::Coord(dx, dy, dz));
+                                    value += std::isfinite(v) && v > 0.f ? v : 0.f;
+                                }
+                        value /= float(mSourceStride * mSourceStride * mSourceStride);
                         maximum = std::max(maximum, value);
                         if (x >= 1 && x <= 8 && y >= 1 && y <= 8 && z >= 1 && z <= 8)
                             core[(x - 1) + 8 * ((y - 1) + 8 * (z - 1))] = value;
@@ -1696,6 +1709,7 @@ public:
 
 private:
     openvdb::FloatGrid::Ptr mGrid;
+    int mSourceStride = 1;
     int3 mOrigin = int3(0);
     uint3 mDims = uint3(0);
     uint3 mChunkDims = uint3(0);
@@ -1755,7 +1769,7 @@ void writeAnalysis(const std::filesystem::path& path, const std::unordered_map<s
 }
 
 /// Stage 1: the canonical cache of every VDB in the source directory whose cache is missing or from another source file.
-void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesystem::path& cacheDirectory)
+void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesystem::path& cacheDirectory, bool halfResolution = false)
 {
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> sources;
@@ -1774,7 +1788,8 @@ void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesy
         const uint64_t bytes = std::filesystem::file_size(source);
         sourceBytes += bytes;
         CanonicalHeader header;
-        if (std::filesystem::exists(path) && readCanonicalHeader(path, header) && header.sourceSignature == sourceSignature(source))
+        const uint64_t signature = halfResolution ? fnv(sourceSignature(source), 0x48414c4632ull) : sourceSignature(source);
+        if (std::filesystem::exists(path) && readCanonicalHeader(path, header) && header.sourceSignature == signature)
         {
             std::cout << source.stem().string() << ": canonical cache up to date\n";
             cacheBytes += std::filesystem::file_size(path);
@@ -1784,9 +1799,9 @@ void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesy
         std::cout << "building " << source.stem().string() << "\n";
         Asset asset;
         asset.source = source;
-        asset.signature = sourceSignature(source);
+        asset.signature = signature;
         asset.sourceBytes = bytes;
-        asset.load();
+        asset.load(halfResolution);
         asset.writeCanonical(path);
         asset.unload();
         cacheBytes += std::filesystem::file_size(path);
@@ -2137,13 +2152,14 @@ int main(int argc, char** argv)
     const std::string mode = argc > 1 ? argv[1] : "";
     if (argc < 4 || (mode != "build" && mode != "pack" && mode != "project"))
     {
-        std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory>\n"
+        std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory> [--half-resolution]\n"
                      "HSTRCloudCompiler project <cache.hstrcloud> <output prefix> [lambda]   (opacity images of the source density, or of its\n"
                      "                       reconstruction at lambda)\n"
                      "HSTRCloudCompiler pack <cache directory> <output directory> [--quality E [--quality-tail T] | --lambda L | --budget-mb N]\n"
                      "                       [--max-error E]\n"
                      "                       [--weight-floor F] [--density-scale S] [--transform haar|identity|cdf53|legacy] [--deadzone D]\n"
-                     "                       [--sample R] [--clouds a,b,...] [--dry-run] [--force]\n";
+                     "                       [--sample R] [--clouds a,b,...] [--dry-run] [--force]\n"
+                     "Default pack: fixed lambda 1e-4; quality search runs only with --quality/--quality-tail.\n";
         return 1;
     }
     if (mode == "project")
@@ -2168,7 +2184,9 @@ int main(int argc, char** argv)
     {
         try
         {
-            buildCaches(argv[2], argv[3]);
+            if (argc > 5 || (argc == 5 && std::string(argv[4]) != "--half-resolution"))
+                throw std::runtime_error("build accepts only --half-resolution");
+            buildCaches(argv[2], argv[3], argc == 5);
             return 0;
         }
         catch (const std::exception& e)
@@ -2186,6 +2204,7 @@ int main(int argc, char** argv)
     double sampleRate = 0.2;
     bool dryRun = false;
     bool force = false;
+    bool qualitySearch = false;
     CodecSettings codec;
     std::unordered_set<std::string> only;
     for (int i = 4; i < argc; ++i)
@@ -2206,9 +2225,15 @@ int main(int argc, char** argv)
         else if (option == "--lambda")
             fixedLambda = std::max(1e-12, std::stod(argv[++i]));
         else if (option == "--quality")
+        {
+            qualitySearch = true;
             quality = std::max(1e-6f, std::stof(argv[++i]));
+        }
         else if (option == "--quality-tail")
+        {
+            qualitySearch = true;
             tail = std::max(1e-6f, std::stof(argv[++i]));
+        }
         else if (option == "--max-error")
             codec.maxError = std::max(0.f, std::stof(argv[++i]));
         else if (option == "--weight-floor")
@@ -2255,11 +2280,13 @@ int main(int argc, char** argv)
         std::cerr << "--transform legacy needs --max-error (its v3 tolerance)\n";
         return 1;
     }
-    if (budgetMB > 0.0 && fixedLambda > 0.0)
+    if (int(budgetMB > 0.0) + int(fixedLambda > 0.0) + int(qualitySearch) > 1)
     {
-        std::cerr << "--budget-mb and --lambda are exclusive\n";
+        std::cerr << "--budget-mb, --lambda and --quality/--quality-tail are exclusive\n";
         return 1;
     }
+    if (!qualitySearch && budgetMB <= 0.0 && fixedLambda <= 0.0)
+        fixedLambda = codec.lambda;
     try
     {
         const auto start = std::chrono::steady_clock::now();

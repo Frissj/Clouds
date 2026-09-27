@@ -1,0 +1,149 @@
+{
+  "source": "https://dpel.aswf.io/intel-cloud-library/",
+  "sets": {
+    "full": [
+      {
+        "file": "intelCloudLib_dense.0.L.hstrlib",
+        "bytes": 67120252,
+        "sha256": "bda58d3dc23cb17199e702b269b9032113b378b0608eb63ddece63fcff80f78b",
+        "padded_dimensions": [
+          2688,
+          1664,
+          2304
+        ],
+        "voxel_world": 0.125,
+        "density_hash": "5a6810e8e1b72579",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.1.L.hstrlib",
+        "bytes": 61725644,
+        "sha256": "563337470bb08193ff1c18f2981da148c1fdbed06154db01c9f0ebd189a21abf",
+        "padded_dimensions": [
+          2688,
+          1664,
+          2304
+        ],
+        "voxel_world": 0.125,
+        "density_hash": "6cdcdbbbadfad037",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.037855152040719986
+      },
+      {
+        "file": "intelCloudLib_dense.2.L.hstrlib",
+        "bytes": 58336920,
+        "sha256": "7f97b6abd66a594402dbc78a018ba1c23a5ea119b84ffbc782ec819b2a1d7e86",
+        "padded_dimensions": [
+          2688,
+          1664,
+          2304
+        ],
+        "voxel_world": 0.1249999925494194,
+        "density_hash": "a076ad7655145edf",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.3.L.hstrlib",
+        "bytes": 58166892,
+        "sha256": "f43a5ba69f0537392a983a8266ea23493f85615ca50395f9810fa27722bc4e6a",
+        "padded_dimensions": [
+          2560,
+          1408,
+          2304
+        ],
+        "voxel_world": 0.125,
+        "density_hash": "3fc9b57e3ad5cf51",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.4.L.hstrlib",
+        "bytes": 62828664,
+        "sha256": "14870c8702e40d4ccef879a07847da7457f21ad7c5c403ab4fa44e65c68bc0e3",
+        "padded_dimensions": [
+          2560,
+          1536,
+          2432
+        ],
+        "voxel_world": 0.125,
+        "density_hash": "e264d46ad54e22bd",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      }
+    ],
+    "half": [
+      {
+        "file": "intelCloudLib_dense.0.L.hstrlib",
+        "bytes": 33954988,
+        "sha256": "629220175d82368b6386b636f76e91eaf06f7f64d7cc4147da21e49ff518f229",
+        "padded_dimensions": [
+          1408,
+          896,
+          1280
+        ],
+        "voxel_world": 0.25,
+        "density_hash": "0787fafdde8f6169",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.1.L.hstrlib",
+        "bytes": 31500108,
+        "sha256": "32f968ba5993020b4a73edcab2276f8b6be9a91e0f4b9a687313e76f8a49492b",
+        "padded_dimensions": [
+          1408,
+          896,
+          1280
+        ],
+        "voxel_world": 0.25,
+        "density_hash": "4207e844b64b1dc6",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.2.L.hstrlib",
+        "bytes": 29664604,
+        "sha256": "438dc78a5d5f5afef646acc0e128da90378e50e61f3e54f79f5633d237f897b6",
+        "padded_dimensions": [
+          1408,
+          896,
+          1280
+        ],
+        "voxel_world": 0.2499999850988388,
+        "density_hash": "0a4a0626b43ae1fb",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.3.L.hstrlib",
+        "bytes": 29510468,
+        "sha256": "aea3bde1cb0c1b236e986294ca07015724b95df3f91b0765decce3bec1604ab1",
+        "padded_dimensions": [
+          1280,
+          768,
+          1280
+        ],
+        "voxel_world": 0.25,
+        "density_hash": "7da9e048d6045437",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03651741147041321
+      },
+      {
+        "file": "intelCloudLib_dense.4.L.hstrlib",
+        "bytes": 31884520,
+        "sha256": "f3dd0999ab473b7dc5c848b6bb22f1440c3c5dcc58de4e8716b3f8f184d5463a",
+        "padded_dimensions": [
+          1280,
+          768,
+          1280
+        ],
+        "voxel_world": 0.25,
+        "density_hash": "a8053124003d31c0",
+        "lambda_value": 9.999999747378752e-05,
+        "compression_transmittance_error_p99": 0.03522694483399391
+      }
+    ]
+  }
+}
