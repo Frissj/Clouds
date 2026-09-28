@@ -177,10 +177,14 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mpOccupancy = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), brickCapacity * kCloudCellWords, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
     );
+    // The sun atlas has the density atlas' layout, sunPoolScale times deeper: slot s sits where density slot s would (cloudSlotOrigin),
+    // so the extra slots are extra layers and no lookup changes.
+    const uint32_t sunScale = std::clamp(mDesc.sunPoolScale, 1u, 3u);
+    const uint32_t sunSlots = slots * sunScale;
     mpSunAtlas = mpDevice->createTexture3D(
         mpAtlas->getWidth(),
         mpAtlas->getHeight(),
-        mpAtlas->getDepth(),
+        mpAtlas->getDepth() * sunScale,
         ResourceFormat::R16Float,
         1,
         nullptr,
@@ -190,10 +194,10 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mpSunBakes = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudSunBake), std::max(1u, mDesc.sunBakesPerFrame), readWrite, MemoryType::DeviceLocal, nullptr, false
     );
-    // As many sun slots as density slots: bricks baked for several orientations are few, and a brick short of a slot keeps the live
-    // march for that orientation.
-    for (uint32_t s = slots; s-- > 0;)
+    // sunPoolScale sun slots per density slot; a brick short of a slot keeps the live march for that orientation.
+    for (uint32_t s = sunSlots; s-- > 0;)
         mFreeSunSlots.push_back(s);
+    mSunSlotCount = sunSlots;
     mSunSlotTable.resize(size_t(brickCapacity) * 2 * kCloudSunBakesPerBrick);
     for (size_t k = 0; k < mSunSlotTable.size(); k += 2)
     {
@@ -402,10 +406,24 @@ void CloudResidency::releaseStore(uint32_t index)
     FALCOR_ASSERT(store.loaded == 0);
     if (store.kind != StoreKind::Coarse && !store.bricks.empty())
         --mPageStores;
+    // A store clears only a link that still points to it. A cut enqueued after the page it asked for arrived re-claims the entry
+    // (enqueue marks it pending, and the page loads again into a new store), so the old store no longer owns it; its chunk, seeing
+    // no pages, can be released and its index reused before it. Clearing unconditionally wrote kNone over the new store's link, or
+    // into the released chunk's empty directory: an access violation here under two-layer churn (every run that swept settings).
+    // MEASURED and REJECTED: refusing to claim a loaded target in enqueue instead also removed the crash, but changed what the cut
+    // refines - desired rose to the 243k atlas cap for one layer too (23k before), walks took 330 ms and the view never settled.
     if (store.kind == StoreKind::Chunk)
-        mAssets[store.asset].chunkStores[store.chunk] = kNone;
-    else if (store.kind == StoreKind::Page && store.parentStore != kNone)
-        mStores[store.parentStore]->pageStores[store.parentPage] = kNone;
+    {
+        uint32_t& link = mAssets[store.asset].chunkStores[store.chunk];
+        if (link == index)
+            link = kNone;
+    }
+    else if (store.kind == StoreKind::Page && store.parentStore < mStores.size())
+    {
+        std::vector<uint32_t>& directory = mStores[store.parentStore]->pageStores;
+        if (store.parentPage < directory.size() && directory[store.parentPage] == index)
+            directory[store.parentPage] = kNone;
+    }
     mpPayload->free(store.payloadWord, store.payloadBytes);
     const uint32_t generation = store.generation;
     mStores[index] = std::make_unique<Store>();
@@ -2239,6 +2257,7 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunFrame.info.classCount = uint32_t(mSunClasses.size());
         mGpuSunFrame.info.bakeMax = mDesc.sunBakesPerFrame;
         mGpuSunFrame.info.capacity = uint32_t(mSunSched.size());
+        mGpuSunFrame.info.sunSlots = mSunSlotCount;
         uploadSunChanges();
         return;
     }

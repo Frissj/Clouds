@@ -305,7 +305,7 @@ struct HSTRCloudSunFrame
     uint nodeResets;
     uint blockLength;
     float reachScale;  ///< World length of the sun reach (sunNearVoxels sea voxels); over a source voxel's world size, its voxels.
-    uint padSunFrame0;
+    uint sunSlots;     ///< Sun atlas slots: the free stack's bound (sunPoolScale times the GPU bricks).
     uint padSunFrame1;
 };
 

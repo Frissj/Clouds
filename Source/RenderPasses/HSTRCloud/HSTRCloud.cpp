@@ -278,10 +278,12 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
-        if (key == "skyModel" || key == "cloudSeaLayers" || key.rfind("atmosphere", 0) == 0)
+        if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key.rfind("atmosphere", 0) == 0)
         {
             if (key == "skyModel")
                 mParams.skyModel = value;
+            else if (key == "cloudSunPoolScale")
+                mCloudSunPoolScale = std::clamp(uint32_t(value), 1u, 3u);
             else if (key == "cloudSeaLayers")
                 mCloudSeaLayers = std::clamp(uint32_t(value), 1u, kCloudSeaLayers);
             else if (key == "atmosphereSunColor")
@@ -1090,7 +1092,9 @@ void HSTRCloud::setProperties(const Properties& props)
     auto cloudSettings = [&]()
     {
         return fmt::format(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            // The sun bake rate and pool are the residency's too: without them here a runtime change never rebuilt it (an arm set
+            // them and kept the old residency).
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             mCloudLibraryPath,
             mCloudProxyResolution,
             mCloudBrickPoolMB,
@@ -1099,6 +1103,8 @@ void HSTRCloud::setProperties(const Properties& props)
             mCloudSeaSeed,
             mCloudSeaCoverage,
             mCloudSeaLayers,
+            mCloudSunBakesPerFrame,
+            mCloudSunPoolScale,
             mCloudLodPixels,
             mCloudFadeFrames,
             mCloudVirtual
@@ -1292,6 +1298,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSeaSeed] = mCloudSeaSeed;
     props[kCloudSeaCoverage] = mCloudSeaCoverage;
     props["cloudSeaLayers"] = mCloudSeaLayers;
+    props["cloudSunPoolScale"] = mCloudSunPoolScale;
     props[kCloudLodPixels] = mCloudLodPixels;
     props[kCloudLodBias] = mParams.cloudLodBias;
     props[kCloudFadeFrames] = mCloudFadeFrames;
@@ -2463,14 +2470,15 @@ void HSTRCloud::buildCloudDomain()
         mCloudInstancesUploaded = false;
     }
     const std::string residencyKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         mCloudBrickPoolMB,
         mCloudBrickLoadsPerFrame,
         mCloudLodPixels,
         mCloudFadeFrames,
         mCloudPayloadPoolMB,
         mCloudDirectStorage,
-        mCloudSunBakesPerFrame
+        mCloudSunBakesPerFrame,
+        mCloudSunPoolScale
     );
     if (!mCloudVirtual)
         mpCloudResidency.reset();
@@ -2486,6 +2494,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.payloadPoolMB = mCloudPayloadPoolMB;
         residencyDesc.directStorage = mCloudDirectStorage;
         residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
+        residencyDesc.sunPoolScale = mCloudSunPoolScale;
         residencyDesc.gpuSun = mCloudGpuSun;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mResidencyPassesBound.clear();
@@ -3144,7 +3153,8 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     {
         const auto& stats = mpCloudResidency->getStats();
         logInfo(
-            "HSTRCloud: sea frame {}: {} desired, {} loaded, {} mapped, {} pending bricks, {} tiles pending, {:.0f} MB resident, cut {:.2f} ms.",
+            "HSTRCloud: sea frame {}: {} desired, {} loaded, {} mapped, {} pending bricks, {} tiles pending, {:.0f} MB resident, cut {:.2f} ms; "
+            "payload {:.0f} MB, {} page stores, {} committed this frame.",
             mCloudFrames,
             stats.desired,
             stats.loaded,
@@ -3152,7 +3162,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             stats.pending,
             mpCloudSea->pendingTiles(),
             stats.residentMB,
-            stats.cutMilliseconds
+            stats.cutMilliseconds,
+            stats.payloadMB,
+            stats.pagesLoaded,
+            stats.committed
         );
     }
 }

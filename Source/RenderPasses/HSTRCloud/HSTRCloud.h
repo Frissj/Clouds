@@ -692,6 +692,7 @@ private:
     uint64_t mSunPageChangedTotal = 0;   ///< ... tiles whose cloud changed (each re-suns the tiles it shadows too) ...
     uint64_t mSunPageQueuedTotal = 0;    ///< ... and tiles the sun-move queue released.
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
+    uint32_t mCloudSunPoolScale = 1;       ///< Sun atlas slots per density slot (CloudResidencyDesc::sunPoolScale).
     LazyComputePass mpBakeCloudSunPass;
     // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).
     bool mCloudGpuSun = true;

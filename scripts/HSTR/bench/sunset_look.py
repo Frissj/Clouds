@@ -48,7 +48,8 @@ def capture(label):
     m.frameCapture.capture()
 
 
-SUN_KEYS = ("desired", "mapped", "pending", "sunBaked", "sunWaiting", "sunSlotsFree", "sunStale", "sunBakesFrame")
+SUN_KEYS = ("desired", "mapped", "pending", "sunBaked", "sunWaiting", "sunSlotsFree", "sunStale", "sunBakesFrame", "cuts", "cutTotalMs",
+            "cutPops")
 
 
 def stats(tag):
@@ -80,7 +81,9 @@ for index, arm in enumerate(ARMS):
     hstr.set_properties(arm)
     tag = f"A{index}"
     print(f"LOOK {tag} = {arm}", flush=True)
-    for checkpoint in range(6):
+    # HSTR_LOOK_SETTLE_LATER: settle checkpoints (300 frames each) for arms after the first, which keep the settled sea when their
+    # properties do not rebuild it.
+    for checkpoint in range(6 if index == 0 else int(os.environ.get("HSTR_LOOK_SETTLE_LATER", "6"))):
         report(f"{tag} settle{checkpoint}", fly(300))
         stats(f"{tag} settle{checkpoint}")
     report(f"{tag} parked", fly(60))

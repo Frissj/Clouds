@@ -27,6 +27,9 @@ struct CloudResidencyDesc
     uint32_t payloadPoolMB = 128;  ///< GPU memory of the packed coefficients of resident pages.
     bool directStorage = true;     ///< Load page payloads with DirectStorage (GPU decompression where supported).
     uint32_t sunBakesPerFrame = 256; ///< Bricks whose sun depth bakeCloudSun bakes per frame.
+    /// Sun atlas slots per density slot (1-3): a brick is baked once per orientation class that uses it, so a sea of several classes
+    /// (the two-layer sea) or a long sun reach wants more bakes than bricks. 2 bytes a texel: ~528 MB per unit at a 256 MB pool.
+    uint32_t sunPoolScale = 1;
     bool gpuSun = false;             ///< Sun bakes are scheduled on the GPU (the scheduler passes of HSTRCloud.cs.slang).
 };
 
@@ -446,6 +449,7 @@ private:
     std::vector<uint32_t> mSunSlotTable;  ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun slot); key kCloudRefNone: not valid.
     std::vector<uint32_t> mSunBakeFrames; ///< Per pair: frame it was baked.
     std::vector<uint32_t> mFreeSunSlots;
+    uint32_t mSunSlotCount = 0; ///< Sun atlas slots (sunPoolScale times the density slots).
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.

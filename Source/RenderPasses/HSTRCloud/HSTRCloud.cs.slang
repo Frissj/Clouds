@@ -4156,7 +4156,7 @@ struct HSTRCloudRenderer
     {
         uint previous;
         InterlockedAdd(hstrCloudSunFreeTop[0], 0xFFFFFFFFu, previous);
-        if (previous == 0u || previous > sunFrame().capacity)
+        if (previous == 0u || previous > sunFrame().sunSlots)
         {
             uint unused;
             InterlockedAdd(hstrCloudSunFreeTop[0], 1u, unused);
