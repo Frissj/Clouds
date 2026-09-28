@@ -2053,7 +2053,7 @@ void CloudResidency::markChanged(uint32_t assetID, const BrickHeader& record)
     {
         // stampSunChanges applies it on the GPU.
         auto pack = [](uint3 c) { return c.x | (c.y << 10) | (c.z << 20); };
-        mSunChanges.push_back({assetID, pack(cellLo), pack(cellHi - 1u)});
+        mSunChanges.push_back({assetID, pack(cellLo), pack(cellHi - 1u), record.level});
         return;
     }
     for (uint32_t z = cellLo.z; z < cellHi.z; ++z)
@@ -2255,9 +2255,11 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunRan = true;
         mGpuSunFrame.info.releaseCount = releases;
         mGpuSunFrame.info.classCount = uint32_t(mSunClasses.size());
-        mGpuSunFrame.info.bakeMax = mDesc.sunBakesPerFrame;
+        mGpuSunFrame.info.bakeMax = mSunBakesCap > 0 ? std::min(mSunBakesCap, mDesc.sunBakesPerFrame) : mDesc.sunBakesPerFrame;
         mGpuSunFrame.info.capacity = uint32_t(mSunSched.size());
         mGpuSunFrame.info.sunSlots = mSunSlotCount;
+        mGpuSunFrame.info.keepStale = mSunKeepStale ? 1u : 0u;
+        mGpuSunFrame.info.levelStamps = mSunLevelStamps ? 1u : 0u;
         uploadSunChanges();
         return;
     }

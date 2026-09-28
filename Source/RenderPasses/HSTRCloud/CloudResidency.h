@@ -162,6 +162,12 @@ public:
     bool cutInFlight() const { return mCutJob.valid(); }
     /// Whether advanceCloudFades has fades to run this frame, and what it binds.
     bool fadesRunning() const { return mActiveFades > 0; }
+    /// Whether an outdated sun bake keeps answering until it rebakes in place (HSTRCloudSunFrame::keepStale).
+    void setSunKeepStale(bool keep) { mSunKeepStale = keep; }
+    /// Bakes staged a frame at most, under CloudResidencyDesc::sunBakesPerFrame (the buffers' size); 0: that many.
+    void setSunBakesCap(uint32_t cap) { mSunBakesCap = cap; }
+    /// Whether a mapping change outdates only the bakes of its brick's level or finer (HSTRCloudSunFrame::levelStamps).
+    void setSunLevelStamps(bool levelStamps) { mSunLevelStamps = levelStamps; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
@@ -450,6 +456,9 @@ private:
     std::vector<uint32_t> mSunBakeFrames; ///< Per pair: frame it was baked.
     std::vector<uint32_t> mFreeSunSlots;
     uint32_t mSunSlotCount = 0; ///< Sun atlas slots (sunPoolScale times the density slots).
+    bool mSunKeepStale = true;
+    uint32_t mSunBakesCap = 0;
+    bool mSunLevelStamps = true;
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.

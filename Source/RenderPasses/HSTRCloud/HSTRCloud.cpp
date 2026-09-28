@@ -427,6 +427,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunAncestors = uint32_t(value);
             continue;
         }
+        if (key == "cloudSunKeepStale")
+        {
+            mCloudSunKeepStale = bool(value);
+            continue;
+        }
+        if (key == "cloudSunBakesCap")
+        {
+            mCloudSunBakesCap = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunBakesMoving")
+        {
+            mCloudSunBakesMoving = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunLevelStamps")
+        {
+            mCloudSunLevelStamps = bool(value);
+            continue;
+        }
         if (key == "cloudSunResolveAlways")
         {
             mSunResolveAlways = bool(value);
@@ -1344,6 +1364,10 @@ Properties HSTRCloud::getProperties() const
     props[kCloudLongitudinalOracle] = mParams.cloudLongitudinalOracle;
     props[kCloudOracleCentroid] = mParams.cloudOracleCentroid != 0;
     props[kCloudSunLiveMarch] = mCloudSunLiveMarch;
+    props["cloudSunKeepStale"] = mCloudSunKeepStale;
+    props["cloudSunBakesCap"] = mCloudSunBakesCap;
+    props["cloudSunBakesMoving"] = mCloudSunBakesMoving;
+    props["cloudSunLevelStamps"] = mCloudSunLevelStamps;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
     props[kCloudGpuSun] = mCloudGpuSun;
@@ -3012,6 +3036,22 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
     // 100 ms a frame on the sea - and while the GPU waits it drops to a lower power state, so its moving-camera timings measured
     // the laptop's power management at five times the settled cost rather than the frame.
+    mpCloudResidency->setSunKeepStale(mCloudSunKeepStale);
+    mpCloudResidency->setSunLevelStamps(mCloudSunLevelStamps);
+    // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
+    // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
+    // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
+    // frame, walk 8.96 / 7.65 / 7.14 ms, sprint 14.09 / 10.43 / 10.64; bakeCloudSun 1.27 / 0.22 / 0.06 ms, the dirty march
+    // 4.94 / 5.39 / 5.58 ms (within the arms' spread). At 256 always, the two-layer sea's load backlog never drained (1871ae53).
+    const float3 cameraPosition = camera->getPosition();
+    const float3 cameraTarget = camera->getTarget();
+    const bool cameraMoved = any(cameraPosition != mSunCapCamera[0]) || any(cameraTarget != mSunCapCamera[1]);
+    mSunCapCamera[0] = cameraPosition;
+    mSunCapCamera[1] = cameraTarget;
+    const uint32_t movingCap = cameraMoved ? mCloudSunBakesMoving : 0u;
+    mpCloudResidency->setSunBakesCap(
+        mCloudSunBakesCap > 0 && movingCap > 0 ? std::min(mCloudSunBakesCap, movingCap) : std::max(mCloudSunBakesCap, movingCap)
+    );
     if (!mCloudResidencyFrozen)
     {
         FALCOR_PROFILE(pRenderContext, "residency");

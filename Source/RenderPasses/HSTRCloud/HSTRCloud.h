@@ -734,6 +734,11 @@ private:
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
+    bool mCloudSunKeepStale = true;           ///< Outdated sun bakes answer until they rebake (CloudResidency::setSunKeepStale).
+    uint32_t mCloudSunBakesCap = 0;           ///< Runtime cap on sun bakes a frame under cloudSunBakesPerFrame; 0: none.
+    uint32_t mCloudSunBakesMoving = 256;      ///< Sun bakes a frame at most while the camera moves; 0: no cap.
+    float3 mSunCapCamera[2] = {};             ///< Last frame's camera position and target (the moving cap).
+    bool mCloudSunLevelStamps = true;         ///< A mapping change outdates only bakes of its level or finer (stampSunChange).
     bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
     LazyComputePass mpCameraPass;            ///< That entry point.
     LazyComputePass mpDecayWorldCachePass;

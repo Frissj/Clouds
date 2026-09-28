@@ -1,0 +1,228 @@
+# Why moving is slow on the sunset sea: SunsetCloudSea.py's graph exactly as the launcher runs it (two layers, residency live, sun
+# reach 8), headless. sea_motion.py cannot answer this: it freezes residency and runs one layer. One settle, then per motion (+z,
+# units a frame): a live flight with per-frame wall times and counter deltas, a profiled live flight (GPU and CPU leaf scopes), and
+# arms alternating every CHUNK frames along one continued path: live, residency frozen, beam stream invalidation off.
+# Usage: Mogwai.exe --headless --script=scripts/HSTR/bench/sunset_motion.py
+#   HSTR_RES=WxH, HSTR_MOTION_SPEEDS=comma list of units a frame (default "2,20"), HSTR_MOTION_SETTLE=settle frames (default 1800).
+import os
+import time
+from pathlib import Path
+from falcor import *
+
+root = Path(__file__).resolve().parents[3]
+launcher = root / "scripts" / "HSTR" / "SunsetCloudSea.py"
+exec(launcher.read_text(), {**globals(), "__file__": str(launcher)})
+m.resizeFrameBuffer(*[int(v) for v in os.environ.get("HSTR_RES", "3840x2160").split("x")])
+hstr = m.activeGraph.getPass("HSTRCloud")
+# HSTR_MOTION_PROPS: a Python dict literal of HSTRCloud properties applied before the settle (e.g. {'skyModel': 0} for scoring, as
+# the quality gates run: the exact view and the beam resolve do not apply the aerial perspective alike).
+if os.environ.get("HSTR_MOTION_PROPS"):
+    hstr.set_properties(eval(os.environ["HSTR_MOTION_PROPS"]))
+SCORE = os.environ.get("HSTR_MOTION_SCORE", "0") != "0"
+if SCORE:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from sea_config import REFERENCE
+cam = m.scene.camera
+position = [float3(cam.position.x, cam.position.y, cam.position.z)]
+VIEW = float3(cam.target.x, cam.target.y, cam.target.z) - position[0]
+COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "seaTilesChanged", "sunBakeFrames",
+            "densityChangedFrames", "cuts", "cutTotalMs", "cutPops")
+LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
+          "beamMarchTiles", "bindCpuMs")
+CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))
+DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm's state.
+
+
+DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "beamWarpListed",
+         "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim")
+
+
+def score():
+    # sea_motion.py's step, without moving: the frame in flight is stored and compared with a frame of the same camera. SCORE 1: the
+    # exact per-pixel view (sea_config.REFERENCE) - on this sea it differs from the launcher's own settled beam by ~17% of pixels
+    # over 0.02 parked, so it cannot judge motion here. SCORE 2: the launcher's own beam view rebuilt from nothing at that camera
+    # (beamReset, then parked frames), i.e. what a parked camera shows there - the error that moving adds. Either way the beam
+    # history is dropped, so the next frames re-march everything.
+    fresh = os.environ.get("HSTR_MOTION_SCORE") == "2"
+    saved = {k: hstr.properties[k] for k in REFERENCE if k in hstr.properties}
+    hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
+    m.renderFrame()
+    s = dict(cloud_stats())
+    marched = float(hstr.properties["beamMarchedFraction"])
+    if fresh:
+        hstr.set_properties({"storeExact": False, "compareReference": False, "compareExact": False, "beamReset": True})
+        for _ in range(4):
+            m.renderFrame()
+    else:
+        hstr.set_properties(dict(REFERENCE, compareReference=False, compareExact=False))
+        m.renderFrame()
+    hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+    m.renderFrame()
+    p = hstr.properties
+    result = {"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]), "max": float(p["referenceLogMax"]),
+              "marched": marched, **{k: s.get(k) for k in DIRTY}}
+    hstr.set_properties(dict(saved, storeExact=False, compareReference=False, compareExact=False))
+    return result
+
+
+COUNT = int(os.environ.get("HSTR_MOTION_COUNT", "0"))
+
+
+def counted(frames, speed):
+    # The beam counters are read back only on compared frames (synchronous readbacks, so these frames are not timed): a short
+    # continued flight comparing each frame with whatever frame was stored, only for its dirty counts.
+    hstr.set_properties({"storeExact": True})
+    m.renderFrame()
+    hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+    rows = []
+    for _ in range(frames):
+        fly(1, speed)
+        s = cloud_stats()
+        rows.append(dict({k: s.get(k) for k in DIRTY if k != "beamFrameDim"}, marched=float(hstr.properties["beamMarchedFraction"]),
+                         marchTiles=s.get("beamMarchTiles")))
+    hstr.set_properties({"compareReference": False, "compareExact": False})
+    return rows
+
+
+def capture(label):
+    if os.environ.get("HSTR_MOTION_OUT"):
+        m.frameCapture.outputDir = os.environ["HSTR_MOTION_OUT"]
+        m.frameCapture.baseFilename = f"sunset_motion_{label}"
+        m.frameCapture.capture()
+
+
+def cloud_stats():
+    return hstr.properties.get("cloudStats", {})
+
+
+def fly(frames, speed, stats=False):
+    walls, per_frame = [], []
+    for _ in range(frames):
+        position[0] = position[0] + float3(0, 0, speed)
+        cam.position = position[0]
+        cam.target = position[0] + VIEW
+        t0 = time.perf_counter()
+        m.renderFrame()
+        walls.append((time.perf_counter() - t0) * 1000.0)
+        if stats:
+            per_frame.append(cloud_stats())
+    return walls, per_frame
+
+
+def summary(walls):
+    v = sorted(walls)
+    return f"mean {sum(v) / len(v):.2f} ms, p50 {v[len(v) // 2]:.2f}, p95 {v[int(0.95 * (len(v) - 1))]:.2f}, max {v[-1]:.2f}"
+
+
+def delta(before, after):
+    out = {}
+    for k in COUNTERS:
+        a, b = before.get(k), after.get(k)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            out[k] = round(b - a, 2)
+    return out
+
+
+def levels(s):
+    return {k: s.get(k) for k in LEVELS if k in s}
+
+
+def profile(tag, frames, speed):
+    m.profiler.enabled = True
+    m.profiler.start_capture()
+    fly(frames, speed)
+    capture = m.profiler.end_capture()
+    m.profiler.enabled = False
+    for kind in ("gpu_time", "cpu_time"):
+        lanes = {name: lane for name, lane in capture["events"].items() if name.endswith("/" + kind)}
+        paths = [name.rsplit("/", 1)[0] for name in lanes]
+        leaves = {n: l for n, l in lanes.items() if not any(p.startswith(n.rsplit("/", 1)[0] + "/") for p in paths)}
+        means = sorted(((sum(l["records"]) / max(len(l["records"]), 1), n) for n, l in leaves.items()), reverse=True)
+        frame = next((sum(l["records"]) / len(l["records"]) for n, l in lanes.items() if n.endswith("/onFrameRender/" + kind)), 0.0)
+        print(f"MOTION {tag} profiled frame {kind} {frame:.2f} ms; top leaves:", flush=True)
+        for value, name in means[:12]:
+            print(f"MOTION {tag}   {value:6.3f} ms  {name.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}", flush=True)
+
+
+# HSTR_MOTION_ARMS: a Python list literal of (name, property dict) pairs; the first is also the state of the live flights.
+ARMS = eval(os.environ.get("HSTR_MOTION_ARMS", "None")) or [
+    ("live", {"cloudResidencyFrozen": False, "beamInvalidate": True}),
+    ("frozen", {"cloudResidencyFrozen": True, "beamInvalidate": True}),
+    ("noInval", {"cloudResidencyFrozen": False, "beamInvalidate": False})]
+
+settle = int(os.environ.get("HSTR_MOTION_SETTLE", "1800"))
+for checkpoint in range(0, settle, 300):
+    if checkpoint == 300:
+        # Every arm's programs compile during the settle, not in a measured chunk.
+        for _, props in ARMS[::-1]:
+            hstr.set_properties(props)
+            fly(3, 0.0)
+    walls, _ = fly(300, 0.0)
+    print(f"MOTION settle{checkpoint // 300}: {summary(walls)} {levels(cloud_stats())}", flush=True)
+walls, _ = fly(60, 0.0)
+print(f"MOTION parked: {summary(walls)} {levels(cloud_stats())}", flush=True)
+profile("parked", 60, 0.0)
+if COUNT:
+    d = counted(COUNT, 0.0)
+    print(f"MOTION parked dirty per frame (counted): "
+          f"{ {k: round(sum(float(x.get(k) or 0) for x in d) / len(d), 1) for k in d[0]} }", flush=True)
+if SCORE:
+    print(f"MOTION parked quality {score()}", flush=True)
+    fly(30, 0.0)
+
+for speed in [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split(",")]:
+    tag = f"v{speed:g}"
+    before = cloud_stats()
+    walls, per_frame = fly(120, speed, stats=True)
+    print(f"MOTION {tag} live: {summary(walls)} counters {delta(before, per_frame[-1])} {levels(per_frame[-1])}", flush=True)
+    capture(f"{tag}_live")
+    # The ten worst frames with what the frame did.
+    prev = [before] + per_frame[:-1]
+    for i in sorted(range(len(walls)), key=lambda i: -walls[i])[:10]:
+        print(f"MOTION {tag}   frame {i}: {walls[i]:.2f} ms {delta(prev[i], per_frame[i])} {levels(per_frame[i])}", flush=True)
+    profile(f"{tag} live", 60, speed)
+    # Arms alternating along the continued path; the first DROP frames of each chunk carry the previous arm's backlog and are dropped.
+    arm_walls = {name: [] for name, _ in ARMS}
+    arm_counts = {name: {} for name, _ in ARMS}
+    arm_scores = {name: [] for name, _ in ARMS}
+    arm_dirty = {name: [] for name, _ in ARMS}
+    arm_levels = {name: [] for name, _ in ARMS}
+    for cycle in range(int(os.environ.get("HSTR_MOTION_CYCLES", "4"))):
+        for name, props in ARMS:
+            hstr.set_properties(props)
+            before = cloud_stats()
+            walls, _ = fly(CHUNK, speed)
+            arm_walls[name] += walls[DROP:]
+            for k, v in delta(before, cloud_stats()).items():
+                arm_counts[name][k] = round(arm_counts[name].get(k, 0) + v, 2)
+            arm_levels[name].append(levels(cloud_stats()))
+            if COUNT:
+                arm_dirty[name] += counted(COUNT, speed)
+            if SCORE:
+                arm_scores[name].append(score())
+    for name, _ in ARMS:
+        print(f"MOTION {tag} arm {name}: {summary(arm_walls[name])} counters {arm_counts[name]}", flush=True)
+        ends = arm_levels[name]
+        print(f"MOTION {tag} arm {name} chunk ends: " + str({k: round(sum(float(e.get(k) or 0) for e in ends) / len(ends))
+                                                             for k in ("sunWaiting", "sunStale", "desired", "mapped")}), flush=True)
+        if arm_dirty[name]:
+            d = arm_dirty[name]
+            means = {k: round(sum(float(x.get(k) or 0) for x in d) / len(d), 1) for k in d[0]}
+            print(f"MOTION {tag} arm {name} dirty per frame (counted, {len(d)} frames): {means}", flush=True)
+        if arm_scores[name]:
+            e = arm_scores[name]
+            print(f"MOTION {tag} arm {name} quality: >0.02 mean {100 * sum(x['over02'] for x in e) / len(e):.3f}% worst "
+                  f"{100 * max(x['over02'] for x in e):.3f}%, p99.9 {max(x['p999'] for x in e):.3g}, marched "
+                  f"{100 * sum(x['marched'] for x in e) / len(e):.1f}%; per score {e}", flush=True)
+    if os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0":
+        for name, props in ARMS:
+            hstr.set_properties(props)
+            fly(5, speed)
+            profile(f"{tag} arm {name}", 20, speed)
+    hstr.set_properties(ARMS[0][1])
+    # Back to parked: how long the backlog takes to drain.
+    for window in range(3):
+        walls, _ = fly(60, 0.0)
+        print(f"MOTION {tag} parkedAfter{window}: {summary(walls)} {levels(cloud_stats())}", flush=True)
+exit()

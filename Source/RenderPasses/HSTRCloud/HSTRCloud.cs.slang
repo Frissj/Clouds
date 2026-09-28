@@ -374,7 +374,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrCloudSunCounters;          ///< kCloudSunCounters entries.
     RWStructuredBuffer<uint> hstrCloudSunHistogram;         ///< kCloudSunBins candidate bins, then kCloudSunBins holder bins.
     RWStructuredBuffer<uint> hstrCloudSunSelect;            ///< Candidate bin and count taken from it, holder bin and count, holders.
-    RWStructuredBuffer<uint> hstrCloudSunNeeds;             ///< Per GPU brick: classes needing a bake (bits 0-15).
+    RWStructuredBuffer<uint> hstrCloudSunNeeds;             ///< Per GPU brick: classes needing a bake (bits 0-15), stale pairs kept answering (bits 16-23).
     RWStructuredBuffer<float4> hstrCloudSunCandidates;      ///< (brick, class, priority, -), cloudSunBakeMax of them.
     RWStructuredBuffer<uint> hstrCloudSunHolders;           ///< Pairs whose slots move to candidates, cloudSunBakeMax of them.
     StructuredBuffer<uint> hstrCloudSunRelease;             ///< Bricks whose bakes are freed this frame (unloaded).
@@ -4229,7 +4229,13 @@ struct HSTRCloudRenderer
         const float3 hi = (float3(uint3(change.last & 1023u, (change.last >> 10) & 1023u, change.last >> 20)) + 1.f) * 32.f;
         const float reach = sunReach(change.asset);
         const uint epoch = frame.frame & 0xFFFFu;
-        const uint levels = min(asset.topLevel + 1u, kCloudSunFieldLevels);
+        // A level-L bake reads, at each point of its sweep, the brick of level max(L, the finest mapped there) (cloudAssetBrickAt
+        // climbs to L): a brick of a finer level than L mapping or unmapping never changes it. levelStamps stamps only the levels
+        // that can have read the changed brick, instead of every level whose sweep crosses its cells. Exact, but worth little:
+        // MEASURED (sunset_motion9, 4K sunset sea, arms alternating on one path) outdated bakes at walk's chunk ends 96k -> 82k,
+        // walk 9.14 -> 9.89 ms and sprint 13.93 -> 11.99 (within the arms' spread). Most of a flight's outdating is real: bricks
+        // of the bake's own level and coarser mapping and unmapping while the cut sits at the atlas cap.
+        const uint levels = min(min(asset.topLevel, frame.levelStamps != 0 ? change.level : 0xFFFFu) + 1u, kCloudSunFieldLevels);
         const uint classes = min(frame.classCount, kCloudSunClasses);
         // Levels >= 2: the blocks of the asset's pairs.
         for (uint c = 0; c < classes; ++c)
@@ -4261,6 +4267,12 @@ struct HSTRCloudRenderer
             for (uint level = 0; level < 2; ++level)
             {
                 const uint i = 2u * c + level;
+                if (level >= levels)
+                {
+                    firsts[i] = int3(1);
+                    lasts[i] = int3(0); // Empty: no bake of this level read the change.
+                    continue;
+                }
                 sunStampRange(lo, hi, sweep, level, int3(sunLevelDims(change.asset, level)), firsts[i], lasts[i]);
                 if (all(firsts[i] <= lasts[i]))
                 {
@@ -4346,6 +4358,7 @@ struct HSTRCloudRenderer
         uint needs = 0;
         uint baked = 0;
         uint waiting = 0;
+        uint staleMask = 0; // Pairs holding an outdated bake that still answers (keepStale).
         if (active)
         {
             // One field entry per bake: the brick's position in its class's block (levels >= 2) or in the node over its 32-voxel cell
@@ -4368,7 +4381,19 @@ struct HSTRCloudRenderer
                 const uint entry = fine ? sunFineEntry(fineNode, sunClass, level, brick) : block + position;
                 if (missing || sunEntryNewer(entry, hstrCloudSunFrames[base + k]))
                 {
-                    hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
+                    // keepStale: a bake whose neighbourhood was mapped or unmapped since keeps its key, so cloudSunSlotOf still
+                    // answers with it, and is counted as waiting; its rebake overwrites it in its own slot (assignSunBake). The change
+                    // is only which LOD of the same cloud the bake's sweep read. Dropped, the key sent every sample of the brick to
+                    // an ancestor (as outdated) and then to sunDepthAt's live march until the rebake: the assets' bricks are shared by
+                    // every instance, so any flight outdates hundreds of thousands of bakes (4K sunset sea, 2 layers, reach 8:
+                    // 300-500k waiting at 1024 bakes a frame; walk 25.1 ms against 9.5 with the live march compiled out).
+                    // MEASURED (sunset_motion.py, same process, arms alternating in 60-frame chunks, live march on): walk (2 units a
+                    // frame) 37.4 -> 11.3 ms wall, sprint (20) 63.4 -> 19.5; parked after the flights 16-21 -> 4.4-4.6 ms. Understated:
+                    // keys a drop chunk cleared stay cleared in the next keep chunk. No path-traced gate (no sunset reference).
+                    if (frame.keepStale != 0 && !missing)
+                        staleMask |= 1u << k;
+                    else
+                        hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
                     ++stale;
                 }
             }
@@ -4381,7 +4406,7 @@ struct HSTRCloudRenderer
                 const uint key = (frame.generation << 4) | c;
                 bool have = false;
                 for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
-                    have = have || hstrCloudSunSlotsOutput[2u * (base + k)] == key;
+                    have = have || (hstrCloudSunSlotsOutput[2u * (base + k)] == key && (staleMask & (1u << k)) == 0);
                 if (have)
                     ++baked;
                 else
@@ -4396,7 +4421,7 @@ struct HSTRCloudRenderer
         {
             const uint key = hstrCloudSunSlotsOutput[2u * (base + k)];
             const bool wanted = active && sunKeyWanted(key, s.flags);
-            held += wanted ? 1u : 0u;
+            held += wanted && (staleMask & (1u << k)) == 0 ? 1u : 0u; // An outdated pair is the rebake's own slot, not a holder.
             if (hstrCloudSunSlotsOutput[2u * (base + k) + 1u] != kCloudRefNone)
                 InterlockedAdd(hstrCloudSunHistogram[kCloudSunBins + sunHolderBin(wanted, inCut, s.priority)], 1u);
         }
@@ -4404,7 +4429,7 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrCloudSunHistogram[sunCandidateBin(s.priority)], 1u);
         else
             needs = 0;
-        hstrCloudSunNeeds[b] = needs;
+        hstrCloudSunNeeds[b] = needs | (staleMask << 16);
         if (baked > 0)
             InterlockedAdd(hstrCloudSunCounters[3], baked);
         if (waiting > 0)
@@ -4459,7 +4484,7 @@ struct HSTRCloudRenderer
         if (b >= frame.capacity)
             return;
         const SunSchedEntry s = sunSched(b);
-        const uint needs = hstrCloudSunNeeds[b];
+        const uint needs = hstrCloudSunNeeds[b] & 0xFFFFu;
         if (needs != 0)
         {
             const uint bin = sunCandidateBin(s.priority);
@@ -4536,10 +4561,21 @@ struct HSTRCloudRenderer
             const uint base = b * kCloudSunBakesPerBrick;
             uint chosen = kCloudRefNone;
             uint slot = kCloudRefNone;
+            // First the class's outdated bake (keepStale), rebaked in place so no second pair ever holds the same key.
+            const uint staleMask = hstrCloudSunNeeds[b] >> 16;
+            for (uint k = 0; k < kCloudSunBakesPerBrick && chosen == kCloudRefNone; ++k)
+            {
+                if ((staleMask & (1u << k)) != 0 && hstrCloudSunSlotsOutput[2u * (base + k) + 1u] != kCloudRefNone &&
+                    hstrCloudSunSlotsOutput[2u * (base + k)] != kCloudRefNone && (hstrCloudSunSlotsOutput[2u * (base + k)] & 15u) == sunClass)
+                {
+                    chosen = k;
+                    slot = hstrCloudSunSlotsOutput[2u * (base + k) + 1u];
+                }
+            }
             for (uint k = 0; k < kCloudSunBakesPerBrick && chosen == kCloudRefNone; ++k)
             {
                 const uint held = hstrCloudSunSlotsOutput[2u * (base + k) + 1u];
-                if (held != kCloudRefNone && !sunKeyWanted(hstrCloudSunSlotsOutput[2u * (base + k)], s.flags))
+                if (held != kCloudRefNone && (staleMask & (1u << k)) == 0 && !sunKeyWanted(hstrCloudSunSlotsOutput[2u * (base + k)], s.flags))
                 {
                     chosen = k;
                     slot = held;
@@ -10053,6 +10089,9 @@ struct HSTRCloudRenderer
             const HSTRCloudSunBake job = hstrCloudSunBakes[change - params.beamChangeInputs];
             if (job.slot == kCloudRefNone)
                 return; // Staged no bake.
+            // REJECTED (sunset_motion6, 4K sunset sea, same process): skipping this for a rebake that replaces an outdated bake kept
+            // answering (keepStale) - walk 8.81 -> 9.84 ms, parked after the flight unchanged (~5.8 ms: the backlog's bakes and
+            // scheduling, not these marks), and sprint frames 0.67% -> 33% of pixels over 0.02 against the same camera rebuilt.
             asset = job.asset;
             level = job.level;
             origin = job.origin;
@@ -12424,6 +12463,11 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
         const float3 x = start + (u + 0.5f * dt) * job.direction;
         CloudSample sample;
         float next = u + dt;
+        // REJECTED (sunset_bake_ab2, 4K sunset sea, parked, same pose): an ancestral bake - the brick where it holds x, else its
+        // nearest ancestor, so no mapping could ever outdate it - at 4.36% of pixels over 0.02 against the classic bake (p99.9 0.29,
+        // max 1.16) where rebaking classic again gave 3.38% (0.17, 0.62), and visibly: the low sun's sweep leaves its brick almost
+        // at once and reads the parent level, drawing a horizontal band per brick row on the lit faces (as 86fbecd9's coarse field
+        // did). The exact narrowing is what stampSunChange does instead: only changes at the bake's level or coarser outdate it.
         if (gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample))
         {
             stepVoxels = 0.5f * float(1u << sample.level);

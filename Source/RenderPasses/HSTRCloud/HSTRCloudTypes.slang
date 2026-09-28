@@ -306,7 +306,8 @@ struct HSTRCloudSunFrame
     uint blockLength;
     float reachScale;  ///< World length of the sun reach (sunNearVoxels sea voxels); over a source voxel's world size, its voxels.
     uint sunSlots;     ///< Sun atlas slots: the free stack's bound (sunPoolScale times the GPU bricks).
-    uint padSunFrame1;
+    uint keepStale;    ///< 1: a bake its neighbourhood's mapping outdated keeps answering until it rebakes in place (scanSunBakes).
+    uint levelStamps;  ///< 1: a change stamps only the bakes of its brick's level or finer (stampSunChange).
 };
 
 /// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed
@@ -338,6 +339,7 @@ struct HSTRCloudSunChange
     uint asset;
     uint first;
     uint last;
+    uint level; ///< Level of the brick that mapped or unmapped: only bakes of that level or finer read it (stampSunChange).
 };
 
 /// A brick staged for GPU reconstruction (see reconstructBrick in CloudFormat.h): parent prediction plus dequantised residual,
