@@ -62,8 +62,9 @@ def write_png(path, width, height, rows):
                 chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-args = [v for v in sys.argv[1:] if not v.startswith("--down=")]
+args = [v for v in sys.argv[1:] if not v.startswith("--")]
 down = int(next((v[7:] for v in sys.argv[1:] if v.startswith("--down=")), "1"))  # Box-average k x k pixels.
+up = int(next((v[5:] for v in sys.argv[1:] if v.startswith("--up=")), "1"))  # Nearest-neighbour k x k blow-up.
 out, x, y, w, h, scale = args[0], *map(int, args[1:5]), float(args[5])
 _, _, ca, a = read_png(args[6])
 b = read_png(args[7])[3] if len(args) > 7 else None
@@ -89,5 +90,7 @@ for j in range(y, y + h, down):
         else:
             pb = pixel(b, cb, i, j)
             row += bytes(min(255, int(abs(p - q) * scale)) for p, q in zip(pa, pb))
-    rows.append(row)
-write_png(out, w // down, h // down, rows)
+    if up > 1:
+        row = bytearray(b"".join(bytes(row[k:k + 3]) * up for k in range(0, len(row), 3)))
+    rows.extend([row] * up)
+write_png(out, w // down * up, h // down * up, rows)

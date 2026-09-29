@@ -1410,6 +1410,18 @@ struct HSTRCloudParams
     uint cloudLayers = 1;
     float skyPad1 = 0.f;
     float skyPad2 = 0.f;
+    /// DIAGNOSTIC (probePixel): the exact per-pixel view's march at this pixel writes one record per step to hstrProbeOutput.
+    uint probeX = 0xffffffffu;
+    uint probeY = 0xffffffffu;
+    uint probeCapacity = 0;
+    /// beamRimTaps: the lean march's longest density quadrature - a step holding density is read at up to this many evenly spaced
+    /// points, one per resident-brick voxel it spans (see marchBeamLean). 1: the midpoint alone.
+    uint beamRimTaps = 1;
+    /// The sun atlas holds cloudSunEncode's 8-bit code of the depth instead of the depth in source voxels (CloudResidencyDesc::sunAtlas8).
+    uint cloudSunAtlas8 = 0;
+    uint sunAtlasPad0 = 0;
+    uint sunAtlasPad1 = 0;
+    uint sunAtlasPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

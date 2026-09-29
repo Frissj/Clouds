@@ -564,6 +564,9 @@ private:
     bool mStoreExact = false;          ///< Copy the next frame into mpExactFrame.
     float mBeamMarchedFraction = -1.f; ///< Share of pixels the beam view marched per pixel, read with the comparison.
     ref<Buffer> mpTransferProbe;       ///< Entry-cell masks per (asset brick, direction class) and two counters (cloudTransferClasses).
+    ref<Buffer> mpProbe;               ///< DIAGNOSTIC (probePixel): one uint4 record per march step of the probed pixel.
+    float mCloudVisibilityFloor = 0.01f; ///< CloudView::visibilityFloor.
+    uint32_t mCloudTraceSlot = ~0u;      ///< DIAGNOSTIC: CloudResidency::mTraceSlot.
     uint32_t mTransferCrossings = 0;   ///< Brick crossings the last probed frame marched.
     uint32_t mTransferEntries = 0;     ///< Distinct entries a transfer cache would have had to produce for them.
     uint32_t mBeamLevelCounts[kBeamCountSlots] = {};    ///< Tiles entering each level, read with the comparison; the last is the

@@ -5,7 +5,11 @@
 
 REFERENCE = {
     "debugView": 8, "hstComponents": 15, "cloudSunCache": True, "minStepVoxels": 1, "maxStepVoxels": 1,
-    "cloudLongitudinalOracle": 0, "cloudOracleCentroid": False, "cloudZeroSkip": 8, "beamTemporal": False,
+    # Four density taps per step (one lighting per step): even at source-voxel steps a backlit rim's density rises ~25x inside one
+    # 0.4-unit step (minValue + range t^2 on a coarse brick), and one tap per step aliased it into per-pixel speckle along every
+    # sunset silhouette. MEASURED (sunset_oracle1, 4K start view): 0.074% of pixels over 0.02 changed, the speckle gone at full
+    # resolution; 4x finer steps did the same at four lightings per step, 10x removed the device (GPU timeout).
+    "cloudLongitudinalOracle": 4, "cloudOracleCentroid": False, "cloudZeroSkip": 8, "beamTemporal": False,
     "beamTileSize": 4, "beamLevels": 1, "beamTolerance": 0.05, "cloudThinDepth": 0.0, "cloudEmptySkip": True,
     "cloudTightReject": 0, "cloudCostProbe": 0, "cloudSunReuse": 0.0, "cloudMinTransmittance": 0.001,
     "cloudLocalStep": False, "cloudTrapezoid": False, "cloudSlabClamp": True, "beamSegments": 1,
@@ -16,6 +20,11 @@ REFERENCE = {
     "sunColumns": False, "sunOctavesHalf": False, "sunInvalidateAngle": 0.0,
     # Sweeps vary the lighting rate; the exact frame must not inherit an arm's.
     "lightingStride": 1,
+    # Steps at the resident brick's own voxels (the clamp's floor, cloudFineMinVoxels): at stepOpticalDepth 0.5 the majorant rule
+    # kept one-sea-voxel steps (~6 source voxels) in thin fringe, and the sunset's backlit single scattering aliased along every
+    # silhouette as hair and column stripes. MEASURED (4K sunset start view, 600-frame settle, sunset_edges4): 0.265% of pixels over
+    # 0.02 changed, the hair gone at full resolution.
+    "stepOpticalDepth": 0.001,
 }
 
 BEAM = {
@@ -54,6 +63,8 @@ BEAM = {
     # screen-space rectangle at beamTolerance 0.05 and no refresh; sweeps that want that set beamOct / beamRefFrame off.
     "beamRefFrame": True, "beamOct": True, "beamOctFull": False, "beamOctScale": 0.5, "beamGuard": True,
     "beamPrebuild": True, "beamScreenResidual": False, "beamSparse": False, "beamSparseCut": False, "beamQueue": False,
+    # REFERENCE marches at source-voxel steps; the beam keeps the default majorant rule.
+    "stepOpticalDepth": 0.5,
 }
 
 

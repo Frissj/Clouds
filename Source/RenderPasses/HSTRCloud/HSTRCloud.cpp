@@ -278,12 +278,23 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
-        if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key.rfind("atmosphere", 0) == 0)
+        if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
+            key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot")
         {
-            if (key == "skyModel")
+            if (key == "cloudTraceSlot")
+                mCloudTraceSlot = int(value) < 0 ? ~0u : uint32_t(int(value));
+            else if (key == "cloudVisibilityFloor")
+                mCloudVisibilityFloor = std::clamp(float(value), 0.f, 1.f);
+            else if (key == "probeX")
+                mParams.probeX = int(value) < 0 ? 0xffffffffu : uint32_t(int(value));
+            else if (key == "probeY")
+                mParams.probeY = int(value) < 0 ? 0xffffffffu : uint32_t(int(value));
+            else if (key == "skyModel")
                 mParams.skyModel = value;
             else if (key == "cloudSunPoolScale")
                 mCloudSunPoolScale = std::clamp(uint32_t(value), 1u, 3u);
+            else if (key == "cloudSunAtlas8")
+                mParams.cloudSunAtlas8 = bool(value) ? 1u : 0u;
             else if (key == "cloudSeaLayers")
                 mCloudSeaLayers = std::clamp(uint32_t(value), 1u, kCloudSeaLayers);
             else if (key == "atmosphereSunColor")
@@ -575,6 +586,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamOverlapResolve")
         {
             mBeamOverlapResolve = bool(value);
+            continue;
+        }
+        if (key == "beamRimTaps")
+        {
+            mParams.beamRimTaps = std::clamp(uint32_t(value), 1u, 16u);
             continue;
         }
         if (key == "beamWarpAuto")
@@ -1194,6 +1210,31 @@ Properties HSTRCloud::getProperties() const
     props[kSunRadiance] = mParams.sunRadiance;
     props[kSkyRadiance] = mParams.skyRadiance;
     props["skyModel"] = mParams.skyModel;
+    props["cloudVisibilityFloor"] = mCloudVisibilityFloor;
+    props["cloudTraceSlot"] = int(mCloudTraceSlot);
+    if (mpCloudResidency && mCloudTraceSlot != ~0u)
+        props["cutTrace"] = mpCloudResidency->walkTrace();
+    props["probeX"] = int(mParams.probeX);
+    props["probeY"] = int(mParams.probeY);
+    // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
+    if (mpProbe && mParams.probeX != 0xffffffffu)
+    {
+        const std::vector<uint4> raw = mpProbe->getElements<uint4>(0, mpProbe->getElementCount());
+        const uint32_t count = std::min(raw[0].x, uint32_t((raw.size() - 2) / 3));
+        std::string records;
+        for (uint32_t i = 0; i < count; ++i)
+            for (uint32_t k = 0; k < 3; ++k)
+            {
+                const uint4 r = raw[2 + 3 * i + k];
+                for (uint32_t c = 0; c < 4; ++c)
+                {
+                    float value;
+                    std::memcpy(&value, &r[c], sizeof(float));
+                    records += fmt::format("{:.6g},", value);
+                }
+            }
+        props["probeRecords"] = records;
+    }
     props["atmosphereSunColor"] = mAtmosphereSunColor;
     props["atmosphereSunIntensity"] = mAtmosphereSunIntensity;
     props["atmosphereWorldToKm"] = mAtmosphere.worldToKm;
@@ -1319,12 +1360,13 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSeaCoverage] = mCloudSeaCoverage;
     props["cloudSeaLayers"] = mCloudSeaLayers;
     props["cloudSunPoolScale"] = mCloudSunPoolScale;
+    props["cloudSunAtlas8"] = mParams.cloudSunAtlas8 != 0;
     props[kCloudLodPixels] = mCloudLodPixels;
     props[kCloudLodBias] = mParams.cloudLodBias;
     props[kCloudFadeFrames] = mCloudFadeFrames;
     props[kCloudVirtual] = mCloudVirtual;
     props[kCloudFineMinVoxels] = mParams.cloudFineMinVoxels;
-    props[kCloudEmptySkip] = mParams.cloudEmptySkip != 0;
+    props["beamRimTaps"] = mParams.beamRimTaps;    props[kCloudEmptySkip] = mParams.cloudEmptySkip != 0;
     props[kCloudSunTilesPerFrame] = mCloudSunTilesPerFrame;
     props[kCloudSunBakesPerFrame] = mCloudSunBakesPerFrame;
     props[kCloudSunBakeAngle] = mCloudSunBakeAngle;
@@ -1384,6 +1426,16 @@ Properties HSTRCloud::getProperties() const
         cloud["executeFrames"] = mExecuteFrames;
         cloud["desired"] = stats.desired;
         cloud["pending"] = stats.pending;
+        cloud["pendingQueued"] = stats.pendingParts.x;
+        cloud["pendingInFlight"] = stats.pendingParts.y;
+        cloud["pendingCompletions"] = stats.pendingParts.z;
+        cloud["pendingWaiting"] = stats.pendingParts.w;
+        cloud["arrivalsStored"] = stats.arrivalsStored;
+        cloud["arrivalsDropped"] = stats.arrivalsDropped;
+        cloud["arrivalsFailed"] = stats.arrivalsFailed;
+        cloud["storesReleased"] = stats.storesReleased;
+        cloud["payloadAllocFailed"] = stats.payloadAllocFailed;
+        cloud["releaseNowFrames"] = stats.releaseNowFrames;
         cloud["committed"] = stats.committed;
         cloud["slotsUsed"] = stats.slotsUsed;
         cloud["nodesUsed"] = stats.nodesUsed;
@@ -2494,7 +2546,7 @@ void HSTRCloud::buildCloudDomain()
         mCloudInstancesUploaded = false;
     }
     const std::string residencyKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         mCloudBrickPoolMB,
         mCloudBrickLoadsPerFrame,
         mCloudLodPixels,
@@ -2502,7 +2554,8 @@ void HSTRCloud::buildCloudDomain()
         mCloudPayloadPoolMB,
         mCloudDirectStorage,
         mCloudSunBakesPerFrame,
-        mCloudSunPoolScale
+        mCloudSunPoolScale,
+        mParams.cloudSunAtlas8
     );
     if (!mCloudVirtual)
         mpCloudResidency.reset();
@@ -2519,6 +2572,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.directStorage = mCloudDirectStorage;
         residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
         residencyDesc.sunPoolScale = mCloudSunPoolScale;
+        residencyDesc.sunAtlas8 = mParams.cloudSunAtlas8 != 0;
         residencyDesc.gpuSun = mCloudGpuSun;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mResidencyPassesBound.clear();
@@ -3008,6 +3062,8 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mParams.cloudPixelAngle = camera->getFrameHeight() / camera->getFocalLength() / float(std::max(1u, mParams.frameDim.y));
     view.pixelAngle = mParams.cloudPixelAngle;
     view.lodBias = mParams.cloudLodBias;
+    view.visibilityFloor = mCloudVisibilityFloor;
+    mpCloudResidency->mTraceSlot = mCloudTraceSlot;
     view.sunDirection = normalize(mParams.sunDirection);
     view.sunReach = (mParams.sunNearVoxels + 1.f) * mpCloudSea->getVoxelWorld();
     // Baked sun depth is valid for one sun direction, density scale and reach. Moving the sun more than cloudSunBakeAngle from the
@@ -4036,6 +4092,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrOccupancy"] = mpOccupancy;
     var["hstrMajorantZero"] = mpMajorantZero;
     var["hstrTransferProbeOutput"] = mpTransferProbe;
+    var["hstrProbeOutput"] = mpProbe;
     if (mpCloudResidency)
         mpCloudResidency->bind(var);
     if (mpCloudTileBatches)
@@ -5045,6 +5102,18 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mParams.referenceRowOffset = 0;
         ++mParams.referenceSamples;
         ++mParams.frameIndex;
+        // storeExact here keeps the path-traced average (what referenceShow put in color) as the exact frame, so a beam frame can
+        // be scored against it with compareExact: the share of pixels over 0.02, p99.9 and max, which the reference compare lacks.
+        if (mStoreExact)
+        {
+            if (!mpExactFrame || mpExactFrame->getWidth() != frameDim.x || mpExactFrame->getHeight() != frameDim.y ||
+                mpExactFrame->getFormat() != color->getFormat())
+                mpExactFrame = mpDevice->createTexture2D(
+                    frameDim.x, frameDim.y, color->getFormat(), 1, 1, nullptr, ResourceBindFlags::ShaderResource
+                );
+            pRenderContext->copyResource(mpExactFrame.get(), color.get());
+            mStoreExact = false;
+        }
         if (!mSaveReferencePath.empty())
         {
             saveReference(pRenderContext, mSaveReferencePath);
@@ -5397,6 +5466,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
     else
         mParams.cloudTransferWords = 0;
+
+    // DIAGNOSTIC (probePixel): element 0 counts records, each record is three uint4 from element 2.
+    if (mParams.probeX != 0xffffffffu)
+    {
+        if (!mpProbe)
+            mpProbe = mpDevice->createStructuredBuffer(
+                sizeof(uint4), 2 + 3 * 1024, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                nullptr, false
+            );
+        mParams.probeCapacity = 1024;
+        pRenderContext->clearUAV(mpProbe->getUAV().get(), uint4(0));
+    }
+    else
+        mParams.probeCapacity = 0;
 
     // Beam view: hierarchical tiles. Level 0 queries every coarsest tile corner and centre and tests every tile; each finer
     // level queries and tests only the children of the tiles refined above it, through compacted lists and indirect

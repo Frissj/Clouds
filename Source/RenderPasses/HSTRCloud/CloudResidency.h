@@ -14,6 +14,31 @@
 #include <tuple>
 #include <unordered_map>
 
+/// HSTR_CLOUD_STREAMING 0 (default): whole-library residency. Every chunk and level-2 page of every asset is read, decompressed and
+/// uploaded once when the residency is created (preloadLibrary), and kept: the cut only chooses which bricks to reconstruct into the
+/// atlas and map. The sea's instances all share a handful of assets (the Intel half sea: 5 clouds), so the whole library is small
+/// next to what streaming it saved, and streaming it failed on the sunset sea (2026-09-29):
+///   - Livelock: an async walk re-requested pages that arrived while it ran; enqueue re-claimed them (kPendingStore over the
+///     arrived store), the next walk asked again, and the same 256 pages loaded on every cut forever (48k requests a cut, the
+///     identical 256 accepted, ~6k pages stored and released unused per 300 frames). Nothing below them refined: level-3/4 bricks
+///     drawn where level 0 was wanted, the box-shaped haze in the path tracer, the exact march and the beam alike.
+///   - With that fixed (enqueue skips loaded targets): desired rose to the 243k atlas budget, but loads fed only when a ~350 ms
+///     walk is taken on (about every 60th frame) mapped ~6k bricks per 300 frames - 69k of 243k after 3000 frames - and the
+///     128 MB payload pool filled by frame ~900 (40k refused allocations by frame 3000).
+/// HSTR_CLOUD_STREAMING 1: the page streaming as it was (requests from the cut, enqueue, IO workers, DirectStorage or CPU GDeflate,
+/// arrivals into stores, release of unused stores), with the livelock fix and 1024 loads a cut. Options if streaming comes back:
+///   - Feed the IO queue every frame from the last walk's sorted requests instead of only when a walk is taken on. enqueue writes
+///     kPendingStore into the page links the running walk reads, so track pending in mLoading only (the walk never reads it).
+///   - Size the payload pool from demand: grow (allocate larger, copy, rebind) on sustained allocation failures up to a VRAM cap,
+///     or size it at creation from the payload bytes of the first unrationed walk's desired set.
+///   - Grow the atlas when the cut is rationed (walk.ordered) for several cuts, up to the 3D texture limit (~835k bricks at sun
+///     pool x1; 2048 texels deep).
+///   - Watchdog: warn when the same accepted request set repeats K cuts, or arrivals are released without ever being desired
+///     (both mean a livelock), and expose "settled" (nothing pending) in cloudStats for benchmarks and reference traces to wait on.
+#ifndef HSTR_CLOUD_STREAMING
+#define HSTR_CLOUD_STREAMING 0
+#endif
+
 namespace hstrcloud
 {
 struct CloudResidencyDesc
@@ -30,6 +55,8 @@ struct CloudResidencyDesc
     /// Sun atlas slots per density slot (1-3): a brick is baked once per orientation class that uses it, so a sea of several classes
     /// (the two-layer sea) or a long sun reach wants more bakes than bricks. 2 bytes a texel: ~528 MB per unit at a 256 MB pool.
     uint32_t sunPoolScale = 1;
+    /// 1 byte a texel instead of 2: the depth log-encoded (cloudSunEncode), so pool 3 costs less than pool 2 at 16 bits.
+    bool sunAtlas8 = false;
     bool gpuSun = false;             ///< Sun bakes are scheduled on the GPU (the scheduler passes of HSTRCloud.cs.slang).
 };
 
@@ -40,6 +67,7 @@ struct CloudView
     float4x4 viewProjection = float4x4::identity();
     float pixelAngle = 1e-3f; ///< World footprint of one pixel per unit distance.
     float lodBias = 0.f;      ///< Levels added to every footprint.
+    float visibilityFloor = 0.01f; ///< Least importance the proxy transmittance to a brick can give it (brickPriority).
     float3 sunDirection = float3(0.f, 1.f, 0.f);
     float sunReach = 0.f;     ///< World distance camera samples march towards the sun on fine density.
     float sunNearVoxels = 0.f;    ///< HSTRCloudParams::sunNearVoxels (0: no baked sun depth).
@@ -74,6 +102,13 @@ public:
         uint32_t mapped = 0;
         uint32_t desired = 0;
         uint32_t pending = 0;
+        uint4 pendingParts = uint4(0); ///< DIAGNOSTIC: pending as queued, in flight on the IO worker, completions, payload waits.
+        uint32_t arrivalsStored = 0;   ///< DIAGNOSTIC: loaded pages that became stores (cumulative).
+        uint32_t arrivalsDropped = 0;  ///< DIAGNOSTIC: loaded pages freed on arrival, their store no longer pending (cumulative).
+        uint32_t arrivalsFailed = 0;   ///< DIAGNOSTIC: loads that failed (cumulative).
+        uint32_t storesReleased = 0;   ///< DIAGNOSTIC: page and chunk stores released (cumulative).
+        uint32_t payloadAllocFailed = 0; ///< DIAGNOSTIC: load requests refused by a full payload pool (cumulative).
+        uint32_t releaseNowFrames = 0; ///< DIAGNOSTIC: frames that released every unused store at once (cumulative).
         uint32_t committed = 0;
         uint32_t slotsUsed = 0;
         uint32_t nodesUsed = 0;
@@ -329,6 +364,22 @@ private:
     uint32_t createStore(StoreKind kind, uint32_t asset, uint32_t chunk, DecodedPage page, uint64_t parentHandle, uint32_t payloadWord, uint32_t payloadBytes);
     void releaseStore(uint32_t store);
     void ioWorker();
+    /// Whole-library residency (HSTR_CLOUD_STREAMING 0): reads and decodes every chunk and level-2 page (in parallel over assets).
+    struct PreloadedPage
+    {
+        DecodedPage meta;
+        std::vector<uint8_t> payload;
+    };
+    struct PreloadedChunk
+    {
+        uint32_t chunk = 0;
+        DecodedPage meta;
+        std::vector<uint8_t> payload;
+        std::vector<PreloadedPage> pages; ///< In the order of meta.pages.
+    };
+    std::vector<std::vector<PreloadedChunk>> readLibrary(const std::vector<CloudAsset>& assets, uint64_t& payloadBytes) const;
+    /// Creates the chunk and page stores of readLibrary's pages, linked as arriving pages were, their payloads uploaded.
+    void createLibraryStores(std::vector<std::vector<PreloadedChunk>>& library);
     void enqueue(std::vector<Request> requests);
     void resetPending(const Request& request);
 
@@ -631,6 +682,22 @@ private:
     void cutWorker();
     std::thread mCutThread;
     std::mutex mCutMutex;
+public:
+    /// DIAGNOSTIC: the cut walk records every expansion in this instance slot (~0u: off); read with walkTrace().
+    uint32_t mTraceSlot = ~0u;
+    std::string walkTrace()
+    {
+        std::lock_guard lock(mTraceMutex);
+        std::string enqueues;
+        for (const std::string& line : mEnqueueTrace)
+            enqueues += line + "\n";
+        return mTrace + enqueues;
+    }
+private:
+    std::mutex mTraceMutex;
+    std::string mTrace;
+    std::vector<std::string> mEnqueueTrace;
+    std::string mTraceBuilding;
     std::condition_variable mCutWake;
     std::packaged_task<CutWalk()> mCutTask; ///< Guarded by mCutMutex.
     bool mCutQueued = false;

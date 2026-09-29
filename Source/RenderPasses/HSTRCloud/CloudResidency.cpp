@@ -56,7 +56,25 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mNodeBlocksDirty.assign((nodeCapacity + kNodeBlock - 1) / kNodeBlock, 0);
     mBrickBlocksDirty.assign((brickCapacity + kBrickBlock - 1) / kBrickBlock, 0);
 
+#if HSTR_CLOUD_STREAMING
     mpPayload = std::make_unique<CloudPayloadPool>(mpDevice, mDesc.files, mDesc.payloadPoolMB, mDesc.directStorage);
+#else
+    // Whole-library residency: the pool holds every page's payload (and the coarse pages), sized from the library itself.
+    const auto readStart = std::chrono::steady_clock::now();
+    uint64_t libraryBytes = 0;
+    std::vector<std::vector<PreloadedChunk>> library = readLibrary(assets, libraryBytes);
+    uint64_t coarseBytes = 0;
+    for (const CloudAsset& asset : assets)
+        coarseBytes += asset.coarsePayload.size();
+    // A word-aligned range per page plus a little slack for the allocator's rounding.
+    const uint64_t poolBytes = (libraryBytes + coarseBytes) * 101 / 100 + (4u << 20);
+    const uint32_t poolMB = std::max(mDesc.payloadPoolMB, uint32_t((poolBytes + (1u << 20) - 1) >> 20));
+    logInfo("HSTRCloud: whole cloud library resident: {:.1f} MB of page payloads ({:.1f} MB coarse), read in {:.1f} s; payload pool {} MB.",
+            double(libraryBytes) / (1 << 20), double(coarseBytes) / (1 << 20),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - readStart).count(), poolMB);
+    // DirectStorage is only used to stream; the library uploads from the CPU once.
+    mpPayload = std::make_unique<CloudPayloadPool>(mpDevice, mDesc.files, poolMB, false);
+#endif
     std::vector<HSTRCloudAsset> gpuAssets;
     uint32_t levelPageCount = 0;
     for (uint32_t a = 0; a < assets.size(); ++a)
@@ -114,6 +132,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     }
     if (mDirectory.empty())
         mDirectory.push_back(kCloudRefNone);
+#if !HSTR_CLOUD_STREAMING
+    createLibraryStores(library);
+#endif
     mInstances.resize(sea.getInstanceTiles().size());
     mTileForward.resize(sea.getInstanceTiles().size(), float3x3::identity());
 
@@ -185,7 +206,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mpAtlas->getWidth(),
         mpAtlas->getHeight(),
         mpAtlas->getDepth() * sunScale,
-        ResourceFormat::R16Float,
+        mDesc.sunAtlas8 ? ResourceFormat::R8Unorm : ResourceFormat::R16Float,
         1,
         nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
@@ -285,8 +306,10 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         sizeof(HSTRCloudStaging), uint32_t(mStagingInfo.size()), shaderResource, MemoryType::DeviceLocal, nullptr, false
     );
 
+#if HSTR_CLOUD_STREAMING
     for (uint32_t i = 0; i < std::max(1u, mDesc.ioThreads); ++i)
         mIoThreads.emplace_back([this] { ioWorker(); });
+#endif
     logInfo(
         "HSTRCloud: cloud residency with {} atlas bricks ({} MB), {} page nodes, {} directory entries.",
         slots,
@@ -400,10 +423,98 @@ uint32_t CloudResidency::createStore(
     return index;
 }
 
+std::vector<std::vector<CloudResidency::PreloadedChunk>> CloudResidency::readLibrary(const std::vector<CloudAsset>& assets,
+                                                                                    uint64_t& payloadBytes) const
+{
+    // One thread per asset, each with its own file handle; what the IO workers did per request, for every page at once.
+    std::vector<std::vector<PreloadedChunk>> library(assets.size());
+    std::vector<uint64_t> bytes(assets.size(), 0);
+    std::vector<std::future<void>> workers;
+    for (uint32_t a = 0; a < assets.size(); ++a)
+        workers.push_back(std::async(std::launch::async, [&, a]
+        {
+            const CloudAsset& asset = assets[a];
+            std::ifstream file(mDesc.files[asset.file], std::ios::binary);
+            std::vector<uint8_t> raw;
+            for (uint32_t c = 0; c < asset.chunks.size(); ++c)
+            {
+                const PageBlobs& blobs = asset.chunks[c];
+                if (blobs.meta.raw == 0)
+                    continue;
+                PreloadedChunk chunk;
+                chunk.chunk = c;
+                if (!readBlob(file, blobs.meta, raw) || !decodeMeta(raw, blobs.payload.raw, chunk.meta) ||
+                    (blobs.payload.raw > 0 && !readBlob(file, blobs.payload, chunk.payload)))
+                    FALCOR_THROW("HSTRCloud: corrupt chunk {} of cloud '{}'.", c, asset.name);
+                bytes[a] += chunk.payload.size();
+                for (const PageEntry& entry : chunk.meta.pages)
+                {
+                    PreloadedPage page;
+                    if (!readBlob(file, entry.blobs.meta, raw) || !decodeMeta(raw, entry.blobs.payload.raw, page.meta) ||
+                        (entry.blobs.payload.raw > 0 && !readBlob(file, entry.blobs.payload, page.payload)))
+                        FALCOR_THROW("HSTRCloud: corrupt page of chunk {} of cloud '{}'.", c, asset.name);
+                    bytes[a] += page.payload.size();
+                    chunk.pages.push_back(std::move(page));
+                }
+                library[a].push_back(std::move(chunk));
+            }
+        }));
+    for (auto& worker : workers)
+        worker.get();
+    payloadBytes = std::accumulate(bytes.begin(), bytes.end(), uint64_t(0));
+    return library;
+}
+
+void CloudResidency::createLibraryStores(std::vector<std::vector<PreloadedChunk>>& library)
+{
+    auto upload = [&](const std::vector<uint8_t>& payload)
+    {
+        if (payload.empty())
+            return CloudPayloadPool::kNone;
+        const uint32_t word = mpPayload->allocate(uint32_t(payload.size()));
+        if (word == CloudPayloadPool::kNone)
+            FALCOR_THROW("HSTRCloud: the payload pool cannot hold the whole cloud library.");
+        mpPayload->upload(word, payload);
+        return word;
+    };
+    for (uint32_t a = 0; a < library.size(); ++a)
+        for (PreloadedChunk& chunk : library[a])
+        {
+            // As a chunk page arriving (the chunk's level-4 brick in the coarse store is the parent of its level-3 bricks).
+            const uint32_t chunkBytes = uint32_t(chunk.payload.size());
+            const std::vector<PageEntry> entries = chunk.meta.pages;
+            const uint32_t chunkStore = createStore(StoreKind::Chunk, a, chunk.chunk, std::move(chunk.meta), mAssets[a].chunkBrick[chunk.chunk],
+                                                    upload(chunk.payload), chunkBytes);
+            mAssets[a].chunkStores[chunk.chunk] = chunkStore;
+            chunk.payload = {};
+            for (uint32_t p = 0; p < chunk.pages.size(); ++p)
+            {
+                // As a level-2 page arriving: its parent is the level-3 brick above it in the chunk store.
+                const uint3 parentCoord = BrickHeader{entries[p].coord}.brick() / 2u;
+                uint64_t parent = kNoHandle;
+                const Store& store = *mStores[chunkStore];
+                for (uint32_t b = 0; b < store.bricks.size(); ++b)
+                    if (all(store.bricks[b].record.brick() == parentCoord))
+                        parent = makeHandle(chunkStore, b);
+                if (parent == kNoHandle)
+                    continue;
+                PreloadedPage& page = chunk.pages[p];
+                const uint32_t pageBytes = uint32_t(page.payload.size());
+                const uint32_t pageStore =
+                    createStore(StoreKind::Page, a, chunk.chunk, std::move(page.meta), parent, upload(page.payload), pageBytes);
+                mStores[pageStore]->parentStore = chunkStore;
+                mStores[pageStore]->parentPage = p;
+                mStores[chunkStore]->pageStores[p] = pageStore;
+                page.payload = {};
+            }
+        }
+}
+
 void CloudResidency::releaseStore(uint32_t index)
 {
     Store& store = *mStores[index];
     FALCOR_ASSERT(store.loaded == 0);
+    ++mStats.storesReleased; // DIAGNOSTIC
     if (store.kind != StoreKind::Coarse && !store.bricks.empty())
         --mPageStores;
     // A store clears only a link that still points to it. A cut enqueued after the page it asked for arrived re-claims the entry
@@ -503,12 +614,27 @@ void CloudResidency::enqueue(std::vector<Request> requests)
     std::vector<bool> kept(mQueue.size(), false);
     // A few frames of pages at most wait in memory.
     const size_t outstanding = mCompletions.size() + mInFlight;
-    const size_t capacity = 256 > outstanding ? 256 - outstanding : 0;
+    // The queue is fed only when a cut is taken on - with an async walk (~340 ms on the settled sunset sea) about every 60th frame -
+    // so this is the load rate: 256 a cut left 178k of 243k desired bricks pending after 1800 frames. 1024 is the DirectStorage
+    // ticket pool (CloudPayloadPool kTickets).
+    const size_t capacity = 1024 > outstanding ? 1024 - outstanding : 0;
     std::vector<Request> accepted;
     std::vector<Request*> fresh;
     // The cut sorted them, most important first.
     for (Request& request : requests)
     {
+        // A walk runs on the snapshot it started from, so it re-requests pages that arrived while it ran. Those are loaded: their
+        // link is a store, or their chunk store has since been replaced. Taking them re-claimed the link (kPendingStore over the
+        // arrived store), the next walk saw it pending and asked again, and the same top 256 pages loaded on every cut forever:
+        // 4K sunset sea, parked, 48k requests a cut, the identical 256 accepted every cut, ~6k pages a second stored and released
+        // unused, and everything below them never refined - the level-3/4 bricks' box-shaped haze in every view, the path tracer's
+        // included (brick 913 of instance 272 asked for its chunk, priority 5.13, on every cut and never got it).
+        if (request.page == kNone ? (mAssets[request.asset].chunkStores[request.chunk] != kNone &&
+                                     mAssets[request.asset].chunkStores[request.chunk] != kPendingStore)
+                                  : (request.store >= mStores.size() || mStores[request.store]->generation != request.generation ||
+                                     (mStores[request.store]->pageStores[request.page] != kNone &&
+                                      mStores[request.store]->pageStores[request.page] != kPendingStore)))
+            continue;
         if (accepted.size() + fresh.size() >= capacity)
             break;
         const LoadKey key = loadKey(request);
@@ -541,6 +667,7 @@ void CloudResidency::enqueue(std::vector<Request> requests)
             if (request.payloadWord == CloudPayloadPool::kNone)
             {
                 mReleaseStores = true;
+                ++mStats.payloadAllocFailed; // DIAGNOSTIC
                 continue;
             }
         }
@@ -550,6 +677,16 @@ void CloudResidency::enqueue(std::vector<Request> requests)
             mStores[request.store]->pageStores[request.page] = kPendingStore;
         mLoading.insert(loadKey(request));
         accepted.push_back(request);
+    }
+    if (mTraceSlot != ~0u) // DIAGNOSTIC: what this cut's loads were, for the last four cuts.
+    {
+        std::string line = fmt::format("frame {} requests {} capacity {} accepted {}:", mFrame, requests.size(), capacity, accepted.size());
+        for (size_t i = 0; i < std::min<size_t>(accepted.size(), 24); ++i)
+            line += fmt::format(" [a{} c{} p{} {:.2f}]", accepted[i].asset, accepted[i].chunk, int(accepted[i].page), accepted[i].priority);
+        std::lock_guard traceLock(mTraceMutex);
+        mEnqueueTrace.push_back(line);
+        if (mEnqueueTrace.size() > 4)
+            mEnqueueTrace.erase(mEnqueueTrace.begin());
     }
     mQueue = std::move(accepted);
     std::make_heap(mQueue.begin(), mQueue.end());
@@ -658,7 +795,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
         }
         visibility = entry.visibility;
     }
-    const float importance = (inside ? 1.f : 0.125f) * std::max(visibility, 0.01f);
+    const float importance = (inside ? 1.f : 0.125f) * std::max(visibility, view.visibilityFloor);
     return std::log2(std::max(pixels * importance / mDesc.lodPixels, 1e-6f)) - view.lodBias + hysteresis;
 }
 
@@ -806,6 +943,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mInstancesDirty = true;
     }
 
+#if HSTR_CLOUD_STREAMING
     // Arrived pages become stores.
     {
         FALCOR_PROFILE(pRenderContext, "pages");
@@ -884,8 +1022,11 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             }
             if (!stored)
                 mpPayload->free(request.payloadWord, payloadBytes);
+            // DIAGNOSTIC: arrivals stored / dropped (not stored: failed, or the store no longer waited for it), cumulative.
+            ++(stored ? mStats.arrivalsStored : (completion.ok ? mStats.arrivalsDropped : mStats.arrivalsFailed));
         }
     }
+#endif
 
     // The cut: greedy refinement by priority from each nearby instance's top brick, within the atlas budget. It is redone when the
     // camera or the sea changed, or newly arrived pages or bricks can refine further; a static, converged view costs nothing.
@@ -907,8 +1048,18 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     const float3 moved = view.position - mCutPosition;
     const float moveLimit = std::max(0.25f * sea.getVoxelWorld(), envelope ? mCutMarginWorld : 0.f);
     const bool viewChanged = dot(moved, moved) > moveLimit * moveLimit || rowAngleChanged(0) || rowAngleChanged(1) || rowAngleChanged(3);
+#if HSTR_CLOUD_STREAMING
     const bool arrivals = mCutCommits > 0 && (!envelope || mFrame >= mCutFrame + 4);
-    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || arrivals || mFrame >= mCutFrame + 30;
+    const bool refresh = mFrame >= mCutFrame + 30;
+#else
+    // With the whole library resident the cut depends on no load (cutChildren reads stores, which all exist), so a commit is no
+    // reason to re-cut, and the 30-frame refresh waits for the loads: loads stop while a walk runs (~500 ms at 243k desired), so
+    // re-cutting on every commit, as streaming does, left one loading frame a cut. MEASURED (4K sunset sea, parked, 1800 frames):
+    // 1024 bricks a cut, 45k of 243k desired mapped.
+    const bool arrivals = false;
+    const bool refresh = mFrame >= mCutFrame + 30 && mToLoadNext >= mToLoad.size();
+#endif
+    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || arrivals || refresh;
     std::vector<Request> requests;
     // With view.cutAsync the walk runs on a worker (launched at the end of this function, taken on in a later frame); otherwise here.
     const bool async = view.cutAsync && mCutFrame != 0;
@@ -1001,12 +1152,14 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     changed |= !mStaged.empty();
     mCutCommits += uint32_t(mStaged.size());
     phase.reset();
+#if HSTR_CLOUD_STREAMING
     // A cut's requests replace the queue. Only a cut's: an empty list between cuts emptied the queue of everything not yet started.
     if (didCut)
     {
         FALCOR_PROFILE(pRenderContext, "enqueue");
         enqueue(std::move(requests));
     }
+#endif
 
     // Staging order: coarsest level first, one dispatch per level.
     {
@@ -1036,9 +1189,11 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     // Page and chunk stores nothing has used for a while are released; at once when the payload pool filled, down to those used
     // this frame. A chunk store is busy while any of its page stores lives, so pages go before their chunks.
     phase.reset();
+#if HSTR_CLOUD_STREAMING
     phase.emplace(pRenderContext, "release");
     const bool releaseNow = mReleaseStores;
     mReleaseStores = false;
+    mStats.releaseNowFrames += releaseNow ? 1u : 0u; // DIAGNOSTIC
     auto tryRelease = [&](uint32_t s)
     {
         Store& store = *mStores[s];
@@ -1075,6 +1230,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             tryRelease(uint32_t(mReleaseCursor));
         }
     }
+#endif
 
     phase.reset();
     // The next cut starts once this one is applied, so the worker never overlaps the loads, maps and releases above.
@@ -1125,6 +1281,7 @@ void CloudResidency::finishFrame(const CloudSea& sea, const CloudView& view, std
     {
         std::lock_guard lock(mIoMutex);
         mStats.pending = uint32_t(mQueue.size() + mCompletions.size() + mWaiting.size()) + mInFlight + waiting;
+        mStats.pendingParts = uint4(uint32_t(mQueue.size()), mInFlight, uint32_t(mCompletions.size()), uint32_t(mWaiting.size()));
     }
     mStats.payloadMB = double(mpPayload->getUsedBytes()) / (1024.0 * 1024.0);
     mStats.nodesUsed = uint32_t(mNodes.size() / 64 - mFreeNodes.size());
@@ -1201,14 +1358,33 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
                 continue;
             }
             ++task.pops;
+            const size_t requestsBefore = task.requests.size();
             cutChildren(entry, children, task.requests);
+            std::string trace;
+            if (entry.slot == mTraceSlot)
+            {
+                trace = fmt::format("expand L{} gpu {} prio {:.3f}: {} children, {} requests;", brick(entry.handle).record.level,
+                                    int(brick(entry.handle).gpu), entry.priority, children.size(), task.requests.size() - requestsBefore);
+                for (size_t r = requestsBefore; r < task.requests.size(); ++r)
+                    trace += fmt::format(" request [a{} c{} p{} {:.2f}]", task.requests[r].asset, task.requests[r].chunk,
+                                         int(task.requests[r].page), task.requests[r].priority);
+            }
             for (uint64_t child : children)
             {
                 float visibility = entry.visibility;
                 const float priority = brickPriority(sea, entry.slot, child, view, visibility);
                 task.visits.push_back({child, priority, entry.slot});
-                if (priority > 0.f && cutRefinable(child))
+                const bool refinable = cutRefinable(child);
+                if (priority > 0.f && refinable)
                     stack.push_back({priority, child, entry.slot, visibility});
+                if (entry.slot == mTraceSlot)
+                    trace += fmt::format(" [L{} gpu {} prio {:.3f} vis {:.3f} refinable {}]", brick(child).record.level, int(brick(child).gpu),
+                                         priority, visibility, refinable ? 1 : 0);
+            }
+            if (!trace.empty())
+            {
+                std::lock_guard lock(mTraceMutex);
+                mTraceBuilding += trace + "\n";
             }
         }
     };
@@ -1219,7 +1395,20 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
         {
             CutEntry top;
             if (!cutSeed(sea, view, slot, top))
+            {
+                if (slot == mTraceSlot)
+                {
+                    std::lock_guard lock(mTraceMutex);
+                    mTraceBuilding += "seed: none\n";
+                }
                 continue;
+            }
+            if (slot == mTraceSlot)
+            {
+                std::lock_guard lock(mTraceMutex);
+                mTraceBuilding += fmt::format("seed L{} gpu {} prio {:.3f} refinable {}\n", brick(top.handle).record.level,
+                                              int(brick(top.handle).gpu), top.priority, cutRefinable(top.handle) ? 1 : 0);
+            }
             coarse[index].visits.push_back({top.handle, top.priority, slot});
             if (cutRefinable(top.handle))
                 stack.push_back(top);
@@ -1387,6 +1576,12 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     // Page requests, most important first (enqueue keeps the head of the list).
     std::sort(walk.requests.begin(), walk.requests.end(), [](const Request& a, const Request& b) { return a.priority > b.priority; });
     walk.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (mTraceSlot != ~0u)
+    {
+        std::lock_guard lock(mTraceMutex);
+        mTrace = fmt::format("ordered {} desired {}\n", walk.ordered ? 1 : 0, walk.desired.size()) + mTraceBuilding;
+        mTraceBuilding.clear();
+    }
     return walk;
 }
 
