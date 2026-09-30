@@ -297,6 +297,11 @@ inline void decodeResidual(const int32_t q[kCoreValues], float step, uint8_t tra
 /// brick at local position (x, y, z) - 1 is the trilinear interpolation of its parent's dequantised atlas values at parent-local
 /// position 4 parity + (local + 0.5) / 2 - 0.5 (parity = brick coordinate & 1), plus the residual on the 8^3 core (none when null),
 /// clamped at zero. A brick without a parent predicts zero.
+/// The parent's apron texels read as its adjacent core texels. The apron is the grandparent's prediction without the neighbour's
+/// residual, and a child's outer voxel layer took a quarter of it per axis: in thin fringe, where that blur is non-zero and the truth
+/// is not, every brick face kept a one-voxel sheet of false density wherever the residual was quantised away or the child dropped -
+/// seen edge-on under the sunset's backlight, hairs along every silhouette (the compiler's own projection showed them against the
+/// source, sunset_hill_rim_codec).
 inline void reconstructBrick(
     const uint8_t* parentCodes,
     float parentMin,
@@ -320,7 +325,7 @@ inline void reconstructBrick(
                     const float3 f = texel - float3(base);
                     for (uint32_t corner = 0; corner < 8; ++corner)
                     {
-                        const int3 q = base + int3(corner & 1, (corner >> 1) & 1, corner >> 2);
+                        const int3 q = clamp(base + int3(corner & 1, (corner >> 1) & 1, corner >> 2), int3(1), int3(8));
                         const float w = ((corner & 1) ? f.x : 1.f - f.x) * ((corner & 2) ? f.y : 1.f - f.y) * ((corner & 4) ? f.z : 1.f - f.z);
                         prediction += w * atlasValue(parentCodes[q.x + 10 * (q.y + 10 * q.z)], parentMin, parentRange);
                     }

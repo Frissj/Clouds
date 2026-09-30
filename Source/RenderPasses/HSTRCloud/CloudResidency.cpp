@@ -423,6 +423,26 @@ uint32_t CloudResidency::createStore(
     return index;
 }
 
+std::string CloudResidency::cutLevels() const
+{
+    std::array<std::vector<float>, 16> priorities;
+    for (uint64_t handle : mDesired)
+    {
+        const Brick& b = brick(handle);
+        priorities[std::min(b.record.level, uint8_t(15))].push_back(b.cut[mCutSlot].priority);
+    }
+    std::string out;
+    for (uint32_t level = 0; level < 16; ++level)
+    {
+        std::vector<float>& p = priorities[level];
+        if (p.empty())
+            continue;
+        std::sort(p.begin(), p.end());
+        out += fmt::format("L{}: {} (p10 {:.2f} p50 {:.2f}) ", level, p.size(), p[p.size() / 10], p[p.size() / 2]);
+    }
+    return out;
+}
+
 std::vector<std::vector<CloudResidency::PreloadedChunk>> CloudResidency::readLibrary(const std::vector<CloudAsset>& assets,
                                                                                     uint64_t& payloadBytes) const
 {
@@ -795,7 +815,9 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
         }
         visibility = entry.visibility;
     }
-    const float importance = (inside ? 1.f : 0.125f) * std::max(visibility, view.visibilityFloor);
+    const float importance = (inside ? 1.f : view.outsideImportance) * std::max(visibility, view.visibilityFloor);
+    if (importance <= 0.f)
+        return -1.f;
     return std::log2(std::max(pixels * importance / mDesc.lodPixels, 1e-6f)) - view.lodBias + hysteresis;
 }
 
@@ -1363,8 +1385,10 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
             std::string trace;
             if (entry.slot == mTraceSlot)
             {
-                trace = fmt::format("expand L{} gpu {} prio {:.3f}: {} children, {} requests;", brick(entry.handle).record.level,
-                                    int(brick(entry.handle).gpu), entry.priority, children.size(), task.requests.size() - requestsBefore);
+                const Brick& traced = brick(entry.handle);
+                trace = fmt::format("expand L{} b({},{},{}) gpu {} prio {:.3f}: {} children, {} requests;", traced.record.level,
+                                    traced.record.brick().x, traced.record.brick().y, traced.record.brick().z, int(traced.gpu), entry.priority,
+                                    children.size(), task.requests.size() - requestsBefore);
                 for (size_t r = requestsBefore; r < task.requests.size(); ++r)
                     trace += fmt::format(" request [a{} c{} p{} {:.2f}]", task.requests[r].asset, task.requests[r].chunk,
                                          int(task.requests[r].page), task.requests[r].priority);
@@ -1378,8 +1402,12 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
                 if (priority > 0.f && refinable)
                     stack.push_back({priority, child, entry.slot, visibility});
                 if (entry.slot == mTraceSlot)
-                    trace += fmt::format(" [L{} gpu {} prio {:.3f} vis {:.3f} refinable {}]", brick(child).record.level, int(brick(child).gpu),
-                                         priority, visibility, refinable ? 1 : 0);
+                {
+                    const Brick& traced = brick(child);
+                    trace += fmt::format(" [L{} b({},{},{}) gpu {} prio {:.3f} vis {:.3f} refinable {}]", traced.record.level,
+                                         traced.record.brick().x, traced.record.brick().y, traced.record.brick().z, int(traced.gpu), priority,
+                                         visibility, refinable ? 1 : 0);
+                }
             }
             if (!trace.empty())
             {

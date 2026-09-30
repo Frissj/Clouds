@@ -18,6 +18,8 @@ hstr = m.activeGraph.getPass("HSTRCloud")
 # beamOct off: the octahedral beam image's resolution follows the pixel angle, and at the crop's narrow field of view it asked for
 # a 12.7 GB buffer (3840-wide crop of a 700x400 region). The settle only needs residency; the beam is not captured.
 hstr.set_properties({"atmosphereAerialDistance": 0.0, "beamOct": False})
+# HSTR_HILL_PRE: properties (a dict literal) set before the settle, e.g. residency settings every arm shares.
+hstr.set_properties(eval(os.environ.get("HSTR_HILL_PRE", "{}")))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sea_config import REFERENCE
 
@@ -72,7 +74,7 @@ def capture(label):
 
 settle = int(os.environ.get("HSTR_TRUTH_SETTLE", "600"))
 for i in range(0, settle, 300):
-    for _ in range(300):
+    for _ in range(min(300, settle - i)):
         m.renderFrame()
     print(f"HILL settle{i // 300}: {stats()}", flush=True)
 beam = {k: hstr.properties[k] for k in REFERENCE if k in hstr.properties}
@@ -80,6 +82,10 @@ hstr.set_properties({"cloudResidencyFrozen": True})
 for _ in range(60):
     m.renderFrame()
 print(f"HILL frozen: {stats()}", flush=True)
+if int(hstr.properties.get("cloudTraceSlot", -1)) >= 0:
+    print("HILL cut trace begin", flush=True)
+    print(hstr.properties.get("cutTrace", ""), flush=True)
+    print("HILL cut trace end", flush=True)
 
 SPP = int(os.environ.get("HSTR_SPP", "2048"))
 BUDGET = float(os.environ.get("HSTR_TRUTH_SECONDS", "900"))
@@ -87,6 +93,25 @@ BUDGET = float(os.environ.get("HSTR_TRUTH_SECONDS", "900"))
 # every frame re-marches), then the exact march.
 TAPS = [int(v) for v in os.environ.get("HSTR_HILL_TAPS", "").split(",") if v]
 POOLS = [int(v) for v in os.environ.get("HSTR_HILL_POOLS", "").split(",") if v]
+# HSTR_HILL_PROBES: (x, y) pixels whose exact-march steps are dumped (probePixel; the light column holds the step's majorant).
+for x, y in eval(os.environ.get("HSTR_HILL_PROBES", "[]")):
+    hstr.set_properties(dict(REFERENCE, probeX=x, probeY=y))
+    m.renderFrame()
+    values = [float(v) for v in hstr.properties.get("probeRecords", "").split(",") if v]
+    print(f"PROBE pixel ({x}, {y}): {len(values) // 12} steps", flush=True)
+    print("PROBE   dist     sigma     sunDepth  majorant   brick empty cell lvl des map  entry  inst layers  x y z", flush=True)
+    for i in range(0, len(values) - 11, 12):
+        d, sigma, sun, major, flags, entry, inst, layers, sx, sy, sz, empty = values[i:i + 12]
+        # Only the steps that read density, unless within HSTR_HILL_PROBE_RANGE (near,far), where every step is shown.
+        near, far = eval(os.environ.get("HSTR_HILL_PROBE_RANGE", "(0, 0)"))
+        if sigma <= 0.0 and not near <= d < far:
+            continue
+        f = int(flags)
+        print(f"PROBE {d:8.2f} {sigma:9.5f} {sun:9.4f} {major:10.6f}   {f & 1} {(f >> 1) & 1} {(f >> 2) & 1}  {(f >> 4) & 15} "
+              f"{(f >> 8) & 15} {(f >> 12) & 15} {int(entry):7d} children {int(inst) & 255:08b} octant {int(inst) >> 8} "
+              f"{'HAS' if (int(inst) >> (int(inst) >> 8)) & 1 else 'NO '} child   {int(layers) & 15}{(int(layers) >> 4) & 15} "
+              f"e{int(empty) & 15:<2d} s{int(empty) >> 4:<7d} {sx:.1f} {sy:.1f} {sz:.1f}", flush=True)
+    hstr.set_properties({"probeX": -1, "probeY": -1})
 SUN_ARMS = eval(os.environ.get("HSTR_HILL_SUN_ARMS", "None"))
 if SUN_ARMS:
     # The exact view scored against the saved path-traced crop (HSTR_TRUTH_SETTLE / width must match its name) under each sun atlas
@@ -139,14 +164,34 @@ elif os.environ.get("HSTR_HILL_EXACT"):
     # HSTR_HILL_ARMS: a Python list of (label, properties) over REFERENCE instead; labels ending "_half" render at half size.
     arms = eval(os.environ.get("HSTR_HILL_ARMS", "None")) or [
         ("exact_all", {}), ("exact_nosun", {"hstComponents": 1 | 8}), ("exact_livesun_half", {"cloudSunCache": False})]
-    for label, props in arms:
+    compare_arms = bool(int(os.environ.get("HSTR_HILL_COMPARE", "0")))
+    for arm_index, (label, props) in enumerate(arms):
+        props = dict(props)
         if label.endswith("_half") and m.frameCapture is not None and OW > 0:
             m.resizeFrameBuffer(OW // 2, OH // 2)
+        if props.pop("resettle", False):
+            # A residency property: thawed and settled again under it, then frozen for the capture.
+            hstr.set_properties(dict(props, cloudResidencyFrozen=False))
+            for _ in range(settle):
+                m.renderFrame()
+            hstr.set_properties({"cloudResidencyFrozen": True})
         hstr.set_properties(dict(REFERENCE, **props))
         for _ in range(8):
             m.renderFrame()
         capture(label)
-        print(f"HILL captured {label}", flush=True)
+        print(f"HILL captured {label}: {stats()}", flush=True)
+        print(f"HILL cut levels {label}: {hstr.properties.get('cutLevels', '')}", flush=True)
+        if compare_arms:
+            if arm_index == 0:
+                hstr.set_properties({"storeExact": True})
+                m.renderFrame()
+            else:
+                hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+                m.renderFrame()
+                p = hstr.properties
+                print(f"HILL {label} vs {arms[0][0]}: >0.02 {100 * float(p['referenceNoiseError']):.3f}%  "
+                      f"p99.9 {float(p['referenceLogP999']):.4f}  max {float(p['referenceLogMax']):.3f}", flush=True)
+                hstr.set_properties({"compareReference": False, "compareExact": False})
 elif TAPS:
     from sea_config import BEAM
     base = [cam.target.x, cam.target.y, cam.target.z]

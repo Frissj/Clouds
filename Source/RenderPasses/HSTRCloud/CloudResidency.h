@@ -68,6 +68,7 @@ struct CloudView
     float pixelAngle = 1e-3f; ///< World footprint of one pixel per unit distance.
     float lodBias = 0.f;      ///< Levels added to every footprint.
     float visibilityFloor = 0.01f; ///< Least importance the proxy transmittance to a brick can give it (brickPriority).
+    float outsideImportance = 0.125f; ///< Importance of a brick outside the frustum and its sun sweep (brickPriority).
     float3 sunDirection = float3(0.f, 1.f, 0.f);
     float sunReach = 0.f;     ///< World distance camera samples march towards the sun on fine density.
     float sunNearVoxels = 0.f;    ///< HSTRCloudParams::sunNearVoxels (0: no baked sun depth).
@@ -693,6 +694,8 @@ public:
             enqueues += line + "\n";
         return mTrace + enqueues;
     }
+    /// DIAGNOSTIC: the desired cut per level: bricks, and the 10th / 50th percentile of their cut priority.
+    std::string cutLevels() const;
 private:
     std::mutex mTraceMutex;
     std::string mTrace;

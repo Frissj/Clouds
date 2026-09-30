@@ -64,7 +64,7 @@ using namespace hstrcloud;
 namespace
 {
 /// Bump whenever encodeBrick or the page layout changes the package bytes: cached analyses of older codecs are then remeasured.
-constexpr uint32_t kCodecVersion = 3;
+constexpr uint32_t kCodecVersion = 5;
 
 /// Default close-up transmittance error of pack (--quality): the 99th percentile of voxel-column errors a cloud's lambda meets.
 /// 0.02 and 0.05 both rendered indistinguishably from near-lossless on cloud_cumulus_1_size_1 (45 and 28 MB against 193 MB).
@@ -440,18 +440,20 @@ void predictBrick(const Reconstruction* parent, uint3 parity, float values[kBric
         decoded[c] = atlasValue(uint8_t(c), parent->valueMin, parent->valueRange);
     const uint3 o = parity * 4u;
     const float next[2] = {0.25f, 0.75f};
+    // The parent's apron texels read as its adjacent core texels (reconstructBrick).
+    auto core = [](uint32_t i) { return std::clamp(i, 1u, 8u); };
     // Along z over the parent's 6^3 texels the brick covers, then y, then x.
     float alongZ[6 * 6 * 10];
     for (uint32_t a = 0; a < 6; ++a)
         for (uint32_t b = 0; b < 6; ++b)
         {
-            const uint32_t column = (o.x + a) + 10 * (o.y + b);
+            const uint32_t column = core(o.x + a) + 10 * core(o.y + b);
             for (uint32_t z = 0; z < 10; ++z)
             {
                 const uint32_t pz = o.z + z / 2;
                 const float f = next[z & 1];
                 alongZ[a + 6 * (b + 6 * z)] =
-                    (1.f - f) * decoded[parent->codes[column + 100 * pz]] + f * decoded[parent->codes[column + 100 * (pz + 1)]];
+                    (1.f - f) * decoded[parent->codes[column + 100 * core(pz)]] + f * decoded[parent->codes[column + 100 * core(pz + 1)]];
             }
         }
     float alongY[6 * 10 * 10];
@@ -1119,6 +1121,7 @@ public:
     {
         uint64_t bricks = 0;
         uint64_t predicted = 0;
+        uint64_t maskKept = 0; ///< Predicted bricks kept only for their empty children (encodeChunk).
         uint64_t nonzero = 0; ///< Non-zero coefficients.
         uint64_t payloadBytes = 0;
         double error = 0.0;
@@ -1188,6 +1191,7 @@ public:
         {
             bricks += other.bricks;
             predicted += other.predicted;
+            maskKept += other.maskKept;
             nonzero += other.nonzero;
             payloadBytes += other.payloadBytes;
             error += other.error;
@@ -1372,13 +1376,23 @@ public:
         if (!pages)
             return result;
         // Bottom-up: a brick is kept if it is needed itself or a descendant is kept.
+        // A predicted brick with an empty child is kept too (a header, no payload): dropped, its child mask went with it, and the
+        // runtime read its parent across the whole octant - trilinear haze over the empty children, which measureTransmittance
+        // never saw (it visits only non-empty level-0 bricks). Kept, the runtime's missing-octant skirt zeroes them. Sunset hill:
+        // flat translucent shelves along the backlit silhouettes, in the exact march and the path tracer alike (level-2 brick
+        // (22,23,10): mask 11111011, octant 3 predicted, its level-1 brick (45,47,20) absent from the package).
         std::array<std::vector<uint8_t>, 4> kept;
         for (uint32_t level = 0; level < 4; ++level)
             kept[level].assign(encoded[level].size(), 0);
         for (uint32_t level = 0; level < 4; ++level)
         {
             for (size_t i = 0; i < encoded[level].size(); ++i)
-                kept[level][i] |= encoded[level][i].droppable ? 0 : 1;
+            {
+                const EncodedBrick& brick = encoded[level][i];
+                const bool partial = level > 0 && brick.header.childMask != 0xFF;
+                kept[level][i] |= !brick.droppable || partial ? 1 : 0;
+                result.stats.maskKept += brick.droppable && partial ? 1 : 0;
+            }
             if (level + 1 < 4)
                 for (size_t i = 0; i < encoded[level].size(); ++i)
                     if (kept[level][i])
@@ -2461,7 +2475,7 @@ int main(int argc, char** argv)
                       << stats.transmittanceSum / double(std::max<uint64_t>(stats.columns, 1)) << ", 99th percentile "
                       << stats.transmittancePercentile(0.99) << ", 99.9th percentile " << stats.transmittancePercentile(0.999) << ", max "
                       << stats.transmittanceMax << "\n"
-                      << "  " << stats.predicted << " predicted; coded bricks average " << double(stats.nonzero) / coded << " non-zero coefficients, "
+                      << "  " << stats.predicted << " predicted (" << stats.maskKept << " kept for empty children); coded bricks average " << double(stats.nonzero) / coded << " non-zero coefficients, "
                       << double(stats.payloadBytes) / coded << " payload bytes before GDeflate\n"
                       << "  optical-depth error per brick: mean " << stats.error / double(std::max<uint64_t>(stats.bricks, 1)) << ", weighted mean "
                       << stats.weightedError / double(std::max<uint64_t>(stats.bricks, 1)) << ", max " << stats.maxError << "\n"

@@ -715,7 +715,12 @@ struct HSTRCloudRenderer
         const uint level = brick.info & 15u;
         const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
         const int3 brickCoord = (i >> int(level)) >> 3;
-        const float3 local = clamp(levelPosition - float3(brickCoord * 8), -0.5f, 7.5f);
+        // Within the core texels only. The apron is the parent's prediction without the neighbour's residual (commitCloudBricks), so
+        // reading it in the half voxel inside each face made the density jump there by half the two bricks' residual difference: a
+        // seam on every brick face, strongest in thin fringe where the residual departs most from the parent - under the sunset's
+        // backlight a lattice of hairs and box outlines along every silhouette, in the exact march and the path tracer alike
+        // (sunset_hill_hair8, 400-wide crop at the start view). Clamped, each side holds its own edge voxel up to the face.
+        const float3 local = clamp(levelPosition - float3(brickCoord * 8), 0.f, 7.f);
         const uint shift = params.cloudAtlasShift;
         const uint mask = (1u << shift) - 1u;
         const uint3 slot = uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift));
@@ -2730,7 +2735,7 @@ struct HSTRCloudRenderer
                     heldEnds = SHIP(cloudSourceLinear, 0u) != 0;
                 }
                 if (gProbe)
-                    probeRecord(tSample * ray.worldLength + ray.entryDistance, sigma, probeSunDepth, probeLight, sourceSample);
+                    probeRecord(tSample * ray.worldLength + ray.entryDistance, sigma, probeSunDepth, majorantAt(midpoint), sourceSample); // DIAGNOSTIC: the majorant in the light slot
                 opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
                 transmittance *= 1.f - alpha;
             }
@@ -10829,7 +10834,14 @@ struct HSTRCloudRenderer
         const uint flags = (s.brick ? 1u : 0u) | (s.empty ? 2u : 0u) | (s.cell ? 4u : 0u) | ((s.level & 15u) << 4) | ((s.desired & 15u) << 8) |
                            ((s.mappedLevel & 15u) << 12);
         hstrProbeOutput[2 + 3 * index] = asuint(float4(distance, sigma, sunDepth, light));
-        hstrProbeOutput[3 + 3 * index] = asuint(float4(float(flags), float(s.entry == kCloudRefNone ? -1.f : float(s.entry)), float(s.instance), float(gProbeCameraLayers)));
+        // DIAGNOSTIC: the instance column holds the brick's child mask (info >> 4, 8 bits) | the sample's octant in it << 8.
+        uint children = 0;
+        if (s.entry != kCloudRefNone)
+        {
+            const uint3 octant = (uint3(floor(s.x + 0.5f)) >> (s.level + 2u)) & 1u;
+            children = ((hstrCloudBricks[s.entry].info >> 4) & 255u) | ((octant.x + 2u * octant.y + 4u * octant.z) << 8);
+        }
+        hstrProbeOutput[3 + 3 * index] = asuint(float4(float(flags), float(s.entry == kCloudRefNone ? -1.f : float(s.entry)), float(children), float(gProbeCameraLayers)));
         hstrProbeOutput[4 + 3 * index] = asuint(float4(gProbeCameraX, float(gProbeCameraEmpty | (gProbeCameraSkirt << 4))));
     }
 
@@ -12429,7 +12441,8 @@ void commitCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
         {
             const uint3 offset = uint3(corner & 1u, (corner >> 1) & 1u, corner >> 2);
             const float3 w = select(offset != 0u, f, 1.f - f);
-            const float t = gHSTRCloud.hstrCloudAtlasOutput[parentOrigin + uint3(base) + offset];
+            // The parent's apron texels read as its adjacent core texels (reconstructBrick in CloudFormat.h).
+            const float t = gHSTRCloud.hstrCloudAtlasOutput[parentOrigin + clamp(uint3(base) + offset, 1u, 8u)];
             prediction += w.x * w.y * w.z * (info.parentMin + info.parentRange * t * t);
         }
     }

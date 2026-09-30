@@ -279,12 +279,15 @@ void HSTRCloud::parseProperties(const Properties& props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
         if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
-            key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot")
+            key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
+            key == "cloudOutsideImportance")
         {
             if (key == "cloudTraceSlot")
                 mCloudTraceSlot = int(value) < 0 ? ~0u : uint32_t(int(value));
             else if (key == "cloudVisibilityFloor")
                 mCloudVisibilityFloor = std::clamp(float(value), 0.f, 1.f);
+            else if (key == "cloudOutsideImportance")
+                mCloudOutsideImportance = std::clamp(float(value), 0.f, 1.f);
             else if (key == "probeX")
                 mParams.probeX = int(value) < 0 ? 0xffffffffu : uint32_t(int(value));
             else if (key == "probeY")
@@ -1211,9 +1214,12 @@ Properties HSTRCloud::getProperties() const
     props[kSkyRadiance] = mParams.skyRadiance;
     props["skyModel"] = mParams.skyModel;
     props["cloudVisibilityFloor"] = mCloudVisibilityFloor;
+    props["cloudOutsideImportance"] = mCloudOutsideImportance;
     props["cloudTraceSlot"] = int(mCloudTraceSlot);
     if (mpCloudResidency && mCloudTraceSlot != ~0u)
         props["cutTrace"] = mpCloudResidency->walkTrace();
+    if (mpCloudResidency)
+        props["cutLevels"] = mpCloudResidency->cutLevels(); // DIAGNOSTIC
     props["probeX"] = int(mParams.probeX);
     props["probeY"] = int(mParams.probeY);
     // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
@@ -3063,6 +3069,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.pixelAngle = mParams.cloudPixelAngle;
     view.lodBias = mParams.cloudLodBias;
     view.visibilityFloor = mCloudVisibilityFloor;
+    view.outsideImportance = mCloudOutsideImportance;
     mpCloudResidency->mTraceSlot = mCloudTraceSlot;
     view.sunDirection = normalize(mParams.sunDirection);
     view.sunReach = (mParams.sunNearVoxels + 1.f) * mpCloudSea->getVoxelWorld();
