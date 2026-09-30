@@ -189,6 +189,9 @@ private:
     LazyComputePass mpWorldCacheResolvePass;
     ref<Buffer> mpWorldCache;        ///< World-space radiance cache experiment: SH running sums per cell.
     ref<Buffer> mpWorldCacheDeposit; ///< Fixed-point light-tracing deposits of the current batch.
+    ref<Buffer> mpWorldCacheRingKernel; ///< Ring edges and ring phase table (worldCacheSunOrder 4), for mWorldCacheRingG.
+    float mWorldCacheRingG = -2.f;
+    float mWorldCacheRingModulation = -1.f; ///< Ring slot modulation b; negative: the medium's transport attenuation.
     LazyComputePass mpWorldCacheBakePass;
     LazyComputePass mpWorldCacheAdvancePass;
     ref<Buffer> mpPhotonPool;                                           ///< Persistent light-tracing photons (48 bytes each).

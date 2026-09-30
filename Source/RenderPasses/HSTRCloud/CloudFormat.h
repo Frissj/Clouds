@@ -235,7 +235,7 @@ inline const std::array<uint16_t, kCoreValues>& coefficientScan()
 
 /// Packed coefficients: a significance bitmap of 16 words (bit s of the scan), then each non-zero value in scan order as a
 /// zigzag varint of 1-3 bytes (7 bits per byte, high bit: more follow), zero-padded to a multiple of 4 bytes. Values are clamped
-/// to +-2^20.
+/// to +-(2^20 - 1): 2^20 itself zigzags to 2^21, a fourth byte.
 inline void packCoefficients(const int32_t q[kCoreValues], std::vector<uint8_t>& out)
 {
     const auto& scan = coefficientScan();
@@ -243,7 +243,7 @@ inline void packCoefficients(const int32_t q[kCoreValues], std::vector<uint8_t>&
     out.resize(start + 64, 0);
     for (uint32_t s = 0; s < kCoreValues; ++s)
     {
-        const int32_t value = std::clamp(q[scan[s]], -(1 << 20), 1 << 20);
+        const int32_t value = std::clamp(q[scan[s]], -(1 << 20) + 1, (1 << 20) - 1);
         if (value == 0)
             continue;
         out[start + s / 8] |= uint8_t(1u << (s % 8));

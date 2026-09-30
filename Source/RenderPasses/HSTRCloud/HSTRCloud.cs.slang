@@ -442,6 +442,7 @@ struct HSTRCloudRenderer
     // The cache means baked for the camera: slot s = 3k + c of the 27 in texture s / 4, channel s % 4, trilinear by hardware.
     Texture3D<float4> hstrWorldCacheTexture[kWorldCacheTextures];
     RWTexture3D<float4> hstrWorldCacheTextureOutput[kWorldCacheTextures];
+    StructuredBuffer<float> hstrWorldCacheRingKernel; ///< worldCacheSunOrder 4: ring edges and ring phase table (kWorldCacheRings).
     // Beam view: exact queries on the lattice of all tile corners and centres, slice 0 (cache rgb, optical depth), slice 1
     // (single scatter without phase, unused); the level that finalised every finest tile (beamLevels: marched per pixel);
     // the per-level lists of refined tiles (list beamLevels: finest tiles marched per pixel), their counts and indirect
@@ -2694,7 +2695,9 @@ struct HSTRCloudRenderer
                         const float cellVoxels = float(params.worldCacheCellVoxels);
                         if (!cached || sinceLighting >= params.lightingStride || dot(moved, moved) > cellVoxels * cellVoxels)
                         {
-                            held = cached ? worldCacheRadiance(sourcePoint, ray.viewDirection) : sourceAtVoxel(sourcePoint);
+                            held = cached ? (params.cacheOracle != 0 ? cacheOracleRadiance(sourcePoint, ray.viewDirection, steps) // DIAGNOSTIC
+                                                                     : worldCacheRadiance(sourcePoint, ray.viewDirection))
+                                          : sourceAtVoxel(sourcePoint);
                             heldAt = sourcePoint;
                             sinceLighting = 0;
                         }
@@ -3523,6 +3526,14 @@ struct HSTRCloudRenderer
     /// sqrt((2 l + 1) / (4 pi)) P_l(d . sun).
     float worldCacheExtensionBasis(uint j, float3 d)
     {
+        if (params.worldCacheSunOrder >= 4)
+        {
+            // Ring j about the sun: Y_00 inside it (the ring's share of the SH band-0 coefficient), zero elsewhere.
+            const float mu = dot(d, normalize(params.sunDirection));
+            const float upper = j == 0 ? 2.f : hstrWorldCacheRingKernel[j - 1];
+            const float lower = j + 1 == kWorldCacheRings ? -2.f : hstrWorldCacheRingKernel[j];
+            return mu <= upper && mu > lower ? 0.282095f : 0.f;
+        }
         if (params.worldCacheSunOrder >= 3)
             return shBasis3(j, d);
         const float mu = dot(d, normalize(params.sunDirection));
@@ -3647,12 +3658,14 @@ struct HSTRCloudRenderer
                     flushDeposits(acc, rng);
                     acc.cell = storedCell;
                 }
-                // Deposits are divided by the modulation at the middle of this cell's part of the flight.
-                const float inverseModulation = 1.f / worldCacheModulation((p0 + (t + 0.5f * fraction) * delta) * cellVoxels);
+                // Deposits are divided by the modulation at the middle of this cell's part of the flight (the ring slots by their own).
+                const float3 middle = (p0 + (t + 0.5f * fraction) * delta) * cellVoxels;
+                const float inverseModulation = 1.f / worldCacheModulation(middle);
                 const float scale = perUnit * fraction * inverseModulation;
+                const float ringScale = extension > 0 && params.worldCacheSunOrder >= 4 ? scale / worldCacheRingFactor(middle) : scale;
                 [unroll]
                 for (uint k = 0; k < 16; ++k)
-                    acc.sums[k] += basis[k] * scale;
+                    acc.sums[k] += basis[k] * (k < 9 ? scale : ringScale);
             }
             if (tNext >= 1.f)
                 break;
@@ -3874,7 +3887,13 @@ struct HSTRCloudRenderer
             direction = -d;
             // f / pdf with pdf = (power / total) (1 / area) (cos / pi); power / (skyMean area) is the side's unit flux.
             const float unitFlux = photonSourcePower(choice, sun, faceArea, sunMean, skyMean) / (skyMean * faceArea[axis]);
-            weight = (0.675f + 0.325f * d.y) * kPi * total / (skyMean * unitFlux * float(params.worldCachePhotons));
+            // The unit sky's radiance in direction d: the atmosphere's own (skyModel 2) over its mean colour, so the cache's sky
+            // field has the real sky's brightness distribution - at sunset bright towards the sun and dark away from it - while the
+            // camera still colours it by skyRadiance. The flat two-tone model lit the shadowed flanks from an average sky
+            // (sunset start view against the path tracer, scattered sky alone: flanks too bright, tops too dark). The sampling
+            // stays the analytic model's, so the weight is still f / pdf.
+            const float shape = params.skyModel == 2 ? dot(skyRadianceAt(d), 1.f / 3.f) / max(skyMean, 1e-6f) : 0.675f + 0.325f * d.y;
+            weight = shape * kPi * total / (skyMean * unitFlux * float(params.worldCachePhotons));
         }
 
         Photon photon;
@@ -4008,7 +4027,8 @@ struct HSTRCloudRenderer
         const uint order = params.worldCacheOrder;
         const uint extension = order == 2 ? worldCacheSunExtension() : 0u;
         const uint sunOrder = extension == 7 ? 3u : order;
-        const bool zonal = order == 2 && params.worldCacheSunOrder < 3 && params.worldCacheZonalBands > 0;
+        const bool rings = order == 2 && params.worldCacheSunOrder == 4;
+        const bool zonal = rings || (order == 2 && params.worldCacheSunOrder < 3 && params.worldCacheZonalBands > 0);
         const uint zonalOrder = params.worldCacheZonalWindow != 0 ? params.worldCacheZonalWindow : max(params.worldCacheZonalBands, 2u);
 
         float4 texels[kWorldCacheTextures];
@@ -4042,7 +4062,31 @@ struct HSTRCloudRenderer
             else
                 sun += shWindow(l, sunOrder) * gl * basis * c;
         }
-        if (zonal)
+        if (rings)
+        {
+            // The sun field's zonal part, scattered by the exact phase: ring j's mean radiance (its deposit over its solid angle)
+            // times the phase averaged over the ring, tabulated against the view's angle from the sun. The rest of bands 0-2
+            // (not symmetric about the sun) through the windowed SH as before. With the phase's forward peak only ~7 degrees wide
+            // at g 0.85, bands 0-2 (or zonal bands to 8) spread it: backlit rims too dark, shadowed flanks too bright.
+            const float mu = dot(w, s);
+            const float legendre[3] = { 1.f, mu, 0.5f * (3.f * mu * mu - 1.f) };
+            [unroll]
+            for (uint l = 0; l <= 2; ++l)
+                sun += (l == 0 ? 1.f : (l == 1 ? g : g * g)) * shWindow(l, 2) * (bandAtView[l] - bandAtSun[l] * legendre[l]);
+            const float x = acos(clamp(mu, -1.f, 1.f)) / kPi * float(kWorldCacheRingSamples - 1);
+            const uint i0 = min(uint(x), kWorldCacheRingSamples - 2);
+            const float f = x - float(i0);
+            float ringSun = 0.f;
+            [unroll]
+            for (uint j = 0; j < kWorldCacheRings; ++j)
+            {
+                const uint base = 8 + j * kWorldCacheRingSamples + i0;
+                const float kernel = lerp(hstrWorldCacheRingKernel[base], hstrWorldCacheRingKernel[base + 1], f);
+                ringSun += kernel * texels[(18 + j) / 4][(18 + j) % 4];
+            }
+            sun += ringSun * worldCacheRingFactor(v);
+        }
+        else if (zonal)
         {
             // Legendre recurrence in mu = w . s through band 8.
             const float mu = dot(w, s);
@@ -4076,7 +4120,10 @@ struct HSTRCloudRenderer
             for (uint m = 0; m < 7; ++m)
                 sun += shWindow(3, 3) * g * g * g * shBasis3(m, w) * texels[(18 + m) / 4][(18 + m) % 4];
         }
-        return max(0.f, sun * params.sunRadiance + sky * params.skyRadiance);
+        // Each field only where hstComponents asks for it, so the two can be scored apart against the path tracer's.
+        const float sunOn = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
+        const float skyOn = (params.hstComponents & kComponentSkyScattered) != 0 ? 1.f : 0.f;
+        return max(0.f, sunOn * sun * params.sunRadiance + skyOn * sky * params.skyRadiance);
     }
 
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
@@ -4084,6 +4131,25 @@ struct HSTRCloudRenderer
     /// rather than black light); bands above worldCacheOrder are dropped.
     /// The modulation reads the voxel-centre sun field exactly as the photon deposits do, so the stored ratio cancels.
     float3 worldCacheRadiance(float3 v, float3 w) { return worldCacheModulation(v) * worldCacheRadianceStored(v, w); }
+
+    /// DIAGNOSTIC (cacheOracle): what worldCacheRadiance estimates, by paths traced from v with the exact phase function and the
+    /// real sky - everything arriving at v but direct sunlight, scattered towards the camera looking along w. Through the transport
+    /// proxy it is the cache without its cells and its SH; through the fine bricks (bit 8) it is the path tracer's own answer.
+    float3 cacheOracleRadiance(float3 v, float3 w, uint seed)
+    {
+        uint rng = hashUint(asuint(v.x) ^ hashUint(asuint(v.y) ^ hashUint(asuint(v.z)))) ^ hashUint(params.frameIndex * 9781u + seed);
+        const uint paths = max(params.cacheOracle & 255u, 1u);
+        const bool fine = (params.cacheOracle & 256u) != 0;
+        float3 sum = 0.f;
+        for (uint k = 0; k < paths; ++k)
+        {
+            // Light from direction d scatters towards the camera by the angle whose cosine is d . w: d is drawn about w.
+            const float3 d = sampleHG(w, float2(randomFloat(rng), randomFloat(rng)));
+            const ReferenceSample r = tracePath(v, d, gScene.getGridVolume(0), rng, fine);
+            sum += r.background + r.sunSingle + r.sunMultiple + r.sky;
+        }
+        return sum / float(paths);
+    }
 
     /// Voxel-resolution factor the cache is divided by when deposited and multiplied by when read: exp(-b tau_sun), with tau_sun
     /// the fine sun optical depth (capped so deep interiors do not inflate the fixed-point deposits). Multiple scattering falls
@@ -4100,6 +4166,17 @@ struct HSTRCloudRenderer
             return 1.f;
         const float depth = fineSunAt(v);
         return exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
+    }
+
+    /// worldCacheSunOrder 4: the ring slots' modulation over worldCacheModulation, the factor their deposits are further divided by
+    /// and their reads further multiplied by. The light arriving from near the sun fades with the sun depth at the transport rate,
+    /// much faster than the diffuse rest: under one shared modulation a shadowed flank read the lit top's sunward glow through its
+    /// 20-unit cell (sunset start view, against the path tracer: flanks too bright, the oracle of exact per-sample paths not).
+    float worldCacheRingFactor(float3 v)
+    {
+        const float depth = fineSunAt(v);
+        const float general = params.worldCacheModulation > 0.f ? params.worldCacheModulation * min(depth, params.worldCacheModulationDepth) : 0.f;
+        return exp(general - params.worldCacheRingModulation * min(depth, params.worldCacheRingDepth));
     }
 
     /// The cache as stored (divided by worldCacheModulation). The float sums (gather, or untextured light tracing) carry bands

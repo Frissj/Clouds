@@ -360,6 +360,11 @@ struct CodecSettings
     float deadzone = 0.2f;         ///< Quantiser rounding offset towards zero (0: round to nearest).
     float weightFloor = 0.01f;     ///< Least visibility weight of a brick's error (1: unweighted).
     float densityScale = 1.f;      ///< Extinction per unit of density per VDB world unit, for visibility and transmittance.
+    /// Weight of density reconstructed where the truth is empty, over the plain error. A parent's blurred prediction spills past a
+    /// silhouette into empty voxels at ~1e-4, far below the plain error's notice beside a ~0.5 core, but backlit sunset rims
+    /// forward-scatter it into a lumpy orange halo with brick-aligned edges (sunset_hill_fuzz1: gone with the sun off, and gone
+    /// at lambda 1e-7, an 11x larger library).
+    float leakWeight = 32.f;
     Transform transform = Transform::Haar;
 };
 
@@ -652,6 +657,8 @@ EncodedBrick encodeBrick(
                 codes[i] = code(values[i]);
         float sum = 0.f;
         float maximum = 0.f;
+        float leakSum = 0.f;
+        float leakMaximum = 0.f;
         const float scale = valueRange / (255.f * 255.f);
         for (uint32_t z = 0; z < 8; ++z)
             for (uint32_t y = 0; y < 8; ++y)
@@ -661,12 +668,19 @@ EncodedBrick encodeBrick(
                 for (uint32_t x = 0; x < 8; ++x)
                 {
                     const float c = float(code(row[x]));
-                    const float error = std::abs(lo + scale * c * c - t[x]);
+                    const float decoded = lo + scale * c * c;
+                    const float error = std::abs(decoded - t[x]);
                     sum += error;
                     maximum = std::max(maximum, error);
+                    if (t[x] <= 0.f)
+                    {
+                        leakSum += decoded;
+                        leakMaximum = std::max(leakMaximum, decoded);
+                    }
                 }
             }
-        return (sum / float(kCoreValues) + 0.25f * maximum) * span;
+        return (sum / float(kCoreValues) + 0.25f * maximum + codec.leakWeight * (leakSum / float(kCoreValues) + 0.25f * leakMaximum)) *
+               span;
     };
     auto cost = [&](float error, uint32_t bytes)
     {
@@ -690,7 +704,8 @@ EncodedBrick encodeBrick(
         uint32_t bytes = 64;
         for (uint32_t i = 0; i < kCoreValues; ++i)
         {
-            const int32_t magnitude = std::min(int32_t(std::abs(coefficients[i]) * inverseStep + bias), 1 << 20);
+            // Below 2^20 (packCoefficients' three-byte varint), clamped before the cast: the finest steps reach past int range.
+            const int32_t magnitude = int32_t(std::min(std::abs(coefficients[i]) * inverseStep + bias, float((1 << 20) - 1)));
             const int32_t value = coefficients[i] < 0.f ? -magnitude : magnitude;
             q[i] = value;
             residual[i] = float(value) * step;
@@ -784,6 +799,18 @@ public:
     uint64_t signature = 0;
     uint64_t densityHash = 0;
     uint64_t sourceBytes = 0;
+    /// Source densities at or below this read as zero, ramping back to the source value at twice it (build --density-floor).
+    /// The Intel clouds wrap every cloud in a shell ~6 voxels thick at exactly 0.01 with a hard stepped outer edge (slice of
+    /// dense.0.L at z 576: 3.8% of the plane's non-zero voxels at that one value, the cloud proper from ~0.02). Backlit, the shell
+    /// is a brown plateau band with a scalloped cutoff around every silhouette, in the path tracer as in the march.
+    float densityFloor = 0.f;
+
+    float withoutFloor(float v) const
+    {
+        if (!(std::isfinite(v) && v > 0.f))
+            return 0.f;
+        return v >= 2.f * densityFloor ? v : std::max(0.f, 2.f * (v - densityFloor));
+    }
 
     void load(bool halfResolution = false)
     {
@@ -1008,6 +1035,23 @@ public:
     }
 
     size_t chunkCount() const { return mChunks.size(); }
+
+    /// Counts of the loaded VDB's active voxel values in bins of width `width` from zero; the last bin takes everything above.
+    std::vector<uint64_t> histogram(float width, uint32_t bins) const
+    {
+        std::vector<uint64_t> counts(bins, 0);
+        for (auto value = mGrid->tree().cbeginValueOn(); value; ++value)
+            if (value.isVoxelValue() && *value > 0.f)
+                ++counts[std::min(uint32_t(*value / width), bins - 1)];
+        return counts;
+    }
+
+    /// The loaded VDB's density at a source voxel (sliceCache).
+    float gridValue(int3 p) const
+    {
+        const float v = mGrid->tree().getValue(openvdb::Coord(p.x, p.y, p.z));
+        return std::isfinite(v) && v > 0.f ? v : 0.f;
+    }
 
     /// Level-4 brick coordinate of chunk c.
     uint32_t chunkCoord(size_t c) const
@@ -1689,8 +1733,7 @@ public:
                             for (int dy = 0; dy < mSourceStride; ++dy)
                                 for (int dx = 0; dx < mSourceStride; ++dx)
                                 {
-                                    const float v = accessor.getValue(p + openvdb::Coord(dx, dy, dz));
-                                    value += std::isfinite(v) && v > 0.f ? v : 0.f;
+                                    value += withoutFloor(accessor.getValue(p + openvdb::Coord(dx, dy, dz)));
                                 }
                         value /= float(mSourceStride * mSourceStride * mSourceStride);
                         maximum = std::max(maximum, value);
@@ -1783,16 +1826,22 @@ void writeAnalysis(const std::filesystem::path& path, const std::unordered_map<s
 }
 
 /// Stage 1: the canonical cache of every VDB in the source directory whose cache is missing or from another source file.
-void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesystem::path& cacheDirectory, bool halfResolution = false)
+void buildCaches(
+    const std::filesystem::path& sourceDirectory,
+    const std::filesystem::path& cacheDirectory,
+    bool halfResolution = false,
+    float densityFloor = 0.f,
+    const std::unordered_set<std::string>& only = {}
+)
 {
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> sources;
     for (const auto& file : std::filesystem::directory_iterator(sourceDirectory))
-        if (file.is_regular_file() && file.path().extension() == ".vdb")
+        if (file.is_regular_file() && file.path().extension() == ".vdb" && (only.empty() || only.count(file.path().stem().string())))
             sources.push_back(file.path());
     std::sort(sources.begin(), sources.end());
     if (sources.empty())
-        throw std::runtime_error("no VDB files in " + sourceDirectory.string());
+        throw std::runtime_error("no VDB files in " + sourceDirectory.string() + (only.empty() ? "" : " matching --clouds"));
     std::filesystem::create_directories(cacheDirectory);
     uint64_t sourceBytes = 0;
     uint64_t cacheBytes = 0;
@@ -1802,7 +1851,13 @@ void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesy
         const uint64_t bytes = std::filesystem::file_size(source);
         sourceBytes += bytes;
         CanonicalHeader header;
-        const uint64_t signature = halfResolution ? fnv(sourceSignature(source), 0x48414c4632ull) : sourceSignature(source);
+        uint64_t signature = halfResolution ? fnv(sourceSignature(source), 0x48414c4632ull) : sourceSignature(source);
+        if (densityFloor > 0.f)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &densityFloor, sizeof(bits));
+            signature = fnv(signature, bits);
+        }
         if (std::filesystem::exists(path) && readCanonicalHeader(path, header) && header.sourceSignature == signature)
         {
             std::cout << source.stem().string() << ": canonical cache up to date\n";
@@ -1815,6 +1870,7 @@ void buildCaches(const std::filesystem::path& sourceDirectory, const std::filesy
         asset.source = source;
         asset.signature = signature;
         asset.sourceBytes = bytes;
+        asset.densityFloor = densityFloor;
         asset.load(halfResolution);
         asset.writeCanonical(path);
         asset.unload();
@@ -1933,6 +1989,77 @@ void projectCache(const std::filesystem::path& cache, const std::string& prefix,
             pixels.data()
         );
         std::cout << "wrote " << path << " (" << width << " x " << height << ")\n";
+    }
+}
+
+/// One z plane of a half-resolution cache beside the VDB it was built from, as images at the VDB's resolution (2 pixels per cache
+/// voxel): the VDB's own voxels, the cache's level-0 means and its level-1 means. Grey is (density / the plane's VDB maximum)^(1/4),
+/// so a fringe at 1e-4 of the core still shows (0.1): whether a rim's faint halo is in the source or made by the compile.
+void sliceCache(const std::filesystem::path& vdb, const std::filesystem::path& cache, const std::string& prefix, uint32_t z)
+{
+    Asset asset;
+    asset.source = cache;
+    asset.open(cache);
+    const uint3 dims(asset.entry.dims[0], asset.entry.dims[1], asset.entry.dims[2]);
+    const int3 origin(asset.entry.sourceMin[0], asset.entry.sourceMin[1], asset.entry.sourceMin[2]);
+    if (z >= dims.z)
+        throw std::runtime_error("slice z outside the cache");
+    const uint32_t width = 2 * dims.x, height = 2 * dims.y;
+    std::array<std::vector<float>, 3> planes;
+    for (auto& plane : planes)
+        plane.assign(size_t(width) * height, 0.f);
+    for (size_t c = 0; c < asset.chunkCount(); ++c)
+    {
+        Asset::ChunkLevels levels;
+        asset.readChunk(c, levels, nullptr, nullptr);
+        for (uint32_t level = 0; level < 2; ++level)
+        {
+            const uint32_t size = 1u << level;
+            for (size_t i = 0; i < levels[level].coords.size(); ++i)
+            {
+                const uint3 base = BrickHeader{levels[level].coords[i]}.brick() * 8u * size;
+                if (z < base.z || z >= base.z + 8u * size)
+                    continue;
+                const uint32_t cz = (z - base.z) / size;
+                for (uint32_t y = 0; y < 8u * size; ++y)
+                    for (uint32_t x = 0; x < 8u * size; ++x)
+                    {
+                        const float value = levels[level].cores[i][x / size + 8 * (y / size + 8 * cz)];
+                        for (uint32_t d = 0; d < 4; ++d)
+                            planes[1 + level][2 * (base.x + x) + (d & 1) + size_t(width) * (2 * (base.y + y) + (d >> 1))] = value;
+                    }
+            }
+        }
+    }
+    Asset source;
+    source.source = vdb;
+    source.load();
+    float maximum = 0.f;
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const float value = source.gridValue(int3(2 * origin.x + int(x), 2 * origin.y + int(y), 2 * (origin.z + int(z))));
+            planes[0][x + size_t(width) * y] = value;
+            maximum = std::max(maximum, value);
+        }
+    const char* names[3] = {"vdb", "half0", "half1"};
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        std::vector<uint8_t> pixels(size_t(width) * height * 4);
+        for (uint32_t row = 0; row < height; ++row)
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const float t = std::pow(std::clamp(planes[k][x + size_t(width) * (height - 1 - row)] / maximum, 0.f, 1.f), 0.25f);
+                uint8_t* px = &pixels[(size_t(row) * width + x) * 4];
+                px[0] = px[1] = px[2] = uint8_t(std::lround(t * 255.f));
+                px[3] = 255;
+            }
+        const std::string path = prefix + "_" + names[k] + ".png";
+        Falcor::Bitmap::saveImage(
+            path, width, height, Falcor::Bitmap::FileFormat::PngFile, Falcor::Bitmap::ExportFlags::None, Falcor::ResourceFormat::RGBA8Unorm, true,
+            pixels.data()
+        );
+        std::cout << "wrote " << path << " (" << width << " x " << height << "), plane maximum " << maximum << "\n";
     }
 }
 
@@ -2164,9 +2291,44 @@ int main(int argc, char** argv)
         }
     );
     const std::string mode = argc > 1 ? argv[1] : "";
+    if (mode == "histogram" && argc == 3)
+    {
+        try
+        {
+            // Where a source's density floor lies (build --density-floor): its pile shows against the neighbouring bins.
+            Asset asset;
+            asset.source = argv[2];
+            asset.load();
+            const std::vector<uint64_t> counts = asset.histogram(0.001f, 41);
+            for (size_t i = 0; i < counts.size(); ++i)
+                std::cout << (i + 1 < counts.size() ? "" : ">= ") << float(i) * 0.001f << ": " << counts[i] << "\n";
+            return 0;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "error: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (mode == "slice" && argc == 6)
+    {
+        try
+        {
+            sliceCache(argv[2], argv[3], argv[4], uint32_t(std::stoul(argv[5])));
+            return 0;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "error: " << e.what() << "\n";
+            return 1;
+        }
+    }
     if (argc < 4 || (mode != "build" && mode != "pack" && mode != "project"))
     {
-        std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory> [--half-resolution]\n"
+        std::cout << "HSTRCloudCompiler histogram <cloud.vdb>   (counts of its voxel values in bins of 0.001 up to 0.04)\n"
+                     "HSTRCloudCompiler slice <cloud.vdb> <half-resolution cache.hstrcloud> <output prefix> <cache z>   (one plane of the\n"
+                     "                       VDB, the cache's level 0 and its level 1, as images at the VDB's resolution)\n";
+        std::cout << "HSTRCloudCompiler build <vdb directory> <cache directory> [--half-resolution] [--density-floor F] [--clouds a,b,...]\n"
                      "HSTRCloudCompiler project <cache.hstrcloud> <output prefix> [lambda]   (opacity images of the source density, or of its\n"
                      "                       reconstruction at lambda)\n"
                      "HSTRCloudCompiler pack <cache directory> <output directory> [--quality E [--quality-tail T] | --lambda L | --budget-mb N]\n"
@@ -2198,9 +2360,23 @@ int main(int argc, char** argv)
     {
         try
         {
-            if (argc > 5 || (argc == 5 && std::string(argv[4]) != "--half-resolution"))
-                throw std::runtime_error("build accepts only --half-resolution");
-            buildCaches(argv[2], argv[3], argc == 5);
+            bool halfResolution = false;
+            float densityFloor = 0.f;
+            std::unordered_set<std::string> clouds;
+            for (int i = 4; i < argc; ++i)
+            {
+                const std::string option = argv[i];
+                if (option == "--half-resolution")
+                    halfResolution = true;
+                else if (option == "--density-floor" && i + 1 < argc)
+                    densityFloor = std::max(0.f, std::stof(argv[++i]));
+                else if (option == "--clouds" && i + 1 < argc)
+                    for (const std::string& name : splitList(argv[++i]))
+                        clouds.insert(name);
+                else
+                    throw std::runtime_error("build accepts only --half-resolution, --density-floor F and --clouds a,b,...");
+            }
+            buildCaches(argv[2], argv[3], halfResolution, densityFloor, clouds);
             return 0;
         }
         catch (const std::exception& e)
@@ -2254,6 +2430,8 @@ int main(int argc, char** argv)
             codec.weightFloor = std::clamp(std::stof(argv[++i]), 0.f, 1.f);
         else if (option == "--density-scale")
             codec.densityScale = std::max(0.f, std::stof(argv[++i]));
+        else if (option == "--leak-weight")
+            codec.leakWeight = std::max(0.f, std::stof(argv[++i]));
         else if (option == "--deadzone")
             codec.deadzone = std::clamp(std::stof(argv[++i]), 0.f, 0.5f);
         else if (option == "--transform")
@@ -2332,7 +2510,7 @@ int main(int argc, char** argv)
         const std::filesystem::path analysisPath = cacheDirectory / "analysis.bin";
         auto analyses = readAnalysis(analysisPath);
         uint64_t codecKey = kCodecVersion;
-        for (float setting : {codec.maxError, codec.weightFloor, codec.deadzone, codec.densityScale, float(codec.transform)})
+        for (float setting : {codec.maxError, codec.weightFloor, codec.deadzone, codec.densityScale, codec.leakWeight, float(codec.transform)})
             codecKey = fnv(codecKey, floatBits(setting));
         const uint64_t settingsKey = fnv(codecKey, uint64_t(std::lround(sampleRate * 1e6)));
         for (Asset& asset : assets)

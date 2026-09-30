@@ -280,9 +280,15 @@ void HSTRCloud::parseProperties(const Properties& props)
         // Split from the chain below, which is at MSVC's nesting limit.
         if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
-            key == "cloudOutsideImportance")
+            key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth")
         {
-            if (key == "cloudTraceSlot")
+            if (key == "cacheOracle")
+                mParams.cacheOracle = value;
+            else if (key == "worldCacheRingModulation")
+                mWorldCacheRingModulation = value;
+            else if (key == "worldCacheRingDepth")
+                mParams.worldCacheRingDepth = std::max(0.f, float(value));
+            else if (key == "cloudTraceSlot")
                 mCloudTraceSlot = int(value) < 0 ? ~0u : uint32_t(int(value));
             else if (key == "cloudVisibilityFloor")
                 mCloudVisibilityFloor = std::clamp(float(value), 0.f, 1.f);
@@ -964,7 +970,7 @@ void HSTRCloud::parseProperties(const Properties& props)
         else if (key == kWorldCacheZonalWindow)
             mParams.worldCacheZonalWindow = value;
         else if (key == kWorldCacheSunOrder)
-            mParams.worldCacheSunOrder = std::clamp(uint32_t(value), 2u, 3u);
+            mParams.worldCacheSunOrder = std::clamp(uint32_t(value), 2u, 4u);
         else if (key == kSunNearVoxels)
             mParams.sunNearVoxels = std::clamp(float(value), 0.f, 16.f);
         else if (key == kWorldCacheSimilarity)
@@ -1128,6 +1134,7 @@ void HSTRCloud::setProperties(const Properties& props)
 {
     const HSTRCloudParams previous = mParams;
     const float previousModulation = mWorldCacheModulation;
+    const float previousRingModulation = mWorldCacheRingModulation;
     auto cloudSettings = [&]()
     {
         return fmt::format(
@@ -1191,7 +1198,8 @@ void HSTRCloud::setProperties(const Properties& props)
         p.worldCacheTextured != q.worldCacheTextured || p.worldCacheSegments != q.worldCacheSegments ||
         mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth ||
         p.worldCacheZonalBands != q.worldCacheZonalBands || p.worldCacheSunOrder != q.worldCacheSunOrder ||
-        p.worldCacheSimilarity != q.worldCacheSimilarity)
+        p.worldCacheSimilarity != q.worldCacheSimilarity || mWorldCacheRingModulation != previousRingModulation ||
+        p.worldCacheRingDepth != q.worldCacheRingDepth)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -1220,6 +1228,9 @@ Properties HSTRCloud::getProperties() const
         props["cutTrace"] = mpCloudResidency->walkTrace();
     if (mpCloudResidency)
         props["cutLevels"] = mpCloudResidency->cutLevels(); // DIAGNOSTIC
+    props["cacheOracle"] = mParams.cacheOracle;
+    props["worldCacheRingModulation"] = mWorldCacheRingModulation;
+    props["worldCacheRingDepth"] = mParams.worldCacheRingDepth;
     props["probeX"] = int(mParams.probeX);
     props["probeY"] = int(mParams.probeY);
     // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
@@ -4120,6 +4131,46 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
         var["hstrWorldCache"] = mpWorldCache;
     if (mpWorldCacheDeposit)
         var["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+    if (!mpWorldCacheRingKernel || mWorldCacheRingG != mParams.anisotropy)
+    {
+        // worldCacheSunOrder 4: ring edges (degrees from the sun, finest where the phase's forward peak is, ~7 degrees wide at
+        // g 0.85), then per ring the HG phase averaged over the ring's solid angle against the view's angle from the sun, over
+        // Y_00 (the ring slots deposit Y_00 inside the ring). Midpoint quadrature over the ring in angle and azimuth.
+        const float edges[kWorldCacheRings + 1] = {0.f, 3.f, 7.f, 13.f, 22.f, 40.f, 75.f, 180.f};
+        const double g = mParams.anisotropy;
+        std::vector<float> table(8 + kWorldCacheRings * kWorldCacheRingSamples, 0.f);
+        for (uint32_t j = 0; j + 1 < kWorldCacheRings; ++j)
+            table[j] = std::cos(edges[j + 1] * float(M_PI) / 180.f);
+        const uint32_t polar = 96, azimuth = 192;
+        for (uint32_t j = 0; j < kWorldCacheRings; ++j)
+        {
+            const double a = edges[j] * M_PI / 180.0, b = edges[j + 1] * M_PI / 180.0;
+            const double solidAngle = 2.0 * M_PI * (std::cos(a) - std::cos(b));
+            for (uint32_t i = 0; i < kWorldCacheRingSamples; ++i)
+            {
+                const double view = M_PI * double(i) / double(kWorldCacheRingSamples - 1);
+                double sum = 0.0;
+                for (uint32_t p = 0; p < polar; ++p)
+                {
+                    const double theta = a + (b - a) * (p + 0.5) / polar;
+                    for (uint32_t q = 0; q < azimuth; ++q)
+                    {
+                        const double phi = 2.0 * M_PI * (q + 0.5) / azimuth;
+                        const double cosine = std::cos(view) * std::cos(theta) + std::sin(view) * std::sin(theta) * std::cos(phi);
+                        const double denominator = std::max(1e-4, 1.0 + g * g - 2.0 * g * cosine);
+                        sum += (1.0 - g * g) / (4.0 * M_PI * denominator * std::sqrt(denominator)) * std::sin(theta);
+                    }
+                }
+                sum *= (b - a) / polar * (2.0 * M_PI / azimuth);
+                table[8 + j * kWorldCacheRingSamples + i] = float(sum / (0.282095 * solidAngle));
+            }
+        }
+        mpWorldCacheRingKernel = mpDevice->createStructuredBuffer(
+            sizeof(float), uint32_t(table.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, table.data(), false
+        );
+        mWorldCacheRingG = mParams.anisotropy;
+    }
+    var["hstrWorldCacheRingKernel"] = mpWorldCacheRingKernel;
     if (mpPhotonPool)
         var["hstrPhotonPool"] = mpPhotonPool;
     if (mpPhotonEmitted)
@@ -5191,6 +5242,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const float albedo = dot(mpScene->getGridVolume(0)->getAlbedo(), float3(1.f / 3.f));
         const float diffusion = std::sqrt(std::max(0.f, 3.f * (1.f - albedo) * (1.f - albedo * mParams.anisotropy)));
         mParams.worldCacheModulation = mWorldCacheModulation < 0.f ? diffusion : mWorldCacheModulation;
+        // The ring slots (worldCacheSunOrder 4) hold the light arriving from near the sun: low-order forward scattering, which
+        // travels with the sun beam and fades at the transport rate 1 - albedo g (the similarity relation's extinction).
+        mParams.worldCacheRingModulation = mWorldCacheRingModulation < 0.f ? 1.f - albedo * mParams.anisotropy : mWorldCacheRingModulation;
     }
 
     // World cache experiment: camera-independent gather passes accumulated while its view is shown.
@@ -5268,7 +5322,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // worldCacheTarget: photon updates only while some tile holds fewer batches than this - the state every benchmark scores
         // (sea_motion.py settles to 64 samples, then freezes the cache). A tile whose cloud changed restarts at 0 and a sun move
         // decays every tile's count, so either resumes them. 0: every frame, as before.
-        const bool converged = mWorldCacheTarget > 0 && !mCloudTileBatches.empty() &&
+        // A restarted cache (worldCacheSamples 0: a cache setting changed) is not converged whatever its tiles counted before;
+        // without this its old deposits were read under the new setting and never retraced (sunset_hill_tone_sh: 0 samples).
+        const bool converged = mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && !mCloudTileBatches.empty() &&
                                *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end()) >= float(mWorldCacheTarget);
         for (uint32_t i = 0; i < (converged ? 0u : mWorldCacheUpdates); ++i)
         {

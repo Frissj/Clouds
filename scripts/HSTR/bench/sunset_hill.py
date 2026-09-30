@@ -125,6 +125,7 @@ if SUN_ARMS:
     # the loaded average before the store, or the rows not yet drawn are stale.
     for _ in range((OH + 134) // 135):
         m.renderFrame()
+    capture("reference")
     hstr.set_properties({"storeExact": True})
     m.renderFrame()
     print(f"HILL reference {int(hstr.properties['referenceSampleCount'])} spp stored", flush=True)
@@ -236,9 +237,42 @@ else:
     samples = int(hstr.properties["referenceSampleCount"])
     print(f"HILL reference {samples} spp in {time.time() - start:.0f} s", flush=True)
     capture(f"pt_{samples}spp")
+    # HSTR_HILL_SPLIT=3,5: the path trace and then the exact march restricted to each component set (kComponent* bits).
+    SPLIT = [int(v) for v in os.environ.get("HSTR_HILL_SPLIT", "").split(",") if v]
+    for bits in SPLIT:
+        hstr.set_properties({"referenceShow": bits})
+        for _ in range((OH + 134) // 135 + 1):
+            m.renderFrame()
+        capture(f"pt_c{bits}")
 
     hstr.set_properties(dict(REFERENCE))
     for _ in range(8):
         m.renderFrame()
     capture("exact")
+    for bits in SPLIT:
+        hstr.set_properties({"hstComponents": bits})
+        for _ in range(8):
+            m.renderFrame()
+        capture(f"exact_c{bits}")
+    # HSTR_HILL_SCORES=[(label, components)]: the exact march restricted to the components against the same components of the
+    # path trace just accumulated, over 8x8 blocks (the trace's own noise from its two halves beside it), and the signed error
+    # map (red: the march brighter, blue: darker; full scale 0.2 in log radiance). The march's cache holds the multiply scattered
+    # sun and the scattered sky together, so those two bits only make sense as 12.
+    # An optional third element is a dict of properties for that arm and the ones after it (a cache setting: the cache is given
+    # 300 frames to rebuild under it). A cache that has met worldCacheTarget traces nothing more, and a changed setting only
+    # zeroes its sample count: raise worldCacheTarget past the last arm's with each change, or the old deposits are scored.
+    # "frames" in the dict overrides the 300 (a setting that needs no rebuild, e.g. cacheOracle).
+    for label, bits, *extra in eval(os.environ.get("HSTR_HILL_SCORES", "[]")):
+        props = dict(extra[0]) if extra else {}
+        frames = props.pop("frames", 300 if extra else 8)
+        hstr.set_properties(dict(REFERENCE, hstComponents=bits, compareTarget=bits, compareSubstitute=0, compareReference=True,
+                                 compareExact=False, compareBlock=8, compareMapScale=0.2, **props))
+        for _ in range(frames):
+            m.renderFrame()
+        p = hstr.properties
+        print(f"HILL score {label}: error {float(p['referenceError']):.4f} log {float(p['referenceLogError']):.4f}  "
+              f"noise {float(p['referenceNoiseError']):.4f} log {float(p['referenceNoiseLogError']):.4f}  "
+              f"cache samples {int(p['worldCacheSampleCount'])}", flush=True)
+        capture(f"map_{label}")
+        hstr.set_properties({"compareReference": False, "compareMapScale": 0.0})
 exit()

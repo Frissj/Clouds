@@ -43,6 +43,11 @@ static const uint kFusedStateCount = 10 * kFusedStride;
 static const uint kWorldCacheView = 8;   ///< debugView of the world-space radiance cache experiment.
 static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: unit sun SH 0-8, unit sky SH 9-17, sun extension 18-24.
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
+/// worldCacheSunOrder 4: the sun extension slots hold the sun field in kWorldCacheRings rings about the sun direction, and
+/// hstrWorldCacheRingKernel holds 8 ring-edge cosines, then per ring the phase function averaged over that ring at
+/// kWorldCacheRingSamples view angles (0 to pi from the sun).
+static const uint kWorldCacheRings = 7;
+static const uint kWorldCacheRingSamples = 256;
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
 static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving the tile edge.
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
@@ -625,7 +630,8 @@ struct HSTRCloudParams
     uint worldCacheZonalBands = 0;  ///< >0: the sun field's zonal part about the sun direction is windowed on its own and extended
                                     ///< by zonal bands 3 up to this (at most 8); 0: off.
     uint worldCacheZonalWindow = 0; ///< Window order of that zonal part (0: max(worldCacheZonalBands, 2)).
-    uint worldCacheSunOrder = 2;    ///< 3: the sun field carries all of band 3 (7 extension slots) instead of zonal bands.
+    uint worldCacheSunOrder = 2;    ///< 3: the sun field carries all of band 3 (7 extension slots) instead of zonal bands;
+                                    ///< 4: its zonal part in rings about the sun, scattered by the exact phase (kWorldCacheRings).
     float beamGuideDepth = 0.05f; ///< Guide test: log deviation of the distance at which a pixel's optical depth reaches one.
 
     float beamGuideSun = 0.05f; ///< Guide test: deviation of the sun attenuations exp(-tau) and exp(-b tau) at that distance.
@@ -1419,9 +1425,13 @@ struct HSTRCloudParams
     uint beamRimTaps = 1;
     /// The sun atlas holds cloudSunEncode's 8-bit code of the depth instead of the depth in source voxels (CloudResidencyDesc::sunAtlas8).
     uint cloudSunAtlas8 = 0;
-    uint sunAtlasPad0 = 0;
-    uint sunAtlasPad1 = 0;
-    uint sunAtlasPad2 = 0;
+    /// DIAGNOSTIC (cacheOracleRadiance): the exact view replaces its cache lookups with paths traced from the sample, bits 0-7 paths
+    /// per lookup, bit 8 through the resident fine bricks instead of the transport proxy. 0: the cache.
+    uint cacheOracle = 0;
+    /// worldCacheSunOrder 4: b of the ring slots' own exp(-b tau_sun) modulation (see worldCacheModulation), negative: the medium's
+    /// transport attenuation 1 - albedo g (set per frame), and the sun depth at which it stops falling.
+    float worldCacheRingModulation = -1.f;
+    float worldCacheRingDepth = 24.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
