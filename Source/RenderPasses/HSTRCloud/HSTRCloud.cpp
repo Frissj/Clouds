@@ -280,9 +280,23 @@ void HSTRCloud::parseProperties(const Properties& props)
         // Split from the chain below, which is at MSVC's nesting limit.
         if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
-            key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth")
+            key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
+            key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
+            key == "seaFarOverlap")
         {
-            if (key == "cacheOracle")
+            if (key == "seaFarOverlap")
+                mSeaFarOverlap = bool(value);
+            else if (key == "seaFarScale")
+                mParams.seaFarScale = std::clamp(uint32_t(value), 1u, 8u);
+            else if (key == "seaFarRefresh")
+                mParams.seaFarRefresh = std::clamp(uint32_t(value), 1u, 16u);
+            else if (key == "seaFarProbe")
+                mParams.seaFarProbe = value;
+            else if (key == "seaFarField")
+                mSeaFarField = bool(value);
+            else if (key == "seaFarDistance")
+                mParams.seaFarDistance = std::max(0.f, float(value));
+            else if (key == "cacheOracle")
                 mParams.cacheOracle = value;
             else if (key == "worldCacheRingModulation")
                 mWorldCacheRingModulation = value;
@@ -1133,6 +1147,7 @@ uint32_t HSTRCloud::beamShipDefine() const
 void HSTRCloud::setProperties(const Properties& props)
 {
     const HSTRCloudParams previous = mParams;
+    mFarSeaDirty = true;
     const float previousModulation = mWorldCacheModulation;
     const float previousRingModulation = mWorldCacheRingModulation;
     auto cloudSettings = [&]()
@@ -1231,6 +1246,12 @@ Properties HSTRCloud::getProperties() const
     props["cacheOracle"] = mParams.cacheOracle;
     props["worldCacheRingModulation"] = mWorldCacheRingModulation;
     props["worldCacheRingDepth"] = mParams.worldCacheRingDepth;
+    props["seaFarField"] = mSeaFarField;
+    props["seaFarDistance"] = mParams.seaFarDistance;
+    props["seaFarProbe"] = mParams.seaFarProbe;
+    props["seaFarScale"] = mParams.seaFarScale;
+    props["seaFarRefresh"] = mParams.seaFarRefresh;
+    props["seaFarOverlap"] = mSeaFarOverlap;
     props["probeX"] = int(mParams.probeX);
     props["probeY"] = int(mParams.probeY);
     // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
@@ -1465,6 +1486,7 @@ Properties HSTRCloud::getProperties() const
         cloud["cutMs"] = stats.cutMilliseconds;
         cloud["sunBaked"] = stats.sunBaked;
         cloud["sunWaiting"] = stats.sunWaiting;
+        cloud["farSeaRuns"] = mFarSeaRuns;
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
@@ -1923,6 +1945,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     };
     mpPass = createPass("main");
     mpCameraPass = createPass("renderCloudCamera");
+    mpFarSeaPass = createPass("renderFarSea");
+    mFarSeaDirty = true;
     mpSolvePass = createPass("solveLeaves");
     mpCameraLightingPass = createPass("updateCameraLighting");
     mpProjectPass = createPass("projectCutNodes");
@@ -2016,6 +2040,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpMarkDirtyCloudPagesPass = createPass("markDirtyCloudPages");
     mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
     mpResolveDirtyCloudPagesPass = createPass("resolveDirtyCloudPages");
+    mpResolveSkirtMasksPass = createPass("resolveCloudSkirtMasks");
     mpResolveCloudSunSlotsPass = createPass("resolveCloudSunSlots");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
@@ -3042,6 +3067,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             mpClearWorldCacheTilesPass->execute(pRenderContext, mParams.worldCacheDims);
         }
         mWorldCacheBakeDirty = true;
+        mFarSeaTilesChanged = true;
         mCutDirty = true; // Domain pages and their non-empty projected cells changed.
         FALCOR_PROFILE(pRenderContext, "sunPages");
         // Sun pages: the changed tiles and every tile whose sun rays cross them (up to the layer height along the sun).
@@ -3204,6 +3230,15 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             pageVar["hstrCloudLevelPages"] = ref<Buffer>();
             pageVar["hstrCloudLevelPagesOutput"] = residency.getLevelPages();
             mpResolveDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
+            // The skirt masks read the pages just resolved, all of them (resolveCloudSkirtMasks).
+            FALCOR_PROFILE(pRenderContext, "skirtMasks");
+            if (bindResidencyPass(pRenderContext, mpResolveSkirtMasksPass, false))
+            {
+                ShaderVar skirtVar = mpResolveSkirtMasksPass->getRootVar()["CB"]["gHSTRCloud"];
+                skirtVar["hstrCloudSkirtMasks"] = ref<Buffer>();
+                skirtVar["hstrCloudSkirtMasksOutput"] = residency.getSkirtMasks();
+            }
+            mpResolveSkirtMasksPass->execute(pRenderContext, uint3(residency.getPageCount(), 1, 1));
         }
         mParams.cloudPageRegionCount = 0;
         residency.pageUpdatesDispatched();
@@ -4136,11 +4171,14 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
         // worldCacheSunOrder 4: ring edges (degrees from the sun, finest where the phase's forward peak is, ~7 degrees wide at
         // g 0.85), then per ring the HG phase averaged over the ring's solid angle against the view's angle from the sun, over
         // Y_00 (the ring slots deposit Y_00 inside the ring). Midpoint quadrature over the ring in angle and azimuth.
+        // The phase table is a 2-row RGBA texture (rings 0-3, rings 4-6), sampled at sin(view / 2) so the camera read is one
+        // sqrt and two filtered fetches, not an acos and 14 buffer loads; sin(view / 2) also puts more samples in the peak.
         const float edges[kWorldCacheRings + 1] = {0.f, 3.f, 7.f, 13.f, 22.f, 40.f, 75.f, 180.f};
         const double g = mParams.anisotropy;
-        std::vector<float> table(8 + kWorldCacheRings * kWorldCacheRingSamples, 0.f);
+        std::vector<float> ringEdges(8, 0.f);
+        std::vector<float> table(2 * 4 * kWorldCacheRingSamples, 0.f);
         for (uint32_t j = 0; j + 1 < kWorldCacheRings; ++j)
-            table[j] = std::cos(edges[j + 1] * float(M_PI) / 180.f);
+            ringEdges[j] = std::cos(edges[j + 1] * float(M_PI) / 180.f);
         const uint32_t polar = 96, azimuth = 192;
         for (uint32_t j = 0; j < kWorldCacheRings; ++j)
         {
@@ -4148,7 +4186,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
             const double solidAngle = 2.0 * M_PI * (std::cos(a) - std::cos(b));
             for (uint32_t i = 0; i < kWorldCacheRingSamples; ++i)
             {
-                const double view = M_PI * double(i) / double(kWorldCacheRingSamples - 1);
+                const double view = 2.0 * std::asin(double(i) / double(kWorldCacheRingSamples - 1));
                 double sum = 0.0;
                 for (uint32_t p = 0; p < polar; ++p)
                 {
@@ -4162,15 +4200,20 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
                     }
                 }
                 sum *= (b - a) / polar * (2.0 * M_PI / azimuth);
-                table[8 + j * kWorldCacheRingSamples + i] = float(sum / (0.282095 * solidAngle));
+                table[4 * ((j / 4) * kWorldCacheRingSamples + i) + j % 4] = float(sum / (0.282095 * solidAngle));
             }
         }
         mpWorldCacheRingKernel = mpDevice->createStructuredBuffer(
-            sizeof(float), uint32_t(table.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, table.data(), false
+            sizeof(float), uint32_t(ringEdges.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, ringEdges.data(), false
+        );
+        mpWorldCacheRingTable = mpDevice->createTexture2D(
+            kWorldCacheRingSamples, 2, ResourceFormat::RGBA32Float, 1, 1, table.data(), ResourceBindFlags::ShaderResource
         );
         mWorldCacheRingG = mParams.anisotropy;
     }
     var["hstrWorldCacheRingKernel"] = mpWorldCacheRingKernel;
+    var["hstrWorldCacheRingTable"] = mpWorldCacheRingTable;
+    var["hstrFarField"] = mpFarField[mFarCurrent];
     if (mpPhotonPool)
         var["hstrPhotonPool"] = mpPhotonPool;
     if (mpPhotonEmitted)
@@ -4279,6 +4322,46 @@ void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Tex
     var[output] = pTexture;
 }
 } // namespace
+
+/// This frame's far-sea run (renderFarSea), writing the layer the composites read next frame. Four threads a texel, one per
+/// stretch of its ray.
+void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "farSea");
+    const ref<ComputePass>& pPass = mpFarSeaPass;
+    bindRenderer(pRenderContext, pPass);
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["hstrFarFieldOutput"] = mpFarField[mFarCurrent ^ 1u];
+    var["hstrFarDistanceOutput"] = mpFarDistance[mFarCurrent ^ 1u];
+    var["hstrFarFieldPrev"] = mpFarField[mFarCurrent];
+    var["hstrFarDistancePrev"] = mpFarDistance[mFarCurrent];
+    // Nothing the unit march beside it holds in another state (any transition between them would wait for this run).
+    var["hstrBeamPixels"] = ref<Texture>();
+    var["hstrBeamPixelPrev"] = ref<Texture>();
+    var["hstrBeamDirtyArgs"] = ref<Buffer>();
+    var["hstrBeamWarpArgs"] = ref<Buffer>();
+    const bool counting = (mParams.seaFarProbe & 64u) != 0;
+    if (counting)
+    {
+        if (!mpFarCounts)
+            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 5);
+        pRenderContext->clearUAV(mpFarCounts->getUAV().get(), uint4(0));
+        var["hstrFarCounts"] = mpFarCounts;
+    }
+    pPass->execute(pRenderContext, uint3(mFarRunDims, 1));
+    if (counting)
+    {
+        // DIAGNOSTIC: stalls for the readback.
+        uint32_t c[5];
+        for (uint32_t i = 0; i < 5; ++i)
+            c[i] = mpFarCounts->getElement<uint32_t>(i);
+        logInfo(
+            "HSTRCloud: far sea run {} (all {}): {} segments, {:.1f} iterations each, max {}, {:.1f} lit each, {} at the cap.", mFarSeaRuns,
+            mParams.seaFarRefreshAll, c[0], double(c[1]) / std::max(c[0], 1u), c[2], double(c[3]) / std::max(c[0], 1u), c[4]
+        );
+    }
+    mFarRunDeferred = false;
+}
 
 void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
 {
@@ -5085,6 +5168,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     mParams.frameDim = frameDim;
     mParams.hstrTileDims = (frameDim + mParams.hstrTileSize - 1u) / mParams.hstrTileSize;
     mParams.hstrLatticeDims = mParams.hstrTileDims + 1u;
+    // The far sea (renderFarSea) shows the tiles past the window itself, so the near march's fade, which only kept them from popping
+    // in, narrows from 30% of the view distance to 5%: the far sea no longer re-marches that band under a partial density, and the
+    // near march keeps its bricks at full density to 0.95 of it.
+    mFarSeaActive = mSeaFarField && mParams.seaMode != 0 && mParams.cloudDomain != 0 &&
+                    (mParams.debugView == kBeamView || mParams.debugView == kWorldCacheView);
+    mParams.seaFadeInverse = mFarSeaActive ? 20.f : 1.f / 0.3f;
     if (!mpScene || !mpPass || (!mpLeafRadiance && !mpCloudSea))
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));
@@ -5543,6 +5632,71 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
     else
         mParams.probeCapacity = 0;
+
+    // The far sea (renderFarSea) behind the near march, for the sea's beam and exact views, one frame behind: this frame's composites
+    // read the layer the last run finished (mpFarField[mFarCurrent], looked up by direction through the camera that made it, so a
+    // turn stays exact and only a walk lags a frame), while this frame's run writes the other one. Nothing this frame reads what the
+    // run writes, so it can run beside the dirty unit march (seaFarOverlap, dispatchFarSea).
+    // It depends on the view, the lighting, the sea's tiles and the cache, so a parked, settled camera never runs it.
+    // MEASURED (fartime14, sunset walk 4K, arms of one launch): frame 14.87 ms overlapped / 15.08 serial / 15.12 with the far sea
+    // off; the run 0.65 ms; the near march 7.24 / 6.98 / 7.45 ms (its fade narrowed to 5%). Start-view log error 0.0490 -> 0.0446,
+    // background 0.0367 -> 0.0008. On the way: full resolution every frame 10-13 ms, half resolution reprojected 1/8 a run 1.46,
+    // the tight majorant and hoisted constants 0.94, one sun read and the ray's cache weights 0.65.
+    mParams.seaFarField = 0;
+    if (mFarSeaActive)
+    {
+        if (mFarPending)
+        {
+            mFarCurrent ^= 1u;
+            mFarLayerCamera = mFarPendingCamera;
+            mFarLayerValid = true;
+            mFarPending = false;
+        }
+        const uint32_t scale = std::max(mParams.seaFarScale, 1u);
+        const uint2 farDims = (mParams.frameDim + scale - 1u) / scale;
+        if (!mpFarField[0] || mpFarField[0]->getWidth() != farDims.x || mpFarField[0]->getHeight() != farDims.y)
+        {
+            const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+            for (uint32_t i = 0; i < 2; ++i)
+            {
+                mpFarField[i] = mpDevice->createTexture2D(farDims.x, farDims.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
+                mpFarDistance[i] = mpDevice->createTexture2D(farDims.x, farDims.y, ResourceFormat::R32Float, 1, 1, nullptr, flags);
+            }
+            mFarSeaDirty = true;
+            mFarLayerValid = false;
+        }
+        // The camera of the layer read this frame: the composites' lookup and the run's reprojection both go through it.
+        mParams.seaFarPrevPosition = mFarLayerCamera.posW;
+        mParams.seaFarPrevU = mFarLayerCamera.cameraU;
+        mParams.seaFarPrevV = mFarLayerCamera.cameraV;
+        mParams.seaFarPrevW = mFarLayerCamera.cameraW;
+        // A change of view, cache or tiles starts a refresh cycle: seaFarRefresh runs, each recomputing its share of the texels and
+        // reprojecting the rest, so every texel is fresh seaFarRefresh runs after the last change and a parked camera stops.
+        const Camera* pCamera = mpScene->getCamera().get();
+        const float4x4 viewProj = pCamera->getViewProjMatrixNoJitter();
+        if (mFarSeaTilesChanged || mFarSeaBakes != mWorldCacheBakes || std::memcmp(&viewProj, &mFarSeaViewProj, sizeof(float4x4)) != 0)
+            mFarCountdown = std::max(mParams.seaFarRefresh, 1u);
+        if (mFarSeaDirty || mFarCountdown > 0)
+        {
+            mParams.seaFarRefreshAll = mFarSeaDirty || !mFarLayerValid ? 1u : 0u;
+            mParams.seaFarPhase = mFarPhase;
+            mFarRunDims = farDims;
+            if (mSeaFarOverlap && mParams.debugView == kBeamView)
+                mFarRunDeferred = true;
+            else
+                dispatchFarSea(pRenderContext);
+            mFarPendingCamera = pCamera->getData();
+            mFarPending = true;
+            mFarSeaViewProj = viewProj;
+            mFarSeaBakes = mWorldCacheBakes;
+            mFarSeaTilesChanged = false;
+            mFarPhase = (mFarPhase + 1u) % std::max(mParams.seaFarRefresh, 1u);
+            mFarCountdown = mFarSeaDirty ? 0u : mFarCountdown - 1u;
+            mFarSeaDirty = false;
+            ++mFarSeaRuns;
+        }
+        mParams.seaFarField = mFarLayerValid ? 1u : 0u;
+    }
 
     // Beam view: hierarchical tiles. Level 0 queries every coarsest tile corner and centre and tests every tile; each finer
     // level queries and tests only the children of the tiles refined above it, through compacted lists and indirect
@@ -6902,10 +7056,30 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         bindDirty(mpBeamDirtyMarchStripPass);
                         mpBeamDirtyMarchStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
                     }
+                    const bool farBeside = mFarRunDeferred;
+                    if (farBeside)
+                    {
+                        // The far-sea run beside the unit march (seaFarOverlap): it is latency-bound on its longest horizon rays
+                        // (1.4 ms at walk with most of the GPU idle), the march is the frame's longest dispatch. Everything the march
+                        // reads is settled first - its arguments in their indirect state, its outputs behind a barrier - and the run
+                        // dispatched with its own barriers; the march then follows with none, so the two overlap. Nothing in the march
+                        // reads what the run writes (the layer for the next frame).
+                        pRenderContext->resourceBarrier(mpBeamDirtyArgs.get(), Resource::State::IndirectArg);
+                        pRenderContext->uavBarrier(mpBeamPixels[0].get());
+                        pRenderContext->uavBarrier(color.get());
+                        dispatchFarSea(pRenderContext);
+                    }
                     {
                         FALCOR_PROFILE(pRenderContext, "units");
                         bindDirty(mpBeamDirtyMarchPass);
+                        if (farBeside)
+                        {
+                            // The march never reads its own arguments; bound, they would transition back to a UAV.
+                            mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamDirtyArgs"] = ref<Buffer>();
+                            pRenderContext->setAutoUavBarriers(false);
+                        }
                         mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                        pRenderContext->setAutoUavBarriers(true);
                     }
                     mParams.beamDirtyFused = 0;
                     if (mPushProbe && mPushShare && mpPushShareRays)
@@ -6949,6 +7123,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         }
         pPass->execute(pRenderContext, uint3(mParams.frameDim, 1));
     }
+
+    // A far-sea run no unit march took beside it this frame (seaFarOverlap): its layer is still next frame's.
+    if (mFarRunDeferred)
+        dispatchFarSea(pRenderContext);
 
     if (mParams.cloudTransferWords > 0 && mpTransferProbe)
     {

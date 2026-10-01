@@ -350,6 +350,8 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<HSTRCloudVirtualPage> hstrCloudPagesOutput;
     StructuredBuffer<uint> hstrCloudLevelPages;         ///< Resolved level pages (HSTRCloudAsset::levelPageBase).
     RWStructuredBuffer<uint> hstrCloudLevelPagesOutput;
+    StructuredBuffer<uint> hstrCloudSkirtMasks;         ///< Per virtual page: which neighbours across its octant's faces hold (cloudOctantSkirt).
+    RWStructuredBuffer<uint> hstrCloudSkirtMasksOutput;
     StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudDirtyRegions;
     RWStructuredBuffer<uint> hstrCloudDirtyBits;
     RWStructuredBuffer<uint> hstrCloudDirtyPages;
@@ -442,7 +444,16 @@ struct HSTRCloudRenderer
     // The cache means baked for the camera: slot s = 3k + c of the 27 in texture s / 4, channel s % 4, trilinear by hardware.
     Texture3D<float4> hstrWorldCacheTexture[kWorldCacheTextures];
     RWTexture3D<float4> hstrWorldCacheTextureOutput[kWorldCacheTextures];
-    StructuredBuffer<float> hstrWorldCacheRingKernel; ///< worldCacheSunOrder 4: ring edges and ring phase table (kWorldCacheRings).
+    StructuredBuffer<float> hstrWorldCacheRingKernel; ///< worldCacheSunOrder 4: ring edge cosines (kWorldCacheRings).
+    Texture2D<float4> hstrWorldCacheRingTable;        ///< worldCacheSunOrder 4: ring phase table.
+    Texture2D<float4> hstrFarField;                   ///< Per texel: the far sea's radiance (hazed) less the sky it hides, and its transmittance.
+    RWTexture2D<float4> hstrFarFieldOutput;
+    Texture2D<float4> hstrFarFieldPrev;               ///< The previous far layer and its opacity-weighted distance, reprojected.
+    Texture2D<float> hstrFarDistancePrev;
+    RWTexture2D<float> hstrFarDistanceOutput;
+    /// DIAGNOSTIC (seaFarProbe bit 6): marched texels, their iterations, the most any one took, their lit samples, texels at the
+    /// iteration cap.
+    RWStructuredBuffer<uint> hstrFarCounts;
     // Beam view: exact queries on the lattice of all tile corners and centres, slice 0 (cache rgb, optical depth), slice 1
     // (single scatter without phase, unused); the level that finalised every finest tile (beamLevels: marched per pixel);
     // the per-level lists of refined tiles (list beamLevels: finest tiles marched per pixel), their counts and indirect
@@ -955,9 +966,10 @@ struct HSTRCloudRenderer
     /// exactly zero, the source-space box around v in which it stays zero at v's footprint level (cloudEmptyExit).
     float cameraExtinctionAtVoxel(float3 v, float footprint, inout float fineVoxels, out CloudSample sample)
     {
-        // The sea fades out over the last 30% of the view distance, so tiles entering the window never pop in.
+        // The sea fades out over the last 30% of the view distance, so tiles entering the window never pop in (5% with the far
+        // sea, which takes the rest: seaFadeInverse).
         const float distanceFade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
-                                       ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
+                                       ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) * params.seaFadeInverse)
                                        : 1.f;
         return distanceFade * cameraExtinctionUnfaded(v, footprint, fineVoxels, sample);
     }
@@ -1137,37 +1149,85 @@ struct HSTRCloudRenderer
         if (all(side == 0))
             return 0.f;
         float keep = 0.f;
-        const uint3 brickDims = asset.dims >> 3u;
+        // Which neighbours hold is the page's, not the sample's: the octant is the page's own (its mapped level), and a neighbour
+        // across a face shares the sample's other coordinates, so it is the page's neighbour too. resolveCloudSkirtMasks writes the
+        // 26 directions as bits (cloudSkirtMask) whenever pages change; here one word and bit tests replace a page load and then a
+        // brick load per neighbour, a chain of dependent loads in the march's innermost path.
+        // MEASURED (sunset 4K walk, arms masks / loads / masks in one launch, skirtmasks): units 6.24 / 7.48 / 6.17 ms, frame mean
+        // 12.95 / 15.81 / 13.17 ms; resolveCloudSkirtMasks 0.10-0.16 ms on frames whose pages changed; hill log 0.0446 (exact).
+        // The kernel stays at 168 registers, 12 warps per SM (a stand-in of this shape, maskprobe_gfx1): the gain is the loads.
+        // REJECTED before it, each timed the same way, exact (hill log 0.0446):
+        // - The neighbour's level-(level - 1) resolved word for its page and then its brick's child mask (one independent load for
+        //   two dependent ones): units 9.24 / 9.23 / 9.21 ms new / old / new (skirtpages).
+        // - That, plus walking only the combinations of faces the sample is near, single faces first, loading no neighbour whose ramp
+        //   cannot raise keep: units 7.64 / 7.56 / 7.73 ms (skirtwalk).
+        // - The loads with less live state (per-axis ramps, faces as one mask, pages packed 10 bits per axis): still 168 registers.
+        // The profiler put the loop at 21-26% of the march's samples, but those were stalls other warps covered. Compiling the skirt
+        // out entirely (wrong image) gave 128 registers, 16 warps and units 4.3 ms (noskirt_gfx1, noskirt_time): the registers belong
+        // to the density path a non-zero skirt keeps alive, not to the skirt's own arithmetic.
+        const uint3 page = uint3(i) >> 3u;
+        const uint3 pages = asset.dims >> 3u;
+        const uint holds = hstrCloudSkirtMasks[asset.pageOffset + page.x + pages.x * (page.y + pages.y * page.z)];
+        const uint faces = (side.x != 0 ? 1u : 0u) | (side.y != 0 ? 2u : 0u) | (side.z != 0 ? 4u : 0u);
+        // Toward the face it is near, per axis; across an edge or corner the neighbour is as far as the farthest of its faces.
+        const float3 ramp = saturate(1.f - select(side < 0, below, above) / reach);
         [loop]
-        for (uint combo = 1; combo < 8; ++combo)
+        for (uint combo = (0u - faces) & faces; combo != 0; combo = (combo - faces) & faces)
         {
-            const int3 mask = int3(combo & 1u, (combo >> 1) & 1u, (combo >> 2) & 1u);
-            // An axis in the combination the sample is not near a face of: that neighbour is out of reach.
-            if ((mask.x != 0 && side.x == 0) || (mask.y != 0 && side.y == 0) || (mask.z != 0 && side.z == 0))
-                continue;
-            const int3 d = mask * side;
-            const int3 n = select(d < 0, origin - 1, select(d > 0, origin + size, i));
-            if (any(n < 0) || any(n >= int3(asset.dims)))
-                continue;
-            // The neighbour holds density at the face only where it is read at this level or coarser (a finer neighbour's own apron
-            // falls to zero there) and is a present child of the brick it reads. A missing neighbour is zero like this octant: its
-            // page resolves to a coarse brick whose halo would otherwise be read across both (blocky panels over every gap, 15.3% of
-            // pixels over 0.02 on the beam, sunset_skirt1). Requiring exactly this level missed rims whose neighbour reads level 2
-            // (sunset_skirt2: the fuzz came back).
-            const uint3 page = uint3(n) >> 3u;
-            const HSTRCloudVirtualPage p = hstrCloudPages[asset.pageOffset + page.x + brickDims.x * (page.y + brickDims.y * page.z)];
-            gProbeSkirt |= (1u << (6u + combo)) | ((p.mappedLevel & 15u) << 16); // DIAGNOSTIC
-            if (p.physicalRef == kCloudRefNone || p.mappedLevel < level)
-                continue;
-            const uint3 child = (uint3(n) >> (p.mappedLevel + 2u)) & 1u;
-            gProbeSkirt |= ((hstrCloudBricks[p.physicalRef].info >> 4) & (1u << (child.x + 2u * child.y + 4u * child.z))) != 0 ? 1u << 20 : 0u; // DIAGNOSTIC
-            if (((hstrCloudBricks[p.physicalRef].info >> 4) & (1u << (child.x + 2u * child.y + 4u * child.z))) == 0)
-                continue;
-            // Across an edge or corner the neighbour is as far as the farthest of its faces.
-            const float3 across = select(d < 0, below, select(d > 0, above, float3(0.f)));
-            keep = max(keep, saturate(1.f - max(across.x, max(across.y, across.z)) / reach));
+            const int3 d = int3(combo & 1u, (combo >> 1) & 1u, (combo >> 2) & 1u) * side;
+            if ((holds & (1u << cloudSkirtBit(d))) != 0)
+                keep = max(keep, min((combo & 1u) != 0 ? ramp.x : 1.f, min((combo & 2u) != 0 ? ramp.y : 1.f, (combo & 4u) != 0 ? ramp.z : 1.f)));
         }
+        gProbeSkirt |= holds << 6; // DIAGNOSTIC
         return keep;
+    }
+
+    /// The bit of direction d (components -1, 0, 1, not all 0) in a skirt mask: the 27 base-3 digits less the centre.
+    static uint cloudSkirtBit(int3 d)
+    {
+        const uint index = uint((d.x + 1) + 3 * (d.y + 1) + 9 * (d.z + 1));
+        return index - (index > 13u ? 1u : 0u);
+    }
+
+    /// The skirt mask of virtual page `brick` of asset: for each direction across the faces of its missing child octant, whether the
+    /// neighbour page there holds density at the face - mapped at the octant's level or coarser and a present child of its brick
+    /// (cloudOctantSkirt's original test, exact). 0 where the page is not in a missing child octant (the skirt is never asked).
+    /// The neighbour holds only where it is read at this level or coarser (a finer neighbour's own apron falls to zero there) and is a
+    /// present child of the brick it reads. A missing neighbour is zero like this octant: its page resolves to a coarse brick whose
+    /// halo would otherwise be read across both (blocky panels over every gap, 15.3% of pixels over 0.02 on the beam, sunset_skirt1).
+    /// Requiring exactly this level missed rims whose neighbour reads level 2 (sunset_skirt2: the fuzz came back).
+    uint cloudSkirtMask(HSTRCloudAsset asset, uint3 brick)
+    {
+        const uint3 pages = asset.dims >> 3u;
+        const HSTRCloudVirtualPage own = hstrCloudPages[asset.pageOffset + brick.x + pages.x * (brick.y + pages.y * brick.z)];
+        const uint level = own.mappedLevel;
+        if (own.physicalRef == kCloudRefNone || level == 0)
+            return 0u;
+        const uint3 child = (brick >> (level - 1u)) & 1u;
+        if (((hstrCloudBricks[own.physicalRef].info >> 4) & (1u << (child.x + 2u * child.y + 4u * child.z))) != 0)
+            return 0u;
+        // The octant in pages: 2^(level - 1) of them per axis (level >= 1, so a page never straddles an octant).
+        const int3 origin = int3((brick >> (level - 1u)) << (level - 1u));
+        const int size = 1 << int(level - 1u);
+        uint mask = 0u;
+        for (int z = -1; z <= 1; ++z)
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x)
+                {
+                    const int3 d = int3(x, y, z);
+                    if (all(d == 0))
+                        continue;
+                    const int3 n = select(d < 0, origin - 1, select(d > 0, origin + size, int3(brick)));
+                    if (any(n < 0) || any(n >= int3(pages)))
+                        continue;
+                    const HSTRCloudVirtualPage p = hstrCloudPages[asset.pageOffset + n.x + pages.x * (n.y + pages.y * n.z)];
+                    if (p.physicalRef == kCloudRefNone || p.mappedLevel < level)
+                        continue;
+                    const uint3 c = (uint3(n) >> (p.mappedLevel - 1u)) & 1u;
+                    if (((hstrCloudBricks[p.physicalRef].info >> 4) & (1u << (c.x + 2u * c.y + 4u * c.z))) != 0)
+                        mask |= 1u << cloudSkirtBit(d);
+                }
+        return mask;
     }
 
     bool cloudAssetBrickAt(HSTRCloudAsset asset, float3 x, uint desired, bool settledOnly, float thinDensity, out CloudSample sample)
@@ -3283,12 +3343,273 @@ struct HSTRCloudRenderer
     /// run with skyModel 0, or with skyModel 2 and atmosphereAerialDistance 0 (no haze; the atmosphere's sun and sky still light).
     float3 hazedBeamRadiance(float3 cache, float3 single, float depth, float distance, float3 w, float3 albedo)
     {
-        const float3 radiance = beamRadiance(cache, single, depth, w, albedo);
+        const float3 radiance = beamRadiance(cache, single, depth, w, albedo) + exp(-depth) * farSeaExtra(w);
         if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f))
             return radiance;
         const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
         const float4 aerial = atmosphereAerial(hstrAtmosphere, hstrAtmosphereAerial, hstrLinearClampSampler, w, distance);
         return radiance - cloud * (1.f - aerial.a) + aerial.rgb * (1.f - exp(-depth));
+    }
+
+    /// The far sea: the path tracer's periodic sea reaches the horizon, the near march stops at seaViewDistance (the camera-centred
+    /// window of tiles). Past 0.95 seaViewDistance, where the near march's density fades out, this march takes the wrapped sea with the
+    /// complementary fade, out to seaFarDistance, through the transport proxy (the always-resident domain-voxel mean density), lit by
+    /// the domain sun field and the world cache, as the near march is. Its own pass, not the beam march: most pixels leave the cloud
+    /// layer before the fade and return at once, and the pass runs only when its view or lighting changed.
+    /// The distances along w (from origin) the far sea covers; false if none.
+    bool farSeaInterval(float3 origin, float3 w, out float2 interval)
+    {
+        const float bottom = max(params.seaOrigin.y, params.seaContentY.x);
+        const float top = min(params.seaOrigin.y + float(params.hstrExtinctionDims.y) * params.seaVoxelSize.y, params.seaContentY.y);
+        interval = float2(0.f, 1e30f);
+        if (abs(w.y) > 1e-7f)
+        {
+            const float2 y = (float2(bottom, top) - origin.y) / w.y;
+            interval = float2(min(y.x, y.y), max(y.x, y.y));
+        }
+        else if (origin.y < bottom || origin.y > top)
+            return false;
+        interval.x = max(interval.x, (1.f - 1.f / params.seaFadeInverse) * params.seaViewDistance);
+        interval.y = min(interval.y, params.seaFarDistance);
+        return interval.y > interval.x;
+    }
+
+    /// Whether the far sea may read the cache through farCacheRadiance: the plain textured order-2 cache (no sun extension).
+    bool farCacheFast()
+    {
+        return params.worldCacheTextured != 0 && params.worldCacheEstimator != 0 && params.worldCacheOrder == 2 &&
+               params.worldCacheSunOrder < 3 && params.worldCacheZonalBands == 0;
+    }
+
+    /// worldCacheRadiance in that case, for a far-sea sample at voxel position v with sun depth `depth` (already read for single
+    /// scattering): the view direction's band weights (shWindow * g^l * Y_k(w), the same for the sun and the sky field) come
+    /// from the ray, so a lit sample is five fetches and two dot products.
+    float3 farCacheRadiance(float3 v, float depth, float weights[9])
+    {
+        const float3 uvw = seaVoxel(v) / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
+        float4 texels[5];
+        [unroll]
+        for (uint t = 0; t < 5; ++t)
+            texels[t] = hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f);
+        float sun = 0.f;
+        float sky = 0.f;
+        [unroll]
+        for (uint k = 0; k < 9; ++k)
+        {
+            sun += weights[k] * texels[k / 4][k % 4];
+            sky += weights[k] * texels[(9 + k) / 4][(9 + k) % 4];
+        }
+        const float modulation =
+            params.worldCacheModulation > 0.f ? exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth)) : 1.f;
+        const float sunOn = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
+        const float skyOn = (params.hstComponents & kComponentSkyScattered) != 0 ? 1.f : 0.f;
+        return max(0.f, modulation * (sunOn * sun * params.sunRadiance + skyOn * sky * params.skyRadiance));
+    }
+
+    /// majorantBlockExit with the ray's inverse voxel direction given (the far sea's, hoisted out of its loop).
+    float farBlockExit(float3 v, float3 inverse, float edge)
+    {
+        const float3 lower = floor(v / edge) * edge;
+        const float3 t0 = (lower - v) * inverse;
+        const float3 t1 = (lower + edge - v) * inverse;
+        const float3 far = select(max(t0, t1) > 1e-5f, max(t0, t1), float3(1e30f));
+        return min(far.x, min(far.y, far.z));
+    }
+
+    /// The far sea over distances [interval.x, interval.y] along w: its radiance (not hazed), transmittance, and the sum of
+    /// transmittance * alpha * distance (for the opacity-weighted distance).
+    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance)
+    {
+        const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0 && (params.seaFarProbe & 2u) == 0;
+        const bool withCache = (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0 && (params.seaFarProbe & 3u) == 0;
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        const float phase = phaseHG(dot(normalize(params.sunDirection), w));
+        const float3 d = w / params.seaVoxelSize;
+        const float3 inverse = 1.f / select(abs(d) < 1e-12f, float3(1e-12f), d); // majorantBlockExit's, once a ray.
+        const float inverseView = 1.f / params.seaViewDistance;
+        const float3 start = (origin - params.seaOrigin) / params.seaVoxelSize - 0.5f;
+        const int3 groups = int3((params.hstrMajorantDims + 3u) / 4u) - 1;
+        const bool fastCache = farCacheFast();
+        float weights[9];
+        [unroll]
+        for (uint k = 0; k < 9; ++k)
+        {
+            const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
+            weights[k] = shWindow(l, 2) * (l == 0 ? 1.f : (l == 1 ? params.anisotropy : params.anisotropy * params.anisotropy)) * shBasis(k, w);
+        }
+        float3 radiance = 0.f;
+        float transmittance = 1.f;
+        distance = 0.f;
+        float s = interval.x;
+        uint iterations = 0;
+        uint lit = 0;
+        // MEASURED and REMOVED (far4, walk 4K): a 2D max-cloud-top pyramid over the columns, skipping any cell the ray passes wholly
+        // above or below - exact (identical scores) but 10.5 -> 13.3 ms. The horizon rays skim among the cloud tops, not above them:
+        // every coarse cell holds a tall cloud, so the traversal descended to single columns, two tests per 20 units instead of one.
+        for (uint i = 0; i < 1024u && s < interval.y && transmittance > params.cloudMinTransmittance; ++i)
+        {
+            ++iterations;
+            const float3 v = start + s * d;
+            const float3 wrapped = seaVoxel(v);
+            // Empty 16-voxel blocks in one jump, empty majorant blocks in another (the path tracer's own skips).
+            if (hstrOccupancy.Load(int4(clamp(int3(floor(wrapped / 16.f)), int3(0), groups), 0)) == 0)
+            {
+                s += farBlockExit(v, inverse, 16.f) + 1e-3f;
+                continue;
+            }
+            // The near march's density fade is saturate((1 - distance / seaViewDistance) * seaFadeInverse); the far sea takes the rest.
+            // The tight majorant: every sample of this step lies inside the block, so the bound of the block alone holds, and the
+            // fringe blocks the dilated one marks (it bounds the block's neighbours for longer steps) are skipped whole. A traced walk
+            // frame (farsea_gfx1) showed the run instruction-bound, its long lanes ~800 steps through such fringes.
+            const float fade = 1.f - saturate((1.f - s * inverseView) * params.seaFadeInverse);
+            const float majorant = fade * hstrTightMajorant.Load(int4(clamp(int3(floor(wrapped * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1), 0));
+            const float exit = farBlockExit(v, inverse, 4.f) + 1e-3f;
+            if (majorant <= 0.f)
+            {
+                s += exit;
+                continue;
+            }
+            // Optical depth 0.25 a step against the block's majorant, at least a domain voxel and at most the rest of the block.
+            // MEASURED (far10, walk 4K, dilated majorant): targeting optical depth 1 or 2 instead changed neither the scores nor
+            // the time.
+            const float ds = min(clamp(0.25f / majorant, params.seaVoxelSize.x, exit), interval.y - s);
+            const float middle = s + 0.5f * ds;
+            const float3 vm = start + middle * d;
+            const float sigma = (1.f - saturate((1.f - middle * inverseView) * params.seaFadeInverse)) * extinctionAtVoxel(vm);
+            // Light only what can show: a sample adding under 1e-4 of the pixel is dropped.
+            if (sigma > 0.f && transmittance * sigma * ds > 1e-4f)
+            {
+                const float alpha = 1.f - exp(-sigma * ds);
+                // One sun-depth read for the single scattering and the cache's modulation.
+                const float depth = fineSunAt(vm);
+                float3 source = 0.f;
+                if (withSingle)
+                    source += phase * params.sunRadiance * exp(-depth);
+                if (withCache)
+                    source += fastCache ? farCacheRadiance(vm, depth, weights) : worldCacheRadiance(vm, w);
+                radiance += transmittance * alpha * albedo * source;
+                distance += transmittance * alpha * middle;
+                transmittance *= 1.f - alpha;
+                ++lit;
+            }
+            s += ds;
+        }
+        if ((params.seaFarProbe & 64u) != 0)
+        {
+            uint unused;
+            InterlockedAdd(hstrFarCounts[0], 1u, unused);
+            InterlockedAdd(hstrFarCounts[1], iterations, unused);
+            InterlockedMax(hstrFarCounts[2], iterations, unused);
+            InterlockedAdd(hstrFarCounts[3], lit, unused);
+            InterlockedAdd(hstrFarCounts[4], iterations >= 1024u ? 1u : 0u, unused);
+        }
+        return float4(radiance, transmittance);
+    }
+
+    /// Screen position (pixels) of world direction w seen from a camera with basis U, V, W (cameraRayDirection's inverse); false
+    /// behind it.
+    bool farProject(float3 w, float3 U, float3 V, float3 W, out float2 position)
+    {
+        const float forward = dot(w, W) / dot(W, W);
+        const float2 ndc = float2(dot(w, U) / dot(U, U), dot(w, V) / dot(V, V)) / max(forward, 1e-12f);
+        position = float2(0.5f + 0.5f * ndc.x, 0.5f - 0.5f * ndc.y) * float2(params.frameDim);
+        return forward > 0.f;
+    }
+
+    /// One far-layer texel (seaFarScale x seaFarScale pixels). A run recomputes the texels of this run's phase (a 4 x 4 ordered
+    /// pattern, 16 / seaFarRefresh of them) or all of them (seaFarRefreshAll); every other texel is its previous value, reprojected
+    /// from the camera that computed it through its opacity-weighted distance (the sky behind, by direction), or recomputed where
+    /// that lands off the previous layer. At 1600+ units the far sea moves a few pixels a frame at a walk; a turn moves it exactly.
+    float3 farTexelDirection(uint2 texel) { return cameraRayDirection((float2(texel) + 0.5f) * float(params.seaFarScale)); }
+
+    /// What this run does with a texel: 0 nothing (outside the layer), 1 reprojects it from the previous layer at uv, 2 marches it.
+    uint farSeaDecision(uint2 texel, out float2 uv)
+    {
+        uv = 0.f;
+        const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+        if (any(texel >= dims))
+            return 0u;
+        // Whole 8 x 8 thread groups share a phase, so a wave either marches or reprojects. Phased per texel (a 4 x 4 pattern), every
+        // wave held marching lanes and waited for its slowest (walk, 4K, half resolution, 1 in 8: 1.46 ms).
+        static const uint kOrder[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+        const uint2 group = texel / 8u;
+        if (params.seaFarRefreshAll != 0 ||
+            ((params.seaFarProbe & 8u) == 0 && kOrder[(group.x & 3u) + 4u * (group.y & 3u)] % params.seaFarRefresh == params.seaFarPhase))
+            return 2u;
+        const float3 origin = gScene.camera.data.posW;
+        const float3 w = farTexelDirection(texel);
+        const float previousDistance = hstrFarDistancePrev[texel];
+        const float3 q = previousDistance > 0.f ? normalize(origin + previousDistance * w - params.seaFarPrevPosition) : w;
+        float2 position;
+        const bool off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
+                         any(position >= float2(params.frameDim));
+        uv = position / (float2(dims) * float(params.seaFarScale));
+        return off && (params.seaFarProbe & 16u) == 0 ? 2u : 1u;
+    }
+
+    /// A texel this run marches: its far interval (farSeaMarch); nothing for the others.
+    float4 farSeaTexelMarch(uint2 texel, out float distanceSum)
+    {
+        distanceSum = 0.f;
+        float2 uv;
+        float2 interval;
+        const float3 origin = gScene.camera.data.posW;
+        const float3 w = farTexelDirection(texel);
+        if (farSeaDecision(texel, uv) != 2u || !farSeaInterval(origin, w, interval))
+            return float4(0.f, 0.f, 0.f, 1.f);
+        return farSeaMarch(origin, w, interval, distanceSum);
+    }
+
+    /// Writes a texel: reprojected, or from its composed segments (radiance, transmittance and distance sum).
+    void farSeaFinish(uint2 texel, float4 far, float distanceSum)
+    {
+        float2 uv;
+        const uint decision = farSeaDecision(texel, uv);
+        if (decision == 0u)
+            return;
+        if ((params.seaFarProbe & 32u) != 0)
+        {
+            hstrFarFieldOutput[texel] = float4(0.f, 0.f, 0.f, 1.f);
+            return;
+        }
+        if (decision == 1u)
+        {
+            hstrFarFieldOutput[texel] = hstrFarFieldPrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+            hstrFarDistanceOutput[texel] = hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+            return;
+        }
+        const float3 w = farTexelDirection(texel);
+        float farDistance = 0.f;
+        const float opacity = 1.f - far.a;
+        if (opacity > 1e-6f)
+        {
+            farDistance = distanceSum / opacity;
+            // Aerial perspective at the far clouds' opacity-weighted distance.
+            if (params.skyModel == 2 && hstrAtmosphere.aerialDistance > 0.f)
+            {
+                const float4 aerial = atmosphereAerial(hstrAtmosphere, hstrAtmosphereAerial, hstrLinearClampSampler, w, farDistance);
+                far.rgb = far.rgb * aerial.a + aerial.rgb * opacity;
+            }
+        }
+        // Stored as what it adds behind the near march - its radiance less the sky it hides - so the composite is one fetch.
+        const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
+        hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
+        hstrFarDistanceOutput[texel] = farDistance;
+    }
+
+    /// What the far sea adds behind the near march along camera ray w: its radiance, less the sky it hides. Read by direction, so
+    /// every composite (beam resolve, exact views) takes it without knowing its pixel.
+    float3 farSeaExtra(float3 w)
+    {
+        if (params.seaFarField == 0)
+            return 0.f;
+        // The layer is the last run's, one frame behind: looked up through the camera that made it, so a turn stays exact.
+        float2 position;
+        if (!farProject(w, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position))
+            return 0.f;
+        // Bilinear over the far layer's texels (seaFarScale pixels each).
+        const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+        return hstrFarField.SampleLevel(hstrLinearClampSampler, position / (float2(dims) * float(params.seaFarScale)), 0.f).rgb;
     }
 
     /// Distance (world units along the ray) to the exit of v's majorant block (edge 4 voxels, or 16 for the occupancy
@@ -3993,19 +4314,31 @@ struct HSTRCloudRenderer
         if (any(cell >= params.worldCacheDims) || majorantAt((float3(cell) + 0.5f) * float(params.worldCacheCellVoxels)) <= 0.f)
             return;
         const uint index = worldCacheIndex(cell);
+        float slots[4 * kWorldCacheTextures];
+        [unroll]
+        for (uint slot = 0; slot < 4 * kWorldCacheTextures; ++slot)
+            slots[slot] = slot < kWorldCacheSlots ? worldCacheSlotMean(index, slot) : 0.f;
+        if (params.worldCacheOrder == 2 && params.worldCacheSunOrder == 4)
+        {
+            // Ring mode: the rings carry the sun field's zonal part about the sun s, so the sun's bands 0-2 are stored without it.
+            // By the addition theorem its band-l zonal part f_l(s) P_l(w . s), f_l(s) = sum_m c_lm Y_lm(s), has the coefficients
+            // 4 pi / (2l + 1) f_l(s) Y_lm(s): subtracted here once a cell, the camera reads the rest as plain windowed SH instead of
+            // splitting every sample (walk trace, rings: the same occupancy as plain, 1.3-1.6 -> 1.64 G instructions in the march).
+            const float3 s = normalize(params.sunDirection);
+            float3 atSun = 0.f;
+            [unroll]
+            for (uint k = 0; k < 9; ++k)
+                atSun[k == 0 ? 0u : (k < 4 ? 1u : 2u)] += slots[k] * shBasis(k, s);
+            [unroll]
+            for (uint k = 0; k < 9; ++k)
+            {
+                const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
+                slots[k] -= 4.f * kPi / (2.f * float(l) + 1.f) * atSun[l] * shBasis(k, s);
+            }
+        }
         [unroll]
         for (uint t = 0; t < kWorldCacheTextures; ++t)
-        {
-            float4 texel = 0.f;
-            [unroll]
-            for (uint c = 0; c < 4; ++c)
-            {
-                const uint slot = 4 * t + c;
-                if (slot < kWorldCacheSlots)
-                    texel[c] = worldCacheSlotMean(index, slot);
-            }
-            hstrWorldCacheTextureOutput[t][cell] = texel;
-        }
+            hstrWorldCacheTextureOutput[t][cell] = float4(slots[4 * t], slots[4 * t + 1], slots[4 * t + 2], slots[4 * t + 3]);
     }
 
     /// Textured form of worldCacheRadiance: one trilinear fetch per four slots, only for the evaluated bands. The unit sun and
@@ -4019,16 +4352,19 @@ struct HSTRCloudRenderer
     /// no window 0.0388. Beyond L2 removes at most ~8%, so the extension is off by default. Unwindowed order 2 is worse than
     /// windowed order 1 (0.040 vs 0.028). A 3x3x3 tent filter of the stored cache plateaus at 0.037. The error maps show lit
     /// faces too dark and silhouettes/creases too bright at every g: sub-cell skin structure, not angular detail.
-    float3 worldCacheRadianceTextured(float3 v, float3 w)
+    /// modulation scales the whole cache and ringModulation the ring slots (worldCacheSunOrder 4) in its place; the camera read
+    /// passes both from one fine sun read (worldCacheRadiance), the stored form 1 and the ring factor.
+    float3 worldCacheRadianceTextured(float3 v, float3 w, float modulation, float ringModulation)
     {
         v = seaVoxel(v);
         const float3 uvw = v / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
         const float g = params.anisotropy;
         const uint order = params.worldCacheOrder;
         const uint extension = order == 2 ? worldCacheSunExtension() : 0u;
-        const uint sunOrder = extension == 7 ? 3u : order;
         const bool rings = order == 2 && params.worldCacheSunOrder == 4;
-        const bool zonal = rings || (order == 2 && params.worldCacheSunOrder < 3 && params.worldCacheZonalBands > 0);
+        // Ring mode's sun bands are stored without their zonal part (bakeWorldCacheCell), so they read as plain order-2 SH.
+        const uint sunOrder = extension == 7 && !rings ? 3u : order;
+        const bool zonal = order == 2 && params.worldCacheSunOrder < 3 && params.worldCacheZonalBands > 0;
         const uint zonalOrder = params.worldCacheZonalWindow != 0 ? params.worldCacheZonalWindow : max(params.worldCacheZonalBands, 2u);
 
         float4 texels[kWorldCacheTextures];
@@ -4041,6 +4377,7 @@ struct HSTRCloudRenderer
 
         const float3 s = normalize(params.sunDirection);
         float sun = 0.f;
+        float ringSun = 0.f;
         float sky = 0.f;
         float3 bandAtView = 0.f; // Sun band l at w and at s, for the zonal split.
         float3 bandAtSun = 0.f;
@@ -4066,25 +4403,15 @@ struct HSTRCloudRenderer
         {
             // The sun field's zonal part, scattered by the exact phase: ring j's mean radiance (its deposit over its solid angle)
             // times the phase averaged over the ring, tabulated against the view's angle from the sun. The rest of bands 0-2
-            // (not symmetric about the sun) through the windowed SH as before. With the phase's forward peak only ~7 degrees wide
+            // (not symmetric about the sun) through the windowed SH above. With the phase's forward peak only ~7 degrees wide
             // at g 0.85, bands 0-2 (or zonal bands to 8) spread it: backlit rims too dark, shadowed flanks too bright.
             const float mu = dot(w, s);
-            const float legendre[3] = { 1.f, mu, 0.5f * (3.f * mu * mu - 1.f) };
-            [unroll]
-            for (uint l = 0; l <= 2; ++l)
-                sun += (l == 0 ? 1.f : (l == 1 ? g : g * g)) * shWindow(l, 2) * (bandAtView[l] - bandAtSun[l] * legendre[l]);
-            const float x = acos(clamp(mu, -1.f, 1.f)) / kPi * float(kWorldCacheRingSamples - 1);
-            const uint i0 = min(uint(x), kWorldCacheRingSamples - 2);
-            const float f = x - float(i0);
-            float ringSun = 0.f;
-            [unroll]
-            for (uint j = 0; j < kWorldCacheRings; ++j)
-            {
-                const uint base = 8 + j * kWorldCacheRingSamples + i0;
-                const float kernel = lerp(hstrWorldCacheRingKernel[base], hstrWorldCacheRingKernel[base + 1], f);
-                ringSun += kernel * texels[(18 + j) / 4][(18 + j) % 4];
-            }
-            sun += ringSun * worldCacheRingFactor(v);
+            // Rings 0-3 are slots 18-21, rings 4-6 slots 22-24; the table rows match (sampled at sin(angle / 2)).
+            const float x = sqrt(saturate(0.5f - 0.5f * mu));
+            const float u = (x * float(kWorldCacheRingSamples - 1) + 0.5f) / float(kWorldCacheRingSamples);
+            const float4 kernel0 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.25f), 0.f);
+            const float4 kernel1 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.75f), 0.f);
+            ringSun = dot(kernel0, float4(texels[4].zw, texels[5].xy)) + dot(kernel1.xyz, float3(texels[5].zw, texels[6].x));
         }
         else if (zonal)
         {
@@ -4123,14 +4450,31 @@ struct HSTRCloudRenderer
         // Each field only where hstComponents asks for it, so the two can be scored apart against the path tracer's.
         const float sunOn = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
         const float skyOn = (params.hstComponents & kComponentSkyScattered) != 0 ? 1.f : 0.f;
-        return max(0.f, sunOn * sun * params.sunRadiance + skyOn * sky * params.skyRadiance);
+        return max(0.f, sunOn * (modulation * sun + ringModulation * ringSun) * params.sunRadiance + skyOn * modulation * sky * params.skyRadiance);
     }
 
     /// In-scattered radiance towards the camera (before albedo) from the cache at voxel position v, for camera ray direction w:
     /// the HG phase convolves SH band l by g^l. Trilinear over valid cell centres (cells without an estimate get no weight
     /// rather than black light); bands above worldCacheOrder are dropped.
     /// The modulation reads the voxel-centre sun field exactly as the photon deposits do, so the stored ratio cancels.
-    float3 worldCacheRadiance(float3 v, float3 w) { return worldCacheModulation(v) * worldCacheRadianceStored(v, w); }
+    /// The textured cache takes both modulations from one fine sun read (the ring mode read it twice).
+    float3 worldCacheRadiance(float3 v, float3 w)
+    {
+        if (params.worldCacheTextured == 0 || params.worldCacheEstimator == 0)
+            return worldCacheModulation(v) * worldCacheRadianceStored(v, w);
+        const bool rings = params.worldCacheOrder == 2 && params.worldCacheSunOrder >= 4;
+        float modulation = 1.f;
+        float ringModulation = 0.f;
+        if (params.worldCacheModulation > 0.f || rings)
+        {
+            const float depth = fineSunAt(v);
+            if (params.worldCacheModulation > 0.f)
+                modulation = exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth));
+            if (rings)
+                ringModulation = exp(-params.worldCacheRingModulation * min(depth, params.worldCacheRingDepth));
+        }
+        return worldCacheRadianceTextured(v, w, modulation, ringModulation);
+    }
 
     /// DIAGNOSTIC (cacheOracle): what worldCacheRadiance estimates, by paths traced from v with the exact phase function and the
     /// real sky - everything arriving at v but direct sunlight, scattered towards the camera looking along w. Through the transport
@@ -4185,7 +4529,7 @@ struct HSTRCloudRenderer
     {
         v = seaVoxel(v);
         if (params.worldCacheTextured != 0 && params.worldCacheEstimator != 0)
-            return worldCacheRadianceTextured(v, w);
+            return worldCacheRadianceTextured(v, w, 1.f, params.worldCacheOrder == 2 && params.worldCacheSunOrder >= 4 ? worldCacheRingFactor(v) : 0.f);
         const float3 p = v / float(params.worldCacheCellVoxels) - 0.5f;
         const float3 base = floor(p);
         const float3 f = p - base;
@@ -4930,7 +5274,7 @@ struct HSTRCloudRenderer
     {
         if (params.seaMode == 0 || params.cloudPixelAngle <= 0.f)
             return 1.f;
-        return saturate((1.f - distance * params.seaVoxelSize.x / params.seaViewDistance) / 0.3f);
+        return saturate((1.f - distance * params.seaVoxelSize.x / params.seaViewDistance) * params.seaFadeInverse);
     }
 
     /// Camera distances (voxels, to the cell centre) over which the density a cell's samples read stays at the level they read
@@ -6885,7 +7229,7 @@ struct HSTRCloudRenderer
         skipTo = -1.f;
         fineVoxels = 1.f;
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
-                               ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) / 0.3f)
+                               ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) * params.seaFadeInverse)
                                : 1.f;
         const float proxy = extinctionAtVoxel(v);
         if (params.cloudLayers > 1)
@@ -7276,7 +7620,7 @@ struct HSTRCloudRenderer
                     const float t = first + float(j) * dt;
                     const float3 v = (position + t * direction) * cellWidth;
                     const float footprint = (entryDistance + t * worldLength) * params.cloudPixelAngle;
-                    const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) / 0.3f) : 1.f;
+                    const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) * params.seaFadeInverse) : 1.f;
                     const float alpha = 1.f - exp(-(fade * extinctionAtVoxel(v) * opticalScale));
                     if (alpha > 1e-6f)
                         L += T * alpha * sunColour * exp(-sunDepthProxy(v));
@@ -7306,7 +7650,7 @@ struct HSTRCloudRenderer
                 const float3 x = x0 + (t - first) * dx;
                 const int3 i = int3(floor(x + 0.5f));
                 const float footprint = (entryDistance + t * worldLength) * params.cloudPixelAngle;
-                const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) / 0.3f) : 1.f;
+                const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) * params.seaFadeInverse) : 1.f;
                 float density = cloudBrickDensity(entry, x, i) * scale;
                 if (brick.fade < 1.f)
                 {
@@ -7800,7 +8144,7 @@ struct HSTRCloudRenderer
         // The sea fades out over the last 30% of the view distance so tiles entering the window never pop in; a paged cell has to
         // carry the same fade the marched cell beside it does (cameraExtinctionAtVoxel).
         const float2 fade = params.seaViewDistance > 0.f
-                                ? saturate((1.f - (ray.entryDistance + t * ray.worldLength) / params.seaViewDistance) / 0.3f)
+                                ? saturate((1.f - (ray.entryDistance + t * ray.worldLength) / params.seaViewDistance) * params.seaFadeInverse)
                                 : float2(1.f);
         const float sigma0 = fade.x * domainPageAt(node.transmittanceCorners0, node.transmittanceCorners1, saturate(local0));
         const float sigma1 = fade.y * domainPageAt(node.transmittanceCorners0, node.transmittanceCorners1, saturate(local1));
@@ -10946,7 +11290,7 @@ struct HSTRCloudRenderer
         const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0;
         marchSegment(ray, float2(0.f, 1.f), withCache, withSingle, cached, single, transmittance, steps);
         const float3 background = (params.hstComponents & kComponentBackground) != 0 ? transmittance * sky : 0.f;
-        color[pixel] = float4((cached + single) * volume.data.albedo + background, 1.f);
+        color[pixel] = float4((cached + single) * volume.data.albedo + background + transmittance * farSeaExtra(direction), 1.f);
     }
 
     void execute(uint2 pixel)
@@ -11004,7 +11348,7 @@ struct HSTRCloudRenderer
             const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0;
             marchSegment(ray, float2(0.f, 1.f), withCache, withSingle, cached, single, cachedTransmittance, cachedSteps);
             const float3 background = (params.hstComponents & kComponentBackground) != 0 ? cachedTransmittance * sky : 0.f;
-            color[pixel] = float4((cached + single) * volume.data.albedo + background, 1.f);
+            color[pixel] = float4((cached + single) * volume.data.albedo + background + cachedTransmittance * farSeaExtra(direction), 1.f);
             if (params.marchProbe != 0)
                 color[pixel] = float4(probeMarch(ray, params.marchProbe).xxx, 1.f);
             transportError[pixel] = 0.f;
@@ -11105,6 +11449,19 @@ void renderCloudCamera(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.executeCamera(dispatchThreadId.xy);
 }
+
+/// The far sea behind the near march, one far-layer texel a thread.
+/// MEASURED and REMOVED (far gfx, walk 4K, refresh 1/8): each ray split into 4 or 16 equal stretches marched by as many threads
+/// and composed in groupshared memory - 4: 0.97 ms against 0.94 ms for one thread (its group barrier the run's top stall, 11-22%
+/// in the GPU trace); 16: 3.2 ms, every stretch lighting what the ones before it hide.
+[numthreads(8, 8, 1)]
+void renderFarSea(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    float distanceSum;
+    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum);
+    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum);
+}
+
 
 groupshared float4 gBeamDepthCache[64];
 groupshared float4 gBeamSingle[64];
@@ -12614,6 +12971,27 @@ void writeDirtyCloudPageArgs()
     gHSTRCloud.hstrCloudDirtyPageArgs[0] = (gHSTRCloud.hstrCloudDirtyPageCount[0] + 255u) / 256u;
     gHSTRCloud.hstrCloudDirtyPageArgs[1] = 1u;
     gHSTRCloud.hstrCloudDirtyPageArgs[2] = 1u;
+}
+
+/// Every page's skirt mask (cloudSkirtMask), after resolveDirtyCloudPages changed pages. All pages, not the dirty ones: a mask reads
+/// neighbours across its octant's faces, up to an octant of the mapped level away, so a change reaches masks far from its page.
+[numthreads(256, 1, 1)]
+void resolveCloudSkirtMasks(uint3 id: SV_DispatchThreadID)
+{
+    uint assetCount, stride;
+    gHSTRCloud.hstrCloudAssets.GetDimensions(assetCount, stride);
+    for (uint a = 0; a < assetCount; ++a)
+    {
+        const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[a];
+        const uint3 dims = asset.dims >> 3u;
+        if (id.x >= asset.pageOffset && id.x - asset.pageOffset < dims.x * dims.y * dims.z)
+        {
+            const uint linear = id.x - asset.pageOffset;
+            const uint3 brick = uint3(linear % dims.x, (linear / dims.x) % dims.y, linear / (dims.x * dims.y));
+            gHSTRCloud.hstrCloudSkirtMasksOutput[id.x] = gHSTRCloud.cloudSkirtMask(asset, brick);
+            return;
+        }
+    }
 }
 
 /// Resolves final canonical hierarchy state once per unique page; no operation ordering or physical-ID comparison is involved.

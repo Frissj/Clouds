@@ -96,15 +96,29 @@ def cloud_stats():
     return hstr.properties.get("cloudStats", {})
 
 
-def fly(frames, speed, stats=False):
+# run_sea.py sunset --ngfx START STOP: an Nsight Graphics GPU Trace of frames [START, STOP) of the first live flight, once (ngfx
+# terminates Mogwai after exporting it, so there is never a second).
+NGFX = [int(v) for v in os.environ["HSTR_NGFX"].split()] if os.environ.get("HSTR_NGFX") else None
+
+
+def fly(frames, speed, stats=False, trace=False):
     walls, per_frame = [], []
-    for _ in range(frames):
+    for i in range(frames):
         position[0] = position[0] + float3(0, 0, speed)
         cam.position = position[0]
         cam.target = position[0] + VIEW
+        if NGFX and trace and i == NGFX[0]:
+            m.gpuTraceStart()
         t0 = time.perf_counter()
         m.renderFrame()
         walls.append((time.perf_counter() - t0) * 1000.0)
+        if NGFX and trace and i == NGFX[1] - 1:
+            from pathlib import Path
+            import shutil
+            report = Path(m.gpuTraceStop())
+            named = report.with_name(f"{os.environ.get('HSTR_TAG', 'sunset')}_f{NGFX[0]}-{NGFX[1]}{report.suffix}")
+            shutil.copyfile(report, named)  # A copy: ngfx opens the original for --auto-export after this.
+            print(f"MOTION ngfx: frames {NGFX[0]}..{NGFX[1] - 1} -> {named}", flush=True)
         if stats:
             per_frame.append(cloud_stats())
     return walls, per_frame
@@ -171,10 +185,11 @@ if SCORE:
     print(f"MOTION parked quality {score()}", flush=True)
     fly(30, 0.0)
 
-for speed in [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split(",")]:
+speeds = [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split(",")]
+for speed in speeds:
     tag = f"v{speed:g}"
     before = cloud_stats()
-    walls, per_frame = fly(120, speed, stats=True)
+    walls, per_frame = fly(120, speed, stats=True, trace=speed == speeds[0])
     print(f"MOTION {tag} live: {summary(walls)} counters {delta(before, per_frame[-1])} {levels(per_frame[-1])}", flush=True)
     capture(f"{tag}_live")
     # The ten worst frames with what the frame did.

@@ -19,7 +19,7 @@ RESULTS = Path("C:/Users/Friss/Documents/HSTR_results")
 MOGWAI = ROOT / "build/windows-ninja-msvc/bin/Release/Mogwai.exe"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("harness", choices=["ab", "motion", "truth"])
+parser.add_argument("harness", choices=["ab", "motion", "truth", "sunset"])
 parser.add_argument("tag")
 parser.add_argument("sweep")
 parser.add_argument("--motions", nargs="*", help='"label forward yaw" per motion (motion harness)')
@@ -37,6 +37,11 @@ parser.add_argument("--ngfx", nargs=2, type=int, metavar=("START", "STOP"),
                          "reports at HSTR_results/ngfx/TAG_<motion>_<arm>_f<START>-<STOP>.ngfx-gputrace")
 parser.add_argument("--ngfx-metrics", default="Throughput Metrics", help="--ngfx: the Ada metric set name")
 parser.add_argument("--ngfx-source", action="store_true", help="--ngfx: shader debug info for source-line correlation (~10 min compile)")
+# sunset: sunset_motion.py (the sunset launcher's view) instead of sea_motion.py, its HSTR_MOTION_* settings given here as KEY=VALUE:
+# the elevated copy (--nsys / --ngfx) is started through ShellExecute and does not inherit the caller's environment. The sweep is
+# not used. With --ngfx, flight frames [START, STOP) of the first live flight are traced, once.
+#   python scripts/HSTR/bench/run_sea.py sunset TAG none --ngfx 60 62 --env HSTR_MOTION_SPEEDS=2 "HSTR_MOTION_ARMS=[...]"
+parser.add_argument("--env", nargs="*", default=[], help="sunset harness: KEY=VALUE settings for sunset_motion.py")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
@@ -46,8 +51,9 @@ if args.nsys or args.ngfx:
     elevate(__file__, ROOT)  # nsys / ngfx need admin for GPU counters; see elevate.py. Mogwai stays --headless.
 from sea_config import REFERENCE  # noqa: E402
 
-tests = runpy.run_path(args.sweep)["TESTS"]
+tests = runpy.run_path(args.sweep)["TESTS"] if args.harness != "sunset" else []
 env = dict(os.environ, HSTR_TAG=args.tag, HSTR_BASE=json.dumps(REFERENCE), HSTR_TESTS=json.dumps(tests))
+env.update(dict(item.split("=", 1) for item in args.env))
 for suffix in ("_test.txt", "_test.jsonl"):
     (RESULTS / f"{args.tag}{suffix}").unlink(missing_ok=True)
 if args.harness == "ab":
@@ -57,6 +63,8 @@ if args.harness == "ab":
 elif args.harness == "truth":
     env.update(HSTR_VIEWS=args.views, HSTR_SPP=str(args.spp))
     script = "scripts/HSTR/bench/sea_truth.py"
+elif args.harness == "sunset":
+    script = "scripts/HSTR/bench/sunset_motion.py"
 else:
     # "label forward yaw" or "label forward yaw sunRadiansPerFrame" - the sun rate is optional and per motion, so one run can
     # hold a static-sun control beside a moving-sun arm instead of comparing across runs.
@@ -95,7 +103,9 @@ with open(log, "w") as f:
 errors = [line for line in open(log, errors="replace") if "(Error)" in line or "Exception" in line or "Error when loading" in line or "RuntimeError" in line]
 if errors:
     print("".join(errors[:5]))
-if args.harness in ("ab", "truth"):
+if args.harness == "sunset":
+    print("".join(line for line in open(log, errors="replace") if line.startswith("MOTION") or "ngfx:" in line))
+elif args.harness in ("ab", "truth"):
     text = RESULTS / f"{args.tag}_test.txt"
     print(text.read_text() if text.exists() else "no results")
 else:

@@ -160,6 +160,11 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mpLevelPages = mpDevice->createStructuredBuffer(
             sizeof(uint32_t), uint32_t(none.size()), pageFlags, MemoryType::DeviceLocal, none.data(), false
         );
+        // Every page starts unmapped, whose skirt mask is 0.
+        const std::vector<uint32_t> noSkirt(std::max<size_t>(mPages.size(), 1u), 0u);
+        mpSkirtMasks = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), uint32_t(noSkirt.size()), pageFlags, MemoryType::DeviceLocal, noSkirt.data(), false
+        );
     }
     mpDirtyPageRegions = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudDirtyPageRegion), 2u * brickCapacity, shaderResource, MemoryType::DeviceLocal, nullptr, false

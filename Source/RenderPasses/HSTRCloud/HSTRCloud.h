@@ -151,6 +151,7 @@ private:
     bool mSunPagesDirty = false;
     std::vector<uint32_t> mSunPageSlots; ///< Sea tiles whose sun pages are stale (all tiles when mResidualDirty).
     void bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass);
+    void dispatchFarSea(RenderContext* pRenderContext);
     void saveReference(RenderContext* pRenderContext, const std::string& path);
     void loadReference(RenderContext* pRenderContext, const std::string& path);
     void ensureCameraResources();
@@ -189,7 +190,8 @@ private:
     LazyComputePass mpWorldCacheResolvePass;
     ref<Buffer> mpWorldCache;        ///< World-space radiance cache experiment: SH running sums per cell.
     ref<Buffer> mpWorldCacheDeposit; ///< Fixed-point light-tracing deposits of the current batch.
-    ref<Buffer> mpWorldCacheRingKernel; ///< Ring edges and ring phase table (worldCacheSunOrder 4), for mWorldCacheRingG.
+    ref<Buffer> mpWorldCacheRingKernel; ///< Ring edge cosines (worldCacheSunOrder 4).
+    ref<Texture> mpWorldCacheRingTable; ///< Ring phase table (worldCacheSunOrder 4), for mWorldCacheRingG.
     float mWorldCacheRingG = -2.f;
     float mWorldCacheRingModulation = -1.f; ///< Ring slot modulation b; negative: the medium's transport attenuation.
     LazyComputePass mpWorldCacheBakePass;
@@ -748,6 +750,27 @@ private:
     bool mCloudSunLevelStamps = true;         ///< A mapping change outdates only bakes of its level or finer (stampSunChange).
     bool mCloudCameraKernel = false;          ///< Whether the per-pixel cloud view renders from its own entry point (renderCloudCamera).
     LazyComputePass mpCameraPass;            ///< That entry point.
+    LazyComputePass mpFarSeaPass;            ///< renderFarSea: the far sea behind the near march.
+    ref<Texture> mpFarField[2];              ///< Its layer (radiance and transmittance), ping-ponged: [mFarCurrent] is this frame's.
+    ref<Texture> mpFarDistance[2];           ///< And its opacity-weighted distance, for the reprojection.
+    uint32_t mFarCurrent = 0;
+    bool mFarLayerValid = false;             ///< mpFarField[mFarCurrent] holds a finished layer.
+    bool mSeaFarOverlap = true;              ///< seaFarOverlap: the run is dispatched beside the dirty unit march (see dispatchFarSea).
+    bool mFarRunDeferred = false;            ///< This frame's run waits for the unit march (or the end of the frame).
+    uint2 mFarRunDims = uint2(0);            ///< Its far-layer size.
+    ref<Buffer> mpFarCounts;                 ///< DIAGNOSTIC: seaFarProbe bit 6 counters.
+    bool mFarPending = false;                ///< This frame's run wrote the other one; it becomes current next frame.
+    CameraData mFarLayerCamera = {};         ///< The camera of mpFarField[mFarCurrent].
+    CameraData mFarPendingCamera = {};
+    bool mSeaFarField = true;                ///< seaFarField: composite the far sea (sea views).
+    bool mFarSeaActive = false;              ///< This frame's view composites it (sea beam or exact view, seaFarField).
+    bool mFarSeaDirty = true;                ///< A property or the frame size changed: the next run recomputes every texel.
+    bool mFarSeaTilesChanged = false;        ///< The sea's tiles changed: a refresh cycle.
+    float4x4 mFarSeaViewProj;                ///< The view the far sea was last run for.
+    uint32_t mFarSeaBakes = ~0u;             ///< mWorldCacheBakes it was last run with.
+    uint32_t mFarCountdown = 0;              ///< Runs left in the refresh cycle since the last change.
+    uint32_t mFarPhase = 0;
+    uint32_t mFarSeaRuns = 0;                ///< Frames that ran it (cloudStats farSeaRuns).
     LazyComputePass mpDecayWorldCachePass;
     // The sea's domain proxy on the GPU (uploadDomainExtinction).
     ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
@@ -775,6 +798,7 @@ private:
     LazyComputePass mpMarkDirtyCloudPagesPass;
     LazyComputePass mpCloudPageArgsPass;
     LazyComputePass mpResolveDirtyCloudPagesPass;
+    LazyComputePass mpResolveSkirtMasksPass;
     LazyComputePass mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
     LazyComputePass mpClearWorldCacheTilesPass;
     LazyComputePass mpAdvanceFadesPass;

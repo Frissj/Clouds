@@ -172,6 +172,7 @@ public:
         var["hstrCloudNodes"] = mpNodes;
         var["hstrCloudPages"] = mpPages;
         var["hstrCloudLevelPages"] = mpLevelPages;
+        var["hstrCloudSkirtMasks"] = mpSkirtMasks;
         var["hstrCloudBricks"] = mpBricks;
         var["hstrCloudAtlas"] = mpAtlas;
         var["hstrCloudOccupancy"] = mpOccupancy;
@@ -208,6 +209,8 @@ public:
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
     const ref<Buffer>& getLevelPages() const { return mpLevelPages; }
+    const ref<Buffer>& getSkirtMasks() const { return mpSkirtMasks; }
+    uint32_t getPageCount() const { return uint32_t(mPages.size()); }
     const ref<Buffer>& getSunResolved() const { return mpSunResolved; }
     /// Bricks whose density settled since the caller last cleared this (fade-in ends, unmaps), as asset, level, packed coordinates,
     /// 0: what the persistent beam image invalidates (markBeamChanges). The caller clears it every frame.
@@ -491,6 +494,7 @@ private:
     ref<Buffer> mpNodes;
     ref<Buffer> mpPages;
     ref<Buffer> mpLevelPages; ///< Resolved level pages of every asset (resolveDirtyCloudPages writes them with the pages).
+    ref<Buffer> mpSkirtMasks; ///< Per page, the neighbours its skirt reads (resolveCloudSkirtMasks rewrites them after page changes).
     ref<Buffer> mpSunResolved; ///< Per brick and orientation class, the sun bake a sample uses (resolveCloudSunSlots, per frame).
     ref<Buffer> mpDirtyPageRegions;
     ref<Buffer> mpDirtyPageBits;

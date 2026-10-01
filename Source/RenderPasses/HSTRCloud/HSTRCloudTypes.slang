@@ -44,8 +44,8 @@ static const uint kWorldCacheView = 8;   ///< debugView of the world-space radia
 static const uint kWorldCacheSlots = 25;   ///< Scalar slots per cache cell: unit sun SH 0-8, unit sky SH 9-17, sun extension 18-24.
 static const uint kWorldCacheTextures = 7; ///< RGBA textures holding the cache slots (slot s in texture s / 4, channel s % 4).
 /// worldCacheSunOrder 4: the sun extension slots hold the sun field in kWorldCacheRings rings about the sun direction, and
-/// hstrWorldCacheRingKernel holds 8 ring-edge cosines, then per ring the phase function averaged over that ring at
-/// kWorldCacheRingSamples view angles (0 to pi from the sun).
+/// hstrWorldCacheRingKernel holds the ring-edge cosines, and hstrWorldCacheRingTable per ring (rings 0-3 in row 0, 4-6 in row 1)
+/// the phase function averaged over that ring at kWorldCacheRingSamples views, uniform in sin(angle from the sun / 2).
 static const uint kWorldCacheRings = 7;
 static const uint kWorldCacheRingSamples = 256;
 static const uint kBeamView = 9;           ///< debugView of the world-cache frame reconstructed from hierarchical beam tiles.
@@ -1432,6 +1432,28 @@ struct HSTRCloudParams
     /// transport attenuation 1 - albedo g (set per frame), and the sun depth at which it stops falling.
     float worldCacheRingModulation = -1.f;
     float worldCacheRingDepth = 24.f;
+    /// The far sea (renderFarSea): the wrapped sea from 0.7 seaViewDistance out to seaFarDistance (world units) through the transport
+    /// proxy, composited behind the near march. 0: the near march alone (bare sky past seaViewDistance). Set per frame.
+    uint seaFarField = 0;
+    float seaFarDistance = 20000.f;
+    /// DIAGNOSTIC: bit 0 the far sea without the cache, bit 1 without any lighting; bit 3 no scheduled refresh, bit 4 no recompute
+    /// where the reprojection leaves the layer, bit 5 an empty pass, bit 6 counters (hstrFarCounts, logged per run).
+    uint seaFarProbe = 0;
+    /// 1 / the width of the near march's density fade before seaViewDistance, as a fraction of it: 0.3 alone (tiles entering the
+    /// window never pop in), 0.05 with the far sea (which shows those tiles; set per frame).
+    float seaFadeInverse = 1.f / 0.3f;
+    uint seaFarScale = 2;      ///< The far layer's texel edge in pixels (seaFarScale; its content is the 5-unit transport proxy).
+    uint seaFarRefresh = 8;    ///< A far-sea run recomputes 1 / seaFarRefresh of the texels (seaFarRefresh), reprojecting the rest.
+    uint seaFarPhase = 0;      ///< Which of them (set per run).
+    uint seaFarRefreshAll = 1; ///< This run recomputes every texel (set per run).
+    float3 seaFarPrevPosition = float3(0.f); ///< The camera of the previous far layer: position and cameraU / V / W.
+    float seaFarPad0 = 0.f;
+    float3 seaFarPrevU = float3(0.f);
+    float seaFarPad1 = 0.f;
+    float3 seaFarPrevV = float3(0.f);
+    float seaFarPad2 = 0.f;
+    float3 seaFarPrevW = float3(0.f);
+    float seaFarPad3 = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
