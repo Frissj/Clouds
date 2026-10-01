@@ -27,7 +27,7 @@ cam = m.scene.camera
 position = [float3(cam.position.x, cam.position.y, cam.position.z)]
 VIEW = float3(cam.target.x, cam.target.y, cam.target.z) - position[0]
 COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "seaTilesChanged", "sunBakeFrames",
-            "densityChangedFrames", "cuts", "cutTotalMs", "cutPops")
+            "densityChangedFrames", "cuts", "cutTotalMs", "cutPops", "skirtMaskChecks", "skirtMaskMismatches")
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
           "beamMarchTiles", "bindCpuMs")
 CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))

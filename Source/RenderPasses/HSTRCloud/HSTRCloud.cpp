@@ -282,9 +282,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
-            key == "seaFarOverlap")
+            key == "seaFarOverlap" || key == "cloudSkirtCheck")
         {
-            if (key == "seaFarOverlap")
+            if (key == "cloudSkirtCheck")
+                mCloudSkirtCheck = bool(value);
+            else if (key == "seaFarOverlap")
                 mSeaFarOverlap = bool(value);
             else if (key == "seaFarScale")
                 mParams.seaFarScale = std::clamp(uint32_t(value), 1u, 8u);
@@ -1252,6 +1254,7 @@ Properties HSTRCloud::getProperties() const
     props["seaFarScale"] = mParams.seaFarScale;
     props["seaFarRefresh"] = mParams.seaFarRefresh;
     props["seaFarOverlap"] = mSeaFarOverlap;
+    props["cloudSkirtCheck"] = mCloudSkirtCheck;
     props["probeX"] = int(mParams.probeX);
     props["probeY"] = int(mParams.probeY);
     // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
@@ -1487,6 +1490,8 @@ Properties HSTRCloud::getProperties() const
         cloud["sunBaked"] = stats.sunBaked;
         cloud["sunWaiting"] = stats.sunWaiting;
         cloud["farSeaRuns"] = mFarSeaRuns;
+        cloud["skirtMaskChecks"] = mSkirtMaskChecks;
+        cloud["skirtMaskMismatches"] = mSkirtMaskMismatches;
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
@@ -2041,6 +2046,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
     mpResolveDirtyCloudPagesPass = createPass("resolveDirtyCloudPages");
     mpResolveSkirtMasksPass = createPass("resolveCloudSkirtMasks");
+    mpCheckSkirtMasksPass = createPass("checkCloudSkirtMasks");
     mpResolveCloudSunSlotsPass = createPass("resolveCloudSunSlots");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
@@ -3242,6 +3248,22 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         }
         mParams.cloudPageRegionCount = 0;
         residency.pageUpdatesDispatched();
+        // DIAGNOSTIC (cloudSkirtCheck): every page's mask recomputed from this frame's pages, as the march is about to read them;
+        // a mismatch is a stale mask. A blocking readback per frame.
+        if (mCloudSkirtCheck)
+        {
+            if (!mpSkirtCheckCount)
+                mpSkirtCheckCount = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+            pRenderContext->clearUAV(mpSkirtCheckCount->getUAV().get(), uint4(0));
+            bindResidencyPass(pRenderContext, mpCheckSkirtMasksPass, false);
+            mpCheckSkirtMasksPass->getRootVar()["CB"]["gHSTRCloud"]["hstrCloudSkirtCheck"] = mpSkirtCheckCount;
+            mpCheckSkirtMasksPass->execute(pRenderContext, uint3(residency.getPageCount(), 1, 1));
+            mSkirtMaskMismatches += mpSkirtCheckCount->getElement<uint32_t>(0);
+            ++mSkirtMaskChecks;
+        }
     }
     // Sun bakes last: they read the bricks and occupancy committed above.
     bool sunSlotsChanged = false;

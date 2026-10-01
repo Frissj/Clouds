@@ -799,6 +799,11 @@ private:
     LazyComputePass mpCloudPageArgsPass;
     LazyComputePass mpResolveDirtyCloudPagesPass;
     LazyComputePass mpResolveSkirtMasksPass;
+    LazyComputePass mpCheckSkirtMasksPass;    ///< DIAGNOSTIC (cloudSkirtCheck).
+    bool mCloudSkirtCheck = false;            ///< DIAGNOSTIC: count stale skirt masks every frame (blocking readback).
+    ref<Buffer> mpSkirtCheckCount;
+    uint32_t mSkirtMaskChecks = 0;            ///< Frames checked (cloudSkirtCheck).
+    uint32_t mSkirtMaskMismatches = 0;        ///< Pages whose stored mask differed from this frame's pages, summed over them.
     LazyComputePass mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
     LazyComputePass mpClearWorldCacheTilesPass;
     LazyComputePass mpAdvanceFadesPass;

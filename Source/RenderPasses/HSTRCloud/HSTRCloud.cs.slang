@@ -352,6 +352,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrCloudLevelPagesOutput;
     StructuredBuffer<uint> hstrCloudSkirtMasks;         ///< Per virtual page: which neighbours across its octant's faces hold (cloudOctantSkirt).
     RWStructuredBuffer<uint> hstrCloudSkirtMasksOutput;
+    RWStructuredBuffer<uint> hstrCloudSkirtCheck;       ///< DIAGNOSTIC (cloudSkirtCheck): stale skirt masks counted.
     StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudDirtyRegions;
     RWStructuredBuffer<uint> hstrCloudDirtyBits;
     RWStructuredBuffer<uint> hstrCloudDirtyPages;
@@ -12983,6 +12984,27 @@ void resolveCloudSkirtMasks(uint3 id: SV_DispatchThreadID)
             const uint linear = id.x - asset.pageOffset;
             const uint3 brick = uint3(linear % dims.x, (linear / dims.x) % dims.y, linear / (dims.x * dims.y));
             gHSTRCloud.hstrCloudSkirtMasksOutput[id.x] = gHSTRCloud.cloudSkirtMask(asset, brick);
+            return;
+        }
+    }
+}
+
+/// DIAGNOSTIC (cloudSkirtCheck): counts the pages whose stored skirt mask differs from one recomputed from the current pages.
+[numthreads(256, 1, 1)]
+void checkCloudSkirtMasks(uint3 id: SV_DispatchThreadID)
+{
+    uint assetCount, stride;
+    gHSTRCloud.hstrCloudAssets.GetDimensions(assetCount, stride);
+    for (uint a = 0; a < assetCount; ++a)
+    {
+        const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[a];
+        const uint3 dims = asset.dims >> 3u;
+        if (id.x >= asset.pageOffset && id.x - asset.pageOffset < dims.x * dims.y * dims.z)
+        {
+            const uint linear = id.x - asset.pageOffset;
+            const uint3 brick = uint3(linear % dims.x, (linear / dims.x) % dims.y, linear / (dims.x * dims.y));
+            if (gHSTRCloud.cloudSkirtMask(asset, brick) != gHSTRCloud.hstrCloudSkirtMasks[id.x])
+                InterlockedAdd(gHSTRCloud.hstrCloudSkirtCheck[0], 1u);
             return;
         }
     }
