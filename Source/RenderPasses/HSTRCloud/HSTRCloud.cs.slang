@@ -1163,8 +1163,8 @@ struct HSTRCloudRenderer
         //   cannot raise keep: units 7.64 / 7.56 / 7.73 ms (skirtwalk).
         // - The loads with less live state (per-axis ramps, faces as one mask, pages packed 10 bits per axis): still 168 registers.
         // The profiler put the loop at 21-26% of the march's samples, but those were stalls other warps covered. Compiling the skirt
-        // out entirely (wrong image) gave 128 registers, 16 warps and units 4.3 ms (noskirt_gfx1, noskirt_time): the registers belong
-        // to the density path a non-zero skirt keeps alive, not to the skirt's own arithmetic.
+        // out entirely (wrong image) gave 128 registers, 16 warps and units 4.3 ms (noskirt_gfx1, noskirt_time): the registers belonged
+        // to the second brick lookup a non-zero skirt took in cloudAssetBrickAtFlat, now gone (the empty level word names the brick).
         const uint3 page = uint3(i) >> 3u;
         const uint3 pages = asset.dims >> 3u;
         const uint holds = hstrCloudSkirtMasks[asset.pageOffset + page.x + pages.x * (page.y + pages.y * page.z)];
@@ -1317,11 +1317,10 @@ struct HSTRCloudRenderer
         if (word == kCloudRefNone)
             return false;
         sample.brick = true;
-        uint read = word;
         float keep = 1.f;
         if ((word & kCloudLevelEmpty) != 0)
         {
-            const uint mapped = word & 15u;
+            const uint mapped = (word >> 24) & 15u;
             keep = cloudOctantSkirt(hstrCloudAssets[instance.asset], i, x, mapped);
             if (keep <= 0.f)
             {
@@ -1334,19 +1333,14 @@ struct HSTRCloudRenderer
                 sample.mappedLevel = mapped;
                 return true;
             }
-            // The mapped brick's skirt reaches here (cloudOctantSkirt): read it, from its own level's page.
-            for (uint l = level; l < mapped; ++l)
-            {
-                const uint3 d = (pages + (1u << l) - 1u) >> l;
-                base += d.x * d.y * d.z;
-            }
-            const uint3 mappedDims = (pages + (1u << mapped) - 1u) >> mapped;
-            const uint3 m = (uint3(i) >> 3u) >> mapped;
-            read = hstrCloudLevelPages[base + m.x + mappedDims.x * (m.y + mappedDims.y * m.z)];
-            if (read == kCloudRefNone || (read & kCloudLevelEmpty) != 0)
-                return false;
+            // The mapped brick's skirt reaches here (cloudOctantSkirt): the word names that brick.
+            // MEASURED (sunset 4K walk, arms new / old / new in one launch, emptyword): it was looked up again from the mapped
+            // level's page (the bases walked on to that level, a second load) - the same word, since there the page reads its own
+            // brick - and that path held the march kernel at 168 registers, 12 warps per SM; without it 128 and 16
+            // (emptyword_gfx1, Shader Pipelines). units 5.50 / 6.16 / 5.44 ms, frame p50 11.71 / 12.28 / 11.88 ms, hill log
+            // 0.0446 (exact).
         }
-        word = read;
+        word &= ~kCloudLevelEmpty;
         sample.skirtCut = 1.f - keep;
         sample.entry = word & 0xFFFFFFu;
         sample.level = (word >> 24) & 15u;
@@ -13052,7 +13046,7 @@ void resolveDirtyCloudPages(uint3 id: SV_DispatchThreadID)
             const uint3 child = (brick >> max(page.mappedLevel, 1u) - 1u) & 1u;
             if (level < page.mappedLevel &&
                 ((gHSTRCloud.hstrCloudBricks[entry].info >> 4) & (1u << (child.x + 2u * child.y + 4u * child.z))) == 0)
-                word = kCloudLevelEmpty | page.mappedLevel;
+                word = kCloudLevelEmpty | entry | (page.mappedLevel << 24); // The mapped brick, which its skirt reads.
             else
             {
                 for (uint k = 0; k < 15 && resolvedLevel < level && gHSTRCloud.hstrCloudBricks[resolved].parent != kCloudRefNone; ++k)

@@ -131,7 +131,8 @@ static const uint kBeamChangeCapacity = 512;
 static const uint kBeamChangeInputCapacity = 16384;
 static const uint kCloudRefNode = 0x80000000;  ///< Directory/node entry flag: index of a 4^3 node in the node pool.
 /// Resolved level page word (hstrCloudLevelPages): kCloudRefNone (the proxy), a brick (index in bits 0-23, its level in bits
-/// 24-27), or kCloudLevelEmpty with the mapped brick's level in bits 0-3 (the asked-for level lies in a missing child octant).
+/// 24-27), or that of the mapped brick with kCloudLevelEmpty (the asked-for level lies in a missing child octant of it; its skirt
+/// reads it, cloudOctantSkirt).
 static const uint kCloudLevelEmpty = 0x40000000;
 static const uint kCloudBrickConstant = 0x1000; ///< HSTRCloudBrick.info flag: the brick holds one value (minValue).
 static const uint kCloudTransformHaar = 1;     ///< HSTRCloudStaging.transform: CloudFormat.h kTransformHaar.
