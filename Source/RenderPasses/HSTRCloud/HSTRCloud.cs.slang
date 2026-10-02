@@ -7413,6 +7413,10 @@ struct HSTRCloudRenderer
         // units identical to the last digit at 960 wide (a 4K pixel is 4x finer): no pixel's footprint reaches a sea voxel within
         // the 20 km view, so nothing is oversampled against the screen. The walk's ~69 steps a unit are path length through cloud
         // at the sunset's grazing angles, not samples finer than a pixel.
+        // MEASURED and REJECTED (sunset_hill_steps / steps_time): the majorant term enabled, min / max 2 / 4 and 1 / 4 voxels (1 / 6,
+        // 1 / 8 score as 1 / 4: the optical depth binds first). Squared error against the path trace +0.000049 / +0.000228 over
+        // 0.020378 (1.3% / 6% of the beam's gap), and slower: 4K walk units 3.12 -> 4.80 / 7.28 ms, query 2.42 -> 3.53 / 5.54;
+        // sprint units 3.06 -> 5.56 / 7.52, query 2.69 -> 4.20 / 6.34. In dense cloud the optical-depth step falls under two voxels.
         float fineVoxels = 1.f;
         float t = segment.x;
 #if (HSTR_SHIP & 4096) != 0
