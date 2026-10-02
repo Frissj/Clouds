@@ -9091,11 +9091,13 @@ struct HSTRCloudRenderer
         const bool own = all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] != 0xFFFFFFFFu;
         // The block's certificate, once for the tile rather than once per unit: it walks the depth pyramid.
         const bool certified = failed && !own && beamCellCertified(block);
-        uint mask = 0;
-        for (uint k = 0; failed && k < ts * ts; ++k)
+        // Two words: an 8-texel tile has 64 units. One word lost units 32-63 (1u << k past 31), so a moving 8-texel build never
+        // re-marched the lower half of a failed tile (tile8_frames: stale stripes, 7.6% of pixels over 0.02 against 2.8% at 4).
+        uint2 mask = 0;
+        for (uint k = 0; failed && k < min(ts * ts, 64u); ++k)
             if (beamFailedUnitNeedsMarch(tile * ts + uint2(k % ts, k / ts), own, true, certified))
-                mask |= 1u << k;
-        const uint count = countbits(mask);
+                mask[k >> 5] |= 1u << (k & 31u);
+        const uint count = countbits(mask.x) + countbits(mask.y);
         const uint total = WaveActiveSum(count);
         if (total == 0)
             return;
@@ -9112,12 +9114,13 @@ struct HSTRCloudRenderer
         }
         const uint first = WaveReadLaneFirst(base);
         uint at = first + WavePrefixSum(count);
-        for (uint bits = mask; bits != 0; bits &= bits - 1u)
-        {
-            const uint k = firstbitlow(bits);
-            const uint2 unit = tile * ts + uint2(k % ts, k / ts);
-            hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
-        }
+        for (uint word = 0; word < 2; ++word)
+            for (uint bits = mask[word]; bits != 0; bits &= bits - 1u)
+            {
+                const uint k = 32u * word + firstbitlow(bits);
+                const uint2 unit = tile * ts + uint2(k % ts, k / ts);
+                hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
+            }
 #if HSTR_DIRTY_FUSED && HSTR_FUSED_UNITS
         // Published in reservation order, so every unit below the published count is written: the waves that reserved before this
         // one are running (they reserved), and publish within a few instructions of it.

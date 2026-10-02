@@ -49,6 +49,9 @@ def score():
     saved = {k: hstr.properties[k] for k in REFERENCE if k in hstr.properties}
     hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
     m.renderFrame()
+    # HSTR_MOTION_OUT: the frame in flight and, below, what it is scored against, numbered per score.
+    score.taken = getattr(score, "taken", 0) + 1
+    capture(f"score{score.taken}_moving")
     s = dict(cloud_stats())
     marched = float(hstr.properties["beamMarchedFraction"])
     if fresh:
@@ -58,6 +61,7 @@ def score():
     else:
         hstr.set_properties(dict(REFERENCE, compareReference=False, compareExact=False))
         m.renderFrame()
+    capture(f"score{score.taken}_against")
     hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
     m.renderFrame()
     p = hstr.properties
