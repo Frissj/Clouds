@@ -44,6 +44,11 @@ g.addPass(createPass("HSTRCloud", {
     # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
     # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:
     # 16x3 183, 8x2 203, 4x1 285, the per-pixel march 333. A brute-force stopgap until the tile test sees sub-tile detail.
+    # MEASURED and REJECTED (centreless 0.4, edge 0.95): 8. Static it wins - squared error against the path trace 0.020378 ->
+    # 0.020336 (sunset 960), 0.082235 -> 0.081985 (crop), rebuild units -20% / -3%; 4K walk query 2.21 -> 1.36 ms, units 2.83 ->
+    # 2.65, residual resolve 0.18 -> 0.67 (a failed tile covers 4x the screen) (tile8_time). In motion it fails: walk 2.23% ->
+    # 7.74% of pixels over 0.02 against a fresh rebuild, p99.9 0.21 -> 0.97 (tile8_motionq) - the held image at 8 does not survive
+    # translation (warp field and guard at twice the lattice spacing).
     "beamTileSize": 4,
     "beamLevels": 1,
     # Whole query rays: split segments each start at unit transmittance, so those behind opaque cloud march on to the view
