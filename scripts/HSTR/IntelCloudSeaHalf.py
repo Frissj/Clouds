@@ -53,7 +53,22 @@ g.addPass(createPass("HSTRCloud", {
     # re-marches nothing already seen, and a per-block parallax guard over a 4 x 4 hierarchy lists only what translation broke.
     # 4K GPU ms park / look / flick / walk / sprint 0.49 / 0.51 / 0.72 / 0.92 / 0.56, 0.137% of pixels over 0.02 against the
     # per-pixel march (a3d4d427). It replaces the screen-space temporal beam at tolerance 0.05.
-    "beamTolerance": 0.01,
+    # Centreless root tiles: no centre queries (half the dirty query's rays), the tile test the corners' curvature against
+    # beamTolerance, which is that test's own scale (HSTRCloud.cs.slang beamTileRefines has the numbers). Against centres at
+    # 0.01 (cache and sun with the rest) -> 0.02 (cache 4, sun 1.5 apart) -> centreless 0.4, 4K sunset walk: units 4.88 -> 3.92 ->
+    # ~3.99 ms, query 3.3 -> 3.3 -> 2.46 ms; sprint units 5.6 -> 4.9 -> 4.7, query 3.9 -> 3.9 -> 2.8. Squared log error against
+    # the path trace (noise subtracted): 0.020288 -> 0.020363 -> 0.020376 (sunset 960), and lower on the 696-spp crop.
+    # In motion, against a fresh rebuild at each scored camera (HSTR_MOTION_SCORE 2, tiletest_motionq, old test vs this one with
+    # edge 0.95 below): walk 2.516% -> 2.379% of pixels over 0.02 (worst 3.48 -> 2.93%, p99.9 0.49 -> 0.21), sprint 5.600% ->
+    # 3.192% (worst 10.5 -> 4.35%, p99.9 1.16 -> 0.49).
+    "beamCentreless": True,
+    "beamTolerance": 0.4,
+    # The silhouette test only past a transmittance range of 0.95 (was the 0.2 default; the hill's BEAM view had 0.5). Squared
+    # error against the path trace at curvature 0.4, edge 0.5 / 0.75 / 0.8 / 0.9 / 0.95 / 1.0 (off): 0.020376 / 0.020378 /
+    # 0.020382 / 0.020379 / 0.020378 / 0.020553 (sunset 960), crop 0.082245 / 0.95 0.082235 - the error is all in the ranges past
+    # 0.95. 4K walk units 6.66M -> 4.93M, march/units 3.63 -> 3.13 ms; sprint 7.83M -> 4.97M, 3.99 -> 3.33 ms (edge_time, against
+    # 0.5, twice each).
+    "beamEdgeContrast": 0.95,
     "beamTemporal": False,
     "beamRefFrame": True,
     "beamOct": True,
@@ -74,8 +89,9 @@ g.addPass(createPass("HSTRCloud", {
     # Held few blocks, the build loosens its tile test instead: tolerance 0.01 -> 0.05 as the held share falls 0.25 -> 0.05,
     # decided on the GPU (decideBeamPolicy). 4K sprint 2.93 -> 2.52 ms at 0.28 -> 0.48% over 0.02, jog 2.79 -> 2.66 at 0.58 ->
     # 0.85%, walk unchanged (policy4). Longer steps as well failed on jog's content (policy3).
+    # Its loose end 0.05 -> 1.0 with the centreless tolerance: 2.5x the tight end 0.4 (timed at sprint, centreless_sprint).
     "beamPolicy": True,
-    "beamPolicyTolerance": 0.05,
+    "beamPolicyTolerance": 1.0,
     "beamPolicyHeldLow": 0.05,
     "beamPolicyHeldHigh": 0.25,
     # The colour output at RGBA16Float: the tone mapper, which reads it, 0.39 -> 0.07 ms at 4K, errors identical (colorfmt1).

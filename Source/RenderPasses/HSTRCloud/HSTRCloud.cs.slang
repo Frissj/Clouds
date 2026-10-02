@@ -4708,6 +4708,14 @@ struct HSTRCloudRenderer
                 continue;
             const float3 halfDifference = abs(target.first - target.second);
             const float3 halfLogDifference = abs(log(1.f + max(target.first, 0.f)) - log(1.f + max(target.second, 0.f)));
+            if (params.compareSquared != 0)
+            {
+                const float3 logDifference = log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f));
+                error += float4(dot(abs(value - reference), 1.f / 3.f), dot(abs(logDifference), 1.f / 3.f),
+                                dot(logDifference * logDifference, 1.f / 3.f), 0.25f * dot(halfLogDifference * halfLogDifference, 1.f / 3.f));
+                ++count;
+                continue;
+            }
             error += float4(
                 dot(abs(value - reference), 1.f / 3.f),
                 dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f),
@@ -8783,6 +8791,18 @@ struct HSTRCloudRenderer
         const float3 wc = beamRayDirection(float2(origin + s / 2));
         const float3 exactCentre = beamRadiance(ac.rgb, bc.rgb, ac.a, wc, albedo);
         const float3 predictedCentre = beamRadiance(ap.rgb, bp.rgb, ap.a, wc, albedo);
+        // Centreless is the sunset launcher's default (IntelCloudSeaHalf.py: beamTolerance 0.4, beamPolicyTolerance 1.0; the
+        // other launchers, unmeasured, keep centres at 0.01); beamCacheTolerance and
+        // beamSunTolerance below apply to the centre test only. MEASURED (sunset_hill_centreless 1-3, squared log error against the
+        // path trace as below, rebuild units; against centres at 0.02 / cache 4 / sun 1.5): sunset 960 centres 0.020363, 37.6k;
+        // curvature 0.01 / 0.05 / 0.1 / 0.2 / 0.4: 0.020220 / 0.020223 / 0.020252 / 0.020273 / 0.020376, 81.9k / 65.2k / 56.9k /
+        // 49.2k / 43.0k (0.4 without the edge test 0.020553, 30.5k). Crop 513,930 (696 spp): centres 0.082584, 26.4k; 0.2 / 0.4
+        // 0.082278 / 0.082245, 29.8k / 18.9k. The curvature reads the tolerance at another scale than the centre's error: at the
+        // centre test's 0.01-0.03 it refines twice the units. 4K, one launch each (centreless_time / centreless_sprint, centres /
+        // 0.4 twice): walk query 3.26 / 3.37 -> 2.46 ms, units 4.08 / 3.87 -> 3.99, dirtyTiles 0.15 -> 0.20; sprint query 3.99 /
+        // 3.73 -> 2.81 / 2.71, units 5.10 / 4.59 -> 4.57 / 4.76. Fewer rays saved less than half the query: the corners' rays
+        // cost more than the centres' or the dispatch tail holds. (The 4K timings ran the launcher's edge contrast, then 0.2; the
+        // hill views 0.5. Edge contrast 0.95 is now the launcher's: IntelCloudSeaHalf.py has its numbers.)
         if (centreless)
         {
             bool refine = beamCornerCurvature(tile, sparse) > beamPolicyTolerance();
@@ -8790,12 +8810,61 @@ struct HSTRCloudRenderer
                 refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
             return refine;
         }
-        // MEASURED and REMOVED (cachetol, 4K, 2026-10-02): the cache in-scatter tested apart, against beamTolerance x k (its error
-        // measured on top of the exact rest), because the cache term fails ~18% more units (beamDirtyStats: 25.8M vs 21.6M units
-        // over 80 walk frames with the cache off). Walk units 26.4M -> 24.4M / 22.3M / 21.2M at k 2 / 4 / ignored, but the
-        // settled frame against k 0 (beamReset each arm; k 0 against itself 0.004% over 0.02, p99.9 0.009): 0.367% / 0.557% /
-        // 0.779% over 0.02, p99.9 0.043 / 0.051 / 0.061, max 0.84. The cache term's tile-scale structure is real detail.
+        // beamCacheTolerance, default 4: the cache in-scatter tested apart, against beamTolerance x k (its error measured on top of
+        // the exact rest), because the cache term fails ~18% more units (beamDirtyStats: 25.8M vs 21.6M units over 80 walk frames
+        // with the cache off). MEASURED (cachetol_time, 4K walk, one launch, k 0 / 2 / 4 / ignored / k 0): units 12.9M / 11.0M /
+        // 9.80M / 9.57M / 13.2M over 40 frames; march/units 6.27 / 5.40 / 4.87 / 4.69 / 6.08 ms.
+        // Quality: against k 0 (cachetol, settled 4K, beamReset) k 2 / 4 / ignored differ by 0.367% / 0.557% / 0.779% of pixels over
+        // 0.02, which first read as lost detail and was rejected. But against the saved path trace (sunset_hill_cachept960c, 326
+        // spp, 960x540, 8 x 8 blocks as the gate scores): exact march log 0.0445, p99 0.410, p99.9 0.579, max 0.673; beam k 0 /
+        // 2 / 4 / ignored log 0.0482 / 0.0482 / 0.0483 / 0.0485, p99 0.487, p99.9 0.689, max 0.718 in every arm. The cache's
+        // tile-scale structure k 0 matches is the cache's own, not light the path trace has. k 4 keeps a guard on gross cache
+        // error for 0.2 ms over ignoring it. Limit: no 4K path-traced reference; at 960 a tile spans 4x the angle.
+        // An 8 x 8 block gate cannot see this test's error at all (a bilinear tile keeps its block means): the numbers below are
+        // per-pixel squared log error against the trace's halves, its noise variance (common to every arm) subtracted
+        // (compareSquared; beamPolicy off so beamTolerance is the tolerance used). Sunset 960x540, 326 spp: exact march 0.016602,
+        // beam 0.020288 at 0.01 / cache 4, so the beam's own gap is 0.003686. Cache k 0 / 2 / 4 / ignored: +0.00002 / -0.00002 /
+        // 0 / +0.00019. Sun ignored: +0.0027 (its tile structure is real). Grid (sunset_hill_grid1, cache 4), cost over the gap and
+        // rebuild units: tolerance 0.01 / sun 3: 0.4%, -5.6%; 0.015 / 1.5: 0.8%, -9.0%; 0.015 / 2: 1.4%, -11.1%; 0.02 / off:
+        // 1.6%, -10.6%; 0.02 / 1.5: 2.0%, -13.5% (the default); 0.015 / 3: 2.2%, -13.2%; 0.02 / 2: 3.6%, -15.3%; 0.025 / 3: 5.6%,
+        // -20.4%. The loosenings compound (a tile both tests held is freed only by both), in error as in units. Second reference
+        // (crop 513,930 140x100 at 500 wide, 696 spp, screen-space beam): every arm within 0.00002 of 0.0826 (gap 0.0308), the
+        // default's units -42%. 4K walk (tol_time2, one launch): units 9.84M / 9.87M -> 8.03M, march/units 4.83 / 4.94 -> 3.92 ms.
+        // 4K sprint against the old test (0.01, cache and sun with the rest; tol_sprint, old / new twice): units 12.3M / 11.5M ->
+        // 10.2M / 9.67M, march/units 5.84 / 5.39 -> 4.84 / 5.03 ms, query unchanged (3.8-4.0 ms).
+        // MEASURED and REMOVED (basisnorm_diag, 4K walk, 4 cycles, 2026-10-02): an opacity-normalised basis - the cache and/or sun
+        // term interpolated, then rescaled by the pixel's reconstructed opacity over the corners' interpolated opacity
+        // (lerp(1, aR / max(aI, 0.05), saturate(aI / 0.05)), unclamped), in this test and beamReconstruct alike. Scored on every
+        // tested tile without deciding: of the ~1.73M tiles failing today, cache-normalised rescues 66.6k (3.9%) and breaks 35.8k
+        // passes (net 1.8%); sun-normalised rescues 5.4k (0.3%), breaks 4.8k; both 66.3k / 38.3k. No ratio passed 4. Failing tiles
+        // are not opacity-edge smearing; the stop rule (< ~5% rescued) applied before any quality or timing run.
+        // MEASURED (failattrib, 4K walk, 2 cycles, 120 frames, non-deciding): what a failing tile needs to pass, swapping each
+        // predicted component for its exact centre value. Of 2.61M failures: the exact cache alone 40%, the sun alone 16%, either
+        // 3.5%, depth (transmittance) alone in any combination 1.5%; no single swap but cache + sun together 31%, cache + depth
+        // 2.7%, only all three 4.6%. The in-scattered transport fails, ~80% of it involving the cache; density inside the tile
+        // does not (so not sample placement).
+        // MEASURED and REMOVED (cubicoracle, same walk, non-deciding): a higher-order basis, the centre predicted by Catmull-Rom over
+        // the 4 x 4 corners about the tile (the four corners alone give the bilinear centre for any fitted plane). Of 1.90M tiles
+        // failing only this test, and 9.15M passing all: cache rescues 225k (11.8%) but breaks 200k, sun 117k / 90k, cache + sun
+        // 288k (15.1%) / 246k, all three with depth identical: net ~2%. Neighbouring corners do not predict the centre; the
+        // failing structure is below the corner spacing, so no corner basis removes it.
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
+        if (params.beamCacheTolerance != 0.f)
+        {
+            // The rest with the exact cache against beamTolerance; the cache's own error (the interpolated cache over the exact rest)
+            // against beamTolerance x beamCacheTolerance, or ignored when negative.
+            const bool sunApart = params.beamSunTolerance != 0.f;
+            const float3 rest = beamRadiance(ac.rgb, sunApart ? bc.rgb : bp.rgb, ap.a, wc, albedo);
+            const float3 cache = beamRadiance(ap.rgb, bc.rgb, ac.a, wc, albedo);
+            refine = maxComponent(abs(log(1.f + max(rest, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
+            if (!refine && params.beamCacheTolerance > 0.f)
+                refine = maxComponent(abs(log(1.f + max(cache, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance() * params.beamCacheTolerance;
+            if (!refine && params.beamSunTolerance > 0.f)
+            {
+                const float3 sun = beamRadiance(ac.rgb, bp.rgb, ac.a, wc, albedo);
+                refine = maxComponent(abs(log(1.f + max(sun, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance() * params.beamSunTolerance;
+            }
+        }
         if (!refine && params.beamEdgeContrast > 0.f)
             refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
         if (!refine && (params.beamGuide == 1 || (params.beamGuide == 2 && level + 1 < params.beamLevels)))
@@ -11235,6 +11304,10 @@ struct HSTRCloudRenderer
             return;
         float4 error = 0.f;
         uint count = 0;
+        // Against the stored exact frame, the blocks' log errors are binned as compareReferenceRow bins pixels (the tail).
+        if (params.compareExact != 0)
+            for (uint b = 0; b < kCompareBins; ++b)
+                hstrReferenceRowHistogram[blockRow * kCompareBins + b] = 0.f;
         for (uint bx = 0; bx < blocks.x; ++bx)
         {
             float3 value = 0.f;
@@ -11271,6 +11344,13 @@ struct HSTRCloudRenderer
                 0.5f * dot(abs(log(1.f + max(first, 0.f)) - log(1.f + max(second, 0.f))), 1.f / 3.f)
             );
             ++count;
+            if (params.compareExact != 0)
+            {
+                const float logError = dot(abs(log(1.f + max(value, 0.f)) - log(1.f + max(reference, 0.f))), 1.f / 3.f);
+                const uint bin = logError <= kCompareBinFloor ? 0u : min(uint(4.f * log2(logError / kCompareBinFloor)) + 1u, kCompareBins - 2u);
+                hstrReferenceRowHistogram[blockRow * kCompareBins + bin] += 1.f;
+                hstrReferenceRowHistogram[blockRow * kCompareBins + kCompareBins - 1u] = max(hstrReferenceRowHistogram[blockRow * kCompareBins + kCompareBins - 1u], logError);
+            }
             if (params.compareMapScale > 0.f)
             {
                 // Error map: the signed block log error, red where the frame is brighter than the reference and blue where

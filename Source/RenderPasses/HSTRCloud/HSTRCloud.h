@@ -180,6 +180,7 @@ private:
     ref<Buffer> mpReferenceRowHistogram; ///< Exact comparisons: per-row log error histogram and maximum.
     bool mCompareReference = false;
     float mReferenceLogP999 = -1.f; ///< Exact comparisons: 99.9th percentile log error (upper edge of its bin).
+    float mReferenceLogP99 = -1.f;  ///< Exact comparisons: 99th percentile log error (upper edge of its bin).
     float mReferenceLogMax = -1.f;  ///< Exact comparisons: largest pixel log error.
     float mReferenceError = -1.f;         ///< Mean |HST - reference| in linear radiance.
     float mReferenceLogError = -1.f;      ///< Mean |log(1 + HST) - log(1 + reference)|.

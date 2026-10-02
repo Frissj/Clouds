@@ -1461,8 +1461,20 @@ struct HSTRCloudParams
     /// 0.0350, 6 merged 0.0392. 4K walk, one launch: units 7.16 / 7.18 ms (7 rings) vs 7.00 ms (6 respaced).
     uint worldCacheRingCount = 6;
     uint worldCacheRingLayout = 1;
-    uint worldCacheRingPad0 = 0;
-    uint worldCacheRingPad1 = 0;
+    /// Tile surplus test with the cache in-scatter tested apart (beamTileRefines): 0 off, k > 0 its error against beamTolerance x k,
+    /// k < 0 the cache's error ignored. Default 4 (MEASURED beside beamTileRefines: 4K walk units 6.17 -> 4.87 ms, the path-traced
+    /// gate unmoved).
+    float beamCacheTolerance = 4.f;
+    /// With beamCacheTolerance on, the sun single scattering tested apart likewise: 0 off (tested with the rest), k > 0 its error
+    /// against beamTolerance x k, k < 0 ignored. Default 1.5 (MEASURED beside beamTileRefines, at beamTolerance 0.01 and 0.02).
+    float beamSunTolerance = 1.5f;
+    /// Per-pixel comparisons against the reference halves: zw become the mean squared log error and the reference's own noise
+    /// variance (the halves' squared log difference / 4). The noise adds the same variance to every arm, so the difference of the
+    /// two is the arm's squared error against the converged trace (a block mean hides the beam's tile-scale interpolation error).
+    uint compareSquared = 0;
+    uint compareSquaredPad0 = 0;
+    uint compareSquaredPad1 = 0;
+    uint compareSquaredPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

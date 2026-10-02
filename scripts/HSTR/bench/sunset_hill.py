@@ -113,7 +113,10 @@ for x, y in eval(os.environ.get("HSTR_HILL_PROBES", "[]")):
               f"e{int(empty) & 15:<2d} s{int(empty) >> 4:<7d} {sx:.1f} {sy:.1f} {sz:.1f}", flush=True)
     hstr.set_properties({"probeX": -1, "probeY": -1})
 SUN_ARMS = eval(os.environ.get("HSTR_HILL_SUN_ARMS", "None"))
-if SUN_ARMS:
+# HSTR_HILL_PT_ARMS: a Python list of (label, properties) over REFERENCE, each scored against the saved path-traced crop; properties
+# may hold "frames" (default 8; a beam arm rebuilds over several).
+PT_ARMS = eval(os.environ.get("HSTR_HILL_PT_ARMS", "None"))
+if SUN_ARMS or PT_ARMS:
     # The exact view scored against the saved path-traced crop (HSTR_TRUTH_SETTLE / width must match its name) under each sun atlas
     # (label, cloudSunPoolScale, cloudSunAtlas8); a change rebuilds residency and settles again.
     ref = f"C:/Users/Friss/Documents/HSTR_results/references/sunset_hill_{cx}_{cy}_{cw}x{ch}_{OW}x{OH}"
@@ -129,21 +132,43 @@ if SUN_ARMS:
     hstr.set_properties({"storeExact": True})
     m.renderFrame()
     print(f"HILL reference {int(hstr.properties['referenceSampleCount'])} spp stored", flush=True)
-    for label, pool, atlas8 in SUN_ARMS:
-        if pool != hstr.properties["cloudSunPoolScale"] or atlas8 != hstr.properties["cloudSunAtlas8"]:
-            hstr.set_properties(dict(REFERENCE, cloudSunPoolScale=pool, cloudSunAtlas8=atlas8, cloudResidencyFrozen=False))
+    touched = {}  # Each property a PT arm set, at its value before the first: restored before every arm, so none leaks into the next.
+    for label, *arm in (SUN_ARMS or PT_ARMS):
+        props = dict(arm[0]) if PT_ARMS else {}
+        frames = props.pop("frames", 8)
+        for k in props:
+            touched.setdefault(k, hstr.properties.get(k))
+        hstr.set_properties({k: v for k, v in touched.items() if v is not None})
+        if SUN_ARMS and (arm[0] != hstr.properties["cloudSunPoolScale"] or arm[1] != hstr.properties["cloudSunAtlas8"]):
+            hstr.set_properties(dict(REFERENCE, cloudSunPoolScale=arm[0], cloudSunAtlas8=arm[1], cloudResidencyFrozen=False))
             for _ in range(settle):
                 m.renderFrame()
             hstr.set_properties({"cloudResidencyFrozen": True})
-        hstr.set_properties(dict(REFERENCE, compareReference=False, compareExact=False))
-        for _ in range(8):
+        hstr.set_properties(dict(REFERENCE, compareReference=False, compareExact=False, **props))
+        # The units the arm's rebuild lists (beamDirtyStats, when an arm sets it): the work side of its error.
+        units_before = int(hstr.properties.get("cloudStats", {}).get("dirtyStatUnits", 0))
+        for _ in range(frames):
             m.renderFrame()
+        units = int(hstr.properties.get("cloudStats", {}).get("dirtyStatUnits", 0)) - units_before
         capture(label)
-        hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+        # Path-traced arms over 8 x 8 blocks, as the gate scores (per pixel, the trace's own noise passes 0.02 almost everywhere).
+        hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 8 if PT_ARMS else 1})
         m.renderFrame()
         p = hstr.properties
-        print(f"HILL {label}: >0.02 {100 * float(p['referenceNoiseError']):.3f}%  p99.9 {float(p['referenceLogP999']):.4f}  "
-              f"max {float(p['referenceLogMax']):.3f}  {stats()}", flush=True)
+        print(f"HILL {label}: >0.02 {100 * float(p['referenceNoiseError']):.3f}%  p99 {float(p['referenceLogP99']):.4f}  "
+              f"p99.9 {float(p['referenceLogP999']):.4f}  max {float(p['referenceLogMax']):.3f}  error {float(p['referenceError']):.4f} log {float(p['referenceLogError']):.4f}  "
+              f"{stats()}", flush=True)
+        if PT_ARMS:
+            # Per pixel against the trace's halves, squared: the trace's noise variance is common to every arm and subtracted, so
+            # "excess" is the arm's mean squared log error against the converged trace, tile-scale interpolation error included.
+            hstr.set_properties({"compareExact": False, "compareBlock": 1, "compareTarget": 15, "compareSubstitute": 0,
+                                 "compareSquared": True})
+            m.renderFrame()
+            p = hstr.properties
+            mse, noise = float(p["referenceNoiseError"]), float(p["referenceNoiseLogError"])
+            print(f"HILL {label} squared: mse {mse:.6f} noise {noise:.6f} excess {mse - noise:.6f} "
+                  f"(rms {math.sqrt(max(mse - noise, 0.0)):.4f}) units {units}", flush=True)
+            hstr.set_properties({"compareSquared": False})
         hstr.set_properties({"compareReference": False, "compareExact": False})
 elif POOLS:
     # The exact view at each cloudSunPoolScale (sun atlas slots per density slot): a pool too small for the view's bakes leaves

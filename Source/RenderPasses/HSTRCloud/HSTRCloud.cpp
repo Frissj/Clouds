@@ -176,6 +176,7 @@ const char kReferenceLogError[] = "referenceLogError";
 const char kReferenceNoiseError[] = "referenceNoiseError";
 const char kReferenceNoiseLogError[] = "referenceNoiseLogError";
 const char kReferenceLogP999[] = "referenceLogP999";
+const char kReferenceLogP99[] = "referenceLogP99";
 const char kReferenceLogMax[] = "referenceLogMax";
 const char kReferenceSampleCount[] = "referenceSampleCount";
 constexpr uint32_t kReferenceView = 6;
@@ -283,10 +284,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
             key == "seaFarOverlap" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
-            key == "beamDirtyStats")
+            key == "beamDirtyStats" || key == "beamCacheTolerance" || key == "beamSunTolerance" || key == "compareSquared")
         {
-            if (key == "beamDirtyStats")
+            if (key == "compareSquared")
+                mParams.compareSquared = bool(value) ? 1u : 0u;
+            else if (key == "beamDirtyStats")
                 mBeamDirtyStats = bool(value);
+            else if (key == "beamCacheTolerance")
+                mParams.beamCacheTolerance = float(value);
+            else if (key == "beamSunTolerance")
+                mParams.beamSunTolerance = float(value);
             else if (key == "worldCacheRingCount")
                 mParams.worldCacheRingCount = std::clamp(uint32_t(value), 6u, 7u);
             else if (key == "worldCacheRingLayout")
@@ -1119,7 +1126,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.compareSubstitute = value;
         else if (key == kCompareTarget)
             mParams.compareTarget = value;
-        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceLogP999 || key == kReferenceLogMax || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction || key == kCloudStats)
+        else if (key == kReferenceError || key == kReferenceLogError || key == kReferenceNoiseError || key == kReferenceNoiseLogError || key == kReferenceLogP999 || key == kReferenceLogP99 || key == kReferenceLogMax || key == kReferenceSampleCount || key == kWorldCacheSampleCount || key == kBeamMarchedFraction || key == kCloudStats)
             continue; // Read-only measurements.
         else
             logWarning("Unknown property '{}' in HSTRCloud.", key);
@@ -1264,6 +1271,8 @@ Properties HSTRCloud::getProperties() const
     props["seaFarOverlap"] = mSeaFarOverlap;
     props["cloudSkirtCheck"] = mCloudSkirtCheck;
     props["beamDirtyStats"] = mBeamDirtyStats;
+    props["beamCacheTolerance"] = mParams.beamCacheTolerance;
+    props["beamSunTolerance"] = mParams.beamSunTolerance;
     props["worldCacheRingCount"] = mParams.worldCacheRingCount;
     props["worldCacheRingLayout"] = mParams.worldCacheRingLayout;
     props["probeX"] = int(mParams.probeX);
@@ -1840,6 +1849,7 @@ Properties HSTRCloud::getProperties() const
     props[kReferenceNoiseError] = mReferenceNoiseError;
     props[kReferenceNoiseLogError] = mReferenceNoiseLogError;
     props[kReferenceLogP999] = mReferenceLogP999;
+    props[kReferenceLogP99] = mReferenceLogP99;
     props[kReferenceLogMax] = mReferenceLogMax;
     props[kReferenceSampleCount] = mParams.referenceSamples;
     return props;
@@ -7249,8 +7259,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mReferenceNoiseError = total.z / float(rows.size());
         mReferenceNoiseLogError = total.w / float(rows.size());
         mReferenceLogP999 = -1.f;
+        mReferenceLogP99 = -1.f;
         mReferenceLogMax = -1.f;
-        if (mParams.compareExact != 0 && mParams.compareBlock <= 1)
+        if (mParams.compareExact != 0)
         {
             const std::vector<float> histogram = mpReferenceRowHistogram->getElements<float>(0, rowCount * kCompareBins);
             std::vector<double> bins(kCompareBins - 1, 0.0);
@@ -7268,14 +7279,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             for (uint32_t b = kCompareBins - 1; b-- > 0;)
             {
                 above += bins[b];
-                if (above > 0.001 * pixels)
+                const float edge = std::min(mReferenceLogMax, kCompareBinFloor * std::pow(2.f, float(b) / 4.f));
+                if (above > 0.001 * pixels && mReferenceLogP999 < 0.f)
+                    mReferenceLogP999 = edge;
+                if (above > 0.01 * pixels)
                 {
-                    mReferenceLogP999 = std::min(mReferenceLogMax, kCompareBinFloor * std::pow(2.f, float(b) / 4.f));
+                    mReferenceLogP99 = edge;
                     break;
                 }
             }
             if (mReferenceLogP999 < 0.f)
                 mReferenceLogP999 = 0.f;
+            if (mReferenceLogP99 < 0.f)
+                mReferenceLogP99 = 0.f;
         }
     }
     if (!mSaveReferencePath.empty())
