@@ -80,6 +80,10 @@ g.addPass(createPass("HSTRCloud", {
     # A guard block holds through 8 texels of parallax, and the resolve warps what it holds to the current camera by the query
     # depths (beamWarp, a field per lattice point). Walk 2.52 -> 2.19 ms at 0.761 -> 0.938% (budgetwarpfield1); unwarped at 8 it
     # fails (1.986%). Sprint is unchanged: every block expires at 20 units a frame, so there is nothing held to warp.
+    # MEASURED (guardpar / inval_share / dirty_reasons, 4K sunset walk, after the centreless tile test): 12 / 16 list ~5% fewer
+    # blocks and units - the multiscale pyramid's coarser levels (2^(L-1) blocks of travel) bind, not this level-0 budget. The
+    # walk lists 17.4k of ~30k on-screen blocks a frame (12.6k held, 1.9k unverified, the rest failing the bound); invalidation off
+    # or residency frozen leaves the listing unchanged (17.2k), so content changes are not where the dirty work comes from.
     "beamGuardParallax": 8.0,
     "beamWarp": True,
     # ...and only while at least a quarter of the classified on-screen blocks are held, decided on the GPU each build
