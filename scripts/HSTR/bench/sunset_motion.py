@@ -38,7 +38,14 @@ DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm
 DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "beamWarpListed",
          "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim") + tuple(
          f"beamProbe{kind}{name}" for kind in ("Rays", "Units", "RaySteps", "UnitSteps")
-         for name in ("Scored", "InPlace", "Reprojected", "Either"))  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
+         for name in ("Scored", "InPlace", "Reprojected", "Either")) + (  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
+         # beamGuardMotion: blocks listed by first failing pyramid level, by the zoom cap; held that the isotropic bound would list.
+         tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardFailZoom", "beamGuardRescued", "beamGuardHeld",
+         "beamGuardDiffHeld") +
+         # beamLayerProbe: the layered lookups of the dirty marches by outcome, and density samples by layers with density.
+         tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2")) +
+         # The near-segment verification probe (beamRepairProbe + beamGuardExtent): lattice rays only.
+         tuple(f"beamNsv{n}" for n in ("Rays", "Steps", "Eligible", "EligibleSaved", "Good", "GoodSaved")))
 
 
 def score():
@@ -106,12 +113,14 @@ def cloud_stats():
 # run_sea.py sunset --ngfx START STOP: an Nsight Graphics GPU Trace of frames [START, STOP) of the first live flight, once (ngfx
 # terminates Mogwai after exporting it, so there is never a second).
 NGFX = [int(v) for v in os.environ["HSTR_NGFX"].split()] if os.environ.get("HSTR_NGFX") else None
+# HSTR_MOTION_DIRECTION: "x,y,z", the world direction a unit of speed moves the camera (default +z, the walk; "1,0,0" strafes).
+DIRECTION = [float(v) for v in os.environ.get("HSTR_MOTION_DIRECTION", "0,0,1").split(",")]
 
 
 def fly(frames, speed, stats=False, trace=False):
     walls, per_frame = [], []
     for i in range(frames):
-        position[0] = position[0] + float3(0, 0, speed)
+        position[0] = position[0] + float3(*DIRECTION) * speed
         cam.position = position[0]
         cam.target = position[0] + VIEW
         if NGFX and trace and i == NGFX[0]:

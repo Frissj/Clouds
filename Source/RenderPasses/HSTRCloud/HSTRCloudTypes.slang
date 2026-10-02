@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 248;
+static const uint kBeamCountSlots = 280;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -64,6 +64,26 @@ static const uint kCellViewCells = 244;
 static const uint kCellViewRequests = 245;
 static const uint kCellViewBuilt = 246;
 static const uint kCellViewSteps = 247;
+/// beamGuardMotion, per classify: blocks by the first pyramid level whose bound failed (12), blocks the zoom cap expired, blocks
+/// the old isotropic bound would have listed but this one held, and blocks held.
+static const uint kBeamGuardFailLevel = 248;
+static const uint kBeamGuardFailLevels = 12;
+static const uint kBeamGuardFailZoom = 260;
+static const uint kBeamGuardRescued = 261;
+static const uint kBeamGuardHeld = 262;
+static const uint kBeamGuardDiffHeld = 263; ///< Of the held, the ones only the differential certificate (mode 3) held.
+/// beamLayerProbe (HSTR_LAYER_PROBE), per build over the dirty query and unit marches: leanExtinctionLayered's per-layer lookups by
+/// outcome - no cloud in the layer's square, outside the asset box, brick empty, density, the proxy - then its density samples by
+/// how many layers had density there (0, 1, 2).
+/// MEASURED (nsv_probe1, 4K sunset walk, today's guard, per frame): ~9.95M layered samples - 77.4% with no density in either layer,
+/// 22.5% in one, 0.08% in both; of 11.9M brick chains (8.0M lookups end outside the asset box first) 9.6M (81%) end on an empty
+/// brick. A per-layer majorant mask only skips chains where the layer's whole majorant block is empty, which this cannot see; the
+/// larger target is the 77% of samples in non-empty majorant blocks that find no density at all. Not built.
+static const uint kBeamLayerProbe = 264;
+/// Near-segment verification probe (beamRepairProbe + beamGuardExtent), per dirty query build: lattice rays scored and their
+/// march steps; rays whose old front lies past the split, and their steps past it; of those, the ones whose composite was within
+/// 0.02 of the fresh march, and their steps past it. See beamProbeNearSegment.
+static const uint kBeamNsvProbe = 272;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1341,6 +1361,20 @@ struct HSTRCloudParams
     /// stays valid while |P - capturedFrom| <= beamGuardParallaxAngle * blockMinDistance, because no point of it can have shifted
     /// by more than |dP| / distance. See beamCellCertified.
     float beamGuardParallaxAngle = 0.f;
+    /// beamGuardMotion (octahedral image only): bits 0-1 the certificate - 0 isotropic (|dP| / distance), 1 the shift of the
+    /// actual displacement (|dP x w| + reach |dP|) / (distance - |dP|), 2 that and only neighbours content can move in from
+    /// (content moves away from the displacement's direction, so a cell farther from it than the block never reaches the block);
+    /// bit 2 warps by the distance from the current eye rather than the capture camera's; any bit (8 alone: today's certificate)
+    /// turns on the classify counters (kBeamGuardFailLevel...). See beamCellMotionCertified. 3: 2, or else the differential
+    /// certificate over per-ray depth extents (beamCellExtentCertified, needs beamGuardExtent); bit 4 its mean-only control.
+    uint beamGuardMotion = 0;
+    /// beamGuardMotion: a block also expires once |dP| > beamGuardZoom x its 3 x 3 nearest depth (content seen that much closer
+    /// is magnified and marched at another level); 0 off.
+    float beamGuardZoom = 0.f;
+    /// beamGuardMotion 3: the parallax between depths a block may carry under the warp, in radians (beamGuardDiff texels at the
+    /// map's smallest texel angle). See beamCellExtentCertified.
+    float beamGuardDiffAngle = 0.f;
+    uint beamGuardMotionPad = 0; ///< Keeps the fields after these on their 16-byte constant-buffer alignment.
     /// Levels of the guard's min-depth pyramid (hstrBeamGuardPyramid), and the one a build pass is writing.
     uint beamGuardPyramidLevels = 0;
     uint beamGuardPyramidLevel = 0;

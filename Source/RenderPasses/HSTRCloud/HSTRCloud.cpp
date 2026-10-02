@@ -617,6 +617,31 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamGuardParallax = value;
             continue;
         }
+        if (key == "beamGuardMotion")
+        {
+            mBeamGuardMotion = value;
+            continue;
+        }
+        if (key == "beamGuardZoom")
+        {
+            mBeamGuardZoom = value;
+            continue;
+        }
+        if (key == "beamGuardExtent")
+        {
+            mBeamGuardExtent = bool(value);
+            continue;
+        }
+        if (key == "beamGuardDiff")
+        {
+            mBeamGuardDiff = value;
+            continue;
+        }
+        if (key == "beamLayerProbe")
+        {
+            mBeamLayerProbe = bool(value);
+            continue;
+        }
         if (key == "beamWarp")
         {
             mBeamWarp = bool(value);
@@ -1361,6 +1386,11 @@ Properties HSTRCloud::getProperties() const
     props["beamGuard"] = mBeamGuard;
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
+    props["beamGuardMotion"] = mBeamGuardMotion;
+    props["beamGuardZoom"] = mBeamGuardZoom;
+    props["beamGuardExtent"] = mBeamGuardExtent;
+    props["beamGuardDiff"] = mBeamGuardDiff;
+    props["beamLayerProbe"] = mBeamLayerProbe;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -1779,6 +1809,20 @@ Properties HSTRCloud::getProperties() const
         cloud["beamUnitThreads"] = mBeamUnitThreads;
         cloud["beamDirtyBlocks"] = mBeamLevelCounts[kBeamDirtyBlocks];
         cloud["beamDirtyUnverified"] = mBeamLevelCounts[kBeamDirtyUnverified];
+        for (uint32_t level = 0; level < kBeamGuardFailLevels; ++level)
+            cloud["beamGuardFail" + std::to_string(level)] = mBeamLevelCounts[kBeamGuardFailLevel + level];
+        cloud["beamGuardFailZoom"] = mBeamLevelCounts[kBeamGuardFailZoom];
+        cloud["beamGuardRescued"] = mBeamLevelCounts[kBeamGuardRescued];
+        cloud["beamGuardHeld"] = mBeamLevelCounts[kBeamGuardHeld];
+        cloud["beamGuardDiffHeld"] = mBeamLevelCounts[kBeamGuardDiffHeld];
+        {
+            const char* layerNames[8] = {"NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2"};
+            for (uint32_t k = 0; k < 8; ++k)
+                cloud[std::string("beamLayer") + layerNames[k]] = mBeamLevelCounts[kBeamLayerProbe + k];
+            const char* nsvNames[6] = {"Rays", "Steps", "Eligible", "EligibleSaved", "Good", "GoodSaved"};
+            for (uint32_t k = 0; k < 6; ++k)
+                cloud[std::string("beamNsv") + nsvNames[k]] = mBeamLevelCounts[kBeamNsvProbe + k];
+        }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
@@ -4281,6 +4325,10 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
     var["hstrBeamWarpField"] = mpBeamWarpField;
     var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
+    var["hstrBeamGuardFront"] = mpBeamGuardFront;
+    var["hstrBeamGuardBack"] = mpBeamGuardBack;
+    var["hstrBeamGuardMeanFar"] = mpBeamGuardMeanFar;
+    var["hstrBeamGuardExtentPyramid"] = mpBeamGuardExtentPyramid;
     var["hstrBeamInvalidations"] = mpBeamInvalidations;
     var["hstrBeamPixelsSnapshot"] = mpBeamPixelsSnapshot;
     var["hstrBeamLatticeSnapshot"] = mpBeamLatticeSnapshot;
@@ -4765,6 +4813,9 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
     // Held under one guard block, because a certificate only looks one ring of blocks out for what can shift in.
     const float blockTexels = float(std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u));
     mParams.beamGuardParallaxAngle = std::min(mBeamGuardParallax, blockTexels) * 1.20f * 2.f / float(dim);
+    mParams.beamGuardMotion = mBeamGuardMotion;
+    mParams.beamGuardZoom = mBeamGuardZoom;
+    mParams.beamGuardDiffAngle = mBeamGuardDiff * 1.20f * 2.f / float(dim);
     // The on-screen test projects a direction through the camera basis instead of comparing against a padded bounding box, so it
     // needs that basis inverted, and a conversion from a box's radius in texels to the normalised device units it can span. Both
     // are taken at their largest: the map's worst-axis texel angle, and the steeper of the two screen axes, where a radian buys
@@ -4813,7 +4864,10 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
-    pPass->getProgram()->addDefine("HSTR_STRIP", "0");}
+    pPass->getProgram()->addDefine("HSTR_STRIP", "0");
+    pPass->getProgram()->addDefine("HSTR_BEAM_EXTENT", mBeamGuardExtent ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
+}
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
 {
@@ -5842,6 +5896,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 mpBeamGuardCamera =
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
+                for (ref<Texture>* pExtent : {&mpBeamGuardFront, &mpBeamGuardBack, &mpBeamGuardMeanFar})
+                    *pExtent = mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 // One entry per block, so the work list can hold every block at once and can never overflow. That is the whole
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
@@ -5890,6 +5946,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         break;
                 }
                 mpBeamGuardPyramid = mpDevice->createStructuredBuffer(sizeof(float), entries);
+                mpBeamGuardExtentPyramid = mpDevice->createStructuredBuffer(sizeof(float4), entries);
                 mBeamGuardCleared = false;
             }
             mParams.beamGuardDims = guardDims;
@@ -6199,6 +6256,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 {
                     pRenderContext->clearUAV(mpBeamGuardDepth->getUAV().get(), uint4(0xFFFFFFFFu));
                     pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
+                    pRenderContext->clearUAV(mpBeamGuardFront->getUAV().get(), uint4(0xFFFFFFFFu));
+                    pRenderContext->clearUAV(mpBeamGuardBack->getUAV().get(), uint4(0));
+                    pRenderContext->clearUAV(mpBeamGuardMeanFar->getUAV().get(), uint4(0));
                     pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
                     pRenderContext->clearUAV(mpBeamCoarseState->getUAV().get(), uint4(0));
                     mBeamGuardCleared = true;
@@ -6493,6 +6553,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                             // Two dispatches: levels 0 - 5 per 32 x 32 tile, then the few above in one group. One
                                             // dispatch per level was 0.07 ms at 4K (policy4), nearly all launches and barriers.
                                             FALCOR_PROFILE(pRenderContext, "pyramid");
+                                            // beamGuardExtent: the extent pyramid beside the min-depth one, the certificate
+                                            // that reads it and the restart of a listed block's range.
+                                            for (const ref<ComputePass>& pPass :
+                                                 {mpBeamGuardPyramidPass, mpBeamGuardPyramidTopPass, mpBeamCoarsePass, mpBeamLeafPass})
+                                                pPass->getProgram()->addDefine("HSTR_BEAM_EXTENT", mBeamGuardExtent ? "1" : "0");
                                             bindRenderer(pRenderContext, mpBeamGuardPyramidPass);
                                             mpBeamGuardPyramidPass->execute(pRenderContext, uint3((mParams.beamGuardDims + 31u) / 32u * 16u, 1));
                                             if (mBeamGuardPyramidLevels > 6)
@@ -6700,6 +6765,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         {
                             FALCOR_PROFILE(pRenderContext, "dirtyTiles");
                             const ref<ComputePass>& pTiles = mBeamDirtyTilesDense ? mpBeamDirtyTileDensePass : mpBeamDirtyTilePass;
+                            pTiles->getProgram()->addDefine("HSTR_BEAM_EXTENT", mBeamGuardExtent ? "1" : "0");
                             bindRenderer(pRenderContext, pTiles);
                             bindOutput(pTiles, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
                             pTiles->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamHistoryOutput"] = mpBeamHistory[mBeamParity];
