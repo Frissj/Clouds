@@ -201,6 +201,9 @@ struct CutRay
     float entryDistance; ///< World distance from the camera to t = 0, for pixel footprints.
     float4 sunOctaves;    ///< Per-octave sun weight a^n p(theta; c^n g) for this ray's direction.
     float3 viewDirection; ///< Unit world-space direction of the camera ray.
+    // MEASURED and REMOVED (ringray, ringray_gfx1): the ring kernel held here for every cache read along the ray (two table fetches a
+    // ray instead of a sample) put the march back at 168 registers, 12 warps per SM (from 128, 16), plain mode included: units
+    // 5.5 -> 6.0-6.2 ms plain, and the ring gap only 1.13 -> ~1.0 ms.
 };
 
 /// cloudLayerSample: what one cloud layer holds at a sample.
@@ -3369,23 +3372,26 @@ struct HSTRCloudRenderer
         return interval.y > interval.x;
     }
 
-    /// Whether the far sea may read the cache through farCacheRadiance: the plain textured order-2 cache (no sun extension).
+    /// Whether the far sea may read the cache through farCacheRadiance: the textured order-2 cache, plain or with rings
+    /// (worldCacheSunOrder 4), without the sun extension or zonal split.
     bool farCacheFast()
     {
         return params.worldCacheTextured != 0 && params.worldCacheEstimator != 0 && params.worldCacheOrder == 2 &&
-               params.worldCacheSunOrder < 3 && params.worldCacheZonalBands == 0;
+               (params.worldCacheSunOrder < 3 || params.worldCacheSunOrder == 4) && params.worldCacheZonalBands == 0;
     }
 
     /// worldCacheRadiance in that case, for a far-sea sample at voxel position v with sun depth `depth` (already read for single
-    /// scattering): the view direction's band weights (shWindow * g^l * Y_k(w), the same for the sun and the sky field) come
-    /// from the ray, so a lit sample is five fetches and two dot products.
-    float3 farCacheRadiance(float3 v, float depth, float weights[9])
+    /// scattering): the view direction's band weights (shWindow * g^l * Y_k(w), the same for the sun and the sky field) and, with
+    /// rings, the ring kernel at the view's angle from the sun (ring0: rings 0-3, ring1: rings 4-6) come from the ray, so a lit
+    /// sample is five fetches (seven with rings) and a few dot products.
+    /// MEASURED (sunset 4K walk, one launch, ringtime2): with rings the far sea fell back to worldCacheRadiance, 0.98 vs 0.71 ms.
+    float3 farCacheRadiance(float3 v, float depth, float weights[9], bool rings, float4 ring0, float3 ring1)
     {
         const float3 uvw = seaVoxel(v) / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
-        float4 texels[5];
+        float4 texels[7];
         [unroll]
-        for (uint t = 0; t < 5; ++t)
-            texels[t] = hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f);
+        for (uint t = 0; t < 7; ++t)
+            texels[t] = t < 5 || rings ? hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f) : 0.f;
         float sun = 0.f;
         float sky = 0.f;
         [unroll]
@@ -3396,9 +3402,22 @@ struct HSTRCloudRenderer
         }
         const float modulation =
             params.worldCacheModulation > 0.f ? exp(-params.worldCacheModulation * min(depth, params.worldCacheModulationDepth)) : 1.f;
+        const float ringSun = rings ? exp(-params.worldCacheRingModulation * min(depth, params.worldCacheRingDepth)) *
+                                          (dot(ring0, float4(texels[4].zw, texels[5].xy)) + dot(ring1, float3(texels[5].zw, texels[6].x)))
+                                    : 0.f;
         const float sunOn = (params.hstComponents & kComponentSunMultiple) != 0 ? 1.f : 0.f;
         const float skyOn = (params.hstComponents & kComponentSkyScattered) != 0 ? 1.f : 0.f;
-        return max(0.f, modulation * (sunOn * sun * params.sunRadiance + skyOn * sky * params.skyRadiance));
+        return max(0.f, sunOn * (modulation * sun + ringSun) * params.sunRadiance + skyOn * modulation * sky * params.skyRadiance);
+    }
+
+    /// The ring kernel at view direction w (worldCacheSunOrder 4): the phase averaged over each ring about the sun, at the view's
+    /// angle from it (rings 0-3 in kernel0, 4-6 in kernel1), from the table sampled at sin(angle / 2).
+    void worldCacheRingKernel(float3 w, out float4 kernel0, out float3 kernel1)
+    {
+        const float x = sqrt(saturate(0.5f - 0.5f * dot(w, normalize(params.sunDirection))));
+        const float u = (x * float(kWorldCacheRingSamples - 1) + 0.5f) / float(kWorldCacheRingSamples);
+        kernel0 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.25f), 0.f);
+        kernel1 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.75f), 0.f).xyz;
     }
 
     /// majorantBlockExit with the ray's inverse voxel direction given (the far sea's, hoisted out of its loop).
@@ -3432,6 +3451,12 @@ struct HSTRCloudRenderer
             const uint l = k == 0 ? 0u : (k < 4 ? 1u : 2u);
             weights[k] = shWindow(l, 2) * (l == 0 ? 1.f : (l == 1 ? params.anisotropy : params.anisotropy * params.anisotropy)) * shBasis(k, w);
         }
+        // The ring kernel at this ray's angle from the sun (worldCacheRadianceTextured's table lookup), once a ray.
+        const bool rings = params.worldCacheSunOrder == 4;
+        float4 ring0 = 0.f;
+        float3 ring1 = 0.f;
+        if (fastCache && rings)
+            worldCacheRingKernel(w, ring0, ring1);
         float3 radiance = 0.f;
         float transmittance = 1.f;
         distance = 0.f;
@@ -3481,7 +3506,7 @@ struct HSTRCloudRenderer
                 if (withSingle)
                     source += phase * params.sunRadiance * exp(-depth);
                 if (withCache)
-                    source += fastCache ? farCacheRadiance(vm, depth, weights) : worldCacheRadiance(vm, w);
+                    source += fastCache ? farCacheRadiance(vm, depth, weights, rings, ring0, ring1) : worldCacheRadiance(vm, w);
                 radiance += transmittance * alpha * albedo * source;
                 distance += transmittance * alpha * middle;
                 transmittance *= 1.f - alpha;
@@ -4349,6 +4374,9 @@ struct HSTRCloudRenderer
     /// faces too dark and silhouettes/creases too bright at every g: sub-cell skin structure, not angular detail.
     /// modulation scales the whole cache and ringModulation the ring slots (worldCacheSunOrder 4) in its place; the camera read
     /// passes both from one fine sun read (worldCacheRadiance), the stored form 1 and the ring factor.
+    /// MEASURED (sunset 4K walk, one launch, ringtime2): rings cost units 5.47 -> 6.60 ms at an unchanged 128 registers (rings128_gfx1),
+    /// per-sample work: two more cache fetches, two table fetches, an exp. Holding the kernel on the camera ray cost registers (CutRay),
+    /// and so did taking the table fetches out of the rings branch below into a wrapper (168 registers, farring_gfx1).
     float3 worldCacheRadianceTextured(float3 v, float3 w, float modulation, float ringModulation)
     {
         v = seaVoxel(v);
@@ -4400,13 +4428,11 @@ struct HSTRCloudRenderer
             // times the phase averaged over the ring, tabulated against the view's angle from the sun. The rest of bands 0-2
             // (not symmetric about the sun) through the windowed SH above. With the phase's forward peak only ~7 degrees wide
             // at g 0.85, bands 0-2 (or zonal bands to 8) spread it: backlit rims too dark, shadowed flanks too bright.
-            const float mu = dot(w, s);
-            // Rings 0-3 are slots 18-21, rings 4-6 slots 22-24; the table rows match (sampled at sin(angle / 2)).
-            const float x = sqrt(saturate(0.5f - 0.5f * mu));
-            const float u = (x * float(kWorldCacheRingSamples - 1) + 0.5f) / float(kWorldCacheRingSamples);
-            const float4 kernel0 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.25f), 0.f);
-            const float4 kernel1 = hstrWorldCacheRingTable.SampleLevel(hstrLinearClampSampler, float2(u, 0.75f), 0.f);
-            ringSun = dot(kernel0, float4(texels[4].zw, texels[5].xy)) + dot(kernel1.xyz, float3(texels[5].zw, texels[6].x));
+            // Rings 0-3 are slots 18-21, rings 4-6 slots 22-24; the kernel's components match (worldCacheRingKernel).
+            float4 kernel0;
+            float3 kernel1;
+            worldCacheRingKernel(w, kernel0, kernel1);
+            ringSun = dot(kernel0, float4(texels[4].zw, texels[5].xy)) + dot(kernel1, float3(texels[5].zw, texels[6].x));
         }
         else if (zonal)
         {
