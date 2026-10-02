@@ -7407,6 +7407,12 @@ struct HSTRCloudRenderer
         // and sprint 0.07 ms at scale 1 - and longer steps had already failed on jog's content (policy3).
         const float minStepVoxels = params.minStepVoxels;
         const float maxStepVoxels = params.maxStepVoxels;
+        // The sunset launcher sets minStepVoxels 4 over maxStepVoxels 2, so the clamp below returns 2: every step is two sea voxels
+        // (times the transmittance boost) and the majorant term never acts. MEASURED and REMOVED (sunset_hill_fpstep, centreless
+        // defaults): the longest step grown to k x the pixel footprint in sea voxels, k 0.5 / 1 / 2 - squared error and rebuild
+        // units identical to the last digit at 960 wide (a 4K pixel is 4x finer): no pixel's footprint reaches a sea voxel within
+        // the 20 km view, so nothing is oversampled against the screen. The walk's ~69 steps a unit are path length through cloud
+        // at the sunset's grazing angles, not samples finer than a pixel.
         float fineVoxels = 1.f;
         float t = segment.x;
 #if (HSTR_SHIP & 4096) != 0
