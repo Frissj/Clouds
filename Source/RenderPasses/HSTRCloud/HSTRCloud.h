@@ -193,6 +193,7 @@ private:
     ref<Buffer> mpWorldCacheRingKernel; ///< Ring edge cosines (worldCacheSunOrder 4).
     ref<Texture> mpWorldCacheRingTable; ///< Ring phase table (worldCacheSunOrder 4), for mWorldCacheRingG.
     float mWorldCacheRingG = -2.f;
+    uint32_t mWorldCacheRingShape = 0; ///< worldCacheRingCount * 16 + worldCacheRingLayout the ring buffers were built for.
     float mWorldCacheRingModulation = -1.f; ///< Ring slot modulation b; negative: the medium's transport attenuation.
     LazyComputePass mpWorldCacheBakePass;
     LazyComputePass mpWorldCacheAdvancePass;
@@ -804,6 +805,10 @@ private:
     ref<Buffer> mpSkirtCheckCount;
     uint32_t mSkirtMaskChecks = 0;            ///< Frames checked (cloudSkirtCheck).
     uint32_t mSkirtMaskMismatches = 0;        ///< Pages whose stored mask differed from this frame's pages, summed over them.
+    bool mBeamDirtyStats = false;             ///< DIAGNOSTIC: sum the dirty blocks and units listed per frame (blocking readback).
+    uint32_t mDirtyStatFrames = 0;            ///< Frames summed (beamDirtyStats).
+    uint32_t mDirtyStatBlocks = 0;            ///< Dirty blocks listed, summed over them (each block's 2 x stride^2 query rays).
+    uint32_t mDirtyStatUnits = 0;             ///< Units listed for the unit march, summed over them.
     LazyComputePass mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
     LazyComputePass mpClearWorldCacheTilesPass;
     LazyComputePass mpAdvanceFadesPass;

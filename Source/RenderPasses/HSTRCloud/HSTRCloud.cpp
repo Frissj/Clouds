@@ -282,9 +282,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
-            key == "seaFarOverlap" || key == "cloudSkirtCheck")
+            key == "seaFarOverlap" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
+            key == "beamDirtyStats")
         {
-            if (key == "cloudSkirtCheck")
+            if (key == "beamDirtyStats")
+                mBeamDirtyStats = bool(value);
+            else if (key == "worldCacheRingCount")
+                mParams.worldCacheRingCount = std::clamp(uint32_t(value), 6u, 7u);
+            else if (key == "worldCacheRingLayout")
+                mParams.worldCacheRingLayout = std::min(uint32_t(value), 1u);
+            else if (key == "cloudSkirtCheck")
                 mCloudSkirtCheck = bool(value);
             else if (key == "seaFarOverlap")
                 mSeaFarOverlap = bool(value);
@@ -1216,7 +1223,8 @@ void HSTRCloud::setProperties(const Properties& props)
         mWorldCacheModulation != previousModulation || p.worldCacheModulationDepth != q.worldCacheModulationDepth ||
         p.worldCacheZonalBands != q.worldCacheZonalBands || p.worldCacheSunOrder != q.worldCacheSunOrder ||
         p.worldCacheSimilarity != q.worldCacheSimilarity || mWorldCacheRingModulation != previousRingModulation ||
-        p.worldCacheRingDepth != q.worldCacheRingDepth)
+        p.worldCacheRingDepth != q.worldCacheRingDepth || p.worldCacheRingCount != q.worldCacheRingCount ||
+        p.worldCacheRingLayout != q.worldCacheRingLayout)
         mParams.worldCacheSamples = 0;
     mResidualDirty |= p.residualTolerance != q.residualTolerance || p.octaveExtinction != q.octaveExtinction ||
                       p.octaveBlurSigma != q.octaveBlurSigma || p.stepOpticalDepth != q.stepOpticalDepth ||
@@ -1255,6 +1263,9 @@ Properties HSTRCloud::getProperties() const
     props["seaFarRefresh"] = mParams.seaFarRefresh;
     props["seaFarOverlap"] = mSeaFarOverlap;
     props["cloudSkirtCheck"] = mCloudSkirtCheck;
+    props["beamDirtyStats"] = mBeamDirtyStats;
+    props["worldCacheRingCount"] = mParams.worldCacheRingCount;
+    props["worldCacheRingLayout"] = mParams.worldCacheRingLayout;
     props["probeX"] = int(mParams.probeX);
     props["probeY"] = int(mParams.probeY);
     // DIAGNOSTIC: the probed pixel's records from the last frame, flattened (12 values each, see probeRecord), read synchronously.
@@ -1492,6 +1503,9 @@ Properties HSTRCloud::getProperties() const
         cloud["farSeaRuns"] = mFarSeaRuns;
         cloud["skirtMaskChecks"] = mSkirtMaskChecks;
         cloud["skirtMaskMismatches"] = mSkirtMaskMismatches;
+        cloud["dirtyStatFrames"] = mDirtyStatFrames;
+        cloud["dirtyStatBlocks"] = mDirtyStatBlocks;
+        cloud["dirtyStatUnits"] = mDirtyStatUnits;
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
@@ -4188,21 +4202,27 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
         var["hstrWorldCache"] = mpWorldCache;
     if (mpWorldCacheDeposit)
         var["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
-    if (!mpWorldCacheRingKernel || mWorldCacheRingG != mParams.anisotropy)
+    const uint32_t ringShape = mParams.worldCacheRingCount * 16u + mParams.worldCacheRingLayout;
+    if (!mpWorldCacheRingKernel || mWorldCacheRingG != mParams.anisotropy || mWorldCacheRingShape != ringShape)
     {
         // worldCacheSunOrder 4: ring edges (degrees from the sun, finest where the phase's forward peak is, ~7 degrees wide at
         // g 0.85), then per ring the HG phase averaged over the ring's solid angle against the view's angle from the sun, over
         // Y_00 (the ring slots deposit Y_00 inside the ring). Midpoint quadrature over the ring in angle and azimuth.
         // The phase table is a 2-row RGBA texture (rings 0-3, rings 4-6), sampled at sin(view / 2) so the camera read is one
         // sqrt and two filtered fetches, not an acos and 14 buffer loads; sin(view / 2) also puts more samples in the peak.
-        const float edges[kWorldCacheRings + 1] = {0.f, 3.f, 7.f, 13.f, 22.f, 40.f, 75.f, 180.f};
+        // Six rings (worldCacheRingCount) leave texture 6 unread: layout 0 merges the 7-ring layout's two backward rings, layout 1
+        // respaces six (default: same quality as 7 rings, units -0.17 ms; numbers at worldCacheRingCount in HSTRCloudTypes.slang).
+        const uint32_t rings = mParams.worldCacheRingCount;
+        const float edges7[kWorldCacheRings + 1] = {0.f, 3.f, 7.f, 13.f, 22.f, 40.f, 75.f, 180.f};
+        const float edges6[2][7] = {{0.f, 3.f, 7.f, 13.f, 22.f, 40.f, 180.f}, {0.f, 4.f, 9.f, 17.f, 32.f, 70.f, 180.f}};
+        const float* edges = rings == 7 ? edges7 : edges6[std::min(mParams.worldCacheRingLayout, 1u)];
         const double g = mParams.anisotropy;
         std::vector<float> ringEdges(8, 0.f);
         std::vector<float> table(2 * 4 * kWorldCacheRingSamples, 0.f);
-        for (uint32_t j = 0; j + 1 < kWorldCacheRings; ++j)
+        for (uint32_t j = 0; j + 1 < rings; ++j)
             ringEdges[j] = std::cos(edges[j + 1] * float(M_PI) / 180.f);
         const uint32_t polar = 96, azimuth = 192;
-        for (uint32_t j = 0; j < kWorldCacheRings; ++j)
+        for (uint32_t j = 0; j < rings; ++j)
         {
             const double a = edges[j] * M_PI / 180.0, b = edges[j + 1] * M_PI / 180.0;
             const double solidAngle = 2.0 * M_PI * (std::cos(a) - std::cos(b));
@@ -4232,6 +4252,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
             kWorldCacheRingSamples, 2, ResourceFormat::RGBA32Float, 1, 1, table.data(), ResourceBindFlags::ShaderResource
         );
         mWorldCacheRingG = mParams.anisotropy;
+        mWorldCacheRingShape = ringShape;
     }
     var["hstrWorldCacheRingKernel"] = mpWorldCacheRingKernel;
     var["hstrWorldCacheRingTable"] = mpWorldCacheRingTable;
@@ -4782,8 +4803,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
     pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
-    pPass->getProgram()->addDefine("HSTR_STRIP", "0");
-}
+    pPass->getProgram()->addDefine("HSTR_STRIP", "0");}
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
 {
@@ -7102,6 +7122,13 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         }
                         mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
+                    }
+                    // DIAGNOSTIC (beamDirtyStats): what this frame listed, so arms can be compared by work as well as time.
+                    if (mBeamDirtyStats && mpBeamDirtyCount)
+                    {
+                        mDirtyStatBlocks += mpBeamDirtyCount->getElement<uint32_t>(0);
+                        mDirtyStatUnits += mpBeamDirtyCount->getElement<uint32_t>(1);
+                        ++mDirtyStatFrames;
                     }
                     mParams.beamDirtyFused = 0;
                     if (mPushProbe && mPushShare && mpPushShareRays)

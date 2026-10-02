@@ -92,6 +92,19 @@ static const uint kMaxTileNodes = 128;
 static const uint kSortGroupSize = 64;
 static const float kMinTransmittance = 1e-3f;
 static const float kPi = 3.14159265f;
+/// shWindow's Hann weights 0.5 + 0.5 cos(pi l / (order + 1)), [order 0-9][band 0-8].
+static const float kShHann[10][9] = {
+    { 1.000000000f, 0.000000000f, 1.000000000f, 0.000000000f, 1.000000000f, 0.000000000f, 1.000000000f, 0.000000000f, 1.000000000f },
+    { 1.000000000f, 0.500000000f, 0.000000000f, 0.500000000f, 1.000000000f, 0.500000000f, 0.000000000f, 0.500000000f, 1.000000000f },
+    { 1.000000000f, 0.750000000f, 0.250000000f, 0.000000000f, 0.250000000f, 0.750000000f, 1.000000000f, 0.750000000f, 0.250000000f },
+    { 1.000000000f, 0.853553391f, 0.500000000f, 0.146446609f, 0.000000000f, 0.146446609f, 0.500000000f, 0.853553391f, 1.000000000f },
+    { 1.000000000f, 0.904508497f, 0.654508497f, 0.345491503f, 0.095491503f, 0.000000000f, 0.095491503f, 0.345491503f, 0.654508497f },
+    { 1.000000000f, 0.933012702f, 0.750000000f, 0.500000000f, 0.250000000f, 0.066987298f, 0.000000000f, 0.066987298f, 0.250000000f },
+    { 1.000000000f, 0.950484434f, 0.811744901f, 0.611260467f, 0.388739533f, 0.188255099f, 0.049515566f, 0.000000000f, 0.049515566f },
+    { 1.000000000f, 0.961939766f, 0.853553391f, 0.691341716f, 0.500000000f, 0.308658284f, 0.146446609f, 0.038060234f, 0.000000000f },
+    { 1.000000000f, 0.969846310f, 0.883022222f, 0.750000000f, 0.586824089f, 0.413175911f, 0.250000000f, 0.116977778f, 0.030153690f },
+    { 1.000000000f, 0.975528258f, 0.904508497f, 0.793892626f, 0.654508497f, 0.500000000f, 0.345491503f, 0.206107374f, 0.095491503f },
+};
 
 /// A GPU brick's sun scheduler entry, from its two tables (HSTRCloudRenderer::sunSched).
 struct SunSchedEntry
@@ -3391,7 +3404,7 @@ struct HSTRCloudRenderer
         float4 texels[7];
         [unroll]
         for (uint t = 0; t < 7; ++t)
-            texels[t] = t < 5 || rings ? hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f) : 0.f;
+            texels[t] = t < 5 || (rings && (t < 6 || params.worldCacheRingCount > 6)) ? hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f) : 0.f;
         float sun = 0.f;
         float sky = 0.f;
         [unroll]
@@ -3858,6 +3871,8 @@ struct HSTRCloudRenderer
     /// Sun extension slots in use: all of band 3, or zonal bands 3-worldCacheZonalBands about the sun direction.
     uint worldCacheSunExtension()
     {
+        if (params.worldCacheSunOrder >= 4)
+            return params.worldCacheRingCount;
         if (params.worldCacheSunOrder >= 3)
             return 7u;
         return params.worldCacheZonalBands > 2 ? min(params.worldCacheZonalBands, 8u) - 2u : 0u;
@@ -3872,7 +3887,7 @@ struct HSTRCloudRenderer
             // Ring j about the sun: Y_00 inside it (the ring's share of the SH band-0 coefficient), zero elsewhere.
             const float mu = dot(d, normalize(params.sunDirection));
             const float upper = j == 0 ? 2.f : hstrWorldCacheRingKernel[j - 1];
-            const float lower = j + 1 == kWorldCacheRings ? -2.f : hstrWorldCacheRingKernel[j];
+            const float lower = j + 1 == params.worldCacheRingCount ? -2.f : hstrWorldCacheRingKernel[j];
             return mu <= upper && mu > lower ? 0.282095f : 0.f;
         }
         if (params.worldCacheSunOrder >= 3)
@@ -3889,10 +3904,15 @@ struct HSTRCloudRenderer
         return sqrt((2.f * (j + 3) + 1.f) / (4.f * kPi)) * current;
     }
 
-    /// Hanning window of SH band l for a truncation at band order (1 without windowing).
+    /// Hanning window of SH band l for a truncation at band order (1 without windowing): 0.5 + 0.5 cos(pi l / (order + 1)), from
+    /// kShHann through order 9. MEASURED (hann1, 4K walk, one launch): the per-call cos (18 per lit sample, a runtime order) held
+    /// the unit march's hottest line, 53k of 2.89M samples (query_src2), yet the table changed nothing - units 5.66 / 5.57 / 5.66 ms
+    /// (table / cos / table). Those samples were stalls the other warps covered.
     float shWindow(uint l, uint order)
     {
-        return params.worldCacheWindow != 0 ? 0.5f + 0.5f * cos(kPi * float(l) / float(order + 1)) : 1.f;
+        if (params.worldCacheWindow == 0)
+            return 1.f;
+        return order <= 9u && l <= 8u ? kShHann[order][l] : 0.5f + 0.5f * cos(kPi * float(l) / float(order + 1));
     }
 
     uint worldCacheIndex(uint3 cell) { return cell.x + params.worldCacheDims.x * (cell.y + params.worldCacheDims.y * cell.z); }
@@ -4393,7 +4413,9 @@ struct HSTRCloudRenderer
         float4 texels[kWorldCacheTextures];
         // Sun slots 0-8 and sky slots 9-17 of bands 0, 0-1 or 0-2 lie in textures {0, 2}, {0, 2, 3} or 0-4; the sun extension
         // (slots 18-24) in textures 4-6.
-        const uint textures = (order == 0 ? 0x5u : (order == 1 ? 0xDu : 0x1Fu)) | (extension > 0 ? 0x70u : 0u);
+        // Slots 18-19 lie in texture 4, 20-23 in 5, 24 in 6 (six rings stop short of it).
+        const uint textures = (order == 0 ? 0x5u : (order == 1 ? 0xDu : 0x1Fu)) | (extension > 0 ? 0x10u : 0u) | (extension > 2 ? 0x20u : 0u) |
+                              (extension > 6 ? 0x40u : 0u);
         [unroll]
         for (uint t = 0; t < kWorldCacheTextures; ++t)
             texels[t] = (textures & (1u << t)) != 0 ? hstrWorldCacheTexture[t].SampleLevel(hstrLinearSampler, uvw, 0.f) : 0.f;
@@ -11755,6 +11777,20 @@ void writeBeamDirtyArgs()
 // The finer the sort the less it costs, and it never beats the listed order: the tail is not long blocks started late, or the
 // prediction under motion is too weak to find them, and moving blocks away from their listed neighbours costs more than it saves.
 
+// MEASURED and REMOVED (2026-10-02, 4K walk, ngfx traces + one-launch A/B): the dirty query allocates 168 registers (12 warps an
+// SM) where the unit march, the same marchBeam, gets 128 (16). Knockouts on the strip copy: tests + march + lattice write 128;
+// adding beamGuardVerified's InterlockedMin alone 168 (its camera write and coarse drop not needed for it; marchBeamUnitExact's own
+// guard block pasted in, also 168). Each fix reached the register target and saved nothing:
+//   compiling beamReprojectQuery's dead resampling out under refFrame + guard (its corner loop held the 164-register peak): still
+//   168, the march's peak taking over; query 3.34 / 3.24 / 3.28 ms (on / off / on).
+//   tests in this pass, march + writes in a listed second pass: the march pass also 168; query 3.78 against 3.28 / 3.21 ms.
+//   march + lattice write here, guard write from a list in a pass after (verifyBeamDirtyQueries): query 128 registers, 16 warps;
+//   query 3.20 + 0.25 against 3.26 + 0.10 / 3.25 + 0.10 ms.
+// Why (ngfx timelines of the query range): ~85% of it is a flat plateau, the tail only its last ~0.4 ms. At 168 registers the
+// plateau holds 7.9 warps an SM with L1 74% / L2 58%; at 128, 10.9 warps with L1 62% / L2 71% - the extra warps push the SM's
+// working set out of L1 (the unit march, dense neighbouring rays, holds L1 74% / L2 85% at 16 warps).
+// MEASURED and REMOVED (querygroup1): 128 / 1024-thread query groups to keep neighbouring blocks on one SM - query 3.09 / 3.07 ms
+// at 64, 3.24 at 256, 3.58 at 1024. The coarser scheduling costs more than the shared L1 gives.
 #ifndef HSTR_BEAM_DIRTY_SLICES
 #define HSTR_BEAM_DIRTY_SLICES 0 // Nonzero: beamDirtySegments > 1 (set by the host), the sliced query below.
 #endif

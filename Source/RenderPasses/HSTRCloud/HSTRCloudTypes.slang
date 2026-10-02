@@ -1455,6 +1455,14 @@ struct HSTRCloudParams
     float seaFarPad2 = 0.f;
     float3 seaFarPrevW = float3(0.f);
     float seaFarPad3 = 0.f;
+    /// worldCacheSunOrder 4: rings about the sun (worldCacheRingCount, 6 or 7; 6 leaves the seventh texture unread) and the edge layout
+    /// (worldCacheRingLayout: 0 the 7-ring edges with the two backward rings merged, 1 six rings respaced).
+    /// Default 6 respaced. MEASURED (sunset hill vs saved PT, bits 15, one launch): 7 rings log 0.0348 / 0.0355 (anchors), 6 respaced
+    /// 0.0350, 6 merged 0.0392. 4K walk, one launch: units 7.16 / 7.18 ms (7 rings) vs 7.00 ms (6 respaced).
+    uint worldCacheRingCount = 6;
+    uint worldCacheRingLayout = 1;
+    uint worldCacheRingPad0 = 0;
+    uint worldCacheRingPad1 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
