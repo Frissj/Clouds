@@ -36,7 +36,9 @@ DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm
 
 
 DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "beamWarpListed",
-         "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim")
+         "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim") + tuple(
+         f"beamProbe{kind}{name}" for kind in ("Rays", "Units", "RaySteps", "UnitSteps")
+         for name in ("Scored", "InPlace", "Reprojected", "Either"))  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
 
 
 def score():

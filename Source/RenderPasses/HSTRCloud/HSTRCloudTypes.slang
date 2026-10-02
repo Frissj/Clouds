@@ -69,6 +69,10 @@ static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows no
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
 static const uint kBeamDirtyApronMarched = 31; ///< Apron units (around listed blocks) it marched.
 /// beamRepairProbe, four each: re-marched samples scored, kept in place within 0.02, reprojected within 0.02, either.
+/// MEASURED (sunset_repair2, 4K sunset sea, centreless 0.4 / edge 0.95 defaults, per frame over 20 counted): walk 68.9k query rays
+/// (39 steps each) 80.8% either, 75% of their steps; 122.0k units (69 steps) 55.7%, 55%; together 60% of the walk's 11.1M march
+/// steps. Sprint 120.1k rays 70%, 45% of steps; 125.6k units 42%, 41%. A free oracle would take the walk's marching ~5 -> ~2 ms;
+/// with ~3.5 ms of other passes no validated reuse reaches 2 ms (the witness validator alone cost 2.7 ms on the older sea).
 static const uint kBeamProbeUnits = 32;
 static const uint kBeamProbeRays = 36;
 /// beamRepairProbe: the kBeamProbeUnits and kBeamProbeRays counts again, weighted by march steps (units at +0, rays at +4).
