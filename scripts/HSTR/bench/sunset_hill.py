@@ -176,8 +176,9 @@ elif os.environ.get("HSTR_HILL_EXACT"):
             for _ in range(settle):
                 m.renderFrame()
             hstr.set_properties({"cloudResidencyFrozen": True})
+        frames = props.pop("frames", 8)  # A beam arm rebuilds over several frames.
         hstr.set_properties(dict(REFERENCE, **props))
-        for _ in range(8):
+        for _ in range(frames):
             m.renderFrame()
         capture(label)
         print(f"HILL captured {label}: {stats()}", flush=True)

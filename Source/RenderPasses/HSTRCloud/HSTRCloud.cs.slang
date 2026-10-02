@@ -8790,6 +8790,11 @@ struct HSTRCloudRenderer
                 refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
             return refine;
         }
+        // MEASURED and REMOVED (cachetol, 4K, 2026-10-02): the cache in-scatter tested apart, against beamTolerance x k (its error
+        // measured on top of the exact rest), because the cache term fails ~18% more units (beamDirtyStats: 25.8M vs 21.6M units
+        // over 80 walk frames with the cache off). Walk units 26.4M -> 24.4M / 22.3M / 21.2M at k 2 / 4 / ignored, but the
+        // settled frame against k 0 (beamReset each arm; k 0 against itself 0.004% over 0.02, p99.9 0.009): 0.367% / 0.557% /
+        // 0.779% over 0.02, p99.9 0.043 / 0.051 / 0.061, max 0.84. The cache term's tile-scale structure is real detail.
         bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
         if (!refine && params.beamEdgeContrast > 0.f)
             refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
