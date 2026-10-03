@@ -40,12 +40,11 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          f"beamProbe{kind}{name}" for kind in ("Rays", "Units", "RaySteps", "UnitSteps")
          for name in ("Scored", "InPlace", "Reprojected", "Either")) + (  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
          # beamGuardMotion: blocks listed by first failing pyramid level, by the zoom cap; held that the isotropic bound would list.
-         tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardFailZoom", "beamGuardRescued", "beamGuardHeld",
-         "beamGuardDiffHeld") +
+         tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardRescued", "beamGuardHeld") +
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, and density samples by layers with density.
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2")) +
-         # The near-segment verification probe (beamRepairProbe + beamGuardExtent): lattice rays only.
-         tuple(f"beamNsv{n}" for n in ("Rays", "Steps", "Eligible", "EligibleSaved", "Good", "GoodSaved")))
+         # The navigation probe (kBeamNavProbe in HSTRCloudTypes.slang has the layout).
+         tuple(f"beamNav{k}" for k in range(31)))
 
 
 def score():

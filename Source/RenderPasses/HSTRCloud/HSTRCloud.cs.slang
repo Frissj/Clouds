@@ -47,19 +47,14 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
-#ifndef HSTR_BEAM_EXTENT
-#define HSTR_BEAM_EXTENT 0 // beamGuardExtent: rays record their depth extent and the guard keeps it per block (beamGuardMotion 3).
-#endif
-#if HSTR_BEAM_EXTENT
-/// The last marchBeam's opacity-weighted second moment of distance, and the distance at which its opacity passed 0.02 (0: never).
-static float gBeamExtentMoment;
-static float gBeamExtentFront;
-#endif
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
+static uint gNavProbe[31];  ///< This thread's kBeamNavProbe counts since its marchBeam began (kBeamNavProbeCount).
+static uint gNavExitKind;   ///< The exit kind of leanExtinctionLayered's last empty sample (kBeamNavProbe + 10).
+static bool gNavClipped;    ///< Whether cloudEmptyExitOf's last exit was cut short by the footprint's next level.
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -77,17 +72,6 @@ static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its 
 /// dirty unit march only, so no shipping program carries it.
 #ifndef HSTR_BEAM_REPAIR_PROBE
 #define HSTR_BEAM_REPAIR_PROBE 0
-#endif
-/// The near-segment verification probe (beamProbeNearSegment): the repair probe with depth extents, lattice rays only.
-#define HSTR_NSV_PROBE (HSTR_BEAM_REPAIR_PROBE && HSTR_BEAM_EXTENT)
-#if HSTR_NSV_PROBE
-/// Set before a probed marchBeam: the distance its near segment ends (0: none). The march records its terms there.
-static float gNearSplit = 0.f;
-static float3 gNearCache;
-static float3 gNearSingle;
-static float gNearTransmittance;
-static uint gNearSteps;
-static bool gNearSet;
 #endif
 #ifndef HSTR_PUSH_SHARE
 #define HSTR_PUSH_SHARE 0 // The dirty query lists the points it marches for countPushShare.
@@ -509,13 +493,6 @@ struct HSTRCloudRenderer
     /// Min-depth pyramid over the guard blocks, levels packed one after another (level 0 is hstrBeamGuardDepth as a float, never
     /// verified as unbounded). See beamCellRadius.
     RWStructuredBuffer<float> hstrBeamGuardPyramid;
-    /// beamGuardExtent, per block since it was last listed (cloud rays only, as uint-ordered floats): the nearest front (where a
-    /// ray's opacity passed 0.02), the farthest back (opacity-weighted mean + 2 sigma) and the farthest opacity-weighted mean.
-    RWTexture2D<uint> hstrBeamGuardFront;
-    RWTexture2D<uint> hstrBeamGuardBack;
-    RWTexture2D<uint> hstrBeamGuardMeanFar;
-    /// Their pyramid beside hstrBeamGuardPyramid's: per entry min front, max back, max mean.
-    RWStructuredBuffer<float4> hstrBeamGuardExtentPyramid;
     RWTexture2D<float4> hstrBeamGuardCamera;
     /// The blocks whose certificate failed this build, compacted, with the count and the indirect arguments that dispatch them.
     RWStructuredBuffer<uint> hstrBeamDirty;
@@ -983,6 +960,9 @@ struct HSTRCloudRenderer
     {
         const float3 dv = ray.direction * float(params.hstrCellWidth);
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
+#if HSTR_LAYER_PROBE
+        gNavClipped = false;
+#endif
         float exit = box.cell ? cloudCellRunExit(box, dx) : 1e30f;
         if (!box.cell)
             for (uint a = 0; a < 3; ++a)
@@ -996,7 +976,11 @@ struct HSTRCloudRenderer
             if (nextLevel > footprintLevel)
             {
                 const float footprint = instance.sourceVoxelWorld * pow(2.f, max(nextLevel - params.cloudLodBias, 0.f));
-                exit = min(exit, (footprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength - t);
+                const float level = (footprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength - t;
+#if HSTR_LAYER_PROBE
+                gNavClipped = level < exit;
+#endif
+                exit = min(exit, level);
             }
         }
         return t + max(exit, 0.f);
@@ -5270,16 +5254,12 @@ struct HSTRCloudRenderer
     BeamSample marchBeam(float3 direction, float2 segment)
     {
         BeamSample result = {};
-#if HSTR_BEAM_EXTENT
-        gBeamExtentMoment = 0.f;
-        gBeamExtentFront = 0.f;
-#endif
-#if HSTR_NSV_PROBE
-        gNearSet = false;
-#endif
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
+        for (uint k = 0; k < kBeamNavProbeCount; ++k)
+            gNavProbe[k] = 0;
+        gNavExitKind = 3u;
 #endif
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
@@ -5311,6 +5291,25 @@ struct HSTRCloudRenderer
             {
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[kBeamLayerProbe + k], sum, unused);
+            }
+        }
+        // The warp ceiling: a wave pays its longest lane, so what skipping empty runs can save is what it does to that lane.
+        gNavProbe[5] = steps;
+        gNavProbe[6] = gNavProbe[0] != 0u || gNavProbe[1] != 0u ? gNavProbe[1] + gNavProbe[2] + gNavProbe[3] : steps;
+        const uint lanes = WaveActiveCountBits(true);
+        const uint longest = WaveActiveMax(steps);
+        const uint longestIdeal = WaveActiveMax(gNavProbe[6]);
+        const bool first = WaveIsFirstLane();
+        gNavProbe[7] = first ? longest * lanes : 0u;
+        gNavProbe[8] = first ? longestIdeal * lanes : 0u;
+        gNavProbe[9] = first ? 1u : 0u;
+        for (uint k = 0; k < kBeamNavProbeCount; ++k)
+        {
+            const uint sum = WaveActiveSum(gNavProbe[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamNavProbe + k], sum, unused);
             }
         }
 #endif
@@ -7269,17 +7268,25 @@ struct HSTRCloudRenderer
                     fineVoxels = 1.f;
                     return proxy;
                 }
-                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
+                const float none = cloudLayerNoneExit(ray, tSample, v, layer, instance);
+#if HSTR_LAYER_PROBE
+                if (none < exit)
+                    gNavExitKind = 2u;
+#endif
+                exit = min(exit, none);
                 continue;
             }
             const uint3 dims = hstrCloudAssets[instance.asset].dims;
             const int3 i = int3(floor(x + 0.5f));
             if (any(i < 0) || any(i >= int3(dims)))
             {
+                const float none = cloudLayerNoneExit(ray, tSample, v, layer, instance);
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[1];
+                if (none < exit)
+                    gNavExitKind = 2u;
 #endif
-                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
+                exit = min(exit, none);
                 continue;
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
@@ -7304,10 +7311,13 @@ struct HSTRCloudRenderer
             resolved = true;
             if (sample.empty)
             {
+                const float empty = cloudEmptyExitOf(ray, tSample, sample, instance);
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[2];
+                if (empty < exit)
+                    gNavExitKind = (sample.cell ? 0u : 1u) | (gNavClipped ? 4u : 0u);
 #endif
-                exit = min(exit, cloudEmptyExitOf(ray, tSample, sample, instance));
+                exit = min(exit, empty);
                 continue;
             }
 #if HSTR_LAYER_PROBE
@@ -7523,6 +7533,9 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
+#if HSTR_LAYER_PROBE
+        uint navRun = 0; // Samples in the empty run the march is in (0: none).
+#endif
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
@@ -7548,6 +7561,9 @@ struct HSTRCloudRenderer
 #if (HSTR_SHIP & 4096) != 0
             ++countSteps;
             countZero += majorant > 0.f ? 0u : 1u;
+#endif
+#if HSTR_LAYER_PROBE
+            gNavProbe[2] += majorant > 0.f ? 0u : 1u;
 #endif
             if (majorant > 0.f)
             {
@@ -7579,6 +7595,25 @@ struct HSTRCloudRenderer
                     }
                 }
                 const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+#if HSTR_LAYER_PROBE
+                if (skipTo >= 0.f)
+                {
+                    const float advanced = min(max(next, skipTo), segment.y) - t;
+                    ++gNavProbe[0];
+                    gNavProbe[4] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
+                    ++gNavProbe[10 + gNavExitKind];
+                    gNavProbe[18 + gNavExitKind] += skipTo <= next ? 1u : 0u;
+                    gNavProbe[3] += navRun == 0u ? 1u : 0u;
+                    ++navRun;
+                }
+                else
+                {
+                    ++gNavProbe[1];
+                    if (navRun != 0u)
+                        ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
+                    navRun = 0;
+                }
+#endif
 #if (HSTR_SHIP & 4096) != 0
                 countEmpty += skipTo >= 0.f ? 1u : 0u;
                 countProxy += hit.entry == kCloudRefNone && skipTo < 0.f ? 1u : 0u;
@@ -7639,25 +7674,6 @@ struct HSTRCloudRenderer
                         radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
                 }
                 opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
-#if HSTR_NSV_PROBE
-                if (!gNearSet && gNearSplit > 0.f && ray.entryDistance + tSample * ray.worldLength >= gNearSplit)
-                {
-                    // The first content sample past the split: everything accumulated so far is the near segment.
-                    gNearSet = true;
-                    gNearCache = radiance;
-                    gNearSingle = residualRadiance;
-                    gNearTransmittance = transmittance;
-                    gNearSteps = steps;
-                }
-#endif
-#if HSTR_BEAM_EXTENT
-                {
-                    const float s = ray.entryDistance + tSample * ray.worldLength;
-                    gBeamExtentMoment += transmittance * alpha * s * s;
-                    if (gBeamExtentFront == 0.f && transmittance * (1.f - alpha) < 0.98f)
-                        gBeamExtentFront = s;
-                }
-#endif
                 transmittance *= 1.f - alpha;
                 if (skipTo >= 0.f)
                     next = min(max(next, skipTo), segment.y);
@@ -7671,6 +7687,10 @@ struct HSTRCloudRenderer
             t = next;
             ++steps;
         }
+#if HSTR_LAYER_PROBE
+        if (navRun != 0u)
+            ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
+#endif
 #if (HSTR_SHIP & 262144) != 0
         if (spanKept)
         {
@@ -9441,10 +9461,9 @@ struct HSTRCloudRenderer
                     return;
                 z = nearest;
             }
-            // beamGuardMotion bit 2: z is a distance from the capture camera; from the eye it is z + (Pc - eye) . w to first order,
-            // which matters once forward motion holds a block over many frames.
-            if ((params.beamGuardMotion & 4u) != 0)
-                z = max(z + dot(held.xyz - eye, w), 1e-3f);
+            // MEASURED and REMOVED (motion_guard1, 4K sunset walk, beamGuardMotion 2 at parallax 8): z taken as the distance from the
+            // eye, z + (Pc - eye) . w, instead of from the capture camera - 4.460% -> 4.648% over 0.02, no gain. Not what the
+            // directional certificate's extra error is (beamCellMotionCertified).
             const float3 d = normalize(eye + w * z - held.xyz);
             float2 warped;
             if (!beamImagePosition(d, warped))
@@ -9853,105 +9872,13 @@ struct HSTRCloudRenderer
         return beamRadiance(depthCache.rgb, single.rgb, depthCache.a, w, albedo);
     }
 
-#if HSTR_NSV_PROBE
-    /// The old lattice's terms at a beam position, bilinear (beamProbeLatticeRadiance before beamRadiance).
-    void beamProbeLatticeTerms(float2 position, out float4 depthCache, out float4 single)
-    {
-        const float2 t = position / float(max(params.beamLatticeStep, 1u));
-        const int2 base = int2(floor(t));
-        const float2 f = t - float2(base);
-        depthCache = 0.f;
-        single = 0.f;
-        for (uint k = 0; k < 4; ++k)
-        {
-            const int2 texel = max(base + int2(k & 1u, k >> 1), 0);
-            const float weight = ((k & 1u) != 0 ? f.x : 1.f - f.x) * ((k >> 1) != 0 ? f.y : 1.f - f.y);
-            const uint2 at = uint2(texel) * max(params.beamLatticeStep, 1u);
-            depthCache += weight * hstrBeamLatticeSnapshot[beamLatticeTexel(at, 0)];
-            single += weight * hstrBeamLatticeSnapshot[beamLatticeTexel(at, 1)];
-        }
-    }
-
-    /// Near-segment verification, planned before the fresh march: the old value of this ray was captured from Pc (its block's
-    /// camera). From the eye E, content beyond D = |(E - Pc) x w| / b + |E - Pc| has moved by at most b (beamGuardDiffAngle). If
-    /// the old ray's content began at or past D + 2|E - Pc| (its stored front), a repair could march only [0, D + |E - Pc|) and
-    /// composite the old value, warped, behind it. Returns whether this ray qualifies, and the split.
-    bool beamNearSegmentPlan(uint2 position, out float split)
-    {
-        split = 0.f;
-        const float4 mark = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 2)];
-        const uint2 cell = beamGuardCell(position);
-        if (!(mark.y > 0.5f) || !(mark.z > 0.f) || any(cell >= params.beamGuardDims))
-            return false;
-        const float4 capture = hstrBeamGuardCameraSnapshot[cell];
-        if (capture.w < 0.5f)
-            return false;
-        const float3 w = beamRayDirection(float2(position));
-        const float3 d = gScene.camera.data.posW - capture.xyz;
-        const float m = length(d);
-        const float reach = length(cross(d, w)) / max(params.beamGuardDiffAngle, 1e-6f) + m;
-        split = reach + m;
-        return mark.z >= reach + 2.f * m;
-    }
-
-    /// Scores the plan against the fresh march: the near segment the march recorded at the split, plus its transmittance times
-    /// the old lattice warped from Pc by the old ray's own mean depth (twice, as beamWarpPosition), against the fresh value.
-    /// kBeamNsvProbe: rays scored, their steps; rays eligible, the steps past the split; eligible within 0.02, their steps past it.
-    /// MEASURED and REJECTED before building any storage (nsv_probe1, 4K sunset walk, today's guard iso p8, ~71k lattice rays and
-    /// 2.8M steps a frame): b 0.5 / 1 / 2 texels - eligible 13.6k / 15.1k / 23.8k rays, steps past the split 1.0% / 4.8% / 20%,
-    /// composite within 0.02 for 97% / 82% / 50% of the eligible, so steps saved AND right 0.3% / 0.9% / 2.5%. Sanity b 16: 82% of
-    /// steps past the split, 21% right. The stop rule was 30% of the steps at a held-block bad rate. At a texel's budget D =
-    /// |d x w| / b is ~1000+ units on a 2-unit walk step, past the cloud tops (60-250 units): there is no far segment to reuse.
-    void beamProbeNearSegment(uint2 position, BeamSample fresh, bool march, bool eligible)
-    {
-        const bool scored = march && hstrBeamLatticeSnapshot[beamLatticeTexel(position, 2)].y > 0.5f;
-        bool good = false;
-        uint saved = 0;
-        if (scored && eligible)
-        {
-            const float3 w = beamRayDirection(float2(position));
-            const float3 albedo = gScene.getGridVolume(0).data.albedo;
-            const float3 eye = gScene.camera.data.posW;
-            float3 nearCache = fresh.cache, nearSingle = fresh.single;
-            float nearT = exp(-fresh.depth);
-            if (gNearSet)
-            {
-                nearCache = gNearCache;
-                nearSingle = gNearSingle;
-                nearT = gNearTransmittance;
-                saved = uint(fresh.steps) - min(gNearSteps, uint(fresh.steps));
-            }
-            float2 moved = float2(position);
-            float4 depthCache = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 0)];
-            float4 single = hstrBeamLatticeSnapshot[beamLatticeTexel(position, 1)];
-            for (uint k = 0; k < 2 && single.a > 0.f; ++k)
-            {
-                const uint2 at = min(uint2(max(moved, 0.f)), params.beamFrameDim - 1u);
-                const uint2 cell = min(beamGuardCell(at), params.beamGuardDims - 1u);
-                const float3 capture = hstrBeamGuardCameraSnapshot[cell].xyz;
-                const float z = max(single.a + dot(capture - eye, w), 1e-3f);
-                float2 landed;
-                if (!beamImagePosition(normalize(eye + w * z - capture), landed))
-                    break;
-                moved = landed;
-                beamProbeLatticeTerms(moved, depthCache, single);
-            }
-            const float3 composite = beamRadiance(nearCache + nearT * depthCache.rgb, nearSingle + nearT * single.rgb,
-                                                  -log(max(nearT, 1e-12f)) + depthCache.a, w, albedo);
-            good = beamProbeError(composite, beamRadiance(fresh.cache, fresh.single, fresh.depth, w, albedo)) <= 0.02f;
-        }
-        const uint steps = scored ? uint(fresh.steps) : 0u;
-        const uint counts[6] = { WaveActiveCountBits(scored), WaveActiveSum(steps), WaveActiveCountBits(scored && eligible),
-                                 WaveActiveSum(scored && eligible ? saved : 0u), WaveActiveCountBits(good),
-                                 WaveActiveSum(good ? saved : 0u) };
-        if (WaveIsFirstLane())
-            for (uint k = 0; k < 6; ++k)
-            {
-                uint unused;
-                InterlockedAdd(hstrBeamCounts[kBeamNsvProbe + k], counts[k], unused);
-            }
-    }
-#endif
+    // MEASURED and REMOVED (fe2a6378, nsv_probe1): near-segment verification. A re-marched ray whose old content began past
+    // D + 2|E - Pc| (its front, stored per lattice ray), with D = |(E - Pc) x w| / b + |E - Pc| the distance beyond which content
+    // has moved under b, would march only [0, D + |E - Pc|) and composite the old value warped behind it. Probed on the 4K sunset
+    // walk (today's guard, ~71k lattice rays and 2.8M steps a frame), b 0.5 / 1 / 2 texels: eligible 13.6k / 15.1k / 23.8k rays,
+    // steps past the split 1.0% / 4.8% / 20%, composite within 0.02 for 97% / 82% / 50% of them - steps saved AND right 0.3% /
+    // 0.9% / 2.5% (sanity b 16: 82% past the split, 21% right). The stop rule was 30%. At a texel's budget D is ~1000+ units on a
+    // 2-unit walk step, past the cloud tops (60-250 units): there is no far segment to reuse.
 
     /// What a current-view witness would see along one ray, from one camera: an extinction march (the same stepping as the camera
     /// march, no lighting) giving the opacity, its centroid and the distances at which 25/50/75% of it has accumulated, then a
@@ -10321,9 +10248,6 @@ struct HSTRCloudRenderer
         {
             const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);
             const uint depth = asuint(exact.distance > 0.f ? exact.distance : 3.4e38f);
-#if HSTR_BEAM_EXTENT
-            beamGuardExtent(cell, exact.distance, beamLastExtent(exact.distance, exact.depth));
-#endif
             uint previous;
             InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
             if (depth < previous)
@@ -10419,13 +10343,6 @@ struct HSTRCloudRenderer
 #endif
         writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
         beamGuardVerified(position, q.distance);
-#if HSTR_BEAM_EXTENT
-        // From marchBeam's last ray: true of buildBeamQueryPoint's single-ray march, not of a ray composed from slices.
-        const float2 extent = beamLastExtent(q.distance, q.depth);
-        beamGuardExtent(beamGuardCell(position), q.distance, extent);
-        // The ray's front, for the near-segment probe: where its content begins (65504, the largest half: none; 0: unknown).
-        hstrBeamLatticeOutput[uint3(position / params.beamLatticeStep, 2)] = float4(q.steps, 1.f, q.distance > 0.f ? extent.x : 65504.f, 0.f);
-#endif
 #if HSTR_PUSH_SHARE
         uint listed, stride;
         hstrPushShareRays.GetDimensions(listed, stride);
@@ -10485,9 +10402,6 @@ struct HSTRCloudRenderer
                 writeBeamQuery(position, depthCache, single, carriedSteps);
             // This point was tested in full against this camera, so it is entitled to vouch for its block.
             beamGuardVerified(position, single.a);
-#if HSTR_BEAM_EXTENT
-            beamGuardExtent(beamGuardCell(position), single.a, single.aa); // A carry knows only its mean.
-#endif
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamMaxLevels - 1], 1u, unused);
             if (params.beamRefreshDebug == 7)
@@ -10627,83 +10541,21 @@ struct HSTRCloudRenderer
         if ((params.beamGuardMotion & 3u) != 0 && params.beamOct != 0)
         {
             uint failed;
-            const uint mode = params.beamGuardMotion & 3u;
-            if (beamCellMotionCertified(cell, min(mode, 2u), failed))
-                return true;
-            return mode == 3u && beamCellExtentCertified(cell);
+            return beamCellMotionCertified(cell, min(params.beamGuardMotion & 3u, 2u), failed);
         }
         const float radius = beamCellRadius(cell);
         return radius > 0.f && length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) <= radius;
     }
 
-    /// beamGuardMotion 3: the differential certificate, for blocks the warp moves. The warp (beamWarpPosition) reads each texel
-    /// where its own depth says the content was, so what it cannot take out is the parallax between depths: content at z_a and
-    /// z_b in one neighbourhood separate by shift (1 / z_a - 1 / z_b), with shift beamCellMotionCertified's min(|d|, |w_c x d| +
-    /// r_L |d|). Held while that stays under beamGuardDiffAngle at level 0 and 2^(L-1) blocks above, over every level's CLOUD
-    /// depth range [nearest front - |d|, farthest back + |d|] (hstrBeamGuardExtentPyramid); the zoom cap still applies.
-    /// beamGuardMotion bit 4: the range from opacity-weighted means alone (min mean, max mean) - the certificate measured and
-    /// removed in f343e335 (beamCellRadius' note), which a ray through a thick cloud reads as one depth.
-    /// MEASURED and REJECTED (motion_extent1, 4K sunset walk, beamGuardExtent on, base mode 2 at parallax 2: 2.12 / 2.08% over 0.02,
-    /// 15.2k / 14.7k blocks, units + query 6.09 / 5.79 ms; iso p8 2.57%, 14.5k, 5.31): mean-only at 1 texel reproduces the old
-    /// failure, 3.85% at 8.9k blocks (5.09 ms). The spread (front to mean + 2 sigma) at 0.5 / 1 / 2 texels: 2.51% / 2.95% / 4.38%
-    /// at 12.4k / 9.7k / 6.4k blocks (5.21 / 4.84 / 3.71 ms). At equal holds (7.0k vs 7.8k blocks held by the differential alone)
-    /// the spread halves the mean-only excess but does not remove it, and no arm beats plain mode 1 on the error/time frontier
-    /// (beamCellMotionCertified's note). Per-ray depth extent is not what the differential certificate was missing. Kept compiled
-    /// out (HSTR_BEAM_EXTENT 0).
-    bool beamCellExtentCertified(uint2 cell)
-    {
-#if HSTR_BEAM_EXTENT
-        if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
-            return false;
-        const bool meanOnly = (params.beamGuardMotion & 16u) != 0;
-        const float edge = float(params.beamDirtyBlockEdge);
-        const float dim = float(max(params.beamFrameDim.x, 1u));
-        const float blockAngle = edge * 1.20f * 2.f / dim;
-        const float texelReach = 2.36f * 2.f / dim;
-        const float3 d = gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz;
-        const float m = length(d);
-        const float p = length(cross(d, beamRayDirection((float2(cell) + 0.5f) * edge)));
-        float nearest0 = 3.4e38f;
-        uint offset = 0;
-        uint2 dims = params.beamGuardDims;
-        for (uint level = 0; level < max(params.beamGuardPyramidLevels, 1u); ++level)
-        {
-            const int2 at = int2(cell >> level);
-            const float span = edge * float(1u << level);
-            float nearest = 3.4e38f, front = 3.4e38f, back = 0.f;
-            for (int y = -1; y <= 1; ++y)
-                for (int x = -1; x <= 1; ++x)
-                {
-                    const int2 n = at + int2(x, y);
-                    if (!all(n >= 0) || !all(n < int2(dims)))
-                        continue;
-                    const uint index = offset + uint(n.y) * dims.x + uint(n.x);
-                    const float4 e = hstrBeamGuardExtentPyramid[index];
-                    nearest = min(nearest, hstrBeamGuardPyramid[index]);
-                    front = min(front, meanOnly ? hstrBeamGuardPyramid[index] : e.x);
-                    back = max(back, meanOnly ? e.z : e.y);
-                }
-            if (!(nearest > 0.f))
-                return false;
-            if (level == 0)
-                nearest0 = nearest;
-            if (back > 0.f)
-            {
-                if (!(front > m))
-                    return false;
-                const float budget = level == 0 ? params.beamGuardDiffAngle : float(1u << (level - 1u)) * blockAngle;
-                const float shift = min(m, p + 2.8285f * span * texelReach * m);
-                if (!(shift * (1.f / (front - m) - 1.f / (back + m)) <= budget))
-                    return false;
-            }
-            offset += dims.x * dims.y;
-            dims = (dims + 1u) / 2u;
-        }
-        return !(params.beamGuardZoom > 0.f && m > params.beamGuardZoom * nearest0);
-#else
-        return false;
-#endif
-    }
+    // MEASURED and REMOVED (fe2a6378, motion_extent1): a differential certificate over per-ray depth extents (beamGuardMotion 3).
+    // marchBeamLean kept an opacity-weighted second moment and the distance its opacity passed 0.02, so each ray had a range
+    // [front, mean + 2 sigma]; blocks kept min front / max back since last listed, in a pyramid beside the min-depth one; a block
+    // was held while shift (1 / (front - |d|) - 1 / (back + |d|)) stayed under a budget at every level, the warp taking out the
+    // common parallax. 4K sunset walk, base mode 2 at parallax 2 (2.12 / 2.08% over 0.02, 15.2k / 14.7k blocks, units + query
+    // 6.09 / 5.79 ms; iso p8 2.57%, 14.5k, 5.31): the mean-only control at 1 texel reproduced f343e335's failure, 3.85% at 8.9k
+    // blocks; the spread at 0.5 / 1 / 2 texels 2.51 / 2.95 / 4.38% at 12.4k / 9.7k / 6.4k blocks (5.21 / 4.84 / 3.71 ms). At equal
+    // holds the spread halves the mean-only excess but does not remove it, and no arm beats plain mode 1 on the error/time
+    // frontier. Per-ray depth extent is not what the differential certificate was missing.
 
     /// beamGuardMotion: beamCellRadius's bound for the camera's actual displacement d = P - capturedFrom rather than its length.
     ///
@@ -10715,10 +10567,13 @@ struct HSTRCloudRenderer
     /// direction is farther from d than all of the block can never move into it and is left out of that level's nearest depth
     /// (levels above 0; level 0's bound is the block's own content). Exact on the octahedral map: angles, not image offsets.
     /// mode 0 runs beamCellRadius's bound through the same loop, for the first failing level only. failed: the first pyramid
-    /// level whose bound failed, 0xFE the zoom cap, 0xFF never verified, kBeamGuardFailLevels certified.
+    /// level whose bound failed, 0xFF never verified, kBeamGuardFailLevels certified.
+    /// MEASURED and REMOVED (motion_guard1): a zoom cap expiring blocks once |d| > c x their 3 x 3 nearest depth (content seen
+    /// closer is magnified and marched at another level). Mode 2 + eye warp at parallax 8, c 0 / 0.02 / 0.1: 4.648 / 4.777 / 4.625%
+    /// over 0.02 - magnification is not the extra error.
     /// MEASURED (motion_guard1 / motion_guard2, 4K sunset walk 2 u/frame, HSTR_MOTION_SCORE 2 = against a fresh rebuild, one
     /// settle each): at today's parallax 8, mode 1 halves the listing (15.6k -> 7.9k blocks, units + query 5.47 -> 3.52 ms) but
-    /// error rises 2.7% -> 4.8% over 0.02; mode 2, the eye-distance warp (bit 2) and zoom caps 0.02 / 0.1 change nothing. The 8-texel
+    /// error rises 2.7% -> 4.8% over 0.02; mode 2, the eye-distance warp and the zoom cap change nothing. The 8-texel
     /// budget is only in gate because the isotropic bound is loose for forward motion; an exact bound lets blocks really drift 8
     /// texels, which the warp cannot correct. On the frontier (iso p8 / p4: 2.67% at 5.62 ms, 1.62% at 6.46; mode 1 p8 / 4 / 2 / 1:
     /// 4.86% at 3.82, 3.17% at 4.36, 1.89% at 5.60, 1.15% at 6.57) mode 1 buys ~0.8 points of error at today's cost, or ~10% of
@@ -10739,7 +10594,6 @@ struct HSTRCloudRenderer
         const float3 axis = sided ? d / m : float3(0.f, 0.f, 1.f);
         const float blockFar = acos(clamp(dot(axis, beamRayDirection((float2(cell) + 0.5f) * edge)), -1.f, 1.f)) +
                                0.7072f * edge * texelReach;
-        float nearest0 = 3.4e38f;
         uint offset = 0;
         uint2 dims = params.beamGuardDims;
         for (uint level = 0; level < max(params.beamGuardPyramidLevels, 1u); ++level)
@@ -10769,8 +10623,6 @@ struct HSTRCloudRenderer
                 failed = level;
                 return false;
             }
-            if (level == 0)
-                nearest0 = nearest;
             if (nearest < 3.4e38f)
             {
                 const float budget = level == 0 ? params.beamGuardParallaxAngle : float(1u << (level - 1u)) * blockAngle;
@@ -10784,11 +10636,6 @@ struct HSTRCloudRenderer
             }
             offset += dims.x * dims.y;
             dims = (dims + 1u) / 2u;
-        }
-        if (mode != 0 && params.beamGuardZoom > 0.f && m > params.beamGuardZoom * nearest0)
-        {
-            failed = 0xFEu;
-            return false;
         }
         failed = kBeamGuardFailLevels;
         return true;
@@ -11011,18 +10858,12 @@ struct HSTRCloudRenderer
             uint failed, unused;
             const bool isotropic = beamCellMotionCertified(cell, 0u, failed);
             if (certified)
-            {
                 InterlockedAdd(hstrBeamCounts[isotropic ? kBeamGuardHeld : kBeamGuardRescued], 1u, unused);
-                if ((params.beamGuardMotion & 3u) == 3u && !beamCellMotionCertified(cell, 2u, failed))
-                    InterlockedAdd(hstrBeamCounts[kBeamGuardDiffHeld], 1u, unused);
-            }
             else
             {
                 beamCellMotionCertified(cell, min(params.beamGuardMotion & 3u, 2u), failed);
                 if (failed < kBeamGuardFailLevels)
                     InterlockedAdd(hstrBeamCounts[kBeamGuardFailLevel + failed], 1u, unused);
-                else if (failed == 0xFEu)
-                    InterlockedAdd(hstrBeamCounts[kBeamGuardFailZoom], 1u, unused);
             }
         }
         if (certified)
@@ -11048,12 +10889,6 @@ struct HSTRCloudRenderer
             uint first;
             InterlockedMin(hstrBeamDirtyMark[cell], slot, first);
         }
-#if HSTR_BEAM_EXTENT
-        // The block is re-marched from this camera: its depth range restarts from what this build's rays see.
-        hstrBeamGuardFront[cell] = 0xFFFFFFFFu;
-        hstrBeamGuardBack[cell] = 0u;
-        hstrBeamGuardMeanFar[cell] = 0u;
-#endif
         uint counted;
         InterlockedAdd(hstrBeamCounts[kBeamDirtyBlocks], 1u, counted);
         return true;
@@ -11110,30 +10945,6 @@ struct HSTRCloudRenderer
     // 4K walk scored 2.890% of pixels over 0.02 (p99.9 0.474) against 0.136%, sprint 5.486% against 0.025%, for 16.1 -> 14.2 ms and
     // 15.9 -> 15.8. The rays it kept were the cheap ones - the query only went 6.3 -> 4.6 ms - and a carried corner beside a fresh
     // centre trips the surplus test, so the tiles failing it rose by half. A change is not linear in the camera distance.
-
-#if HSTR_BEAM_EXTENT
-    /// beamGuardExtent: the depth extent [front, mean + 2 sigma] of the ray marchBeam last marched, given that ray's opacity-weighted
-    /// mean distance and optical depth. A ray through a thick cloud is one mean distance; its extent is what parallax acts on.
-    float2 beamLastExtent(float distance, float depth)
-    {
-        const float opacity = max(1.f - exp(-depth), 1e-6f);
-        const float variance = max(gBeamExtentMoment / opacity - distance * distance, 0.f);
-        const float front = gBeamExtentFront > 0.f ? min(gBeamExtentFront, distance) : distance;
-        return float2(front, distance + 2.f * sqrt(variance));
-    }
-
-    /// Widens a block's depth range by one cloud ray's. A ray that hit nothing has none: sky is left out, as the warp carries
-    /// edges over it by its neighbours' depths (beamWarpPosition).
-    void beamGuardExtent(uint2 cell, float distance, float2 extent)
-    {
-        if (!(distance > 0.f) || any(cell >= params.beamGuardDims))
-            return;
-        uint unused;
-        InterlockedMin(hstrBeamGuardFront[cell], asuint(extent.x), unused);
-        InterlockedMax(hstrBeamGuardBack[cell], asuint(extent.y), unused);
-        InterlockedMax(hstrBeamGuardMeanFar[cell], asuint(distance), unused);
-    }
-#endif
 
     /// Records what a point that took the full test this build proves about its block: the camera it was verified from, and a
     /// running minimum of the distances its points hold. The minimum is never raised - a block that has drifted nearer keeps the
@@ -12099,12 +11910,6 @@ void compactBeamChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
 }
 
 groupshared float gPyramid[16 * 16]; ///< buildBeamGuardPyramidTiles: one level of the group's tile at a time.
-#if HSTR_BEAM_EXTENT
-groupshared float3 gExtentPyramid[16 * 16]; ///< The same for hstrBeamGuardExtentPyramid: min front, max back, max mean.
-
-/// One reduction step of hstrBeamGuardExtentPyramid: min front, max back, max mean.
-float3 beamExtentMerge(float3 a, float3 b) { return float3(min(a.x, b.x), max(a.y, b.y), max(a.z, b.z)); }
-#endif
 
 /// The guard's min-depth pyramid in two dispatches instead of one per level (twelve at 4K, 0.07 ms of launches and barriers:
 /// classify/pyramid in policy4). One 16 x 16 group per 32 x 32 tile of level 0 writes levels 0 - 5 of that tile, reducing in
@@ -12119,9 +11924,6 @@ void buildBeamGuardPyramidTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: 
     uint offset = 0;
     uint2 dims = gHSTRCloud.params.beamGuardDims;
     float nearest = 3.4e38f;
-#if HSTR_BEAM_EXTENT
-    float3 extent = float3(3.4e38f, 0.f, 0.f);
-#endif
     for (uint k = 0; k < 4; ++k)
     {
         const uint2 cell = groupId.xy * 32u + local * 2u + uint2(k & 1u, k >> 1);
@@ -12131,13 +11933,6 @@ void buildBeamGuardPyramidTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: 
             const float depth = stored == 0xFFFFFFFFu ? 3.4e38f : asfloat(stored);
             gHSTRCloud.hstrBeamGuardPyramid[cell.y * dims.x + cell.x] = depth;
             nearest = min(nearest, depth);
-#if HSTR_BEAM_EXTENT
-            const uint front = gHSTRCloud.hstrBeamGuardFront[cell];
-            const float3 e = float3(front == 0xFFFFFFFFu ? 3.4e38f : asfloat(front), asfloat(gHSTRCloud.hstrBeamGuardBack[cell]),
-                                    asfloat(gHSTRCloud.hstrBeamGuardMeanFar[cell]));
-            gHSTRCloud.hstrBeamGuardExtentPyramid[cell.y * dims.x + cell.x] = float4(e, 0.f);
-            extent = beamExtentMerge(extent, e);
-#endif
         }
     }
     // Levels 1 - 5: at level L the tile holds 32 >> L entries a side, the first (32 >> L)^2 threads each one.
@@ -12155,28 +11950,15 @@ void buildBeamGuardPyramidTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: 
                 const uint below = side * 2u;
                 nearest = min(min(gPyramid[c.y * below + c.x], gPyramid[c.y * below + c.x + 1u]),
                               min(gPyramid[(c.y + 1u) * below + c.x], gPyramid[(c.y + 1u) * below + c.x + 1u]));
-#if HSTR_BEAM_EXTENT
-                extent = beamExtentMerge(beamExtentMerge(gExtentPyramid[c.y * below + c.x], gExtentPyramid[c.y * below + c.x + 1u]),
-                                         beamExtentMerge(gExtentPyramid[(c.y + 1u) * below + c.x],
-                                                         gExtentPyramid[(c.y + 1u) * below + c.x + 1u]));
-#endif
             }
             GroupMemoryBarrierWithGroupSync();
         }
         if (all(local < side))
         {
             gPyramid[local.y * side + local.x] = nearest;
-#if HSTR_BEAM_EXTENT
-            gExtentPyramid[local.y * side + local.x] = extent;
-#endif
             const uint2 entry = groupId.xy * side + local;
             if (all(entry < dims))
-            {
                 gHSTRCloud.hstrBeamGuardPyramid[offset + entry.y * dims.x + entry.x] = nearest;
-#if HSTR_BEAM_EXTENT
-                gHSTRCloud.hstrBeamGuardExtentPyramid[offset + entry.y * dims.x + entry.x] = float4(extent, 0.f);
-#endif
-            }
         }
     }
 }
@@ -12203,22 +11985,13 @@ void buildBeamGuardPyramidTop(uint3 groupThreadId: SV_GroupThreadID)
         {
             const uint2 thread = uint2(i % dims.x, i / dims.x);
             float nearest = 3.4e38f;
-#if HSTR_BEAM_EXTENT
-            float3 extent = float3(3.4e38f, 0.f, 0.f);
-#endif
             for (uint y = 0; y < 2; ++y)
                 for (uint x = 0; x < 2; ++x)
                 {
                     const uint2 c = min(thread * 2u + uint2(x, y), belowDims - 1u);
                     nearest = min(nearest, gHSTRCloud.hstrBeamGuardPyramid[below + c.y * belowDims.x + c.x]);
-#if HSTR_BEAM_EXTENT
-                    extent = beamExtentMerge(extent, gHSTRCloud.hstrBeamGuardExtentPyramid[below + c.y * belowDims.x + c.x].xyz);
-#endif
                 }
             gHSTRCloud.hstrBeamGuardPyramid[offset + thread.y * dims.x + thread.x] = nearest;
-#if HSTR_BEAM_EXTENT
-            gHSTRCloud.hstrBeamGuardExtentPyramid[offset + thread.y * dims.x + thread.x] = float4(extent, 0.f);
-#endif
         }
         DeviceMemoryBarrierWithGroupSync();
         below = offset;
@@ -12460,20 +12233,12 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #if HSTR_BEAM_REPAIR_PROBE
     // The probe reads its block's other lanes, so every lane has to reach it.
     BeamSample ray = {};
-#if HSTR_NSV_PROBE
-    float split = 0.f;
-    const bool eligible = march && gHSTRCloud.beamNearSegmentPlan(position, split);
-    gNearSplit = eligible ? split : 0.f;
-#endif
     if (march)
     {
         ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
         if (!(1.f - exp(-ray.depth) > 1e-4f))
             ray.distance = 0.f;
     }
-#if HSTR_NSV_PROBE
-    gHSTRCloud.beamProbeNearSegment(position, ray, march, eligible);
-#endif
     const bool shadowCarried = gHSTRCloud.beamProbeQuery(position, ray, march);
     // beamShadowCarry: an accepted block keeps its old values and is certified from here, as a real carry would be.
     if (march && !shadowCarried)

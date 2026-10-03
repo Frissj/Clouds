@@ -368,10 +368,7 @@ private:
     bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
     float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
     uint32_t mBeamGuardMotion = 0;  ///< beamGuardMotion: the motion-aware certificate (HSTRCloudTypes.slang).
-    float mBeamGuardZoom = 0.f;     ///< beamGuardZoom: expire once the camera has moved this share of a block's nearest depth.
-    bool mBeamGuardExtent = false;  ///< beamGuardExtent: compile per-ray depth extents into the guard (HSTR_BEAM_EXTENT).
     bool mBeamLayerProbe = false;   ///< beamLayerProbe: count the layered lookups by outcome (HSTR_LAYER_PROBE).
-    float mBeamGuardDiff = 1.f;     ///< beamGuardDiff: texels of between-depth parallax a block may carry (beamGuardMotion 3).
     bool mBeamWarp = true;        ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
     /// beamOverlapResolve: the resolve's pixel pass runs without barriers behind the dirty unit march, filling that march's tail
     /// (ngfx8: the dirty passes fill the SMs at launch and then only drain, the last third on a few long rays). The pixel pass reads
@@ -546,10 +543,6 @@ private:
     LazyComputePass mpBeamGuardPyramidPass;    ///< Levels 0 - 5 per 32 x 32 tile (buildBeamGuardPyramidTiles) ...
     LazyComputePass mpBeamGuardPyramidTopPass; ///< ... and the levels above, in one group (buildBeamGuardPyramidTop).
     ref<Buffer> mpBeamGuardPyramid;     ///< Min-depth pyramid over the guard blocks (beamCellRadius).
-    ref<Texture> mpBeamGuardFront;      ///< beamGuardExtent: per block, nearest ray front since last listed.
-    ref<Texture> mpBeamGuardBack;       ///< beamGuardExtent: per block, farthest ray back (mean + 2 sigma).
-    ref<Texture> mpBeamGuardMeanFar;    ///< beamGuardExtent: per block, farthest opacity-weighted mean.
-    ref<Buffer> mpBeamGuardExtentPyramid; ///< beamGuardExtent: min front, max back, max mean beside the min-depth pyramid.
     uint32_t mBeamGuardPyramidLevels = 0;
     bool mBeamGuardDriven = false; ///< This build's blocks all came from the guard's dirty list: no grid regions, no sweeps.
     bool mBeamDirtyActive = false; ///< This build listed invalidated blocks, so the residual has to cover them too.
