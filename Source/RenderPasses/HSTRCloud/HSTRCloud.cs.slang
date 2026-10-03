@@ -10783,6 +10783,17 @@ struct HSTRCloudRenderer
     /// texels, which the warp cannot correct. On the frontier (iso p8 / p4: 2.67% at 5.62 ms, 1.62% at 6.46; mode 1 p8 / 4 / 2 / 1:
     /// 4.86% at 3.82, 3.17% at 4.36, 1.89% at 5.60, 1.15% at 6.57) mode 1 buys ~0.8 points of error at today's cost, or ~10% of
     /// the march at today's error - not the 25-40% a block model predicted. Not yet gated against the path trace; off by default.
+    /// MEASURED (motion_strafe1, 4K sunset strafe along +x at 2 u/frame, units + query ms, over 0.02 / p99.9, blocks a frame):
+    /// iso p8 6.42 3.88% / 0.487 16.7k, mode 1 p4 7.39 2.32% / 0.290 18.9k, p3 8.08 1.81%, p2 8.26 1.36%, iso p4 7.38 2.22% / 0.290
+    /// 18.5k, iso p8 again 6.43 3.55%. Sideways d is near-perpendicular to most rays, |w_c x d| ~ |d|: mode 1 is the isotropic
+    /// bound. (motion_sprint1, forward at 20 u/frame): every arm lists 29-30k blocks at 6.2-7.0 ms (iso p8 6.28 / 6.98 against
+    /// itself, mode 1 p4 6.23, iso p4 6.51); the parallax budget no longer decides what is listed, and the scores (5.4-11.2%) are
+    /// within sprint's noise. Mode 1 helps the forward walk only.
+    /// MEASURED (motion_walk_m1, 4K sunset walk, arms iso p8 / mode 1 p4 / mode 1 p3 / iso p8): units + query 5.08 / 4.01 / 4.86
+    /// / 5.36 ms, over 0.02 2.01% / 2.75% / 2.69% / 2.66%, p99.9 0.205 / 0.29 / 0.689 / 0.819, blocks 15.9k / 13.4k / 14.8k /
+    /// 15.7k. Mode 1 p4 lists 15% fewer blocks for -1.2 ms (-23%) at +0.4 points over 0.02 against the anchors' mean (2.34%),
+    /// as in motion_guard2 (+0.5 points, -22%); p3 sits between with no edge over p4. The trade is motion error only: a parked
+    /// frame lists nothing, so the static path-trace gate cannot see it.
     bool beamCellMotionCertified(uint2 cell, uint mode, out uint failed)
     {
         failed = 0xFFu;
