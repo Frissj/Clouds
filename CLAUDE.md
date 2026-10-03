@@ -2,6 +2,15 @@
 
 HSTR is a quality-constrained real-time renderer. The target is below 2 ms at 4K without surrendering opportunities for performance, while preserving at least the required 99th-percentile quality against the original path-traced result.
 
+## Memories are orders
+
+- The memories in MEMORY.md are my instructions, learned from past mistakes. Obey them like this file. Before every decision
+  (what to run next, what a result means, what to keep or remove), check which memories apply and follow them.
+- Never remove, revert or reject an experiment on your own. Removal only on my word. Everything else - adding logging,
+  diagnostics, oracle arms, the next run - just do it without asking; do not stop to wait for my answer.
+- Every explanation of why something failed must cite a counter from the run. If no counter answers it, say "unknown", add
+  the logging that would answer it and run it.
+
 ## Editing and building
 
 - The build copies shaders into `build/windows-ninja-msvc/bin/Release/shaders`. A shader edit is NOT live until the build command
@@ -24,6 +33,36 @@ HSTR is a quality-constrained real-time renderer. The target is below 2 ms at 4K
 - Run only the motions the question needs (e.g. `--motions "sprint 20 0"` alone), with the fewest arms and steps that answer it.
 - Log the state needed to explain the result (counters, settle state) in the same run, so a surprising number never needs a second run just to find out what happened.
 - Compare A/B arms within one run. Numbers from different runs are not comparable until the harness is shown to be deterministic.
+
+## Check what was already tried - before suggesting anything
+
+- Hundreds of experiments are recorded. Before proposing any optimisation, diagnostic or "missing option", search them:
+  commit message bodies (`git log --format='%h %s%n%b' | grep -i -B2 -A8 <keyword>`), the MEASURED / MEASURED and REMOVED /
+  REJECTED comments beside the code (`grep -rn MEASURED Source/RenderPasses/HSTRCloud scripts/HSTR`).
+- Cite what you found ("tried in <commit>: result") and propose only what is genuinely new. Already measured, among many: register /
+  occupancy cuts on the march and dirty query (no gain - L1-bound), prefetch / steps in flight, load cuts, deferred lighting, query
+  group size, witness / carry reuse and its oracle ceiling, longer / footprint / adaptive steps, certificate loosening, tile size 8,
+  reconstruction bases. Profiler samples are stall attribution, not removable time.
+
+## Measuring correctly - lessons that cost runs
+
+- Defaults go in the launcher the benchmark actually loads. The sunset benches run `SunsetCloudSea.py`, which runs
+  `IntelCloudSeaHalf.py` - not `CloudSea.py`. Check the exec chain before changing a default.
+- Beam quality against the path trace: the 8 x 8 block gate cannot see tile-scale interpolation error (a bilinear tile keeps its
+  block means). Score per pixel with `compareSquared` (`sunset_hill.py` `HSTR_HILL_PT_ARMS`: squared log error with the trace's
+  noise variance subtracted). Hill beam arms need `beamPolicy=False` (otherwise the GPU policy, not `beamTolerance`, sets the
+  tolerance) and `beamReset=True`. Usable references: `sunset_hill_0_0_3840x2160_960x540` (326 spp, beamOct on) and the crop
+  `sunset_hill_513_930_140x100_500x357` (696 spp, beamOct off). The 3840-wide 700x400 crop has 86 spp: too noisy to use.
+- Every arm list needs a sanity arm that must change the result (a known-bad setting) and an anchor repeated at the end. Arms
+  identical to the last digit mean the parameter is not reaching the code (wrong launcher, policy override, state leaking between
+  arms) or the metric is blind - find out which before concluding anything.
+- Motion quality: `HSTR_MOTION_SCORE=2` (moving frame against a fresh rebuild at that camera). When a number looks wrong, rerun with
+  `HSTR_MOTION_OUT=<dir>` and look at the difference images before theorising. Per-build counters (repair probe, dirty reasons)
+  go through `HSTR_MOTION_COUNT=<frames>`; as chunk deltas they read 0.
+- Timing: compare profiled leaf scopes (`march/units`, `beamDirty/query`, ...). Whole-frame means on the live walk are dominated
+  by CPU residency and swing +-20%. Sprint quality scores are noisy (single chunks past 30%): judge on the walk first.
+- Measure the ceiling before building: a non-deciding diagnostic or oracle arm, with a stop rule stated in advance (e.g. stop if it
+  rescues under 5%), settles most ideas in one run before any real implementation.
 
 ## Optimization philosophy
 
