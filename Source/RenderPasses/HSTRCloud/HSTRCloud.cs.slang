@@ -52,9 +52,21 @@ import Atmosphere;
 #endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
-static uint gNavProbe[31];  ///< This thread's kBeamNavProbe counts since its marchBeam began (kBeamNavProbeCount).
+static uint gNavProbe[kBeamNavProbeCount]; ///< This thread's kBeamNavProbe counts since its marchBeam began.
 static uint gNavExitKind;   ///< The exit kind of leanExtinctionLayered's last empty sample (kBeamNavProbe + 10).
 static bool gNavClipped;    ///< Whether cloudEmptyExitOf's last exit was cut short by the footprint's next level.
+static uint gNavExitFace;   ///< The box face (2 axis + 1 for the high side) that set cloudEmptyExitOf's last box exit.
+static bool gNavSkirtBox;   ///< Whether cloudAssetBrickAtFlat's last empty octant box was cloudSkirtFaces' (exit kind 3).
+static uint gNavSkirtFaces; ///< cloudSkirtFaces' last box: per face two bits, 0 octant face, 1 shrunk by the reach, 2 page face.
+static uint gNavSkirtMapped; ///< cloudSkirtFaces' last box's mapped level.
+static bool gNavSkirtOctant; ///< Whether cloudSkirtFaces' last box was the octant-mask oracle's (cloudSkirtBox 2).
+static bool gNavSkirtStopOctant; ///< Whether the winning skirt box was the octant-mask oracle's.
+static float gNavBehind;    ///< cloudEmptyExitOf's last box: the ray's t distance back to where it entered it.
+static float gNavWinBehind; ///< The winning box exit's gNavBehind.
+static float4 gNavWinBox;   ///< The winning box: lo.xyz + instance, and hi in gNavWinBoxHi.
+static float3 gNavWinBoxHi;
+static uint gNavSkirtStop;  ///< What stopped the winning skirt box exit (kBeamNavProbe + 31): face class, or 3 the next level.
+static uint gNavSkirtStopMapped; ///< The winning skirt box's mapped level.
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -962,12 +974,23 @@ struct HSTRCloudRenderer
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
 #if HSTR_LAYER_PROBE
         gNavClipped = false;
+        gNavBehind = 1e30f;
 #endif
         float exit = box.cell ? cloudCellRunExit(box, dx) : 1e30f;
         if (!box.cell)
             for (uint a = 0; a < 3; ++a)
                 if (abs(dx[a]) > 1e-12f)
-                    exit = min(exit, ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a]);
+                {
+                    const float face = ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a];
+#if HSTR_LAYER_PROBE
+                    // The ray's distance back to where it entered the box (the nearest face behind it).
+                    const float back = (box.x[a] - (dx[a] > 0.f ? box.lo[a] : box.hi[a])) / abs(dx[a]);
+                    gNavBehind = min(gNavBehind, back);
+                    if (face < exit)
+                        gNavExitFace = 2u * a + (dx[a] > 0.f ? 1u : 0u);
+#endif
+                    exit = min(exit, face);
+                }
         exit = max(exit, 0.f);
         if (params.cloudPixelAngle > 0.f && ray.worldLength > 0.f)
         {
@@ -1215,6 +1238,91 @@ struct HSTRCloudRenderer
         return keep;
     }
 
+    /// cloudSkirtBox: the empty box of a missing child octant of a level-`mapped` brick for a sample at x (voxel i) whose skirt keep
+    /// is zero but which lies in a skirt zone, within reach R of a face. cloudOctantSkirt's keep at p is positive exactly when some
+    /// combination of the faces p is within reach of has its mask bit set. Keep at x is zero, so every combination of x's faces is
+    /// unset; a point whose faces are x's, or faces no mask bit involves at all, is zero too. So per axis the box takes a face's
+    /// zone only if x is in it or no bit has that face's component, and stops at the other zone otherwise. The mask is the page's:
+    /// its bits straight across a face name the neighbour in the page's own row, so the box is also clipped to the page.
+    /// Before, every face was shrunk, which leaves (2R / 4R)^3 = 1/8 of the octant as box: a sample in the other 7/8 got a box
+    /// that did not hold it and stepped on - nav_probe1, 4K sunset walk: 92% of empty samples stop at this box, 86% of those after
+    /// one regular step; skirtbox2: 85% of empty samples lie outside it.
+    /// MEASURED (skirtbox3, 4K sunset walk, probe on, 3 cycles, arms off / on / noZeroSkip / off2): exact, quality unchanged (over
+    /// 0.02: 2.99% / 2.36% / 2.75% / 2.27%). It takes over the stops (2.97M of 3.50M empty samples stop at it) but 96.6% of them
+    /// still advance one regular step, voxels per empty sample 2.54 -> 2.36, warp-paid / ideal steps 2.57 -> 2.71. Why (skirtbox4,
+    /// kBeamNavProbe + 31..): 84% of its stops are the page clip, 90% of them in octants mapped at level 3+ (32+ voxels).
+    void cloudSkirtFaces(HSTRCloudAsset asset, int3 i, float3 x, uint mapped, out float3 lo, out float3 hi)
+    {
+        const uint3 page = uint3(i) >> 3u;
+        const uint3 pages = asset.dims >> 3u;
+        const uint holds = hstrCloudSkirtMasks[asset.pageOffset + page.x + pages.x * (page.y + pages.y * page.z)];
+        // The mask bits of every direction with a -1 / +1 component on x, y, z (cloudSkirtBit).
+        const uint lowFaces[3] = { 0x925249u, 0xe0e07u, 0x1ffu };
+        const uint highFaces[3] = { 0x2492924u, 0x381c1c0u, 0x3fe0000u };
+        const float reach = float(1u << mapped);
+        const float3 octantLo = float3((uint3(i) >> (mapped + 2u)) << (mapped + 2u)) - 0.5f;
+        const float3 octantHi = octantLo + float(1u << (mapped + 2u));
+        const float3 pageLo = float3(page * 8u) - 0.5f;
+#if HSTR_LAYER_PROBE
+        gNavSkirtFaces = 0u;
+        gNavSkirtMapped = mapped;
+        gNavSkirtOctant = false;
+        // cloudSkirtBox 2, ORACLE (navigation counts only, not timed): the OR of every page's mask in the octant holds for the whole
+        // octant, so where x lies in the octant shrunk on the faces that OR has, that box needs no page clip. Computed here from up
+        // to 512 page masks; a stored per-octant word would be one load.
+        if (params.cloudSkirtBox == 2u && mapped >= 1u && mapped <= 4u)
+        {
+            const uint span = 1u << (mapped - 1u);
+            const uint3 first = (page / span) * span;
+            uint held = 0u;
+            for (uint pz = 0; pz < span; ++pz)
+                for (uint py = 0; py < span; ++py)
+                    for (uint px = 0; px < span; ++px)
+                    {
+                        const uint3 q = first + uint3(px, py, pz);
+                        held |= hstrCloudSkirtMasks[asset.pageOffset + q.x + pages.x * (q.y + pages.y * q.z)];
+                    }
+            float3 octLo, octHi;
+            [unroll]
+            for (uint a = 0; a < 3; ++a)
+            {
+                octLo[a] = octantLo[a] + ((held & lowFaces[a]) != 0 ? reach : 0.f);
+                octHi[a] = octantHi[a] - ((held & highFaces[a]) != 0 ? reach : 0.f);
+            }
+            if (all(x >= octLo) && all(x <= octHi))
+            {
+                lo = octLo;
+                hi = octHi;
+                gNavSkirtOctant = true;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                {
+                    gNavSkirtFaces |= ((held & lowFaces[a]) != 0 ? 1u : 0u) << (4u * a);
+                    gNavSkirtFaces |= ((held & highFaces[a]) != 0 ? 1u : 0u) << (4u * a + 2u);
+                }
+                return;
+            }
+        }
+#endif
+        [unroll]
+        for (uint a = 0; a < 3; ++a)
+        {
+            const bool lowZone = x[a] < octantLo[a] + reach;
+            const bool highZone = x[a] > octantHi[a] - reach; // cloudOctantSkirt's side tests, in octant-box coordinates.
+            const bool lowShrunk = !lowZone && (holds & lowFaces[a]) != 0;
+            const bool highShrunk = !highZone && (holds & highFaces[a]) != 0;
+            const float lowFace = octantLo[a] + (lowShrunk ? reach : 0.f);
+            const float highFace = octantHi[a] - (highShrunk ? reach : 0.f);
+            lo[a] = max(pageLo[a], lowFace);
+            hi[a] = min(pageLo[a] + 8.f, highFace);
+#if HSTR_LAYER_PROBE
+            // Per face (2a low, 2a + 1 high), two bits: 0 the octant's face, 1 shrunk by the reach, 2 the page's face.
+            gNavSkirtFaces |= (pageLo[a] > lowFace ? 2u : (lowShrunk ? 1u : 0u)) << (4u * a);
+            gNavSkirtFaces |= (pageLo[a] + 8.f < highFace ? 2u : (highShrunk ? 1u : 0u)) << (4u * a + 2u);
+#endif
+        }
+    }
+
     /// The bit of direction d (components -1, 0, 1, not all 0) in a skirt mask: the 27 base-3 digits less the centre.
     static uint cloudSkirtBit(int3 d)
     {
@@ -1362,6 +1470,14 @@ struct HSTRCloudRenderer
                 sample.empty = true;
                 sample.lo = float3((uint3(i) >> (mapped + 2u)) << (mapped + 2u)) - 0.5f + reach;
                 sample.hi = sample.lo + float(1u << (mapped + 2u)) - 2.f * reach;
+                // Only where that box does not hold x: inside it, it is the larger box for any brick mapped at level 2 or coarser
+                // (skirtbox1: replacing it everywhere left 96% of empty samples on one step, against 86%).
+                const bool skirtBox = params.cloudSkirtBox != 0 && (any(x < sample.lo) || any(x > sample.hi));
+                if (skirtBox)
+                    cloudSkirtFaces(hstrCloudAssets[instance.asset], i, x, mapped, sample.lo, sample.hi);
+#if HSTR_LAYER_PROBE
+                gNavSkirtBox = skirtBox;
+#endif
                 sample.level = mapped - 1u;
                 sample.mappedLevel = mapped;
                 return true;
@@ -7291,6 +7407,9 @@ struct HSTRCloudRenderer
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
             CloudSample sample;
+#if HSTR_LAYER_PROBE
+            gNavSkirtBox = false;
+#endif
 #if (HSTR_SHIP & 2048) != 0
             const bool found = cloudAssetBrickAtFlat(instance, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
 #else
@@ -7315,7 +7434,16 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[2];
                 if (empty < exit)
-                    gNavExitKind = (sample.cell ? 0u : 1u) | (gNavClipped ? 4u : 0u);
+                {
+                    gNavExitKind = (sample.cell ? 0u : (gNavSkirtBox ? 3u : 1u)) | (gNavClipped ? 4u : 0u);
+                    // A skirt box's stop: 3 the footprint's next level, else the stopping face's class (cloudSkirtFaces).
+                    gNavSkirtStop = gNavClipped ? 3u : (gNavSkirtFaces >> (2u * gNavExitFace)) & 3u;
+                    gNavSkirtStopMapped = gNavSkirtMapped;
+                    gNavSkirtStopOctant = gNavSkirtOctant;
+                    gNavWinBehind = gNavBehind;
+                    gNavWinBox = float4(sample.lo, float(sample.instance));
+                    gNavWinBoxHi = sample.hi;
+                }
 #endif
                 exit = min(exit, empty);
                 continue;
@@ -7535,6 +7663,9 @@ struct HSTRCloudRenderer
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
 #if HSTR_LAYER_PROBE
         uint navRun = 0; // Samples in the empty run the march is in (0: none).
+        bool navBoxed = false; // Whether the previous empty sample stopped at a box (navBox, navBoxHi).
+        float4 navBox = 0.f;
+        float3 navBoxHi = 0.f;
 #endif
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
@@ -7596,13 +7727,79 @@ struct HSTRCloudRenderer
                 }
                 const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
 #if HSTR_LAYER_PROBE
+                {
+                    // ORACLE: the Chebyshev distance, in 4-voxel majorant blocks (up to 3), from the sample's block to the nearest
+                    // block whose undilated majorant is non-zero - how far any static sea-space empty structure could reach.
+                    const int3 home = clamp(int3(floor(seaVoxel(midpoint) * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+                    uint reachBlocks = 3u;
+                    for (uint r = 0; r < 3u && reachBlocks == 3u; ++r)
+                        for (int bz = -int(r); bz <= int(r) && reachBlocks == 3u; ++bz)
+                            for (int by = -int(r); by <= int(r) && reachBlocks == 3u; ++by)
+                                for (int bx = -int(r); bx <= int(r); ++bx)
+                                {
+                                    const int3 b = home + int3(bx, by, bz);
+                                    if (max(abs(bx), max(abs(by), abs(bz))) != int(r) || any(b < 0) || any(b >= int3(params.hstrMajorantDims)))
+                                        continue;
+                                    if (hstrTightMajorant.Load(int4(b, 0)) > 0.f)
+                                    {
+                                        reachBlocks = r;
+                                        break;
+                                    }
+                                }
+                    ++gNavProbe[(skipTo >= 0.f ? 70u : 74u) + reachBlocks];
+                }
                 if (skipTo >= 0.f)
                 {
                     const float advanced = min(max(next, skipTo), segment.y) - t;
+                    const bool segmentCut = skipTo > segment.y;
+                    const uint lost = segmentCut ? uint(4.f * min((skipTo - segment.y) * voxelsPerUnit, 64.f) + 0.5f) : 0u;
                     ++gNavProbe[0];
                     gNavProbe[4] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
+                    gNavProbe[51] += uint(4.f * dt * voxelsPerUnit + 0.5f);
+                    gNavProbe[52] += segmentCut ? 1u : 0u;
+                    gNavProbe[53] += lost;
                     ++gNavProbe[10 + gNavExitKind];
                     gNavProbe[18 + gNavExitKind] += skipTo <= next ? 1u : 0u;
+                    if ((gNavExitKind & 3u) == 3u)
+                    {
+                        const uint mappedBin = min(gNavSkirtStopMapped, 3u);
+                        ++gNavProbe[31 + gNavSkirtStop];
+                        gNavProbe[35 + gNavSkirtStop] += skipTo <= next ? 1u : 0u;
+                        ++gNavProbe[39 + mappedBin];
+                        gNavProbe[43 + mappedBin] += skipTo <= next ? 1u : 0u;
+                        gNavProbe[47] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
+                        if (gNavSkirtStopOctant)
+                        {
+                            ++gNavProbe[48];
+                            gNavProbe[49] += skipTo <= next ? 1u : 0u;
+                            gNavProbe[50] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
+                            gNavProbe[59] += uint(4.f * dt * voxelsPerUnit + 0.5f);
+                            gNavProbe[60] += segmentCut ? 1u : 0u;
+                        }
+                    }
+                    const uint boxKind = gNavExitKind & 3u;
+                    if (boxKind == 1u || boxKind == 3u)
+                    {
+                        // A box exit: did the previous empty sample stop at this same box, and where along its chord is this one?
+                        const bool revisit = navRun != 0u && navBoxed && all(gNavWinBox == navBox) && all(gNavWinBoxHi == navBoxHi);
+                        const float behind = min(gNavWinBehind * voxelsPerUnit, 256.f);
+                        const float ahead = min((skipTo - tSample) * voxelsPerUnit, 256.f);
+                        ++gNavProbe[65];
+                        gNavProbe[61] += revisit ? 1u : 0u;
+                        gNavProbe[62] += uint(4.f * (behind + ahead) + 0.5f);
+                        gNavProbe[63] += uint(4.f * behind + 0.5f);
+                        gNavProbe[64] += uint(4.f * ahead + 0.5f);
+                        if (boxKind == 3u && gNavSkirtStopOctant)
+                        {
+                            gNavProbe[66] += revisit ? 1u : 0u;
+                            gNavProbe[67] += uint(4.f * (behind + ahead) + 0.5f);
+                            gNavProbe[68] += uint(4.f * behind + 0.5f);
+                            gNavProbe[69] += uint(4.f * ahead + 0.5f);
+                        }
+                        navBox = gNavWinBox;
+                        navBoxHi = gNavWinBoxHi;
+                    }
+                    navBoxed = boxKind == 1u || boxKind == 3u;
                     gNavProbe[3] += navRun == 0u ? 1u : 0u;
                     ++navRun;
                 }
@@ -7690,6 +7887,14 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
         if (navRun != 0u)
             ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
+        ++gNavProbe[54];
+        gNavProbe[55] += uint(max(segment.y - segment.x, 0.f) * voxelsPerUnit + 0.5f);
+        if (t >= segment.y)
+            ++gNavProbe[56];
+        else if (transmittance <= params.cloudMinTransmittance)
+            ++gNavProbe[57];
+        else
+            ++gNavProbe[58];
 #endif
 #if (HSTR_SHIP & 262144) != 0
         if (spanKept)

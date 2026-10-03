@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 304;
+static const uint kBeamCountSlots = 352;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -83,10 +83,31 @@ static const uint kBeamLayerProbe = 264;
 /// majorant), 3 empty runs (maximal runs of empty samples, air inside them included), 4 the voxels the empty samples advanced, x4;
 /// 5 lane steps, 6 lane ideal steps (1 + 2 + 3: what a march skipping every empty run in one step would take), 7 warp-paid steps
 /// (longest lane x active lanes), 8 warp-paid ideal steps, 9 warps; 10-17 empty samples by the exit that stopped them (0 cell run,
-/// 1 octant / brick box, 2 a layer's square or asset entry, 3 unused; +4 where the footprint's next level cut it short); 18-25
-/// those of them that advanced no further than the regular step; 26-30 empty runs by length in samples: 1, 2-3, 4-7, 8-15, 16+.
+/// 1 octant / brick box, 2 a layer's square or asset entry, 3 cloudSkirtBox's box; +4 where the footprint's next level cut it short); 18-25
+/// those of them that advanced no further than the regular step; 26-30 empty runs by length in samples: 1, 2-3, 4-7, 8-15, 16+;
+/// 31-34 the skirt box's empty samples (kinds 3 and 7) by what stopped them: the octant's face, a face shrunk by the skirt reach,
+/// the page's face, the footprint's next level; 35-38 those of them that advanced no further than the regular step; 39-42 the
+/// skirt box's empty samples by mapped level 0, 1, 2, 3+; 43-46 those that advanced one step; 47 the voxels they advanced, x4;
+/// 48-50 the same three for those that used cloudSkirtBox 2's octant-mask box; 51 the empty samples' regular step (dt) in voxels,
+/// x4; 52 empty samples whose skip ran past the segment's end, 53 the voxels cut off there (up to 64 each), x4; 54 marches, 55
+/// their segments' length in voxels, 56-58 marches that ended at the segment's end, on transmittance, on the step limit; 59-60
+/// the octant-mask box samples' regular step in voxels x4 and those cut at the segment's end; 61 box-exit empty samples (exit
+/// kinds 1 and 3) whose box is the one the previous empty sample stopped at, 62-64 their box chord along the ray, the part
+/// behind the sample, the part ahead (voxels x4, up to 256 each), 65 box-exit empty samples; 66-69 the same four for the
+/// octant-mask box; 70-73 empty samples by the Chebyshev distance in 4-voxel majorant blocks to the nearest block with a non-zero
+/// undilated majorant (0, 1, 2, 3+), 74-77 the same for samples with density (sanity: all at 0).
+/// MEASURED (skirtbox7, arms off / octant / off2): no exit bug. The off arm's 38.9% of box exits in the previous sample's box
+/// are skirt-zone samples outside the shrunk box (exit 0, the next sample in the same octant); the octant box has 0.1%. Octant
+/// box samples sit at its entry (0.00 voxels behind) with 0.73 sea voxels ahead: a source voxel is ~0.075 sea voxels, so a
+/// mapped-3 octant spans ~2.4 sea voxels against empty runs of ~45. Asset-hierarchy boxes cannot reach the runs.
+/// MEASURED (skirtbox6, 4K sunset walk, arms off / octant / off2): 0.4% of empty samples are cut at the segment's end; segments
+/// are ~290 voxels and end at their end (38%) or on transmittance (62%), never the step limit. Empty samples' regular step is
+/// 1.74 voxels (the octant box's 1.20), they advance 2.5; empty runs average 18 samples.
+/// MEASURED (skirtbox4, 4K sunset walk, 3 cycles, arms off / on / off2): the skirt box's 4.19M stops were 84% its page face
+/// (97.6% of those one step), 15% the octant face, 1.4% a shrunk face; by mapped level 0 / 1 / 2 / 3+: 0 / 2% / 8% / 90%; 1.73
+/// voxels per sample. The octants are 32+ voxels; the page clip, not the octant, ends the box.
 static const uint kBeamNavProbe = 272;
-static const uint kBeamNavProbeCount = 31;
+static const uint kBeamNavProbeCount = 78;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1510,6 +1531,12 @@ struct HSTRCloudParams
     uint compareSquaredPad0 = 0;
     uint compareSquaredPad1 = 0;
     uint compareSquaredPad2 = 0;
+    /// A missing child octant's empty box (cloudAssetBrickAtFlat) is shrunk by the skirt reach only on the faces where its page's
+    /// skirt mask has a neighbour that holds, and clipped to the page, instead of on all six faces. See cloudSkirtFaces.
+    uint cloudSkirtBox = 0;
+    uint cloudSkirtBoxPad0 = 0;
+    uint cloudSkirtBoxPad1 = 0;
+    uint cloudSkirtBoxPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

@@ -622,6 +622,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamGuardMotion = value;
             continue;
         }
+        if (key == "cloudSkirtBox")
+        {
+            mParams.cloudSkirtBox = uint32_t(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1373,6 +1378,7 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamGuardMotion"] = mBeamGuardMotion;
     props["beamLayerProbe"] = mBeamLayerProbe;
+    props["cloudSkirtBox"] = mParams.cloudSkirtBox;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;

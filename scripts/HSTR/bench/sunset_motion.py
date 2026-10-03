@@ -44,7 +44,7 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, and density samples by layers with density.
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2")) +
          # The navigation probe (kBeamNavProbe in HSTRCloudTypes.slang has the layout).
-         tuple(f"beamNav{k}" for k in range(31)))
+         tuple(f"beamNav{k}" for k in range(78)))
 
 
 def score():
