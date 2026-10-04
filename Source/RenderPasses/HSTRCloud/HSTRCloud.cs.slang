@@ -50,6 +50,9 @@ import Atmosphere;
 #ifndef HSTR_LAYER_MASK_COST
 #define HSTR_LAYER_MASK_COST 0 // cloudLayerMaskCost: doubled layer-mask loads (a probe; see HSTRCloudTypes.slang).
 #endif
+#ifndef HSTR_UNIT_START
+#define HSTR_UNIT_START 0 // beamUnitStart: the dirty query records first-density distances, the units start from them.
+#endif
 #ifndef HSTR_LAYER_WRAP_SELECT
 #define HSTR_LAYER_WRAP_SELECT 0 // cloudLayerWrapSelect: domainVoxelLayers wraps by selects (see HSTRCloudTypes.slang).
 #endif
@@ -77,6 +80,9 @@ static uint gLayerUnitsPass = 0u; ///< 1 in marchBeamDirtyUnits: its lane / paid
 static bool gLayerPrevTight;
 static uint gLeadSteps;  ///< beamLayerProbe: steps before the ray's first sample with density (kBeamLeadSteps).
 static bool gLeadDone;
+#endif
+#if HSTR_UNIT_START
+static float gFirstDistance; ///< HSTR_UNIT_START: world distance to the start of marchBeam's first step with density (-1: none).
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -5395,9 +5401,13 @@ struct HSTRCloudRenderer
 
     /// Split-frame terms along the [segment.x, segment.y] part of one camera ray's volume interval, starting from unit
     /// transmittance. The phase is applied per pixel: octave 0 carries a unit weight.
-    BeamSample marchBeam(float3 direction, float2 segment)
+    /// startDistance (beamUnitStart): a world distance from the camera the march may start at instead (0: the segment's start).
+    BeamSample marchBeam(float3 direction, float2 segment, float startDistance = 0.f)
     {
         BeamSample result = {};
+#if HSTR_UNIT_START
+        gFirstDistance = -1.f;
+#endif
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
@@ -5434,6 +5444,10 @@ struct HSTRCloudRenderer
         float transmittance = 1.f;
         uint steps = 0;
         float opacityDistance = 0.f;
+#if HSTR_UNIT_START
+        if (startDistance > 0.f)
+            segment.x = max(segment.x, (startDistance - ray.entryDistance) / ray.worldLength);
+#endif
 #if (HSTR_SHIP & 1024) != 0
         marchBeamLean(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
 #elif (HSTR_SHIP & 512) != 0
@@ -8096,6 +8110,10 @@ struct HSTRCloudRenderer
 #else
                 next = min(max(next, majorantZeroExit(ray, t)), segment.y);
 #endif
+#if HSTR_UNIT_START
+            if (gFirstDistance < 0.f && transmittance < 1.f)
+                gFirstDistance = ray.entryDistance + t * ray.worldLength;
+#endif
             t = next;
             ++steps;
 #if HSTR_LAYER_PROBE
@@ -8533,7 +8551,7 @@ struct HSTRCloudRenderer
 
     /// Writes a lattice query: slice 0 the cache and optical depth, 1 the single scatter and opacity-weighted distance, 2 the march
     /// steps it cost (beamQueue's prediction for the next build).
-    void writeBeamQuery(uint2 position, float4 depthCache, float4 single, float steps = 0.f)
+    void writeBeamQuery(uint2 position, float4 depthCache, float4 single, float steps = 0.f, float first = 0.f)
     {
         const uint2 texel = position / params.beamLatticeStep;
         hstrBeamLatticeOutput[uint3(texel, 0)] = depthCache;
@@ -8544,7 +8562,18 @@ struct HSTRCloudRenderer
         // .y marks the point as holding a marched value. With the ping-ponged pair that had to be a build stamp, because the
         // image it was written into became the history exactly once; the persistent lattice is cleared when the frame re-anchors
         // and a mark then stands until then.
-        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, 0.f, 0.f);
+        // .z: the ray's first-density distance for the units' start (beamUnitStart; 0: none recorded, or no density - no hint).
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, max(first, 0.f), 0.f);
+    }
+
+    /// The first-density distance of the march this thread just ran (beamUnitStart), for writeBeamQuery; 0 without HSTR_UNIT_START.
+    float beamFirstDistance()
+    {
+#if HSTR_UNIT_START
+        return gFirstDistance;
+#else
+        return 0.f;
+#endif
     }
 
     uint beamSparseListOffset(uint level)
@@ -9059,7 +9088,7 @@ struct HSTRCloudRenderer
             return;
         const uint2 position = unpackBeamTile(hstrBeamQueue[bucket * params.beamQueueCapacity + thread]);
         const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
-        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance());
     }
 
     /// Queues a finest tile of the per-pixel march list by the steps its corners cost (beamQueue, one level).
@@ -10641,11 +10670,79 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrBeamDirtyCount[2], 1u);
     }
 
+    /// beamUnitStart: where a unit may start - the least first-density distance over its tile's corner and centre lattice points,
+    /// less the margin; 0 (from the segment's start) where any of them has none.
+    float beamUnitStartDistance(uint2 unit)
+    {
+#if HSTR_UNIT_START && !HSTR_DIRTY_FUSED
+        const uint s = params.beamTileSize;
+        const uint2 tile = unit / s;
+        float first = 3.4e38f;
+        if (params.beamUnitStartWide != 0)
+        {
+            // The 3 x 3 tiles around it: their 4 x 4 corners, then their 9 centres (off the lattice's edges: no hint).
+            const int2 low = int2(tile) - 1;
+            [loop]
+            for (uint k = 0; k < 25; ++k)
+            {
+                if (k >= 16 && params.beamCentreless != 0)
+                    break;
+                const int2 position = k < 16 ? (low + int2(k & 3u, k >> 2)) * int(s) : (low + int2((k - 16u) % 3u, (k - 16u) / 3u)) * int(s) + int(s / 2u);
+                const bool inside = all(position >= 0) && all(uint2(max(position, 0)) <= params.beamTileDims * s);
+                const float4 stored = inside ? beamLatticeAt(uint2(position), 2) : float4(0.f);
+                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z) : 0.f;
+            }
+        }
+        else
+        {
+            [unroll]
+            for (uint k = 0; k < 5; ++k)
+            {
+                if (k == 4 && params.beamCentreless != 0)
+                    break;
+                const uint2 position = k < 4 ? (tile + uint2(k & 1u, k >> 1)) * s : tile * s + s / 2u;
+                const float4 stored = beamLatticeAt(position, 2);
+                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z) : 0.f;
+            }
+        }
+        return first > 0.f && first < 3.4e38f ? max(first - params.beamUnitStart * params.seaVoxelSize.x, 0.f) : 0.f;
+#else
+        return 0.f;
+#endif
+    }
+
     void marchBeamUnitExact(uint2 unit)
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        const BeamSample exact = marchBeam(w, float2(0.f, 1.f));
+        const float start = beamUnitStartDistance(unit);
+        const BeamSample exact = marchBeam(w, float2(0.f, 1.f), start);
+#if HSTR_LAYER_PROBE && HSTR_UNIT_START
+        // kBeamUnitStartProbe: the same ray from the segment's start (probe only), and whether the start skipped density.
+        if (start > 0.f)
+        {
+            const BeamSample full = marchBeam(w, float2(0.f, 1.f));
+            const float trueFirst = gFirstDistance;
+            const bool missed = trueFirst >= 0.f && trueFirst < start;
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe], 1u, unused);
+            const float3 kLum = float3(0.2126f, 0.7152f, 0.0722f);
+            const float hinted = dot(exact.cache + exact.single, kLum);
+            const float whole = dot(full.cache + full.single, kLum);
+            const bool radianceOff = abs(log((hinted + 1e-4f) / (whole + 1e-4f))) > 0.02f;
+            const bool transmittanceOff = abs(exp(-exact.depth) - exp(-full.depth)) > 0.02f;
+            InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 4], radianceOff ? 1u : 0u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 5], transmittanceOff ? 1u : 0u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 6], radianceOff && !missed ? 1u : 0u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 7], uint(max(full.steps - exact.steps, 0.f)), unused);
+            if (missed)
+            {
+                InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 1], 1u, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 2], full.depth - exact.depth > 0.02f ? 1u : 0u, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamUnitStartProbe + 3], uint(16.f * (start - trueFirst) / params.seaVoxelSize.x), unused);
+            }
+        }
+#endif
 #if HSTR_STRIP != 0
         beamStripSink(exact);
         return;
@@ -10753,7 +10850,8 @@ struct HSTRCloudRenderer
             }
         }
 #endif
-        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps);
+        // Called right after this thread's marchBeam (beamFirstDistance is that march's).
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance());
         beamGuardVerified(position, q.distance);
 #if HSTR_PUSH_SHARE
         uint listed, stride;
@@ -12513,7 +12611,8 @@ void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupTh
         single += transmittance * gBeamSingle[groupThreadId.x + k].rgb;
         depth += gBeamDepthCache[groupThreadId.x + k].a;
     }
-    gHSTRCloud.writeBeamQuery(position, float4(cache, depth), float4(single, 0.f));
+    // beamUnitStart: one segment is this thread's own march, so its first-density distance is the ray's.
+    gHSTRCloud.writeBeamQuery(position, float4(cache, depth), float4(single, 0.f), 0.f, segments == 1u ? gHSTRCloud.beamFirstDistance() : 0.f);
 }
 
 [numthreads(64, 1, 1)]

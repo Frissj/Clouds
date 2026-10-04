@@ -55,6 +55,13 @@ g.addPass(createPass("HSTRCloud", {
     # three interleaved triples against the shipped anchor at each position): units + query 3.91 / 3.79 / 4.18 vs ~4.06 / ~4.0 /
     # ~4.45 ms, about -0.2 ms; the packed mask with the same fix (cloudLayerPacked 15) ~-0.09 ms, within the noise.
     "cloudLayerWrapSelect": True,
+    # Dirty units start at their tile's least lattice first-density distance less 8 sea voxels (an approximation). 4K sunset walk:
+    # ustart6 (motion score 2, hint in every pass) units off 2.45 / 2.65 / 2.54 -> m8 2.39 / 2.30 ms, query 1.81 / 1.79 / 1.82 ->
+    # 1.74 / 1.70, over 0.02 2.26 / 2.31 / 2.35 -> 2.54 (one score 3.35, the rest 2.24-2.32) / 2.30%; m4 2.40 / 2.45%. Path trace
+    # (sunset_hill_ustart3, squared excess): off 0.020187, m8 0.020178, m2 0.020201, sanity -8 0.037139. Misses (ustart4): 55 of
+    # 117k hinted units a frame start past their first density; 25% of hinted rays differ from a march from zero by > 2% only
+    # because the step positions move (the march's own discretisation, neutral against the path trace).
+    "beamUnitStart": 8.0,
     # Sun bakes a frame while the camera moves (HSTRCloud.cpp's default 256 was tuned on frame time alone, when a bake cost less).
     # 4K sunset walk, bakeCloudSun ms / over 0.02 (motion score 2): bakes1 256 0.73 / 2.52%, 128 0.35 / 2.28%, 64 0.19 / 2.26%,
     # 256 again 0.63 / 2.73%; bakeexit1 256 1.01 / 2.41%, 128 0.50 / 2.25%, 256 again 0.80 / 2.26%. Sprint scores swung 3-11% on

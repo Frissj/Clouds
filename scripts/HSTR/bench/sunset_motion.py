@@ -55,7 +55,10 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
           "beamLayerUnitWarps") +
          # ... and a perfect ray start's oracle (kBeamLeadSteps): leading empty steps, warp-paid steps with that run as one step,
          # rays with no density and their steps, for the dirty query and the units.
-         tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")))
+         tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")) +
+         # ... and beamUnitStart's misses (kBeamUnitStartProbe).
+         ("beamUnitStartHinted", "beamUnitStartMissed", "beamUnitStartLost", "beamUnitStartMissedVoxels16",
+          "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved"))
 
 
 def score():

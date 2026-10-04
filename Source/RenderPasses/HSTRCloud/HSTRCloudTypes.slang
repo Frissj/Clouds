@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 324;
+static const uint kBeamCountSlots = 332;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -110,6 +110,12 @@ static const uint kBeamLayerUnitSteps = 312;
 /// steps). The far sea's same oracle (seaFarProbe bit 6): 36-55 of 95-129 iterations a texel before the first lit, waves pay
 /// 0.70-0.76 of today's. Stop rule was 15%: a ray start (reprojected or probed first density) is worth building.
 static const uint kBeamLeadSteps = 316;
+/// beamLayerProbe with beamUnitStart: units given a start, of them those whose own first density (a march from the segment's
+/// start, probe only) lies before it, of those the ones that lose more than 0.02 of optical depth, and their missed distance
+/// (sixteenths of a sea voxel); then the hinted units whose result differs from the full march's by more than 0.02 in log
+/// radiance (cache + single, luminance) and in transmittance, the hinted ones without a miss among those, and the full
+/// march's steps over the hinted one's.
+static const uint kBeamUnitStartProbe = 324;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1624,7 +1630,21 @@ struct HSTRCloudParams
     /// (its input is already wrapped by seaVoxel). Exact. A compile define of the dirty and full-build passes (HSTR_LAYER_WRAP_SELECT).
     /// MEASURED (wrap2, 4K sunset walk): units + query ~-0.2 ms (3 of 3 triples below the interpolated anchor). On in the launcher.
     uint cloudLayerWrapSelect = 0;
-    uint cloudLayerMaskCostPad2 = 0;
+    /// Ray start for the dirty units (an approximation): the dirty query stores each lattice ray's first-density distance (slice 2
+    /// .z), and a unit starts its march at the least over its tile's corner and centre points, less beamUnitStart sea voxels. 0:
+    /// off (compile define HSTR_UNIT_START of the dirty and full-build passes - both must take it, or the motion score compares a
+    /// hinted moving frame against an unhinted rebuild). A negative margin starts past the first density: a sanity arm.
+    /// MEASURED: the sunset launcher ships 8 (IntelCloudSeaHalf.py has the numbers): units + query ~-0.25 ms, path trace neutral.
+    /// The scored hint moves each ray's step positions, and 25-47% of rays (m8 / m2) then differ by > 2% from a march from zero
+    /// (ustart4) without missing density - so an A/B whose rebuild lacks the hint reads +0.5-0.8 points over 0.02 (ustart2 / 5).
+    float beamUnitStart = 0.f;
+    /// beamUnitStart over the 3 x 3 tiles around the unit's (their 4 x 4 corners and 9 centres) instead of its own tile's 5 points.
+    /// MEASURED (ustart3): misses 55 -> 0 a frame, but units 2.58 / 2.35 (own tile) vs 2.74 / 2.70 ms: the misses were never the
+    /// problem. Off.
+    uint beamUnitStartWide = 0;
+    uint beamUnitStartPad0 = 0;
+    uint beamUnitStartPad1 = 0;
+    uint beamUnitStartPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

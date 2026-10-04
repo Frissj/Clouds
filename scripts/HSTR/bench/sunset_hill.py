@@ -144,7 +144,10 @@ if SUN_ARMS or PT_ARMS:
             for _ in range(settle):
                 m.renderFrame()
             hstr.set_properties({"cloudResidencyFrozen": True})
-        hstr.set_properties(dict(REFERENCE, compareReference=False, compareExact=False, **props))
+        # "launcherBeam": True - the arm runs over the launcher's own values of REFERENCE's keys (its shipped beam view, as settled)
+        # instead of the exact view's, so a beam arm (with beamPolicy False, beamReset True and a few frames) is scored as shipped.
+        base = beam if props.pop("launcherBeam", False) else REFERENCE
+        hstr.set_properties(dict(base, compareReference=False, compareExact=False, **props))
         # The units the arm's rebuild lists (beamDirtyStats, when an arm sets it): the work side of its error.
         units_before = int(hstr.properties.get("cloudStats", {}).get("dirtyStatUnits", 0))
         for _ in range(frames):
