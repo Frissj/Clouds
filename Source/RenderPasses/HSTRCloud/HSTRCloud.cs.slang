@@ -7378,7 +7378,12 @@ struct HSTRCloudRenderer
         if ((params.cloudLayerTightSkip >= 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
             voxelMask = domainVoxelLayers(v);
         // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
-        // cloudLayerTightRun), each tested, instead of one step per voxel.
+        // cloudLayerTightRun), each tested, instead of one step per voxel. REJECTED (HSTRCloudTypes.slang cloudLayerTightSkip):
+        // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel's registers.
+#ifndef HSTR_LAYER_TIGHT_VOXEL_RUN
+#define HSTR_LAYER_TIGHT_VOXEL_RUN 0
+#endif
+#if HSTR_LAYER_TIGHT_VOXEL_RUN
         if (params.cloudLayerTightSkip == 5u && voxelMask == 0u)
         {
             const float3 dv = ray.direction * float(params.hstrCellWidth);
@@ -7403,6 +7408,7 @@ struct HSTRCloudRenderer
             skipTo = cursor;
             return 0.f;
         }
+#endif
         [unroll]
         for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
         {
