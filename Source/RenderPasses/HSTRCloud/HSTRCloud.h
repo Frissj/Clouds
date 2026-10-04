@@ -799,6 +799,7 @@ private:
     /// the passes' intermediate.
     ref<Texture> mpDomainLayerDistance;
     ref<Texture> mpDomainLayerDistanceTemp;
+    bool mLayerDistanceRebuild = false; ///< DIAGNOSTIC (cloudLayerDistanceRebuild): rebuild the field every frame.
     float3 mTravelPosition = float3(0.f); ///< Last frame's camera position (for beamTravel).
     bool mTravelValid = false;
     ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).

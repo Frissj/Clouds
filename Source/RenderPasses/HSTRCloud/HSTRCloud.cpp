@@ -674,6 +674,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayerRunDistance = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "cloudLayerDistanceRebuild")
+        {
+            mLayerDistanceRebuild = bool(value);
+            continue;
+        }
         if (key == "beamUnitStart")
         {
             mParams.beamUnitStart = float(value);
@@ -1477,6 +1482,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
     props["cloudLayerWrapSelect"] = mParams.cloudLayerWrapSelect != 0;
     props["cloudLayerRunDistance"] = mParams.cloudLayerRunDistance != 0;
+    props["cloudLayerDistanceRebuild"] = mLayerDistanceRebuild;
     props["beamUnitStart"] = mParams.beamUnitStart;
     props["seaFarCap"] = mParams.seaFarCap;
     props["seaFarFootprint"] = mParams.seaFarFootprint;
@@ -3276,6 +3282,13 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         changed.resize(mCloudTileBatches.size());
         std::iota(changed.begin(), changed.end(), 0u);
         mCloudInstancesUploaded = true;
+    }
+    if (mLayerDistanceRebuild && mpDomainLayerDistance && changed.empty())
+    {
+        // DIAGNOSTIC (cloudLayerDistanceRebuild): the distance field's full rebuild every frame, to price what a domain change pays.
+        FALCOR_PROFILE(pRenderContext, "layerDistanceRebuild");
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            mpDomainLayerDistancePass[axis]->execute(pRenderContext, mParams.hstrMajorantDims);
     }
     if (!changed.empty())
     {

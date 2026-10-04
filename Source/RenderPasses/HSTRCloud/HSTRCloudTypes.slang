@@ -1665,6 +1665,8 @@ struct HSTRCloudParams
     /// the Chebyshev distance to the nearest block holding a layer, capped at 16, rebuilt over the whole grid in three 1D passes
     /// whenever the domain changes) - the cube it certifies empty in one load, where the run paid one load a block. Exact. A
     /// compile define of the dirty and full-build passes (HSTR_LAYER_RUN_DISTANCE).
+    /// MEASURED: walk units + query ~-0.18 ms (rundist1, IntelCloudSeaHalf.py has the numbers). The rebuild (all three passes, the
+    /// whole grid; cloudLayerDistanceRebuild forces it every frame) costs 0.131 ms (distcost1), paid only on frames that upload tiles.
     uint cloudLayerRunDistance = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
