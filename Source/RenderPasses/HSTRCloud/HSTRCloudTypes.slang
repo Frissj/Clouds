@@ -1519,7 +1519,7 @@ struct HSTRCloudParams
     /// The lean layered march reads the layers with density in the sample's undilated majorant block (hstrDomainLayers, from the
     /// conservative maxima the majorants are built from, widened in CloudSea::accumulate by the coarsest brick level's reach).
     /// 1: a block with none is empty to its exit, without a lookup. 2: also a layer without its bit is skipped, empty to the
-    /// block's exit. 3: 2, and a block with none skips on through up to 8 more such blocks. 4: 3, and a layer whose bit is clear
+    /// block's exit. 3: 2, and a block with none skips on through up to cloudLayerTightRun more such blocks. 4: 3, and a layer whose bit is clear
     /// in the nearest domain voxel is empty to that voxel's exit. 0: off. Shipped at 4 (IntelCloudSeaHalf.py has the numbers).
     /// MEASURED (tight3 / tight5, 4K sunset walk, units + query): mode 1 -0.6 to -1.0 ms, mode 2 -1.0 ms; mode 1 alone removes
     /// 25% of samples' lookups, mode 2 then 96% of the out-of-box ones and 14% of the brick walks that end empty. The 4.86M brick
@@ -1529,7 +1529,9 @@ struct HSTRCloudParams
     /// margin (all at levels 2-4), 1895 with the reach margin, 374 dilated by a voxel more (tight12-14) - see domainBlocks.
     /// The per-voxel layer bits ride the packed domain upload's float16 sign bits (CloudSea::TileVolume::packed), at no upload cost.
     uint cloudLayerTightSkip = 0;
-    uint cloudLayerTightSkipPad0 = 0;
+    /// cloudLayerTightSkip 3 / 4: how many more layer-free blocks one skip may cross. MEASURED (tight21, 4K sunset walk, mode 4,
+    /// two pairs): 0 / 8 / 32: units + query 4.28 / 4.11 / 4.01 ms, over 0.02 2.37 / 2.35 / 2.19%.
+    uint cloudLayerTightRun = 32;
     uint cloudLayerTightSkipPad1 = 0;
     uint cloudLayerTightSkipPad2 = 0;
 };

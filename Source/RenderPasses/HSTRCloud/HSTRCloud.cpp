@@ -634,6 +634,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayerTightSkip = uint32_t(value);
             continue;
         }
+        if (key == "cloudLayerTightRun")
+        {
+            mParams.cloudLayerTightRun = std::min(uint32_t(value), 256u);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1388,6 +1393,7 @@ Properties HSTRCloud::getProperties() const
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
     props["cloudLayerTightSkip"] = mParams.cloudLayerTightSkip;
+    props["cloudLayerTightRun"] = mParams.cloudLayerTightRun;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;

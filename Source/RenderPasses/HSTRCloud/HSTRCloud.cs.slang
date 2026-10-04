@@ -7349,11 +7349,11 @@ struct HSTRCloudRenderer
                     skipTo = blockExit;
                     // Mode 3: on through the blocks after it that hold no layer either (up to 8), as majorantZeroExit crosses zero
                     // majorant blocks: the march's per-step work is paid once for the run.
-                    if (params.cloudLayerTightSkip == 3u)
+                    if (params.cloudLayerTightSkip >= 3u)
                     {
                         const float nudge = 0.25f / max(length(dv), 1e-9f);
                         [loop]
-                        for (uint k = 0; k < 8u; ++k)
+                        for (uint k = 0; k < params.cloudLayerTightRun; ++k)
                         {
                             const float3 p = seaVoxel((ray.position + (skipTo + nudge) * ray.direction) * float(params.hstrCellWidth));
                             const int3 b = int3(floor(p * 0.25f));
