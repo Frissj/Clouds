@@ -753,6 +753,10 @@ private:
     /// cloudSunScanWave: scanSunBakes' atomics summed per wave and bin first (HSTRCloudSunFrame::scanWave). Exact. MEASURED
     /// (scanwave1, 4K sunset walk, two pairs): scan 0.334 / 0.292 -> 0.144 / 0.127 ms, chunk-end counts and scores alike.
     bool mCloudSunScanWave = true;
+    /// cloudSunStampSplit: stampSunChanges per change and class (HSTRCloudSunFrame::stampSplit). Exact (the same epoch stores).
+    /// MEASURED (stampsplit2, 4K sunset walk, two pairs, 60 profiled frames each): stamp 0.188 / 0.069 -> 0.000 / 0.031 ms a frame
+    /// (it varies with the frame's changes), chunk-end sunStale 101k / 99k -> 104k / 96k.
+    bool mCloudSunStampSplit = true;
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
     bool mCloudSunKeepStale = true;           ///< Outdated sun bakes answer until they rebake (CloudResidency::setSunKeepStale).

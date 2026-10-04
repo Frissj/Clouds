@@ -2489,6 +2489,7 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunFrame.info.keepStale = mSunKeepStale ? 1u : 0u;
         mGpuSunFrame.info.levelStamps = mSunLevelStamps ? 1u : 0u;
         mGpuSunFrame.info.scanWave = mSunScanWave ? 1u : 0u;
+        mGpuSunFrame.info.stampSplit = mSunStampSplit ? 1u : 0u;
         uploadSunChanges();
         return;
     }

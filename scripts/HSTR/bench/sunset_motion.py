@@ -5,6 +5,7 @@
 # Usage: Mogwai.exe --headless --script=scripts/HSTR/bench/sunset_motion.py
 #   HSTR_RES=WxH, HSTR_MOTION_SPEEDS=comma list of units a frame (default "2,20"), HSTR_MOTION_SETTLE=settle frames (default 1800).
 import os
+import re
 import time
 from pathlib import Path
 from falcor import *
@@ -174,6 +175,16 @@ def profile(tag, frames, speed):
         print(f"MOTION {tag} profiled frame {kind} {frame:.2f} ms; top leaves:", flush=True)
         for value, name in means[:12]:
             print(f"MOTION {tag}   {value:6.3f} ms  {name.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}", flush=True)
+        # HSTR_MOTION_PROFILE_MATCH (a regex): these leaves always, with the frames they ran in and their mean over all frames - a
+        # pass that runs on some frames only (the sun stamp) drops out of the top list or reads its mean over its own frames.
+        match = os.environ.get("HSTR_MOTION_PROFILE_MATCH")
+        if match and kind == "gpu_time":
+            for n, l in leaves.items():
+                if re.search(match, n):
+                    records = l["records"]
+                    print(f"MOTION {tag}   match {sum(records) / frames:6.3f} ms a frame ({len(records)} of {frames} frames, "
+                          f"{sum(records) / max(len(records), 1):.3f} when run)  {n.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}",
+                          flush=True)
 
 
 # HSTR_MOTION_ARMS: a Python list literal of (name, property dict) pairs; the first is also the state of the live flights.
@@ -251,7 +262,7 @@ for speed in speeds:
         for name, props in ARMS:
             hstr.set_properties(props)
             fly(5, speed)
-            profile(f"{tag} arm {name}", 20, speed)
+            profile(f"{tag} arm {name}", int(os.environ.get("HSTR_MOTION_PROFILE_FRAMES", "20")), speed)
     hstr.set_properties(ARMS[0][1])
     # Back to parked: how long the backlog takes to drain.
     for window in range(3):

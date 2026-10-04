@@ -345,6 +345,7 @@ struct HSTRCloudSunFrame
     uint keepStale;    ///< 1: a bake its neighbourhood's mapping outdated keeps answering until it rebakes in place (scanSunBakes).
     uint levelStamps;  ///< 1: a change stamps only the bakes of its brick's level or finer (stampSunChange).
     uint scanWave;     ///< 1: scanSunBakes sums its histogram and counter adds per wave and bin before the atomics (exact).
+    uint stampSplit;   ///< 1: stampSunChanges runs a thread per change and orientation class instead of per change (exact).
 };
 
 /// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed

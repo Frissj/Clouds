@@ -679,6 +679,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudSunScanWave = bool(value);
             continue;
         }
+        if (key == "cloudSunStampSplit")
+        {
+            mCloudSunStampSplit = bool(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1442,6 +1447,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
+    props["cloudSunStampSplit"] = mCloudSunStampSplit;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -3280,6 +3286,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setSunKeepStale(mCloudSunKeepStale);
     mpCloudResidency->setSunLevelStamps(mCloudSunLevelStamps);
     mpCloudResidency->setSunScanWave(mCloudSunScanWave);
+    mpCloudResidency->setSunStampSplit(mCloudSunStampSplit);
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
@@ -3562,7 +3569,7 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
     if (info.nodeResets > 0)
         run("resetNodes", mpResetSunNodesPass, uint3(kCloudSunFineEntries, info.nodeResets, 1));
     if (info.changeCount > 0)
-        run("stamp", mpStampSunPass, uint3(info.changeCount, 1, 1));
+        run("stamp", mpStampSunPass, uint3(info.changeCount, info.stampSplit != 0 ? info.classCount : 1u, 1));
     run("scan", mpScanSunPass, uint3(info.capacity, 1, 1));
     run("select", mpSelectSunPass, uint3(1));
     run("emit", mpEmitSunPass, uint3(info.capacity, 1, 1));

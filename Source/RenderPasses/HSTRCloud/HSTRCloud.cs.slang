@@ -4877,10 +4877,15 @@ struct HSTRCloudRenderer
     }
 
     /// Stamp: this frame into every entry, of every class, whose bakes read the change's cells.
-    void stampSunChange(uint entry)
+    void stampSunChange(uint entry, uint thread)
     {
         const HSTRCloudSunFrame frame = sunFrame();
         if (entry >= frame.changeCount)
+            return;
+        // stampSplit: thread (entry, c) stamps class c only; otherwise thread 0 stamps every class.
+        const uint classFirst = frame.stampSplit != 0 ? thread : 0u;
+        const uint classEnd = frame.stampSplit != 0 ? thread + 1u : min(frame.classCount, kCloudSunClasses);
+        if (classFirst >= min(frame.classCount, kCloudSunClasses) || (frame.stampSplit == 0 && thread > 0))
             return;
         const HSTRCloudSunChange change = hstrCloudSunChanges[entry];
         const HSTRCloudAsset asset = hstrCloudAssets[change.asset];
@@ -4895,9 +4900,8 @@ struct HSTRCloudRenderer
         // walk 9.14 -> 9.89 ms and sprint 13.93 -> 11.99 (within the arms' spread). Most of a flight's outdating is real: bricks
         // of the bake's own level and coarser mapping and unmapping while the cut sits at the atlas cap.
         const uint levels = min(min(asset.topLevel, frame.levelStamps != 0 ? change.level : 0xFFFFu) + 1u, kCloudSunFieldLevels);
-        const uint classes = min(frame.classCount, kCloudSunClasses);
         // Levels >= 2: the blocks of the asset's pairs.
-        for (uint c = 0; c < classes; ++c)
+        for (uint c = classFirst; c < classEnd; ++c)
         {
             const uint block = hstrCloudSunFieldBlocks[change.asset * kCloudSunClasses + c];
             if (block == kCloudRefNone)
@@ -4920,7 +4924,7 @@ struct HSTRCloudRenderer
         int3 lasts[2 * kCloudSunClasses];
         int3 cellFirst = int3(0x3FFFFFFF);
         int3 cellLast = int3(-1);
-        for (uint c = 0; c < classes; ++c)
+        for (uint c = classFirst; c < classEnd; ++c)
         {
             const float3 sweep = reach * hstrCloudSunDirections[c].xyz;
             for (uint level = 0; level < 2; ++level)
@@ -4948,7 +4952,7 @@ struct HSTRCloudRenderer
                     const uint node = sunFineNode(change.asset, uint3(cell));
                     if (node == kCloudRefNone)
                         continue;
-                    for (uint c = 0; c < classes; ++c)
+                    for (uint c = classFirst; c < classEnd; ++c)
                         for (uint level = 0; level < 2; ++level)
                         {
                             const uint i = 2u * c + level;
@@ -14211,7 +14215,7 @@ void ageSunField(uint3 dispatchThreadId: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void stampSunChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    gHSTRCloud.stampSunChange(dispatchThreadId.x);
+    gHSTRCloud.stampSunChange(dispatchThreadId.x, dispatchThreadId.y);
 }
 
 [numthreads(256, 1, 1)]
