@@ -7375,8 +7375,34 @@ struct HSTRCloudRenderer
         // Mode 4: also the layer bits of the domain voxel nearest v (its footprint, widened by the brick reach in CloudSea): a layer
         // with its block bit but not this one is empty to the voxel's exit, without its lookup.
         uint voxelMask = ~0u;
-        if ((params.cloudLayerTightSkip == 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
+        if ((params.cloudLayerTightSkip >= 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
             voxelMask = domainVoxelLayers(v);
+        // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
+        // cloudLayerTightRun), each tested, instead of one step per voxel.
+        if (params.cloudLayerTightSkip == 5u && voxelMask == 0u)
+        {
+            const float3 dv = ray.direction * float(params.hstrCellWidth);
+            const float nudge = 0.25f / max(length(dv), 1e-9f);
+            float cursor = tSample;
+            [loop]
+            for (uint k = 0; k <= params.cloudLayerTightRun; ++k)
+            {
+                const float3 p = seaVoxel((ray.position + (cursor + (k == 0 ? 0.f : nudge)) * ray.direction) * float(params.hstrCellWidth));
+                if (k > 0 && domainVoxelLayers((ray.position + (cursor + nudge) * ray.direction) * float(params.hstrCellWidth)) != 0u)
+                    break;
+                const float3 lo = floor(p + 0.5f) - 0.5f;
+                float out = 1e30f;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                    if (abs(dv[a]) > 1e-12f)
+                        out = min(out, ((dv[a] > 0.f ? lo[a] + 1.f : lo[a]) - p[a]) / dv[a]);
+                cursor += (k == 0 ? 0.f : nudge) + max(out, 0.f);
+            }
+            fineVoxels = 1.f;
+            hit.entry = kCloudRefNone;
+            skipTo = cursor;
+            return 0.f;
+        }
         [unroll]
         for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
         {
@@ -7391,7 +7417,7 @@ struct HSTRCloudRenderer
                 exit = min(exit, blockExit);
                 continue;
             }
-            if (params.cloudLayerTightSkip == 4u && (voxelMask & (1u << layer)) == 0u)
+            if (params.cloudLayerTightSkip >= 4u && (voxelMask & (1u << layer)) == 0u)
             {
                 const float3 s = seaVoxel(v);
                 const float3 lo = floor(s + 0.5f) - 0.5f;

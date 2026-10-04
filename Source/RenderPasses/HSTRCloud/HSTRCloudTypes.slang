@@ -1521,6 +1521,9 @@ struct HSTRCloudParams
     /// 1: a block with none is empty to its exit, without a lookup. 2: also a layer without its bit is skipped, empty to the
     /// block's exit. 3: 2, and a block with none skips on through up to cloudLayerTightRun more such blocks. 4: 3, and a layer whose bit is clear
     /// in the nearest domain voxel is empty to that voxel's exit. 0: off. Shipped at 4 (IntelCloudSeaHalf.py has the numbers).
+    /// MEASURED and REJECTED (kept, off): 5, mode 4 plus a run through the voxels after a layer-free one, each tested (up to
+    /// cloudLayerTightRun). tight23, 4K sunset walk, two pairs: units + query 4.44 / 4.07 (mode 4) -> 6.20 / 6.00 ms; the loop in
+    /// the lookup's hot path costs far more than the steps it saves. Squared excess mode 4 0.020143, mode 5 0.020235 (tight22).
     /// MEASURED (tight3 / tight5, 4K sunset walk, units + query): mode 1 -0.6 to -1.0 ms, mode 2 -1.0 ms; mode 1 alone removes
     /// 25% of samples' lookups, mode 2 then 96% of the out-of-box ones and 14% of the brick walks that end empty. The 4.86M brick
     /// walks left end empty inside blocks where their layer has density: finer than the 4-voxel block. 22% of lane steps were
