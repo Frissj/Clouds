@@ -1658,7 +1658,14 @@ struct HSTRCloudParams
     /// tested: residency (finer bricks streaming in near the camera put density where a coarser level had none).
     float beamQueryStart = 0.f;
     float beamTravel = 0.f; ///< The camera's cumulative path length in world units (set per frame; beamQueryStart's odometer).
-    uint beamUnitStartPad2 = 0;
+    /// Far-sea ray start (an approximation): a refreshed texel starts at the least first-lit distance of the previous layer's 2 x 2
+    /// texels its direction reprojects onto, less the camera's travel since those were marched and seaFarStart sea voxels. 0: off.
+    /// A hinted march keeps its hint's record (no ratchet), none if lit in its first step.
+    /// MEASURED (farstart1, 4K sunset walk, one launch, f0 / f8 / f32 twice): farSea 0.681 / 0.633 -> 0.653 / 0.624 (8),
+    /// 0.637 / 0.601 ms (32); over 0.02 2.47 / 2.37 -> 2.34 / 2.45 (8), 2.38 / 4.34% (32, one score 10.1%); sanity -16 4.02%.
+    /// Iterations before the first lit 36-55 -> 10-18 a texel, all 95-129 -> 60-92, but waves pay 1.41-1.57x their lanes'
+    /// iterations (was 1.30-1.43): the pass is set by its longest rays (max 364-746), which keep their length. ~-0.03 ms. Off.
+    float seaFarStart = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

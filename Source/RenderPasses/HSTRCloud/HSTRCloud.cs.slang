@@ -510,8 +510,10 @@ struct HSTRCloudRenderer
     Texture2D<float4> hstrFarField;                   ///< Per texel: the far sea's radiance (hazed) less the sky it hides, and its transmittance.
     RWTexture2D<float4> hstrFarFieldOutput;
     Texture2D<float4> hstrFarFieldPrev;               ///< The previous far layer and its opacity-weighted distance, reprojected.
-    Texture2D<float> hstrFarDistancePrev;
-    RWTexture2D<float> hstrFarDistanceOutput;
+    /// Per texel: x the opacity-weighted distance, y the first lit sample's distance (seaFarStart; 0: none), z the camera's
+    /// odometer (beamTravel) when that was marched.
+    Texture2D<float4> hstrFarDistancePrev;
+    RWTexture2D<float4> hstrFarDistanceOutput;
     /// DIAGNOSTIC (seaFarProbe bit 6): marched texels, their iterations, the most any one took, their lit samples, texels at the
     /// iteration cap, occupancy skips, zero-majorant skips, the iterations their waves paid (slowest lane x marching lanes), the
     /// iterations before each texel's first lit sample, and what the waves would pay with those taken in one (a perfect ray start).
@@ -3546,8 +3548,9 @@ struct HSTRCloudRenderer
 
     /// The far sea over distances [interval.x, interval.y] along w: its radiance (not hazed), transmittance, and the sum of
     /// transmittance * alpha * distance (for the opacity-weighted distance).
-    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance)
+    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance, out float firstLit)
     {
+        firstLit = 0.f; // The distance along w of the first lit step's start (seaFarStart); 0: none.
         const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0 && (params.seaFarProbe & 2u) == 0;
         const bool withCache = (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0 && (params.seaFarProbe & 3u) == 0;
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
@@ -3630,6 +3633,7 @@ struct HSTRCloudRenderer
                 distance += transmittance * alpha * middle;
                 transmittance *= 1.f - alpha;
                 lead = lit == 0u ? iterations : lead;
+                firstLit = lit == 0u ? s : firstLit;
                 ++lit;
             }
             s += ds;
@@ -3692,7 +3696,7 @@ struct HSTRCloudRenderer
             return 2u;
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
-        const float previousDistance = hstrFarDistancePrev[texel];
+        const float previousDistance = hstrFarDistancePrev[texel].x;
         const float3 q = previousDistance > 0.f ? normalize(origin + previousDistance * w - params.seaFarPrevPosition) : w;
         float2 position;
         const bool off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
@@ -3701,21 +3705,62 @@ struct HSTRCloudRenderer
         return off && (params.seaFarProbe & 16u) == 0 ? 2u : 1u;
     }
 
-    /// A texel this run marches: its far interval (farSeaMarch); nothing for the others.
-    float4 farSeaTexelMarch(uint2 texel, out float distanceSum)
+    /// A texel this run marches: its far interval (farSeaMarch); nothing for the others. record: what the texel stores for the
+    /// next start (seaFarStart) - the first lit distance and odometer of a march from the interval's start; a hinted march keeps
+    /// its hint's (what it finds lies past its own start), or none if it was lit in its first step.
+    float4 farSeaTexelMarch(uint2 texel, out float distanceSum, out float2 record)
     {
         distanceSum = 0.f;
+        record = 0.f;
         float2 uv;
         float2 interval;
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
         if (farSeaDecision(texel, uv) != 2u || !farSeaInterval(origin, w, interval))
             return float4(0.f, 0.f, 0.f, 1.f);
-        return farSeaMarch(origin, w, interval, distanceSum);
+        float2 hint = 0.f;
+        float start = interval.x;
+        if (params.seaFarStart != 0.f && params.seaFarRefreshAll == 0)
+        {
+            // The previous layer's 2 x 2 texels around this direction, through the camera that made it.
+            float2 position;
+            const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+            if (farProject(w, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position))
+            {
+                const int2 base = int2(floor(position / float(params.seaFarScale) - 0.5f));
+                float first = 3.4e38f;
+                float odometer = 0.f;
+                [unroll]
+                for (uint k = 0; k < 4; ++k)
+                {
+                    const int2 t = base + int2(k & 1u, k >> 1);
+                    const float4 stored = all(t >= 0) && all(t < int2(dims)) ? hstrFarDistancePrev[uint2(t)] : float4(0.f);
+                    if (stored.y <= 0.f)
+                        first = 0.f;
+                    else if (stored.y < first)
+                    {
+                        first = stored.y;
+                        odometer = stored.z;
+                    }
+                }
+                if (first > 0.f && first < 3.4e38f)
+                {
+                    hint = float2(first, odometer);
+                    start = max(start, first - max(params.beamTravel - odometer, 0.f) - params.seaFarStart * params.seaVoxelSize.x);
+                }
+            }
+        }
+        float firstLit;
+        const float4 far = farSeaMarch(origin, w, float2(start, interval.y), distanceSum, firstLit);
+        if (start <= interval.x)
+            record = firstLit > 0.f ? float2(firstLit, params.beamTravel) : 0.f;
+        else
+            record = firstLit > 0.f && firstLit <= start + 1e-3f * params.seaVoxelSize.x ? float2(0.f) : hint;
+        return far;
     }
 
     /// Writes a texel: reprojected, or from its composed segments (radiance, transmittance and distance sum).
-    void farSeaFinish(uint2 texel, float4 far, float distanceSum)
+    void farSeaFinish(uint2 texel, float4 far, float distanceSum, float2 record)
     {
         float2 uv;
         const uint decision = farSeaDecision(texel, uv);
@@ -3729,7 +3774,12 @@ struct HSTRCloudRenderer
         if (decision == 1u)
         {
             hstrFarFieldOutput[texel] = hstrFarFieldPrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-            hstrFarDistanceOutput[texel] = hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+            // The distance bilinear, as before; the start record from the nearest texel (an interpolated first distance or odometer
+            // would mean nothing).
+            const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+            const uint2 nearest = min(uint2(max(uv * float2(dims), 0.f)), dims - 1u);
+            hstrFarDistanceOutput[texel] = float4(hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f).x,
+                                                  hstrFarDistancePrev[nearest].yz, 0.f);
             return;
         }
         const float3 w = farTexelDirection(texel);
@@ -3748,7 +3798,7 @@ struct HSTRCloudRenderer
         // Stored as what it adds behind the near march - its radiance less the sky it hides - so the composite is one fetch.
         const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
         hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
-        hstrFarDistanceOutput[texel] = farDistance;
+        hstrFarDistanceOutput[texel] = float4(farDistance, record, 0.f);
     }
 
     /// What the far sea adds behind the near march along camera ray w: its radiance, less the sky it hides. Read by direction, so
@@ -12595,8 +12645,9 @@ void renderCloudCamera(uint3 dispatchThreadId: SV_DispatchThreadID)
 void renderFarSea(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     float distanceSum;
-    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum);
-    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum);
+    float2 record;
+    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum, record);
+    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum, record);
 }
 
 

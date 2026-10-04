@@ -684,6 +684,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamUnitStart = float(value);
             continue;
         }
+        if (key == "seaFarStart")
+        {
+            mParams.seaFarStart = float(value);
+            continue;
+        }
         if (key == "beamQueryStart")
         {
             mParams.beamQueryStart = float(value);
@@ -1486,6 +1491,7 @@ Properties HSTRCloud::getProperties() const
     props["beamUnitStart"] = mParams.beamUnitStart;
     props["beamUnitStartWide"] = mParams.beamUnitStartWide != 0;
     props["beamQueryStart"] = mParams.beamQueryStart;
+    props["seaFarStart"] = mParams.seaFarStart;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -5976,7 +5982,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             for (uint32_t i = 0; i < 2; ++i)
             {
                 mpFarField[i] = mpDevice->createTexture2D(farDims.x, farDims.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
-                mpFarDistance[i] = mpDevice->createTexture2D(farDims.x, farDims.y, ResourceFormat::R32Float, 1, 1, nullptr, flags);
+                // x the opacity-weighted distance, y / z the first lit distance and its odometer (seaFarStart).
+                mpFarDistance[i] = mpDevice->createTexture2D(farDims.x, farDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
             }
             mFarSeaDirty = true;
             mFarLayerValid = false;
