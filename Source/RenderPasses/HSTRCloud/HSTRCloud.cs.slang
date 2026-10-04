@@ -86,6 +86,18 @@ static uint gRunSkip[4];       ///< beamLayerProbe: the layer-free run skip (kBe
 #if HSTR_UNIT_START
 static float gFirstDistance; ///< HSTR_UNIT_START: world distance to the start of marchBeam's first step with density (-1: none).
 #endif
+// beamUnitSpan (HSTR_UNIT_START 2): the lattice rays record their depth spans with density, the dirty units skip the rest.
+#define HSTR_UNIT_SPAN (HSTR_UNIT_START >= 2)
+#if HSTR_UNIT_SPAN
+static uint2 gSpanMask;      ///< Recording: the 64 bins (beamUnitSpan sea voxels each) from gSpanOrigin with density.
+static float gSpanOrigin;    ///< Recording: world distance of the start of the first step with density (-1: none yet).
+static bool gSpanSkip = false; ///< Units: skip by gSpanSkipMask (set only by marchBeamUnitExact, so the query kernels drop it).
+static uint2 gSpanSkipMask;
+static float gSpanSkipOrigin;
+#if HSTR_LAYER_PROBE
+static uint gSpanJumps;
+#endif
+#endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
@@ -531,6 +543,9 @@ struct HSTRCloudRenderer
     /// Per block of lattice points: the smallest distance any of its points holds, and the camera it was last verified from.
     /// Together they certify that translation cannot have invalidated the block (params.beamGuard).
     RWTexture2D<uint> hstrBeamGuardDepth;
+    /// beamGuardWarpParallax: per guard block, the running maximum of the distances its points that hit something hold (float
+    /// bits; 0: none), beside hstrBeamGuardDepth's minimum.
+    RWTexture2D<uint> hstrBeamGuardFar;
     /// Min-depth pyramid over the guard blocks, levels packed one after another (level 0 is hstrBeamGuardDepth as a float, never
     /// verified as unbounded). See beamCellRadius.
     RWStructuredBuffer<float> hstrBeamGuardPyramid;
@@ -633,6 +648,8 @@ struct HSTRCloudRenderer
     /// beamPolicy (decideBeamPolicy): [11] the tile tolerance, as float bits ([10] unused).
     RWStructuredBuffer<uint> hstrBeamWarpArgs;
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
+    /// beamUnitSpan: per lattice point, its ray's depth-span record (writeBeamQuery): bins with density, origin, odometer.
+    RWTexture2D<uint4> hstrBeamSpan;
     /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
     Texture2D<float2> hstrBeamWarpField;
     RWTexture2D<float2> hstrBeamWarpFieldOutput;
@@ -5411,6 +5428,10 @@ struct HSTRCloudRenderer
 #if HSTR_UNIT_START
         gFirstDistance = -1.f;
 #endif
+#if HSTR_UNIT_SPAN
+        gSpanMask = 0u;
+        gSpanOrigin = -1.f;
+#endif
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
@@ -7914,6 +7935,46 @@ struct HSTRCloudRenderer
         return sunDepthAt(v, footprint, sample);
     }
 
+#if HSTR_UNIT_SPAN
+    /// beamUnitSpan's 64-bit bin masks (x bins 0-31, y 32-63). The bits [0, n), n <= 64.
+    uint2 spanBelow(uint n)
+    {
+        return n >= 64u ? uint2(~0u, ~0u) : (n >= 32u ? uint2(~0u, (1u << (n - 32u)) - 1u) : uint2((1u << n) - 1u, 0u));
+    }
+
+    /// m moved n bins later; whatever would leave the last bin stays in it (bin 63 stands for everything past it).
+    uint2 spanLater(uint2 m, uint n)
+    {
+        if (n == 0u || all(m == 0u))
+            return m;
+        const int top = m.y != 0u ? 32 + int(firstbithigh(m.y)) : int(firstbithigh(m.x));
+        uint2 r = n >= 64u ? uint2(0u, 0u)
+                           : (n >= 32u ? uint2(0u, m.x << (n - 32u)) : uint2(m.x << n, (m.y << n) | (m.x >> (32u - n))));
+        if (top + int(n) >= 63)
+            r.y |= 0x80000000u;
+        return r;
+    }
+
+    /// m widened by one bin each way.
+    uint2 spanWiden(uint2 m)
+    {
+        const uint2 earlier = uint2((m.x >> 1) | (m.y << 31), (m.y >> 1) | (m.y & 0x80000000u));
+        return m | earlier | spanLater(m, 1u);
+    }
+
+    /// Recording: the world distances [d0, d1] of a step with density (from the first such step on, everything past dEnd when the
+    /// march stopped short).
+    void spanMark(float d0, float d1)
+    {
+        if (gSpanOrigin < 0.f)
+            gSpanOrigin = d0;
+        const float inverse = 1.f / (params.beamUnitSpan * params.seaVoxelSize.x);
+        const uint b0 = uint(min(max(d0 - gSpanOrigin, 0.f) * inverse, 63.f));
+        const uint b1 = uint(min(max(d1 - gSpanOrigin, 0.f) * inverse, 63.f));
+        gSpanMask |= spanBelow(b1 + 1u) & ~spanBelow(b0);
+    }
+#endif
+
     /// The shipping beam march (every HSTR_SHIP switch at its shipping value, lightingStride 1, cloudSunReuse 0) with as little
     /// state live across a step as it can have: the Nsight capture of the shipping walk frame showed its dirty passes at 22% / 32%
     /// warps in flight with 68% / 63% of the warp slots unallocated on active SMs and DRAM read at 31% / 22% - occupancy-bound, not
@@ -8004,6 +8065,32 @@ struct HSTRCloudRenderer
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
+#if HSTR_UNIT_SPAN
+            // beamUnitSpan: a unit in a bin none of its tile's corners saw density in moves on to the next bin one did, and ends
+            // where none did after it. Before the corners' first density (the start's margin) and in bin 63 it marches as usual.
+            if (gSpanSkip)
+            {
+                const float inverse = 1.f / (params.beamUnitSpan * params.seaVoxelSize.x);
+                const float k = (ray.entryDistance + t * ray.worldLength - gSpanSkipOrigin) * inverse;
+                if (k >= 0.f && k < 63.f)
+                {
+                    const uint bin = uint(k);
+                    const uint2 ahead = gSpanSkipMask & ~spanBelow(bin);
+                    if (((bin < 32u ? ahead.x >> bin : ahead.y >> (bin - 32u)) & 1u) == 0u)
+                    {
+                        if (all(ahead == 0u))
+                            break;
+                        const uint nextBin = ahead.x != 0u ? firstbitlow(ahead.x) : 32u + firstbitlow(ahead.y);
+                        t = (gSpanSkipOrigin + float(nextBin) / inverse - ray.entryDistance) / ray.worldLength;
+#if HSTR_LAYER_PROBE
+                        ++gSpanJumps;
+#endif
+                        if (t >= segment.y)
+                            break;
+                    }
+                }
+            }
+#endif
             const float3 v = (ray.position + t * ray.direction) * cellWidth;
             const float majorant = majorantAt(v);
             const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * minStepVoxels;
@@ -8057,6 +8144,10 @@ struct HSTRCloudRenderer
                     }
                 }
                 const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+#if HSTR_UNIT_SPAN
+                if (alpha > 0.f)
+                    spanMark(ray.entryDistance + t * ray.worldLength, ray.entryDistance + (t + dt) * ray.worldLength);
+#endif
 #if (HSTR_SHIP & 4096) != 0
                 countEmpty += skipTo >= 0.f ? 1u : 0u;
                 countProxy += hit.entry == kCloudRefNone && skipTo < 0.f ? 1u : 0u;
@@ -8140,6 +8231,11 @@ struct HSTRCloudRenderer
             gTailTransmittance = transmittance;
 #endif
         }
+#if HSTR_UNIT_SPAN
+        // Stopped short (opacity or the step cap): this ray says nothing about what lies past where it stopped.
+        if (!gSpanSkip && t < segment.y)
+            spanMark(ray.entryDistance + t * ray.worldLength, 3.4e38f);
+#endif
 #if (HSTR_SHIP & 262144) != 0
         if (spanKept)
         {
@@ -8570,9 +8666,15 @@ struct HSTRCloudRenderer
 
     /// Writes a lattice query: slice 0 the cache and optical depth, 1 the single scatter and opacity-weighted distance, 2 the march
     /// steps it cost (beamQueue's prediction for the next build).
-    void writeBeamQuery(uint2 position, float4 depthCache, float4 single, float steps = 0.f, float first = 0.f)
+    void writeBeamQuery(uint2 position, float4 depthCache, float4 single, float steps = 0.f, float first = 0.f,
+                        uint4 span = uint4(0u, 0u, 0xC0000000u, 0u))
     {
         const uint2 texel = position / params.beamLatticeStep;
+#if HSTR_UNIT_SPAN
+        // beamUnitSpan: the ray's bins with density, their origin (-1: none; the default -2: no record, as a carried point) and
+        // the odometer when marched.
+        hstrBeamSpan[texel] = span;
+#endif
         hstrBeamLatticeOutput[uint3(texel, 0)] = depthCache;
         hstrBeamLatticeOutput[uint3(texel, 1)] = single;
         // .y stamps the build that wrote this point. In the reference frame the image reaches past the screen and only the part the
@@ -8593,6 +8695,16 @@ struct HSTRCloudRenderer
         return gFirstDistance;
 #else
         return 0.f;
+#endif
+    }
+
+    /// The depth-span record of the march this thread just ran (beamUnitSpan), for writeBeamQuery.
+    uint4 beamSpanRecord()
+    {
+#if HSTR_UNIT_SPAN
+        return uint4(gSpanMask, asuint(gSpanOrigin), asuint(params.beamTravel));
+#else
+        return uint4(0u, 0u, 0xC0000000u, 0u);
 #endif
     }
 
@@ -9108,7 +9220,7 @@ struct HSTRCloudRenderer
             return;
         const uint2 position = unpackBeamTile(hstrBeamQueue[bucket * params.beamQueueCapacity + thread]);
         const BeamSample q = marchBeam(beamRayDirection(float2(position)), float2(0.f, 1.f));
-        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance());
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance(), beamSpanRecord());
     }
 
     /// Queues a finest tile of the per-pixel march list by the steps its corners cost (beamQueue, one level).
@@ -9886,21 +9998,35 @@ struct HSTRCloudRenderer
     /// from the new eye. A block never verified is read as is.
     /// MEASURED (4K walk, 2x steps + tstep + beamOctScale 0.5, beamGuardParallax 8, in-flight scoring): 1.985% of pixels over
     /// 0.02 unwarped, 1.439% warped by each query's own depth (budgetwarp1), 0.960% with the sky fallback below (budgetwarp2).
-    void beamWarpPosition(float3 w, inout float2 position, out float3 read)
+    /// fine (beamWarpFold's edge pixels): three passes, and where the read lands on a failed tile's marched unit, that unit's own
+    /// depth instead of the nearest lattice point's - texel-scale depth exactly where a near edge lies over far content.
+    void beamWarpPosition(float3 w, inout float2 position, out float3 read, bool fine = false)
     {
         read = w;
         const float3 eye = gScene.camera.data.posW;
         const uint step = max(params.beamLatticeStep, 1u);
         const uint2 last = (params.beamLatticeDims - 1u) * step;
         [unroll]
-        for (uint k = 0; k < 2; ++k)
+        for (uint k = 0; k < 3; ++k)
         {
+            if (k == 2 && !fine)
+                break;
             const uint2 lattice = min(uint2(round(max(position, 0.f) / float(step))) * step, last);
             const uint2 cell = beamGuardCell(lattice);
             const float4 held = hstrBeamGuardCamera[cell];
             if (held.w < 0.5f)
                 return;
             float z = beamLatticeAt(lattice, 1).w;
+            if (fine)
+            {
+                const uint2 unit = min(uint2(max(position, 0.f)), params.beamFrameDim - 1u);
+                if (hstrBeamLevel[unit / beamTileEdge(params.beamLevels - 1)] >= params.beamLevels)
+                {
+                    const float4 marched = hstrBeamPixels[unit];
+                    if (marched.a > 0.f)
+                        z = marched.a;
+                }
+            }
             // Sky: no depth of its own, but a cloud may have slid into it since the capture. Warp by the nearest depth among the
             // guard blocks around; the second pass then reads what is really there. 91.9% of walk's pixels read a query that hit
             // nothing (budgetwarpdiag1), and warping only by their own depth left every cloud edge moving over sky unfollowed.
@@ -10003,6 +10129,71 @@ struct HSTRCloudRenderer
         hstrBeamWarpFieldOutput[texel] = (params.beamOct != 0 ? beamOctUnfold(warped, position) : warped) - position;
     }
 
+    /// beamWarpEdge: a tile of a held block whose four corner warp offsets differ by more than beamWarpEdge texels lies on an edge
+    /// whose near side has moved over (or off) far content since the capture - content the image never held, which no warp can
+    /// produce. Its units are listed into this build's unit march (marched from this camera), and the tile takes level
+    /// beamLevels + 2 (failed, and read unwarped by the resolve) until its block is re-marched; so does every tile already at it.
+    void repairBeamWarpEdgeAt(uint2 tile)
+    {
+        const uint ts = max(params.beamTileSize, 1u);
+        const uint finest = beamTileEdge(params.beamLevels - 1);
+        bool repair = false;
+        if (all(tile < params.beamTileDims) && all(tile * ts < params.beamFrameDim) && beamTileOnScreen(0, tile) &&
+            (params.beamWarpAuto <= 0.f || hstrBeamWarpArgs[9] == 1u))
+        {
+            const uint2 block = tile * ts / max(params.beamDirtyBlockEdge, 1u);
+            if (all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] == 0xFFFFFFFFu && hstrBeamGuardCamera[block].w >= 0.5f)
+            {
+                const uint level = hstrBeamLevelOutput[tile * ts / finest];
+                if (level == params.beamLevels + 2u)
+                    repair = true;
+                else if (level != params.beamLevels + 1u)
+                {
+                    const uint step = max(params.beamLatticeStep, 1u);
+                    const int2 base = int2(tile * ts / step);
+                    const int2 last = int2(params.beamLatticeDims) - 1;
+                    float2 lo = 3.4e38f, hi = -3.4e38f;
+                    [unroll]
+                    for (uint k = 0; k < 4; ++k)
+                    {
+                        const float2 o = hstrBeamWarpField.Load(int3(clamp(base + int2(k & 1u, k >> 1) * int(ts / step), 0, last), 0));
+                        lo = min(lo, o);
+                        hi = max(hi, o);
+                    }
+                    repair = max(hi.x - lo.x, hi.y - lo.y) > params.beamWarpEdge;
+                }
+            }
+        }
+        if (repair)
+            writeBeamLevel(0, tile, params.beamLevels + 2u);
+        // Every unit of a repaired tile, appended a tile at a time (listBeamFailedTileUnits' layout: a wave marches neighbours).
+        const uint count = repair ? min(ts * ts, 64u) : 0u;
+        const uint total = WaveActiveSum(count);
+        if (total == 0)
+            return;
+        uint base = 0;
+        if (WaveIsFirstLane())
+        {
+            InterlockedAdd(hstrBeamDirtyCount[1], total, base);
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamWarpEdgeUnits], total, unused);
+        }
+        uint at = WaveReadLaneFirst(base) + WavePrefixSum(count);
+        for (uint k = 0; k < count; ++k)
+        {
+            const uint2 unit = tile * ts + uint2(k % ts, k / ts);
+            hstrBeamDirtyUnits[at++] = unit.x | (unit.y << 16);
+        }
+    }
+
+    /// beamWarpEdge: whether the resolve reads this beam position unwarped (its tile was repaired from this camera).
+    bool beamWarpEdgeRepaired(float2 position)
+    {
+        return params.beamWarpEdge > 0.f &&
+               hstrBeamLevel[min(uint2(max(position, 0.f)), params.beamFrameDim - 1u) / beamTileEdge(params.beamLevels - 1)] ==
+                   params.beamLevels + 2u;
+    }
+
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
 #if HSTR_DIRTY_FUSED || HSTR_DIRTY_OVERLAP
     // The warp arguments stay in their indirect state for the resolve, so the fused chain reads its copy (setupBeamDirtyFused).
@@ -10016,7 +10207,29 @@ struct HSTRCloudRenderer
     {
         const float step = float(max(params.beamLatticeStep, 1u));
         const float2 uv = (position / step + 0.5f) / float2(params.beamLatticeDims);
-        const float2 warped = position + hstrBeamWarpField.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+        float2 offset = hstrBeamWarpField.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+        if (params.beamWarpFold > 0.f)
+        {
+            // beamWarpFold: across a depth edge the blend folds; the nearest content's offset (the longest) wins instead.
+            const int2 base = int2(floor(position / step));
+            const int2 last = int2(params.beamLatticeDims) - 1;
+            float2 o[4];
+            [unroll]
+            for (uint k = 0; k < 4; ++k)
+                o[k] = hstrBeamWarpField.Load(int3(clamp(base + int2(k & 1u, k >> 1), 0, last), 0));
+            const float2 lo = min(min(o[0], o[1]), min(o[2], o[3]));
+            const float2 hi = max(max(o[0], o[1]), max(o[2], o[3]));
+            if (max(hi.x - lo.x, hi.y - lo.y) > params.beamWarpFold)
+            {
+                // The blend folds here (and the longest offset alone tears the edge into slivers, warpfold1): this pixel takes
+                // the warp itself, by texel-scale depth where the edge's units were marched.
+                float2 exact = position;
+                float3 read;
+                beamWarpPosition(beamRayDirection(position), exact, read, true);
+                return exact;
+            }
+        }
+        const float2 warped = position + offset;
         return params.beamOct != 0 ? beamOctFold(warped) : warped;
     }
 
@@ -10032,8 +10245,11 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
 #if HSTR_BEAM_WARP
-        beamPosition = beamWarpedPosition(beamPosition);
-        w = beamRayDirection(beamPosition);
+        if (!beamWarpEdgeRepaired(beamPosition))
+        {
+            beamPosition = beamWarpedPosition(beamPosition);
+            w = beamRayDirection(beamPosition);
+        }
 #endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
@@ -10081,7 +10297,8 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
 #if HSTR_BEAM_WARP
-        beamPosition = beamWarpedPosition(beamPosition);
+        if (!beamWarpEdgeRepaired(beamPosition))
+            beamPosition = beamWarpedPosition(beamPosition);
 #endif
         const float2 texel = beamPosition - 0.5f;
         const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
@@ -10714,12 +10931,89 @@ struct HSTRCloudRenderer
 #endif
     }
 
+#if HSTR_UNIT_SPAN && !HSTR_DIRTY_FUSED
+    /// beamUnitSpan: the unit's skip mask (gSpanSkipMask from gSpanSkipOrigin) - its tile's corners' depth spans moved to their least
+    /// origin, ORed and widened. False (no skipping) where a corner holds no record or was marched too long ago.
+    bool beamUnitSpanSetup(uint2 unit)
+    {
+        const uint s = params.beamTileSize;
+        const uint2 tile = unit / s;
+        const float inverse = 1.f / (params.beamUnitSpan * params.seaVoxelSize.x);
+        uint4 records[4];
+        float origin = 3.4e38f;
+        uint widen = params.beamUnitSpanDilate;
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint2 position = (tile + uint2(k & 1u, k >> 1)) * s;
+            records[k] = hstrBeamSpan[position / params.beamLatticeStep];
+            const float o = asfloat(records[k].z);
+            if (o < -1.5f || beamLatticeAt(position, 2).y <= 0.f)
+                return false; // No record (carried, cleared or never marched).
+            // The camera's travel since the corner was marched moves its content along the ray by at most that much.
+            const float travel = max(params.beamTravel - asfloat(records[k].w), 0.f);
+            const uint late = uint(ceil(travel * inverse));
+            if (late > 2u)
+                return false;
+            widen = max(widen, params.beamUnitSpanDilate + late);
+            if (o >= 0.f)
+                origin = min(origin, o);
+        }
+        if (origin > 3e38f)
+            return false; // No corner saw density: the start has no hint either.
+        uint2 mask = 0u;
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const float o = asfloat(records[k].z);
+            if (o < 0.f)
+                continue;
+            // The corner's bin j covers [o + j W, o + (j + 1) W): bins floor(shift) + j and the one after of the common grid.
+            const float shift = (o - origin) * inverse;
+            const uint whole = uint(min(shift, 64.f));
+            mask |= spanLater(records[k].xy, whole) | spanLater(records[k].xy, whole + 1u);
+        }
+        for (uint k = 0; k < widen; ++k)
+            mask = spanWiden(mask);
+        gSpanSkipMask = mask;
+        gSpanSkipOrigin = origin;
+        return true;
+    }
+#endif
+
     void marchBeamUnitExact(uint2 unit)
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
         const float start = beamUnitStartDistance(unit);
+#if HSTR_UNIT_SPAN && !HSTR_DIRTY_FUSED
+        gSpanSkip = beamUnitSpanSetup(unit);
+#if HSTR_LAYER_PROBE
+        gSpanJumps = 0u;
+#endif
+#endif
         const BeamSample exact = marchBeam(w, float2(0.f, 1.f), start);
+#if HSTR_UNIT_SPAN && !HSTR_DIRTY_FUSED
+#if HSTR_LAYER_PROBE
+        // kBeamUnitSpanProbe: the same unit from the same start without the mask (probe only).
+        if (gSpanSkip)
+        {
+            const uint jumps = gSpanJumps;
+            gSpanSkip = false;
+            const BeamSample plain = marchBeam(w, float2(0.f, 1.f), start);
+            const float3 kLum = float3(0.2126f, 0.7152f, 0.0722f);
+            const float spanned = dot(exact.cache + exact.single, kLum);
+            const float whole = dot(plain.cache + plain.single, kLum);
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamUnitSpanProbe], 1u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitSpanProbe + 1], jumps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitSpanProbe + 2], abs(log((spanned + 1e-4f) / (whole + 1e-4f))) > 0.02f ? 1u : 0u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitSpanProbe + 3], abs(exp(-exact.depth) - exp(-plain.depth)) > 0.02f ? 1u : 0u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamUnitSpanProbe + 4], uint(max(plain.steps - exact.steps, 0.f)), unused);
+        }
+#endif
+        gSpanSkip = false;
+#endif
 #if HSTR_LAYER_PROBE && HSTR_UNIT_START
         // kBeamUnitStartProbe: the same ray from the segment's start (probe only), and whether the start skipped density.
         if (start > 0.f)
@@ -10762,6 +11056,8 @@ struct HSTRCloudRenderer
             const uint depth = asuint(exact.distance > 0.f ? exact.distance : 3.4e38f);
             uint previous;
             InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
+            if (params.beamGuardWarpParallaxAngle > 0.f && exact.distance > 0.f)
+                InterlockedMax(hstrBeamGuardFar[cell], depth);
             if (depth < previous)
             {
 #if HSTR_DIRTY_FUSED
@@ -10854,7 +11150,7 @@ struct HSTRCloudRenderer
         }
 #endif
         // Called right after this thread's marchBeam (beamFirstDistance is that march's).
-        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance());
+        writeBeamQuery(position, float4(q.cache, q.depth), float4(q.single, q.distance), q.steps, beamFirstDistance(), beamSpanRecord());
         beamGuardVerified(position, q.distance);
 #if HSTR_PUSH_SHARE
         uint listed, stride;
@@ -11152,10 +11448,33 @@ struct HSTRCloudRenderer
                 const float budget = level == 0 ? params.beamGuardParallaxAngle : float(1u << (level - 1u)) * blockAngle;
                 const float reach = 2.8285f * span * texelReach; // The 3 x 3's farthest point from the block's centre.
                 const float shift = mode == 0 ? m : min(m, p + reach * m);
-                if (!(shift <= budget * (nearest - m)))
+                // beamGuardIsoParallaxAngle: level 0 also passes on the isotropic bound at its own (larger) budget.
+                const bool iso = level == 0 && params.beamGuardIsoParallaxAngle > 0.f && m <= params.beamGuardIsoParallaxAngle * (nearest - m);
+                if (!(shift <= budget * (nearest - m)) && !iso)
                 {
                     failed = min(level, kBeamGuardFailLevels - 1u);
                     return false;
+                }
+                // beamGuardWarpParallax: the near-to-far parallax over the 3 x 3, which the warp field cannot follow.
+                if (level == 0 && params.beamGuardWarpParallaxAngle > 0.f)
+                {
+                    uint far = 0u;
+                    for (int y = -1; y <= 1; ++y)
+                        for (int x = -1; x <= 1; ++x)
+                        {
+                            const int2 n = at + int2(x, y);
+                            if (all(n >= 0) && all(n < int2(dims)))
+                                far = max(far, hstrBeamGuardFar[uint2(n)]);
+                        }
+                    if (far != 0u && asfloat(far) > nearest)
+                    {
+                        const float differential = shift / max(nearest - m, 1e-6f) - shift / (asfloat(far) + m);
+                        if (!(differential <= params.beamGuardWarpParallaxAngle))
+                        {
+                            failed = 0u;
+                            return false;
+                        }
+                    }
                 }
             }
             offset += dims.x * dims.y;
@@ -11485,6 +11804,8 @@ struct HSTRCloudRenderer
             const uint depth = asuint(exact.distance > 0.f ? exact.distance : 3.4e38f);
             uint previous;
             InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
+            if (params.beamGuardWarpParallaxAngle > 0.f && exact.distance > 0.f)
+                InterlockedMax(hstrBeamGuardFar[cell], depth);
             if (depth < previous)
                 beamGuardDropCoarse(cell);
         }
@@ -11693,6 +12014,9 @@ struct HSTRCloudRenderer
         // that exist, counted twice by the double-buffered readback. That is the whole of the residual's cost under translation.
         uint previous;
         InterlockedMin(hstrBeamGuardDepth[cell], asuint(distance > 0.f ? distance : 3.4e38f), previous);
+        // A miss is warped by its neighbours' nearest depth (buildBeamWarpField), so it never folds against them: hits only.
+        if (params.beamGuardWarpParallaxAngle > 0.f && distance > 0.f)
+            InterlockedMax(hstrBeamGuardFar[cell], asuint(distance));
         // Every thread of the block writes the same camera, so the race between them has one outcome.
         hstrBeamGuardCamera[cell] = float4(gScene.camera.data.posW, 1.f);
         // The coarse certificate over this block was derived from the sphere just replaced, so it no longer follows. A block the
@@ -12615,7 +12939,8 @@ void buildBeamQueries(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupTh
         depth += gBeamDepthCache[groupThreadId.x + k].a;
     }
     // beamUnitStart: one segment is this thread's own march, so its first-density distance is the ray's.
-    gHSTRCloud.writeBeamQuery(position, float4(cache, depth), float4(single, 0.f), 0.f, segments == 1u ? gHSTRCloud.beamFirstDistance() : 0.f);
+    gHSTRCloud.writeBeamQuery(position, float4(cache, depth), float4(single, 0.f), 0.f, segments == 1u ? gHSTRCloud.beamFirstDistance() : 0.f,
+                              segments == 1u ? gHSTRCloud.beamSpanRecord() : uint4(0u, 0u, 0xC0000000u, 0u));
 }
 
 [numthreads(64, 1, 1)]
@@ -13661,6 +13986,13 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_
 /// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
 /// a 4K frame has 129,600 resolve groups.
 static const uint kResidualRow = 32768;
+
+/// beamWarpEdge: one thread per level-0 tile, after the warp field and before the unit march's arguments.
+[numthreads(8, 8, 1)]
+void repairBeamWarpEdge(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.repairBeamWarpEdgeAt(dispatchThreadId.xy);
+}
 
 /// beamWarp: the warp field over the on-screen lattice box (buildBeamWarpFieldAt), before the resolve reads it.
 [numthreads(8, 8, 1)]

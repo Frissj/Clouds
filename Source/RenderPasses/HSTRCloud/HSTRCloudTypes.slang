@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 348;
+static const uint kBeamCountSlots = 354;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -134,6 +134,12 @@ static const uint kBeamLayerRayHint = 340;
 /// 1.71M (30%) of those blocks lie in a 16-voxel parent holding no layer - a coarse level would save ~1.2M loads, a distance
 /// field more (cloudLayerRunDistance).
 static const uint kBeamRunSkip = 344;
+/// beamLayerProbe with beamUnitSpan: units given a span mask, the jumps they took, and against the same unit marched from the same
+/// start without the mask (probe only): units whose log radiance (cache + single, luminance) differs by more than 0.02, whose
+/// transmittance differs by more than 0.02, and the steps the mask saved.
+static const uint kBeamUnitSpanProbe = 348;
+/// beamWarpEdge: units its repaired edge tiles added to the unit march (always counted).
+static const uint kBeamWarpEdgeUnits = 353;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1668,6 +1674,51 @@ struct HSTRCloudParams
     /// MEASURED: walk units + query ~-0.18 ms (rundist1, IntelCloudSeaHalf.py has the numbers). The rebuild (all three passes, the
     /// whole grid; cloudLayerDistanceRebuild forces it every frame) costs 0.131 ms (distcost1), paid only on frames that upload tiles.
     uint cloudLayerRunDistance = 0;
+    /// Depth spans for the dirty units (an approximation; needs beamUnitStart): every lattice ray records which bins of this many sea
+    /// voxels, counted from its first density, held density (64 bins, the last also standing for everything past it; from where
+    /// it stopped on opacity or its step cap on, all of them). A unit ORs its tile's corners' bins, aligned to their least first
+    /// density and widened by beamUnitSpanDilate bins each way (plus the camera's travel since a corner was marched), and jumps
+    /// over the bins none of them saw density in - its empty runs between the corners' wisps, and its end past their last. 0: off
+    /// (HSTR_UNIT_START 2 in the dirty and full-build passes when on). The navigation probe (4f900bbe) priced perfect empty-run
+    /// skips at 2.6x fewer warp-paid steps; beamUnitStart takes only the leading run.
+    /// MEASURED and REJECTED (kept, off; 4K sunset walk, per frame, kBeamUnitSpanProbe against the same unit from the same start
+    /// without the mask): unitspan1 4 voxels / dilate 1: 108k units masked, 45k jumps, 345k of ~4.2M unit steps saved (8%), 4.2k
+    /// units off by > 0.02 in log radiance; units 2.09 / 2.05 ms ship -> 2.03 (4) / 2.13 (8), noise. unitspan2 (probe only),
+    /// steps saved / units off: 4 d1 376k / 6.4k, 2 d0 754k / 14.1k, 1 d0 776k / 14.5k, 0.5 d0 674k / 12.8k - at most ~17% of
+    /// the steps for 12% of units wrong. Stop rule 20%. The corners' density spans, even unwidened, cover nearly all of a unit's
+    /// own empty runs: the runs thread gaps between wisps narrower than the 8-pixel corner spacing (as ec2c1879 found for static
+    /// structures), so no neighbour-ray record reaches the 2.6x.
+    float beamUnitSpan = 0.f;
+    uint beamUnitSpanDilate = 1;
+    /// beamGuardMotion 1 / 2: a block whose level-0 test fails may still be held by the isotropic test (|dP| / distance) at this
+    /// budget (radians; beamGuardIsoParallax texels, set by the host; 0: off). Levels above 0 do not depend on the budget, and
+    /// mode 1's bound is never looser than the isotropic one at equal budget, so this is mode 1 at beamGuardParallax OR the
+    /// isotropic certificate at beamGuardIsoParallax: forward motion gets mode 1's tighter shift, sideways motion (where mode 1 is
+    /// the isotropic bound) keeps the larger budget instead of paying mode 1 p4's ~+1 ms on strafe (motion_strafe1).
+    float beamGuardIsoParallaxAngle = 0.f;
+    /// beamGuardWarpParallax (radians; texels set by the host; 0: off): a block is held only while the parallax between the nearest
+    /// and farthest depths over its 3 x 3 blocks (hstrBeamGuardDepth / hstrBeamGuardFar), shift / (near - m) - shift / (far + m),
+    /// stays within it - the part of the motion the warp cannot take out. Under beamGuardMotion 1 held blocks really drift, and
+    /// where a near edge lies over far content the warp field interpolated between their lattice points folds: dark chips along
+    /// every silhouette (guardor_img3: gone with beamWarp off, which instead misaligns everything, 3.36% -> 4.58% over 0.02).
+    float beamGuardWarpParallaxAngle = 0.f;
+    /// beamWarpFold (texels; 0: off): where the warp field's four lattice offsets around a resolve position differ by more than
+    /// this (a near edge over far content), the pixel runs beamWarpPosition itself (fine: three passes, a failed tile's unit
+    /// depth where it reads one) instead of their bilinear blend, which folds there and reads the far side inside the near edge
+    /// (beamGuardWarpParallax's chips).
+    /// MEASURED and REPLACED (warpfold1, 4K sunset walk, OR guard): the longest of the four offsets instead - chips unchanged (85 /
+    /// 144 / 109 pixels a frame under 0.6x the rebuild, OR / fold 1 / fold 2) and the held edge torn into diagonal slivers.
+    float beamWarpFold = 0.f;
+    /// beamWarpEdge (texels; 0: off): held blocks' tiles whose corner warp offsets differ by more than this are re-marched from
+    /// this camera and read unwarped (repairBeamWarpEdgeAt) - the disoccluded edge strips, instead of the whole block. A dense
+    /// pass over the level-0 tiles after the warp field.
+    /// MEASURED and REJECTED (warpedge1, 4K sunset walk, OR guard beamGuardMotion 1 p4 / iso 8, 4 cycles, motion score 2): units +
+    /// query / over 0.02 / units a frame - iso p8 anchors 4.34 / 3.84 ms, 2.33 / 2.54%, 111k / 109k; OR 3.14 ms, 3.05%, 80k; OR +
+    /// edge 1 6.13 ms, 2.27%, 76k + 261k repaired; edge 2 4.74 ms, 2.75%, 74k + 145k. Quality comes back, but on fluffy cumulus the
+    /// disoccluded area is not a strip: depth breaks are everywhere, and a block held longer exposes more unseen content than its
+    /// own units cost. Together with warpfold1 / 2 (no warp fixes missing data) and guardwarp2 (bounding the block's near-to-far
+    /// parallax keeps quality and loses the gain), the OR guard's -1 ms on the walk is not available at today's motion quality.
+    float beamWarpEdge = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

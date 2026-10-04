@@ -361,12 +361,16 @@ private:
     float4x4 mBeamPrevViewProj;
     float3 mBeamPrevCamera = float3(0.f);
     ref<Texture> mpBeamLattice; ///< Beam view queries at every tile corner and centre (2 slices).
+    ref<Texture> mpBeamSpan;    ///< beamUnitSpan: per lattice point, its ray's depth-span record (RGBA32Uint).
     ref<Buffer> mpBeamPageTable; ///< Identity page table for the beamPageIndirect probe.
     ref<Texture> mpBeamGuardDepth;  ///< Per block: the smallest distance any of its lattice points holds.
+    ref<Texture> mpBeamGuardFar;    ///< Per block: the largest hit distance (beamGuardWarpParallax).
     ref<Texture> mpBeamGuardCamera; ///< Per block: the camera position its points were last tested against.
     bool mBeamGuard = false;        ///< Certify translation survival per block instead of per point.
     bool mBeamPrebuild = false;     ///< The build that anchors the octahedral image builds all of it (beamBuildAll).
     float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
+    float mBeamGuardIsoParallax = 0.f; ///< beamGuardIsoParallax: the isotropic level-0 budget ORed with beamGuardMotion's (0: off).
+    float mBeamGuardWarpParallax = 0.f; ///< beamGuardWarpParallax: texels of near-to-far parallax a held block may carry (0: off).
     uint32_t mBeamGuardMotion = 0;  ///< beamGuardMotion: the motion-aware certificate (HSTRCloudTypes.slang).
     bool mBeamLayerProbe = false;   ///< beamLayerProbe: count the layered lookups by outcome (HSTR_LAYER_PROBE).
     bool mBeamUnitRefill = false;   ///< beamUnitRefill: PROBE, the units pass with lane refill (marchBeamDirtyUnitsRefill).
@@ -384,6 +388,7 @@ private:
     /// With it on, the units scope's time includes the pixel pass running inside it: compare HSTRCloud totals, not these two scopes.
     bool mBeamOverlapResolve = true;
     LazyComputePass mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
+    LazyComputePass mpBeamWarpEdgePass;  ///< beamWarpEdge: held blocks' disoccluded edge tiles re-marched (repairBeamWarpEdge).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     /// beamWarpAuto: the warp runs only while at least this share of the on-screen guard blocks this build classified are held
     /// (certified, so read from an older camera). 0 = always, as beamWarp alone. Sprint expires every block, so the field and the
@@ -543,6 +548,11 @@ private:
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.
     void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
+    /// HSTR_UNIT_START: 0 off, 1 beamUnitStart, 2 beamUnitStart with beamUnitSpan.
+    const char* unitStartDefine() const
+    {
+        return mParams.beamUnitStart == 0.f ? "0" : (mParams.beamUnitSpan > 0.f ? "2" : "1");
+    }
     LazyComputePass mpBeamDirtyTilePass;
     LazyComputePass mpBeamDirtyTileDensePass;
     LazyComputePass mpBeamRefreshListPass;

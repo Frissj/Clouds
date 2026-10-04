@@ -622,6 +622,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamGuardMotion = value;
             continue;
         }
+        if (key == "beamGuardIsoParallax")
+        {
+            mBeamGuardIsoParallax = value;
+            continue;
+        }
+        if (key == "beamGuardWarpParallax")
+        {
+            mBeamGuardWarpParallax = value;
+            continue;
+        }
+        if (key == "beamWarpFold")
+        {
+            mParams.beamWarpFold = float(value);
+            continue;
+        }
+        if (key == "beamWarpEdge")
+        {
+            mParams.beamWarpEdge = float(value);
+            continue;
+        }
         // PROBE: the sea's cloud layers the shaders read (set from CloudSeaDesc::layers at load; residency still streams them all).
         // Prices the second layer: a wrong image, a real floor on cost.
         if (key == "cloudLayersRead")
@@ -682,6 +702,16 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamUnitStart")
         {
             mParams.beamUnitStart = float(value);
+            continue;
+        }
+        if (key == "beamUnitSpan")
+        {
+            mParams.beamUnitSpan = float(value);
+            continue;
+        }
+        if (key == "beamUnitSpanDilate")
+        {
+            mParams.beamUnitSpanDilate = uint32_t(value);
             continue;
         }
         if (key == "seaFarCap")
@@ -1469,6 +1499,10 @@ Properties HSTRCloud::getProperties() const
     props["beamPrebuild"] = mBeamPrebuild;
     props["beamGuardParallax"] = mBeamGuardParallax;
     props["beamGuardMotion"] = mBeamGuardMotion;
+    props["beamGuardIsoParallax"] = mBeamGuardIsoParallax;
+    props["beamGuardWarpParallax"] = mBeamGuardWarpParallax;
+    props["beamWarpFold"] = mParams.beamWarpFold;
+    props["beamWarpEdge"] = mParams.beamWarpEdge;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
@@ -1484,6 +1518,8 @@ Properties HSTRCloud::getProperties() const
     props["cloudLayerRunDistance"] = mParams.cloudLayerRunDistance != 0;
     props["cloudLayerDistanceRebuild"] = mLayerDistanceRebuild;
     props["beamUnitStart"] = mParams.beamUnitStart;
+    props["beamUnitSpan"] = mParams.beamUnitSpan;
+    props["beamUnitSpanDilate"] = mParams.beamUnitSpanDilate;
     props["seaFarCap"] = mParams.seaFarCap;
     props["seaFarFootprint"] = mParams.seaFarFootprint;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
@@ -1968,8 +2004,14 @@ Properties HSTRCloud::getProperties() const
             cloud["beamRunSkipBlocks"] = mBeamLevelCounts[kBeamRunSkip + 1];
             cloud["beamRunSkipCoarseBlocks"] = mBeamLevelCounts[kBeamRunSkip + 2];
             cloud["beamRunSkipCapped"] = mBeamLevelCounts[kBeamRunSkip + 3];
+            cloud["beamUnitSpanUnits"] = mBeamLevelCounts[kBeamUnitSpanProbe];
+            cloud["beamUnitSpanJumps"] = mBeamLevelCounts[kBeamUnitSpanProbe + 1];
+            cloud["beamUnitSpanRadianceOff"] = mBeamLevelCounts[kBeamUnitSpanProbe + 2];
+            cloud["beamUnitSpanTransmittanceOff"] = mBeamLevelCounts[kBeamUnitSpanProbe + 3];
+            cloud["beamUnitSpanStepsSaved"] = mBeamLevelCounts[kBeamUnitSpanProbe + 4];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
+        cloud["beamWarpEdgeUnits"] = mBeamLevelCounts[kBeamWarpEdgeUnits];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
         cloud["beamWarpHeld"] = mBeamWarpHeld;
@@ -2192,6 +2234,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamTemporalTilePass = createPass("testBeamTilesTemporal");
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamWarpFieldPass = createPass("buildBeamWarpField");
+    mpBeamWarpEdgePass = createPass("repairBeamWarpEdge");
     mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
     mpBeamPolicyPass = createPass("decideBeamPolicy");
     mpBeamResolveWarpPass = createPass("resolveBeam");
@@ -4550,8 +4593,10 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // The indirect argument buffer is bound only by the pass that writes it: a dispatch cannot read it as arguments and
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
+    var["hstrBeamSpan"] = mpBeamSpan;
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
+    var["hstrBeamGuardFar"] = mpBeamGuardFar;
     var["hstrBeamWarpField"] = mpBeamWarpField;
     var["hstrBeamGuardPyramid"] = mpBeamGuardPyramid;
     var["hstrBeamInvalidations"] = mpBeamInvalidations;
@@ -5054,6 +5099,8 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
     // Held under one guard block, because a certificate only looks one ring of blocks out for what can shift in.
     const float blockTexels = float(std::max(mParams.beamRefreshBlock, 1u) * std::max(mParams.beamLatticeStep, 1u));
     mParams.beamGuardParallaxAngle = std::min(mBeamGuardParallax, blockTexels) * 1.20f * 2.f / float(dim);
+    mParams.beamGuardIsoParallaxAngle = std::min(mBeamGuardIsoParallax, blockTexels) * 1.20f * 2.f / float(dim);
+    mParams.beamGuardWarpParallaxAngle = mBeamGuardWarpParallax * 1.20f * 2.f / float(dim);
     mParams.beamGuardMotion = mBeamGuardMotion;
     // The on-screen test projects a direction through the camera basis instead of comparing against a padded bounding box, so it
     // needs that basis inverted, and a conversion from a box's radius in texels to the normalised device units it can span. Both
@@ -5107,7 +5154,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
-    pPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -6120,6 +6167,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         const uint32_t tileCount = mParams.beamTileDims.x * mParams.beamTileDims.y;
         if (!mpBeamLattice || mpBeamLattice->getWidth() != latticeDims.x || mpBeamLattice->getHeight() != latticeDims.y)
             mpBeamLattice = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA16Float, 3, 1, nullptr, flags);
+        if (!mpBeamSpan || mpBeamSpan->getWidth() != latticeDims.x || mpBeamSpan->getHeight() != latticeDims.y)
+            mpBeamSpan = mpDevice->createTexture2D(latticeDims.x, latticeDims.y, ResourceFormat::RGBA32Uint, 1, 1, nullptr, flags);
         // Identity page table for the indirection probe: one entry per page of the lattice, entry i = i. Rebuilt only when the
         // lattice is resized, so it costs nothing per frame; what it buys is the ability to pay a sparse atlas's addressing cost
         // without building a sparse atlas.
@@ -6144,6 +6193,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             if (!mpBeamGuardDepth || mpBeamGuardDepth->getWidth() != guardDims.x || mpBeamGuardDepth->getHeight() != guardDims.y)
             {
                 mpBeamGuardDepth =
+                    mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+                mpBeamGuardFar =
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
                 mpBeamGuardCamera =
                     mpDevice->createTexture2D(guardDims.x, guardDims.y, ResourceFormat::RGBA32Float, 1, 1, nullptr, flags);
@@ -6370,7 +6421,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
-        mpBeamQueryPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -6435,7 +6486,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
-                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
                     for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                     {
@@ -6509,6 +6560,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 if (mpBeamGuardDepth && (!mBeamGuardCleared || (mBeamRefFrame && mParams.beamRefValid == 0)))
                 {
                     pRenderContext->clearUAV(mpBeamGuardDepth->getUAV().get(), uint4(0xFFFFFFFFu));
+                    pRenderContext->clearUAV(mpBeamGuardFar->getUAV().get(), uint4(0u));
                     pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));
                     pRenderContext->clearUAV(mpBeamCoarse->getUAV().get(), float4(0.f));
                     pRenderContext->clearUAV(mpBeamCoarseState->getUAV().get(), uint4(0));
@@ -6540,7 +6592,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
-                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                             // Launch over the screen box, not the whole beam image. beamPointOnScreen keeps a point while any
@@ -6962,7 +7014,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
-                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
@@ -7116,6 +7168,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpBeamWarpFieldPass->execute(pRenderContext, uint3(end - origin, 1));
                 }
             }
+            // beamWarpEdge: held blocks' edge tiles the warp cannot carry join this build's unit march (listed before its arguments
+            // are written, in the march scope below). Only on builds that run the dirty march, which consumes the list.
+            if (warp && early && !fusedChain && mParams.beamWarpEdge > 0.f && mBeamDirtyActive && mBeamGuardDriven)
+            {
+                FALCOR_PROFILE(pRenderContext, "warpEdge");
+                bindRenderer(pRenderContext, mpBeamWarpEdgePass);
+                bindOutput(mpBeamWarpEdgePass, "hstrBeamLevelOutput", mpBeamLevel, "hstrBeamLevel");
+                mpBeamWarpEdgePass->execute(pRenderContext, uint3(mParams.beamTileDims, 1));
+            }
             // The reference frame's failed tiles resolve from the residual image in their own light-register dispatch, so the
             // common resolve is not made heavier for every pixel by the ~6% that need it (see resolveBeamResidualPixel). The
             // resolve queues its 8 x 8 groups that hold such pixels, with a mask, so the second pass runs over them alone.
@@ -7216,7 +7277,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pMarch->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
         pMarch->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         // beamUnitStart in the full build too: the motion score's fresh rebuild then marches its units the same way.
-        pMarch->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
+        pMarch->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
         auto bindMarch = [&]()
         {
             bindRenderer(pRenderContext, pMarch);

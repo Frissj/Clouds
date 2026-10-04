@@ -36,7 +36,7 @@ CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))
 DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm's state.
 
 
-DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "beamWarpListed",
+DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpEdgeUnits", "beamWarpHeld", "beamWarpListed",
          "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim") + tuple(
          f"beamProbe{kind}{name}" for kind in ("Rays", "Units", "RaySteps", "UnitSteps")
          for name in ("Scored", "InPlace", "Reprojected", "Either")) + (  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
@@ -64,7 +64,11 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... and a per-ray layer hint's (kBeamLayerRayHint): brick walks in layers the ray found no density in, those ray-layers.
          tuple(f"beamLayerHint{p}{n}" for p in ("Query", "Unit") for n in ("Walks", "Layers")) +
          # ... and the layer-free run skip's (kBeamRunSkip): runs, blocks crossed, those in a layer-free 16-voxel parent, capped runs.
-         ("beamRunSkipRuns", "beamRunSkipBlocks", "beamRunSkipCoarseBlocks", "beamRunSkipCapped"))
+         ("beamRunSkipRuns", "beamRunSkipBlocks", "beamRunSkipCoarseBlocks", "beamRunSkipCapped") +
+         # ... and beamUnitSpan's (kBeamUnitSpanProbe): units with a mask, jumps, against the unmasked march from the same start
+         # units off by > 0.02 in log radiance / in transmittance, steps saved.
+         ("beamUnitSpanUnits", "beamUnitSpanJumps", "beamUnitSpanRadianceOff", "beamUnitSpanTransmittanceOff",
+          "beamUnitSpanStepsSaved"))
 
 
 def score():

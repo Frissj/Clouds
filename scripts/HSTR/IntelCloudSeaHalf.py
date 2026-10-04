@@ -134,7 +134,25 @@ g.addPass(createPass("HSTRCloud", {
     # blocks and units - the multiscale pyramid's coarser levels (2^(L-1) blocks of travel) bind, not this level-0 budget. The
     # walk lists 17.4k of ~30k on-screen blocks a frame (12.6k held, 1.9k unverified, the rest failing the bound); invalidation off
     # or residency frozen leaves the listing unchanged (17.2k), so content changes are not where the dirty work comes from.
+    # Spending motion error on the forward walk (an explicit approximation, motion only: a parked frame lists nothing, so the
+    # path-trace gate cannot see it). Level 0 holds a block on beamGuardMotion 1's shift (|dP x w| + reach |dP|) at 4 texels OR
+    # the isotropic |dP| at 8 (beamGuardIsoParallax): forward motion gets mode 1's tighter bound, sideways motion keeps today's.
+    # 4K sunset, HSTR_MOTION_SCORE 2, units + query ms / over 0.02 mean / dirty units a frame, anchors iso p8 first and last:
+    # walk (guardor1) iso 5.26 / 2.33% / 116k, m1 p4 3.30 / 3.17% / 81k, OR 2.95 / 3.27% / 79k, sanity iso p16 3.47 / 2.53% /
+    # 109k, iso 3.67 / 2.76% / 108k - about -1.0 ms for +0.7 points against the drifting anchors; strafe +x (guardor2) iso 4.21 /
+    # 4.46% / 126k, m1 p4 4.87 / 2.31% / 170k, OR 3.90 / 4.61% / 116k, iso 3.97 / 4.38% / 120k - mode 1 p4 alone pays ~+0.8 ms
+    # sideways (as motion_strafe1), the OR does not. Sprint lists every block whatever the budget (motion_sprint1).
+    # REJECTED for what it looks like: dark chips along every silhouette in motion (guardor_img: 1178 pixels a frame under 0.6x the
+    # rebuild's luminance, iso p8 14). Mode 1 p4 alone has them too (guardor_img2); beamWarp off removes them and misaligns all
+    # else (guardor_img3, 3.36% -> 4.58%): held blocks really drift under mode 1, and the warp field, interpolated between lattice
+    # points on both sides of a near edge over far cloud, folds. Bounding the near-to-far parallax a held block carries
+    # (beamGuardWarpParallax 1) removes the chips and the gain together (guardwarp2, interleaved, 10 scores each: iso p8 3.68 /
+    # 3.75 ms, 2.03 / 2.16%, 69 / 7 chip pixels; OR + warp 1 3.55 / 3.77 ms, 2.22 / 2.01%, 46 / 23; units 111k -> 100k). The
+    # walk's -1 ms was the blocks the warp cannot follow. All three settings stay available, off.
+    "beamGuardMotion": 0,
     "beamGuardParallax": 8.0,
+    "beamGuardIsoParallax": 0.0,
+    "beamGuardWarpParallax": 0.0,
     "beamWarp": True,
     # ...and only while at least a quarter of the classified on-screen blocks are held, decided on the GPU each build
     # (writeBeamWarpArgs): walk holds 62%, sprint 0-0.9%, so sprint skips the field and the warped resolve. Sprint 2.95-2.97 ->
