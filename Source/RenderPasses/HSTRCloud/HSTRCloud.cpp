@@ -684,6 +684,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudSunStampSplit = bool(value);
             continue;
         }
+        if (key == "beamUnitRefill")
+        {
+            mBeamUnitRefill = bool(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1448,6 +1453,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
+    props["beamUnitRefill"] = mBeamUnitRefill;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -1895,6 +1901,9 @@ Properties HSTRCloud::getProperties() const
                     cloud["beamSplit" + std::to_string(layer) + splitNames[k]] = mBeamLevelCounts[kBeamLayerSplit + 7 * layer + k];
             cloud["beamSplit1EmptyAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 14];
             cloud["beamSplit1DenseAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 15];
+            cloud["beamLayerUnitLaneSteps"] = mBeamLevelCounts[kBeamLayerUnitSteps];
+            cloud["beamLayerUnitPaidSteps"] = mBeamLevelCounts[kBeamLayerUnitSteps + 1];
+            cloud["beamLayerUnitWarps"] = mBeamLevelCounts[kBeamLayerUnitSteps + 2];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
@@ -2143,6 +2152,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
+    mpBeamDirtyMarchRefillPass = createPass("marchBeamDirtyUnitsRefillPass");
     mpBeamDirtyQueryStripPass = createPass("buildBeamDirtyQueries");
     mpBeamDirtyMarchStripPass = createPass("marchBeamDirtyUnits");
     mpSpanArgsPass = createPass("writeSpanArgs");
@@ -7299,14 +7309,29 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     }
                     {
                         FALCOR_PROFILE(pRenderContext, "units");
-                        bindDirty(mpBeamDirtyMarchPass);
+                        // PROBE (beamUnitRefill): the same units, lanes refilled as their rays end.
+                        const ref<ComputePass>& pUnits = mBeamUnitRefill ? mpBeamDirtyMarchRefillPass : mpBeamDirtyMarchPass;
+                        if (mBeamUnitRefill)
+                        {
+                            pUnits->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
+                            setBeamDirtyMarchDefines(pUnits);
+                            if (!mpBeamRefill)
+                                mpBeamRefill = mpDevice->createStructuredBuffer(
+                                    sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                                    MemoryType::DeviceLocal, nullptr, false
+                                );
+                            pRenderContext->clearUAV(mpBeamRefill->getUAV().get(), uint4(0));
+                        }
+                        bindDirty(pUnits);
+                        if (mBeamUnitRefill)
+                            pUnits->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamRefill"] = mpBeamRefill;
                         if (farBeside)
                         {
                             // The march never reads its own arguments; bound, they would transition back to a UAV.
-                            mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamDirtyArgs"] = ref<Buffer>();
+                            pUnits->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamDirtyArgs"] = ref<Buffer>();
                             pRenderContext->setAutoUavBarriers(false);
                         }
-                        mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                        pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
                     }
                     // DIAGNOSTIC (beamDirtyStats): what this frame listed, so arms can be compared by work as well as time.

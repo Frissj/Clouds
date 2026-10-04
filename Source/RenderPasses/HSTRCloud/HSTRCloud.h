@@ -369,6 +369,7 @@ private:
     float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
     uint32_t mBeamGuardMotion = 0;  ///< beamGuardMotion: the motion-aware certificate (HSTRCloudTypes.slang).
     bool mBeamLayerProbe = false;   ///< beamLayerProbe: count the layered lookups by outcome (HSTR_LAYER_PROBE).
+    bool mBeamUnitRefill = false;   ///< beamUnitRefill: PROBE, the units pass with lane refill (marchBeamDirtyUnitsRefill).
     /// HSTR_SUN_BAKE_PROBE=1 in the environment (fixed from the first bake, so the pass compiles once): count bakeCloudSun's steps
     /// and exits (HSTR_BAKE_PROBE), logged every 240 frames.
     const bool mSunBakeProbe = std::getenv("HSTR_SUN_BAKE_PROBE") != nullptr;
@@ -462,6 +463,8 @@ private:
     LazyComputePass mpBeamDirtyArgsPass;
     LazyComputePass mpBeamDirtyQueryPass;
     LazyComputePass mpBeamDirtyMarchPass;
+    LazyComputePass mpBeamDirtyMarchRefillPass; ///< beamUnitRefill's units pass (marchBeamDirtyUnitsRefill).
+    ref<Buffer> mpBeamRefill;                   ///< Its claim counter.
     LazyComputePass mpBeamDirtyUnitArgsPass;
     // Cell views (cellViews): cached per-cell views of the transfer. No reader since composeBeam's removal.
     bool mCellViews = false;

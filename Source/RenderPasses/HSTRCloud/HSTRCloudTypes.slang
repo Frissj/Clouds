@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 312;
+static const uint kBeamCountSlots = 316;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -100,6 +100,8 @@ static const uint kBeamLayerSteps = 272;
 /// unlayered path): 9.49M lane steps / 11.94M paid against two layers' 7.70M / 10.45M - more steps (no layer-mask run skips), yet
 /// ~1.1 ms cheaper (fused2), so a two-layer step costs ~1.7x: the per-step mask loads and the second layer's brick walks.
 static const uint kBeamLayerSplit = 296;
+/// beamLayerProbe: the units pass's share of kBeamLayerSteps' lane steps, paid steps and warps (the rest is the dirty query's).
+static const uint kBeamLayerUnitSteps = 312;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.

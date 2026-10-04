@@ -64,6 +64,7 @@ static uint gLayerBlockDenseEdge; ///< ... 7+ sea tiles from the ray's origin (+
 static uint gLayerMissBins[4];    ///< ... by density under 1% / under 1x / over the thin bound, and fading bricks (+ 13 .. 16).
 static uint gLayerMissLevels[4];  ///< ... by brick level 0-1, 2, 3, 4+ (+ 17 .. 20).
 static uint gLayerSplit[16];      ///< kBeamLayerSplit: per layer, visits by what answered; layer 1's after a dense layer 0.
+static uint gLayerUnitsPass = 0u; ///< 1 in marchBeamDirtyUnits: its lane / paid steps and warps also go to kBeamLayerUnitSteps.
 static bool gLayerPrevTight;
 #endif
 #ifndef HSTR_STRIP
@@ -521,6 +522,7 @@ struct HSTRCloudRenderer
     RWTexture2D<uint> hstrBeamDirtyMark;
     /// The units the dirty march has to march, compacted (count in hstrBeamDirtyCount[1]), packed x | y << 16.
     RWStructuredBuffer<uint> hstrBeamDirtyUnits;
+    RWStructuredBuffer<uint> hstrBeamRefill; ///< beamUnitRefill: the next listed unit to claim (cleared before the pass).
     /// World regions whose content (density or lighting) changed since the last build, as bounding spheres (xyz centre, w radius),
     /// params.beamInvalidateCount of them. See invalidateBeamGuardBlock.
     StructuredBuffer<float4> hstrBeamInvalidations;
@@ -5416,6 +5418,12 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 10u], blockDense, unused);
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 11u], blockDenseSum, unused);
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 12u], blockDenseEdge, unused);
+            if (gLayerUnitsPass != 0u)
+            {
+                InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps], laneSteps, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 1u], paidSteps, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 2u], 1u, unused);
+            }
         }
         for (uint k = 0; k < 4; ++k)
         {
@@ -11205,6 +11213,201 @@ struct HSTRCloudRenderer
         marchBeamUnitExact(uint2(packed & 0xFFFFu, packed >> 16));
     }
 
+    /// marchBeamUnitExact's writes for a marched unit.
+    void beamUnitWrite(uint2 unit, float3 w, BeamSample exact)
+    {
+        const float3 albedo = gScene.getGridVolume(0).data.albedo;
+        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
+        if (params.beamGuard != 0 && params.beamRefFrame != 0)
+        {
+            const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);
+            const uint depth = asuint(exact.distance > 0.f ? exact.distance : 3.4e38f);
+            uint previous;
+            InterlockedMin(hstrBeamGuardDepth[cell], depth, previous);
+            if (depth < previous)
+                beamGuardDropCoarse(cell);
+        }
+    }
+
+    /// PROBE (beamUnitRefill: the hard test of lane refill). The listed units marched by lanes that each take the next unclaimed
+    /// unit as soon as their ray ends, inside one step loop, so a wave's lanes stay busy until the list runs out instead of waiting
+    /// for its longest ray. The same march as marchBeam / marchBeamLean (shipping switches: no step-count or span probes), the same
+    /// writes, no new order beyond claiming: a wave claims its idle lanes' units with one atomic.
+    /// MEASURED and REJECTED (kept, off - beamUnitRefill): the dirty units carried 1.29x warp-paid over lane steps (lanes3; the
+    /// query 1.55x). refill1 (4K sunset walk, two pairs): units 3.16 / 2.52 -> 3.88 / 3.75 ms, scores alike; paid / lane
+    /// 1.29 -> 1.19 (each lane marches ~7 rays before the list runs out, so the end tail stays). Why (ngfx refillgfx0 / 1, units
+    /// range, frames 60-61): L1 sector hit 77 / 82% -> 53 / 52% and compute warps active 15.6 / 15.8 -> 12.5 a cycle a TPC. The
+    /// shipped kernel's neighbouring lanes march neighbouring listed units, so a wave's samples share bricks and lines; refilled
+    /// lanes each take their next unit at their own moment, so a wave marches scattered rays, and the claim / setup / write path
+    /// in the loop costs resident warps. Lane refill trades the march's locality for lane occupancy, and locality is worth more.
+    void marchBeamDirtyUnitsRefill(uint start)
+    {
+        const uint count = hstrBeamDirtyCount[1];
+        const float cellWidth = float(params.hstrCellWidth);
+        const bool withSource = beamWithCache();
+        const bool residual = beamWithSingle();
+        const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
+        const float minStepVoxels = params.minStepVoxels;
+        const float maxStepVoxels = params.maxStepVoxels;
+        const uint maxSteps = params.maxMarchSteps;
+        bool live = false;
+        bool exhausted = false;
+        uint2 unit = 0;
+        float3 w = 0.f;
+        CutRay ray = {};
+        float voxelsPerUnit = 0.f;
+        float unitsPerVoxel = 0.f;
+        float t = 0.f;
+        float fineVoxels = 1.f;
+        float transmittance = 1.f;
+        float opacityDistance = 0.f;
+        float3 radiance = 0.f;
+        float3 residualRadiance = 0.f;
+        uint steps = 0;
+#if HSTR_LAYER_PROBE
+        uint laneSteps = 0;
+        uint iterations = 0;
+#endif
+        [loop]
+        while (true)
+        {
+            // Refill: every idle lane of the wave takes the next unit, with one claim for the wave.
+            const bool idle = !live && !exhausted;
+            if (WaveActiveAnyTrue(idle))
+            {
+                uint base = 0;
+                const uint need = WaveActiveCountBits(idle);
+                if (WaveIsFirstLane())
+                    InterlockedAdd(hstrBeamRefill[0], need, base);
+                base = WaveReadLaneFirst(base);
+                if (idle)
+                {
+                    const uint item = start + base + WavePrefixCountBits(idle);
+                    if (item >= count)
+                        exhausted = true;
+                    else
+                    {
+                        const uint packed = hstrBeamDirtyUnits[item];
+                        unit = uint2(packed & 0xFFFFu, packed >> 16);
+                        w = beamRayDirection(float2(unit) + 0.5f);
+                        t = 0.f;
+                        fineVoxels = 1.f;
+                        transmittance = 1.f;
+                        opacityDistance = 0.f;
+                        radiance = 0.f;
+                        residualRadiance = 0.f;
+                        steps = 0;
+                        live = makeCutRay(gScene.camera.data.posW, w, gScene.getGridVolume(0), ray);
+                        ray.sunOctaves = float4(1.f, 0.f, 0.f, 0.f);
+                        voxelsPerUnit = length(ray.direction) * cellWidth;
+                        unitsPerVoxel = 1.f / max(voxelsPerUnit, 1e-6f);
+                        live = live && voxelsPerUnit > 1e-6f;
+                        if (!live)
+                        {
+                            const BeamSample missed = {}; // What marchBeam returns for a ray that misses the volume.
+                            beamUnitWrite(unit, w, missed);
+                        }
+                    }
+                }
+            }
+            if (exhausted)
+                break;
+#if HSTR_LAYER_PROBE
+            ++iterations;
+#endif
+            if (!live)
+                continue;
+            // One step of marchBeamLean.
+            {
+                const float3 v = (ray.position + t * ray.direction) * cellWidth;
+                const float majorant = majorantAt(v);
+                const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * minStepVoxels;
+                const float stepVoxels =
+                    clamp(params.stepOpticalDepth / max(1e-6f, majorant * ray.worldLength * unitsPerVoxel), minimumStep, maxStepVoxels);
+#if (HSTR_SHIP & (16384 | 32768)) != 0
+                const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
+                const float dt = min(boost * stepVoxels * unitsPerVoxel, 1.f - t);
+#else
+                const float dt = min(stepVoxels * unitsPerVoxel, 1.f - t);
+#endif
+                float next = t + dt;
+                if (majorant > 0.f)
+                {
+                    const float tSample = t + 0.5f * dt;
+                    const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                    const float footprint = rayFootprint(ray, tSample);
+                    LeanHit hit;
+                    float skipTo;
+                    float sigma = leanExtinction(ray, midpoint, footprint, tSample, fineVoxels, hit, skipTo);
+                    if (params.beamRimTaps > 1u && hit.entry != kCloudRefNone)
+                    {
+                        const uint taps = min(params.beamRimTaps, uint(ceil(dt * voxelsPerUnit / max(fineVoxels, 1e-3f))));
+                        if (taps > 1u)
+                        {
+                            const float sub = dt / float(taps);
+                            float sum = 0.f;
+                            for (uint o = 0; o < taps; ++o)
+                            {
+                                const float to = t + (float(o) + 0.5f) * sub;
+                                LeanHit tapHit;
+                                float tapSkip, tapVoxels;
+                                sum += leanExtinction(ray, (ray.position + to * ray.direction) * cellWidth, footprint, to, tapVoxels, tapHit, tapSkip);
+                            }
+                            sigma = sum / float(taps);
+                        }
+                    }
+                    const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
+                    if (alpha > 1e-6f)
+                    {
+                        if (residual)
+                            residualRadiance += transmittance * alpha * residualAtDepth(midpoint, leanSunDepth(midpoint, footprint, hit), ray.sunOctaves);
+                        if (withSource)
+                            radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
+                    }
+                    opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
+                    transmittance *= 1.f - alpha;
+                    if (skipTo >= 0.f)
+                        next = min(max(next, skipTo), 1.f);
+                }
+                else
+#if (HSTR_SHIP & 8192) != 0
+                    next = min(max(next, majorantZeroExitFine(ray, t)), 1.f);
+#else
+                    next = min(max(next, majorantZeroExit(ray, t)), 1.f);
+#endif
+                t = next;
+                ++steps;
+#if HSTR_LAYER_PROBE
+                ++laneSteps;
+#endif
+            }
+            // The ray's end (marchBeamLean's loop condition): its writes, and the lane is free for the next unit.
+            if (!(t < 1.f && transmittance > params.cloudMinTransmittance && steps < maxSteps))
+            {
+                BeamSample exact = {};
+                exact.cache = radiance;
+                exact.single = residualRadiance;
+                exact.depth = -log(max(transmittance, 1e-12f));
+                exact.steps = float(steps);
+                exact.distance = transmittance < 1.f - 1e-4f ? opacityDistance / (1.f - transmittance) : 0.f;
+                beamUnitWrite(unit, w, exact);
+                live = false;
+            }
+        }
+#if HSTR_LAYER_PROBE
+        // Lane steps, and the wave's loop iterations times its lanes: what refill leaves of the 1.29x.
+        const uint lane = WaveActiveSum(laneSteps);
+        const uint paid = WaveActiveMax(iterations) * WaveActiveCountBits(true);
+        if (WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps], lane, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 1u], paid, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 2u], 1u, unused);
+        }
+#endif
+    }
+
     // MEASURED and REMOVED (2026-09-22): letting each sample the guard lists decide for itself whether to march, from its own history.
     // Near cloud shifts by more than a block every frame at walk (90% of the listed blocks with content, all of them at sprint), so
     // no per-block budget can hold it - one learned per block up to the pyramid's next level changed nothing, 0.136% / 15.9 ms either
@@ -12593,7 +12796,17 @@ void writeBeamDirtyUnitArgs()
 [numthreads(64, 1, 1)]
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
+#if HSTR_LAYER_PROBE
+    gLayerUnitsPass = 1u;
+#endif
     gHSTRCloud.marchBeamDirtyListedUnit(beamDirtyUnitStart() + foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// beamUnitRefill: the listed units, each lane taking the next as its ray ends (HSTRCloudRenderer::marchBeamDirtyUnitsRefill).
+[numthreads(64, 1, 1)]
+void marchBeamDirtyUnitsRefillPass(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.marchBeamDirtyUnitsRefill(beamDirtyUnitStart());
 }
 
 /// Before the fused chain: its counters, and the build's GPU decisions it reads (the warp arguments stay unbound in it, in their

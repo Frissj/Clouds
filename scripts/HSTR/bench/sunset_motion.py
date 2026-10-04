@@ -51,7 +51,8 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... per layer by what answered, and layer 1's lookups after a dense layer 0.
          tuple(f"beamSplit{layer}{n}" for layer in (0, 1)
                for n in ("BlockSkip", "VoxelSkip", "NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy")) +
-         ("beamSplit1EmptyAfterDense", "beamSplit1DenseAfterDense"))
+         ("beamSplit1EmptyAfterDense", "beamSplit1DenseAfterDense", "beamLayerUnitLaneSteps", "beamLayerUnitPaidSteps",
+          "beamLayerUnitWarps"))
 
 
 def score():
