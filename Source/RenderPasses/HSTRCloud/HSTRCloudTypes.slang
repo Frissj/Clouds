@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 316;
+static const uint kBeamCountSlots = 324;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -102,6 +102,14 @@ static const uint kBeamLayerSteps = 272;
 static const uint kBeamLayerSplit = 296;
 /// beamLayerProbe: the units pass's share of kBeamLayerSteps' lane steps, paid steps and warps (the rest is the dirty query's).
 static const uint kBeamLayerUnitSteps = 312;
+/// beamLayerProbe, ORACLE of a perfect ray start (a reprojected or probed first-density distance): the steps each ray takes
+/// before its first sample with density (its leading empty run), the warp-paid steps if that run were one step, and the rays
+/// with no density at all and their steps - for the passes other than the units (the dirty query), then for the units.
+/// MEASURED (wrap1 'lead' arm, 4K sunset walk, per frame): query 0.90M leading empty of 2.08M lane steps, warp-paid 3.19M ->
+/// 2.36M with a perfect start (-26%); units 2.69M of 6.60M, 8.55M -> 6.29M (-26%); rays with no density 10k / 9k (181k / 266k
+/// steps). The far sea's same oracle (seaFarProbe bit 6): 36-55 of 95-129 iterations a texel before the first lit, waves pay
+/// 0.70-0.76 of today's. Stop rule was 15%: a ray start (reprojected or probed first density) is worth building.
+static const uint kBeamLeadSteps = 316;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1607,9 +1615,15 @@ struct HSTRCloudParams
     /// was that disagreement. But no faster in any run: units + query packed1 4.00 / 4.27 / 3.77 / 4.22 ms, packed3b (select, not
     /// a dynamic index) 4.03 -> 4.55 / 4.35, packedsplit1 units 2.34 -> 2.47 (bit 0) and query 1.77 -> 1.95 (bit 1), packed5
     /// 4.12 / 4.28 / 4.35 / 4.86. Not registers or occupancy (packedgfx0 / 1: units 128 registers 16 warps, query 168 / 12, both
-    /// arms), not L1 (units 78% / 78%, query 67% / 66%) or DRAM. Why each step costs more is not yet measured. Off.
+    /// arms), not L1 (units 78% / 78%, query 67% / 66%) or DRAM. The Nsight source trace (packedsrc15) named it: the x / z wrap's
+    /// two signed integer modulos took 17.3% of the units kernel's samples; now selects. After that fix, wrap2 (three interleaved
+    /// triples): ~-0.09 ms against the shipped anchor, within the noise, where the same select fix in the shipped kernel
+    /// (cloudLayerWrapSelect) gives ~-0.2 ms with no extra texture. Off.
     uint cloudLayerPacked = 0;
-    uint cloudLayerMaskCostPad1 = 0;
+    /// domainVoxelLayers (mode 4's per-sample voxel bits) wraps its voxel's x / z by selects instead of signed integer modulo
+    /// (its input is already wrapped by seaVoxel). Exact. A compile define of the dirty and full-build passes (HSTR_LAYER_WRAP_SELECT).
+    /// MEASURED (wrap2, 4K sunset walk): units + query ~-0.2 ms (3 of 3 triples below the interpolated anchor). On in the launcher.
+    uint cloudLayerWrapSelect = 0;
     uint cloudLayerMaskCostPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).

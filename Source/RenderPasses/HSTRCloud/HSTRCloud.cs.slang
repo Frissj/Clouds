@@ -50,6 +50,9 @@ import Atmosphere;
 #ifndef HSTR_LAYER_MASK_COST
 #define HSTR_LAYER_MASK_COST 0 // cloudLayerMaskCost: doubled layer-mask loads (a probe; see HSTRCloudTypes.slang).
 #endif
+#ifndef HSTR_LAYER_WRAP_SELECT
+#define HSTR_LAYER_WRAP_SELECT 0 // cloudLayerWrapSelect: domainVoxelLayers wraps by selects (see HSTRCloudTypes.slang).
+#endif
 #ifndef HSTR_LAYER_PACKED
 #define HSTR_LAYER_PACKED 0 // cloudLayerPacked: both layer masks from one packed word (see HSTRCloudTypes.slang).
 #endif
@@ -72,6 +75,8 @@ static uint gLayerMissLevels[4];  ///< ... by brick level 0-1, 2, 3, 4+ (+ 17 ..
 static uint gLayerSplit[16];      ///< kBeamLayerSplit: per layer, visits by what answered; layer 1's after a dense layer 0.
 static uint gLayerUnitsPass = 0u; ///< 1 in marchBeamDirtyUnits: its lane / paid steps and warps also go to kBeamLayerUnitSteps.
 static bool gLayerPrevTight;
+static uint gLeadSteps;  ///< beamLayerProbe: steps before the ray's first sample with density (kBeamLeadSteps).
+static bool gLeadDone;
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -502,7 +507,8 @@ struct HSTRCloudRenderer
     Texture2D<float> hstrFarDistancePrev;
     RWTexture2D<float> hstrFarDistanceOutput;
     /// DIAGNOSTIC (seaFarProbe bit 6): marched texels, their iterations, the most any one took, their lit samples, texels at the
-    /// iteration cap, occupancy skips, zero-majorant skips, and the iterations their waves paid (slowest lane x marching lanes).
+    /// iteration cap, occupancy skips, zero-majorant skips, the iterations their waves paid (slowest lane x marching lanes), the
+    /// iterations before each texel's first lit sample, and what the waves would pay with those taken in one (a perfect ray start).
     RWStructuredBuffer<uint> hstrFarCounts;
     // Beam view: exact queries on the lattice of all tile corners and centres, slice 0 (cache rgb, optical depth), slice 1
     // (single scatter without phase, unused); the level that finalised every finest tile (beamLevels: marched per pixel);
@@ -1650,8 +1656,14 @@ struct HSTRCloudRenderer
         const int3 dims = int3(params.hstrExtinctionDims);
         if (p.y < 0 || p.y >= dims.y)
             return 0u;
+#if HSTR_LAYER_WRAP_SELECT
+        // cloudLayerWrapSelect: seaVoxel already wrapped v, so p.x / p.z lie in [0, dims] - selects instead of signed modulo.
+        p.x = p.x >= dims.x ? p.x - dims.x : (p.x < 0 ? p.x + dims.x : p.x);
+        p.z = p.z >= dims.z ? p.z - dims.z : (p.z < 0 ? p.z + dims.z : p.z);
+#else
         p.x = (p.x % dims.x + dims.x) % dims.x;
         p.z = (p.z % dims.z + dims.z) % dims.z;
+#endif
         const float2 value = hstrDomainVolume.Load(int4(p, 0));
         return (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
     }
@@ -1667,9 +1679,11 @@ struct HSTRCloudRenderer
         const int3 dims = int3(params.hstrMajorantDims);
         if (block.y < 0 || block.y >= dims.y)
             return false;
+        // s is wrapped (seaVoxel), so block x / z lie in [0, dims]: selects, not modulo. MEASURED (packedsrc15, Nsight source
+        // trace, units): the two signed integer modulos took 17.3% of the units kernel's samples (Wait stalls).
         int3 wrapped = block;
-        wrapped.x = (wrapped.x % dims.x + dims.x) % dims.x;
-        wrapped.z = (wrapped.z % dims.z + dims.z) % dims.z;
+        wrapped.x = wrapped.x >= dims.x ? wrapped.x - dims.x : (wrapped.x < 0 ? wrapped.x + dims.x : wrapped.x);
+        wrapped.z = wrapped.z >= dims.z ? wrapped.z - dims.z : (wrapped.z < 0 ? wrapped.z + dims.z : wrapped.z);
         word = hstrDomainVoxelBits.Load(int4(wrapped, 0));
         return true;
     }
@@ -3559,6 +3573,7 @@ struct HSTRCloudRenderer
         uint lit = 0;
         uint occupancySkips = 0; // seaFarProbe bit 6: iterations that jumped an empty 16-voxel block, a zero majorant block.
         uint zeroSkips = 0;
+        uint lead = 0; // seaFarProbe bit 6: iterations through the first lit one (all of them on a ray never lit).
         // MEASURED and REMOVED (far4, walk 4K): a 2D max-cloud-top pyramid over the columns, skipping any cell the ray passes wholly
         // above or below - exact (identical scores) but 10.5 -> 13.3 ms. The horizon rays skim among the cloud tops, not above them:
         // every coarse cell holds a tall cloud, so the traversal descended to single columns, two tests per 20 units instead of one.
@@ -3608,6 +3623,7 @@ struct HSTRCloudRenderer
                 radiance += transmittance * alpha * albedo * source;
                 distance += transmittance * alpha * middle;
                 transmittance *= 1.f - alpha;
+                lead = lit == 0u ? iterations : lead;
                 ++lit;
             }
             s += ds;
@@ -3624,8 +3640,16 @@ struct HSTRCloudRenderer
             InterlockedAdd(hstrFarCounts[6], zeroSkips, unused);
             // What the wave pays: its slowest marching lane's iterations for each of its marching lanes.
             const uint paid = WaveActiveMax(iterations) * WaveActiveCountBits(true);
+            // ORACLE: a perfect ray start (the first lit sample's distance, reprojected) takes the iterations before it in one.
+            const uint empties = lit == 0u ? iterations : lead - 1u;
+            const uint ideal = iterations - (empties > 1u ? empties - 1u : 0u);
+            const uint idealPaid = WaveActiveMax(lit == 0u ? 1u : ideal) * WaveActiveCountBits(true);
+            InterlockedAdd(hstrFarCounts[8], empties, unused);
             if (WaveIsFirstLane())
+            {
                 InterlockedAdd(hstrFarCounts[7], paid, unused);
+                InterlockedAdd(hstrFarCounts[9], idealPaid, unused);
+            }
         }
         return float4(radiance, transmittance);
     }
@@ -5395,6 +5419,8 @@ struct HSTRCloudRenderer
         for (uint k = 0; k < 16; ++k)
             gLayerSplit[k] = 0;
         gLayerPrevTight = false;
+        gLeadSteps = 0;
+        gLeadDone = false;
 #endif
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
@@ -5471,6 +5497,26 @@ struct HSTRCloudRenderer
                 InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps], laneSteps, unused);
                 InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 1u], paidSteps, unused);
                 InterlockedAdd(hstrBeamCounts[kBeamLayerUnitSteps + 2u], 1u, unused);
+            }
+        }
+        {
+            // ORACLE: a perfect ray start takes the leading empty run in one step; a ray with no density keeps its steps.
+            // gLeadSteps counts through the first step with density, so the leading empty run is gLeadSteps - 1 steps.
+            const bool none = !gLeadDone;
+            const uint empties = none || gLeadSteps == 0u ? 0u : gLeadSteps - 1u;
+            const uint ideal = steps - (empties > 1u ? empties - 1u : 0u);
+            const uint lead = WaveActiveSum(empties);
+            const uint idealPaid = WaveActiveMax(ideal) * WaveActiveCountBits(true);
+            const uint noneRays = WaveActiveCountBits(none);
+            const uint noneSteps = WaveActiveSum(none ? steps : 0u);
+            if (WaveIsFirstLane())
+            {
+                const uint base = kBeamLeadSteps + (gLayerUnitsPass != 0u ? 4u : 0u);
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[base], lead, unused);
+                InterlockedAdd(hstrBeamCounts[base + 1u], idealPaid, unused);
+                InterlockedAdd(hstrBeamCounts[base + 2u], noneRays, unused);
+                InterlockedAdd(hstrBeamCounts[base + 3u], noneSteps, unused);
             }
         }
         for (uint k = 0; k < 4; ++k)
@@ -8052,6 +8098,10 @@ struct HSTRCloudRenderer
 #endif
             t = next;
             ++steps;
+#if HSTR_LAYER_PROBE
+            gLeadSteps += gLeadDone ? 0u : 1u;
+            gLeadDone = gLeadDone || transmittance < 1.f;
+#endif
         }
 #if (HSTR_SHIP & 262144) != 0
         if (spanKept)
