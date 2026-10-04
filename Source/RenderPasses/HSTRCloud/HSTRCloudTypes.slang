@@ -1482,7 +1482,10 @@ struct HSTRCloudParams
     /// window never pop in), 0.05 with the far sea (which shows those tiles; set per frame).
     float seaFadeInverse = 1.f / 0.3f;
     uint seaFarScale = 2;      ///< The far layer's texel edge in pixels (seaFarScale; its content is the 5-unit transport proxy).
-    uint seaFarRefresh = 8;    ///< A far-sea run recomputes 1 / seaFarRefresh of the texels (seaFarRefresh), reprojecting the rest.
+    /// A far-sea run recomputes 1 / seaFarRefresh of the texels (seaFarRefresh), reprojecting the rest.
+    /// MEASURED (far1, 4K sunset walk, arms base / refresh 16 / scale 4 / base): farSea 0.97 / 0.81 / 0.67 / 0.80 ms, over 0.02
+    /// in motion 2.23 / 2.82 / 2.46 / 2.31% - ~0.1 ms for a visible error rise each; kept at 8 and scale 2.
+    uint seaFarRefresh = 8;
     uint seaFarPhase = 0;      ///< Which of them (set per run).
     uint seaFarRefreshAll = 1; ///< This run recomputes every texel (set per run).
     float3 seaFarPrevPosition = float3(0.f); ///< The camera of the previous far layer: position and cameraU / V / W.
@@ -1516,8 +1519,8 @@ struct HSTRCloudParams
     /// The lean layered march reads the layers with density in the sample's undilated majorant block (hstrDomainLayers, from the
     /// conservative maxima the majorants are built from, widened in CloudSea::accumulate by the coarsest brick level's reach).
     /// 1: a block with none is empty to its exit, without a lookup. 2: also a layer without its bit is skipped, empty to the
-    /// block's exit. 3: 2, and a block with none skips on through up to 8 more such blocks. 0: off. Shipped at 3
-    /// (IntelCloudSeaHalf.py has the numbers).
+    /// block's exit. 3: 2, and a block with none skips on through up to 8 more such blocks. 4: 3, and a layer whose bit is clear
+    /// in the nearest domain voxel is empty to that voxel's exit. 0: off. Shipped at 4 (IntelCloudSeaHalf.py has the numbers).
     /// MEASURED (tight3 / tight5, 4K sunset walk, units + query): mode 1 -0.6 to -1.0 ms, mode 2 -1.0 ms; mode 1 alone removes
     /// 25% of samples' lookups, mode 2 then 96% of the out-of-box ones and 14% of the brick walks that end empty. The 4.86M brick
     /// walks left end empty inside blocks where their layer has density: finer than the 4-voxel block. 22% of lane steps were

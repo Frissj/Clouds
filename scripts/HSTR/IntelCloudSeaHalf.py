@@ -46,7 +46,10 @@ g.addPass(createPass("HSTRCloud", {
     # bit is clear (tight13; lossy-compressed bricks hold density outside the source maxima) and are dropped. Without the reach
     # margin it saved ~1.0 ms but dropped 0.41% (tight5 / tight12); jog and sprint were measured on that version: 7.68 -> 6.50
     # and 6.94 -> 5.67 ms (tight6).
-    "cloudLayerTightSkip": 3,
+    # Mode 4 also tests the nearest domain voxel's layer bits before a layer's lookup: walk 4.49 -> 4.15 ms (tight18, two pairs),
+    # squared excess 0.020163 -> 0.020175 (sunset_hill_tight17), motion over 0.02 within the arms' spread. It catches 72% of the
+    # brick walks that end empty, and drops 0.27% of density samples (probe VoxelDense, against 0.08% at block scale).
+    "cloudLayerTightSkip": 4,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K

@@ -1629,25 +1629,19 @@ struct HSTRCloudRenderer
         return hstrMajorant.Load(int4(block, 0));
     }
 
-    /// The layers with density over the 3^3 domain voxels around the one nearest v (the hstrDomainVolume signs). Probe builds only
-    /// (the cloudLayerTightSkip oracle). The 2^3 voxels floor(v) .. floor(v) + 1 were not enough: 2876 density samples had their
-    /// layer's bits clear there (tight7, 0.13%).
+    /// The layers with density over the footprint of the domain voxel nearest v (the hstrDomainVolume signs, which CloudSea widens
+    /// by the coarsest brick level's reach): cloudLayerTightSkip 4. Before that widening, the oracle over the 3^3 voxels around it
+    /// still missed 11008 of 2.34M density samples (tight8).
     uint domainVoxelLayers(float3 v)
     {
-        const int3 base = int3(floor(seaVoxel(v) + 0.5f)) - 1;
+        int3 p = int3(floor(seaVoxel(v) + 0.5f));
         const int3 dims = int3(params.hstrExtinctionDims);
-        uint layers = 0u;
-        for (uint corner = 0; corner < 27u; ++corner)
-        {
-            int3 p = base + int3(corner % 3u, (corner / 3u) % 3u, corner / 9u);
-            if (p.y < 0 || p.y >= dims.y)
-                continue;
-            p.x = (p.x % dims.x + dims.x) % dims.x;
-            p.z = (p.z % dims.z + dims.z) % dims.z;
-            const float2 value = hstrDomainVolume.Load(int4(p, 0));
-            layers |= (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
-        }
-        return layers;
+        if (p.y < 0 || p.y >= dims.y)
+            return 0u;
+        p.x = (p.x % dims.x + dims.x) % dims.x;
+        p.z = (p.z % dims.z + dims.z) % dims.z;
+        const float2 value = hstrDomainVolume.Load(int4(p, 0));
+        return (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
     }
 
     /// Upper bound on the trilinear extinction inside v's majorant block (for delta and ratio tracking, which re-read it at
@@ -7378,6 +7372,11 @@ struct HSTRCloudRenderer
                 }
             }
         }
+        // Mode 4: also the layer bits of the domain voxel nearest v (its footprint, widened by the brick reach in CloudSea): a layer
+        // with its block bit but not this one is empty to the voxel's exit, without its lookup.
+        uint voxelMask = ~0u;
+        if ((params.cloudLayerTightSkip == 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
+            voxelMask = domainVoxelLayers(v);
         [unroll]
         for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
         {
@@ -7390,6 +7389,19 @@ struct HSTRCloudRenderer
             if (params.cloudLayerTightSkip >= 2u && layerEmpty)
             {
                 exit = min(exit, blockExit);
+                continue;
+            }
+            if (params.cloudLayerTightSkip == 4u && (voxelMask & (1u << layer)) == 0u)
+            {
+                const float3 s = seaVoxel(v);
+                const float3 lo = floor(s + 0.5f) - 0.5f;
+                const float3 dv = ray.direction * float(params.hstrCellWidth);
+                float leave = 1e30f;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                    if (abs(dv[a]) > 1e-12f)
+                        leave = min(leave, ((dv[a] > 0.f ? lo[a] + 1.f : lo[a]) - s[a]) / dv[a]);
+                exit = min(exit, tSample + max(leave, 0.f));
                 continue;
             }
             uint instanceIndex;
