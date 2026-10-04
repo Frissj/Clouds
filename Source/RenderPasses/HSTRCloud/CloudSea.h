@@ -5,7 +5,9 @@
 #include "CloudLibrary.h"
 #include "HSTRCloudTypes.slang"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -116,6 +118,12 @@ public:
     std::vector<uint32_t> instanceSlots(const std::vector<uint32_t>& domainSlots) const;
     uint32_t slotIndex(int2 worldTile) const;
     uint32_t pendingTiles() const;
+    /// PROBE (HSTR_LAYER_OCTANT_PROBE=1 in the environment): of the (tile, domain voxel) layer bits set, how many there were and how
+    /// many of their 2 x 2 x 2 octants the same reach test finds empty - a half-voxel layer mask's ceiling. MEASURED (octant1, 4K
+    /// sunset settle + walk, 13.9M bits): 6.86% of octants empty (stop rule was 15%) - the brick reach (1.5 x 2^2 + 1 source voxels
+    /// each side) dominates a half-voxel box, so a 2 x 2 x 2 per-layer mask (R16, 16 bits per voxel) is not worth building.
+    uint64_t probeLayerBits() const { return mProbeLayerBits; }
+    uint64_t probeLayerOctantsEmpty() const { return mProbeLayerOctantsEmpty; }
 
 private:
     struct Job
@@ -152,6 +160,10 @@ private:
     std::vector<Tile> mInstanceTiles;     ///< Per instance slot.
     std::vector<int2> mRequested;         ///< Per slot: world tile queued or applied.
     int2 mCenter = int2(std::numeric_limits<int32_t>::min());
+
+    const bool mProbeLayerOctants = std::getenv("HSTR_LAYER_OCTANT_PROBE") != nullptr;
+    mutable std::atomic<uint64_t> mProbeLayerBits{0};
+    mutable std::atomic<uint64_t> mProbeLayerOctantsEmpty{0};
 
     mutable std::mutex mMutex;
     std::condition_variable mWake;

@@ -3411,6 +3411,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     }
     if (++mCloudFrames % 240 == 0)
     {
+        if (const uint64_t bits = mpCloudSea->probeLayerBits(); bits > 0)
+            logInfo(
+                "HSTRCloud: layer octant probe: {} layer bits set, {:.2f}% of their octants empty", bits,
+                100.0 * double(mpCloudSea->probeLayerOctantsEmpty()) / (8.0 * double(bits))
+            );
         const auto& stats = mpCloudResidency->getStats();
         logInfo(
             "HSTRCloud: sea frame {}: {} desired, {} loaded, {} mapped, {} pending bricks, {} tiles pending, {:.0f} MB resident, cut {:.2f} ms; "

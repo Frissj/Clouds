@@ -322,7 +322,21 @@ void CloudSea::accumulate(const Tile& tile, float3 squareCorner, std::vector<flo
                 // brick halo. MEASURED (tight12, 4K sunset walk, cloudLayerTightSkip off, probe): with the one-voxel margin 9954 of
                 // 2.36M density samples fell in blocks whose layer bit was clear - 9536 at level 2, 412 at 3, 6 at 4+, none at 0-1.
                 if (maximum > 0.f || proxyMaxOver(centre - halfBox - layerReach, centre + halfBox + layerReach) > 0.f)
+                {
                     layers[index] |= uint8_t(1u << tile.layer);
+                    if (mProbeLayerOctants)
+                    {
+                        uint32_t empty = 0;
+                        for (uint32_t o = 0; o < 8; ++o)
+                        {
+                            const float3 d = float3(float(o & 1), float((o >> 1) & 1), float(o >> 2)) * 0.5f - 0.25f;
+                            const float3 octant = mul(a, p + d) + b;
+                            empty += proxyMaxOver(octant - 0.5f * halfBox - layerReach, octant + 0.5f * halfBox + layerReach) > 0.f ? 0u : 1u;
+                        }
+                        mProbeLayerBits += 1;
+                        mProbeLayerOctantsEmpty += empty;
+                    }
+                }
             }
 }
 
