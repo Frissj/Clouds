@@ -62,7 +62,9 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... and a perfect ray end as well (kBeamTailSteps): trailing empty steps, warp-paid steps with both runs as one step.
          tuple(f"beamTail{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid")) +
          # ... and a per-ray layer hint's (kBeamLayerRayHint): brick walks in layers the ray found no density in, those ray-layers.
-         tuple(f"beamLayerHint{p}{n}" for p in ("Query", "Unit") for n in ("Walks", "Layers")))
+         tuple(f"beamLayerHint{p}{n}" for p in ("Query", "Unit") for n in ("Walks", "Layers")) +
+         # ... and the layer-free run skip's (kBeamRunSkip): runs, blocks crossed, those in a layer-free 16-voxel parent, capped runs.
+         ("beamRunSkipRuns", "beamRunSkipBlocks", "beamRunSkipCoarseBlocks", "beamRunSkipCapped"))
 
 
 def score():

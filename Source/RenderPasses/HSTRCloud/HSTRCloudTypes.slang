@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 344;
+static const uint kBeamCountSlots = 348;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -128,6 +128,12 @@ static const uint kBeamTailSteps = 336;
 /// MEASURED (layerhint1, 4K sunset walk, per frame): 68k (query) + 280k (units) of 7.26M brick walks (4.8%), 47k ray-layers. A
 /// ray that walks a layer's bricks almost always finds its density. Stop rule 20%: no per-ray layer hint.
 static const uint kBeamLayerRayHint = 340;
+/// beamLayerProbe: the layer-free run skip (cloudLayerTightSkip >= 3) - runs entered, loads the runs paid (one per block, or one
+/// per distance-field cube with cloudLayerRunDistance), slot 2 unused, and runs that reached the cap.
+/// MEASURED (runskip1, 4K sunset walk, per frame, block runs): 725k runs crossing 5.66M blocks (7.8 a run), 36k capped at 32;
+/// 1.71M (30%) of those blocks lie in a 16-voxel parent holding no layer - a coarse level would save ~1.2M loads, a distance
+/// field more (cloudLayerRunDistance).
+static const uint kBeamRunSkip = 344;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1655,6 +1661,11 @@ struct HSTRCloudParams
     /// Far-sea density steps at least this times a far texel's footprint (seaFarScale pixels at the step's distance), still inside
     /// the 4-voxel majorant block (an approximation). 0: off (one sea voxel).
     float seaFarFootprint = 0.f;
+    /// The layer-free run skip (cloudLayerTightSkip >= 3) jumps by a distance field (hstrDomainLayerDistance: per majorant block
+    /// the Chebyshev distance to the nearest block holding a layer, capped at 16, rebuilt over the whole grid in three 1D passes
+    /// whenever the domain changes) - the cube it certifies empty in one load, where the run paid one load a block. Exact. A
+    /// compile define of the dirty and full-build passes (HSTR_LAYER_RUN_DISTANCE).
+    uint cloudLayerRunDistance = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

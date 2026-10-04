@@ -55,6 +55,10 @@ g.addPass(createPass("HSTRCloud", {
     # three interleaved triples against the shipped anchor at each position): units + query 3.91 / 3.79 / 4.18 vs ~4.06 / ~4.0 /
     # ~4.45 ms, about -0.2 ms; the packed mask with the same fix (cloudLayerPacked 15) ~-0.09 ms, within the noise.
     "cloudLayerWrapSelect": True,
+    # The layer-free run skip jumps by a Chebyshev distance field over the majorant blocks (exact). rundist1 (4K sunset walk,
+    # off / on / off / on): units 2.294 / 2.208 / 2.310 / 2.135, query 1.787 / 1.756 / 1.798 / 1.721 ms (~-0.18 ms together);
+    # over 0.02 2.36 / 2.34% (second pair). Run loads 5.66M -> 3.82M a frame, capped runs 36k -> 5.6k.
+    "cloudLayerRunDistance": True,
     # Dirty units start at their tile's least lattice first-density distance less 8 sea voxels (an approximation). 4K sunset walk:
     # ustart6 (motion score 2, hint in every pass) units off 2.45 / 2.65 / 2.54 -> m8 2.39 / 2.30 ms, query 1.81 / 1.79 / 1.82 ->
     # 1.74 / 1.70, over 0.02 2.26 / 2.31 / 2.35 -> 2.54 (one score 3.35, the rest 2.24-2.32) / 2.30%; m4 2.40 / 2.45%. Path trace

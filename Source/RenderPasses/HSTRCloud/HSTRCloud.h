@@ -795,6 +795,10 @@ private:
     ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
     ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
     ref<Texture> mpDomainLayers; ///< Per majorant block: bit L where layer L has density over that support (R8Uint).
+    /// Per majorant block: Chebyshev distance in blocks to the nearest one holding a layer (R8Uint, cloudLayerRunDistance), and
+    /// the passes' intermediate.
+    ref<Texture> mpDomainLayerDistance;
+    ref<Texture> mpDomainLayerDistanceTemp;
     float3 mTravelPosition = float3(0.f); ///< Last frame's camera position (for beamTravel).
     bool mTravelValid = false;
     ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).
@@ -805,6 +809,7 @@ private:
     LazyComputePass mpDomainExtinctionPass;
     LazyComputePass mpDomainBlocksPass;
     LazyComputePass mpDomainMajorantPass;
+    LazyComputePass mpDomainLayerDistancePass[3]; ///< cloudLayerRunDistance's field, one axis each.
     LazyComputePass mpDomainOccupancyPass;
     /// World Y of the occupied band, from the majorant blocks, dilated by one. mParams.seaContentY carries this when cloudSlabClamp
     /// is on and an unbounded range when it is off, so the shader clamps without a branch.

@@ -47,6 +47,9 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
+#ifndef HSTR_LAYER_RUN_DISTANCE
+#define HSTR_LAYER_RUN_DISTANCE 0 // cloudLayerRunDistance: the layer-free run skip jumps by hstrDomainLayerDistance's cubes.
+#endif
 #ifndef HSTR_UNIT_START
 #define HSTR_UNIT_START 0 // beamUnitStart: the dirty query records first-density distances, the units start from them.
 #endif
@@ -78,6 +81,7 @@ static uint gLastDenseStep; ///< beamLayerProbe: the step count through the ray'
 static float gTailTransmittance;
 static uint gRayLayerWalks[2]; ///< beamLayerProbe: the ray's brick walks per layer (kBeamLayerRayHint).
 static uint gRayLayerDense[2]; ///< ... and its density samples per layer.
+static uint gRunSkip[4];       ///< beamLayerProbe: the layer-free run skip (kBeamRunSkip).
 #endif
 #if HSTR_UNIT_START
 static float gFirstDistance; ///< HSTR_UNIT_START: world distance to the start of marchBeam's first step with density (-1: none).
@@ -385,6 +389,12 @@ struct HSTRCloudRenderer
     Texture3D<float2> hstrDomainBlocks;                 ///< Per majorant block: unscaled maximum and mean over its trilinear support.
     Texture3D<uint> hstrDomainLayers;                   ///< Per majorant block: bit L where layer L has density (cloudLayerTightSkip).
     RWTexture3D<uint> hstrDomainLayersOutput;
+    /// Per majorant block: the Chebyshev distance in blocks to the nearest block holding any layer (0 there, capped at
+    /// kLayerDistanceCap; x / z wrap) - every block nearer than that holds none (cloudLayerRunDistance). Built by
+    /// domainLayerDistanceX / Y / Z, one axis each, through hstrDomainLayerDistanceInput.
+    Texture3D<uint> hstrDomainLayerDistance;
+    Texture3D<uint> hstrDomainLayerDistanceInput;
+    RWTexture3D<uint> hstrDomainLayerDistanceOutput;
     RWTexture3D<float2> hstrDomainVolumeOutput;
     StructuredBuffer<uint> hstrDomainStaged;            ///< Packed volumes of a batch's slots (CloudSea::TileVolume::packed).
     RWTexture3D<float> hstrExtinctionOutput;
@@ -5428,6 +5438,8 @@ struct HSTRCloudRenderer
         gTailTransmittance = 1.f;
         gRayLayerWalks[0] = gRayLayerWalks[1] = 0;
         gRayLayerDense[0] = gRayLayerDense[1] = 0;
+        for (uint k = 0; k < 4; ++k)
+            gRunSkip[k] = 0;
 #endif
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
@@ -5559,6 +5571,15 @@ struct HSTRCloudRenderer
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[base], walksSum, unused);
                 InterlockedAdd(hstrBeamCounts[base + 1u], layersSum, unused);
+            }
+            for (uint k = 0; k < 4; ++k)
+            {
+                const uint sum = WaveActiveSum(gRunSkip[k]);
+                if (WaveIsFirstLane())
+                {
+                    uint unused;
+                    InterlockedAdd(hstrBeamCounts[kBeamRunSkip + k], sum, unused);
+                }
             }
         }
         for (uint k = 0; k < 4; ++k)
@@ -7555,19 +7576,44 @@ struct HSTRCloudRenderer
                     if (params.cloudLayerTightSkip >= 3u)
                     {
                         const float nudge = 0.25f / max(length(dv), 1e-9f);
+#if HSTR_LAYER_PROBE
+                        ++gRunSkip[0];
+                        gRunSkip[3] += 1u; // Undone below unless the run reaches its cap.
+#endif
                         [loop]
                         for (uint k = 0; k < params.cloudLayerTightRun; ++k)
                         {
                             const float3 p = seaVoxel((ray.position + (skipTo + nudge) * ray.direction) * float(params.hstrCellWidth));
                             const int3 b = int3(floor(p * 0.25f));
+#if HSTR_LAYER_RUN_DISTANCE
+                            // cloudLayerRunDistance: every block within Chebyshev distance d - 1 of b holds no layer, so the run leaves that
+                            // whole cube in one load instead of one block a load.
+                            const uint d = any(b < 0) || any(b >= int3(params.hstrMajorantDims)) ? 0u : hstrDomainLayerDistance.Load(int4(b, 0));
+                            if (d == 0u)
+#else
                             if (any(b < 0) || any(b >= int3(params.hstrMajorantDims)) || hstrDomainLayers.Load(int4(b, 0)) != 0u)
+#endif
+                            {
+#if HSTR_LAYER_PROBE
+                                gRunSkip[3] -= 1u;
+#endif
                                 break;
+                            }
+#if HSTR_LAYER_PROBE
+                            ++gRunSkip[1]; // Loads the run paid.
+#endif
+#if HSTR_LAYER_RUN_DISTANCE
+                            const float3 bl = float3(b - int(d - 1u)) * 4.f;
+                            const float side = 4.f * float(2u * d - 1u);
+#else
                             const float3 bl = float3(b) * 4.f;
+                            const float side = 4.f;
+#endif
                             float out = 1e30f;
                             [unroll]
                             for (uint a = 0; a < 3; ++a)
                                 if (abs(dv[a]) > 1e-12f)
-                                    out = min(out, ((dv[a] > 0.f ? bl[a] + 4.f : bl[a]) - p[a]) / dv[a]);
+                                    out = min(out, ((dv[a] > 0.f ? bl[a] + side : bl[a]) - p[a]) / dv[a]);
                             skipTo += nudge + max(out, 0.f);
                         }
                     }
@@ -14842,4 +14888,53 @@ void domainOccupancy(uint3 id: SV_DispatchThreadID)
             }
     gHSTRCloud.hstrOccupancyOutput[cell] = occupied;
     gHSTRCloud.hstrMajorantZeroOutput[cell] = majorant;
+}
+
+/// cloudLayerRunDistance: the layer-free distance field (hstrDomainLayerDistance), one axis a pass over the whole block grid. The
+/// Chebyshev distance d(p) = min_q max(|p - q|_inf, f(q)) is separable: each pass takes min over its axis' offsets o of
+/// max(|o|, the previous pass's value), starting from f = 0 at blocks holding a layer and the cap elsewhere.
+static const uint kLayerDistanceCap = 16;
+uint domainLayerDistanceAxis(uint3 block, uint axis)
+{
+    const int3 dims = int3(gHSTRCloud.hstrDomainFrame[0].blockDims);
+    if (any(int3(block) >= dims))
+        return kLayerDistanceCap;
+    uint best = kLayerDistanceCap;
+    for (int o = -int(kLayerDistanceCap) + 1; o < int(kLayerDistanceCap); ++o)
+    {
+        int3 c = int3(block);
+        c[axis] += o;
+        if (axis == 1u)
+        {
+            if (c.y < 0 || c.y >= dims.y)
+                continue; // Above and below the domain: no layer.
+        }
+        else
+            c[axis] = c[axis] < 0 ? c[axis] + dims[axis] : (c[axis] >= dims[axis] ? c[axis] - dims[axis] : c[axis]);
+        const uint value = axis == 0u ? (gHSTRCloud.hstrDomainLayers.Load(int4(c, 0)) != 0u ? 0u : kLayerDistanceCap)
+                                      : gHSTRCloud.hstrDomainLayerDistanceInput.Load(int4(c, 0));
+        best = min(best, max(uint(abs(o)), value));
+    }
+    return best;
+}
+
+[numthreads(4, 4, 4)]
+void domainLayerDistanceX(uint3 id: SV_DispatchThreadID)
+{
+    if (all(id < gHSTRCloud.hstrDomainFrame[0].blockDims))
+        gHSTRCloud.hstrDomainLayerDistanceOutput[id] = domainLayerDistanceAxis(id, 0u);
+}
+
+[numthreads(4, 4, 4)]
+void domainLayerDistanceY(uint3 id: SV_DispatchThreadID)
+{
+    if (all(id < gHSTRCloud.hstrDomainFrame[0].blockDims))
+        gHSTRCloud.hstrDomainLayerDistanceOutput[id] = domainLayerDistanceAxis(id, 1u);
+}
+
+[numthreads(4, 4, 4)]
+void domainLayerDistanceZ(uint3 id: SV_DispatchThreadID)
+{
+    if (all(id < gHSTRCloud.hstrDomainFrame[0].blockDims))
+        gHSTRCloud.hstrDomainLayerDistanceOutput[id] = domainLayerDistanceAxis(id, 2u);
 }

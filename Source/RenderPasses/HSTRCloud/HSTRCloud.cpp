@@ -669,6 +669,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayerWrapSelect = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "cloudLayerRunDistance")
+        {
+            mParams.cloudLayerRunDistance = bool(value) ? 1u : 0u;
+            continue;
+        }
         if (key == "beamUnitStart")
         {
             mParams.beamUnitStart = float(value);
@@ -1471,6 +1476,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeReuse"] = mParams.cloudSunBakeReuse;
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
     props["cloudLayerWrapSelect"] = mParams.cloudLayerWrapSelect != 0;
+    props["cloudLayerRunDistance"] = mParams.cloudLayerRunDistance != 0;
     props["beamUnitStart"] = mParams.beamUnitStart;
     props["seaFarCap"] = mParams.seaFarCap;
     props["seaFarFootprint"] = mParams.seaFarFootprint;
@@ -1952,6 +1958,10 @@ Properties HSTRCloud::getProperties() const
             cloud["beamLayerHintQueryLayers"] = mBeamLevelCounts[kBeamLayerRayHint + 1];
             cloud["beamLayerHintUnitWalks"] = mBeamLevelCounts[kBeamLayerRayHint + 2];
             cloud["beamLayerHintUnitLayers"] = mBeamLevelCounts[kBeamLayerRayHint + 3];
+            cloud["beamRunSkipRuns"] = mBeamLevelCounts[kBeamRunSkip];
+            cloud["beamRunSkipBlocks"] = mBeamLevelCounts[kBeamRunSkip + 1];
+            cloud["beamRunSkipCoarseBlocks"] = mBeamLevelCounts[kBeamRunSkip + 2];
+            cloud["beamRunSkipCapped"] = mBeamLevelCounts[kBeamRunSkip + 3];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
@@ -2254,6 +2264,9 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpDomainExtinctionPass = createPass("domainExtinction");
     mpDomainBlocksPass = createPass("domainBlocks");
     mpDomainMajorantPass = createPass("domainMajorant");
+    mpDomainLayerDistancePass[0] = createPass("domainLayerDistanceX");
+    mpDomainLayerDistancePass[1] = createPass("domainLayerDistanceY");
+    mpDomainLayerDistancePass[2] = createPass("domainLayerDistanceZ");
     mpDomainOccupancyPass = createPass("domainOccupancy");
     mpStampSunPass = createPass("stampSunChanges");
     mpResetSunBlocksPass = createPass("resetSunBlocks");
@@ -3069,6 +3082,8 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     ensure(mpExtinction, dims, ResourceFormat::R16Float);
     ensure(mpDomainBlocks, blockDims, ResourceFormat::RG16Float);
     ensure(mpDomainLayers, blockDims, ResourceFormat::R8Uint);
+    ensure(mpDomainLayerDistance, blockDims, ResourceFormat::R8Uint);
+    ensure(mpDomainLayerDistanceTemp, blockDims, ResourceFormat::R8Uint);
     ensure(mpMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpTightMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpOccupancy, occupancyDims, ResourceFormat::R8Uint);
@@ -3104,6 +3119,12 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         bind(mpDomainBlocksPass,
              {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}, {"hstrDomainLayersOutput", mpDomainLayers}});
         bind(mpDomainMajorantPass, {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorantOutput", mpMajorant}, {"hstrTightMajorantOutput", mpTightMajorant}});
+        // The distance field ping-pongs: x (from the layers) into the field, y into the spare, z back into the field.
+        bind(mpDomainLayerDistancePass[0], {{"hstrDomainLayers", mpDomainLayers}, {"hstrDomainLayerDistanceOutput", mpDomainLayerDistance}});
+        bind(mpDomainLayerDistancePass[1],
+             {{"hstrDomainLayerDistanceInput", mpDomainLayerDistance}, {"hstrDomainLayerDistanceOutput", mpDomainLayerDistanceTemp}});
+        bind(mpDomainLayerDistancePass[2],
+             {{"hstrDomainLayerDistanceInput", mpDomainLayerDistanceTemp}, {"hstrDomainLayerDistanceOutput", mpDomainLayerDistance}});
         bind(mpDomainOccupancyPass,
              {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorant", mpMajorant}, {"hstrOccupancyOutput", mpOccupancy}, {"hstrMajorantZeroOutput", mpMajorantZero}});
         bind(mpClearWorldCacheTilesPass, {{"hstrCloudTileReset", mpCloudTileReset}});
@@ -3168,6 +3189,13 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         run("blocks", mpDomainBlocksPass, uint3(blocksWide, blockDims.y, blocksWide * count));
         run("majorant", mpDomainMajorantPass, uint3(majorantWide, blockDims.y, majorantWide * count));
         run("occupancy", mpDomainOccupancyPass, uint3(cellsWide, occupancyDims.y, cellsWide * count));
+    }
+    {
+        // cloudLayerRunDistance: the whole grid's layer-free distance field, once for the batches (a changed tile moves the field
+        // up to 16 blocks around it). Built whether or not the march reads it, so switching it on needs no rebuild.
+        FALCOR_PROFILE(pRenderContext, "layerDistance");
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            mpDomainLayerDistancePass[axis]->execute(pRenderContext, blockDims);
     }
 
     // The occupied vertical band, in world units, dilated by one block to cover the camera majorant's own dilation. A sea ray was
@@ -4416,6 +4444,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     if (mpDomainLayers)
     {
         var["hstrDomainLayers"] = mpDomainLayers; // cloudLayerTightSkip.
+        var["hstrDomainLayerDistance"] = mpDomainLayerDistance; // cloudLayerRunDistance.
         var["hstrDomainBlocks"] = mpDomainBlocks; // Its probe's check that the layer bits agree with the block maxima.
         var["hstrDomainVolume"] = mpDomainVolume; // Its probe's voxel-scale oracle (domainVoxelLayers).
     }
@@ -5064,6 +5093,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_STRIP", "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
 }
 
@@ -6326,6 +6356,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
@@ -6390,6 +6421,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
                     for (uint32_t level = 0; level < mParams.beamLevels; ++level)
@@ -6494,6 +6526,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
@@ -6915,6 +6948,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
@@ -7167,6 +7201,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pMarch->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         pMarch->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
         pMarch->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
+        pMarch->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         // beamUnitStart in the full build too: the motion score's fresh rebuild then marches its units the same way.
         pMarch->getProgram()->addDefine("HSTR_UNIT_START", mParams.beamUnitStart != 0.f ? "1" : "0");
         auto bindMarch = [&]()
