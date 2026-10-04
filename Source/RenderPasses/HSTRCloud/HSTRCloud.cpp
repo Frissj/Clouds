@@ -1842,6 +1842,10 @@ Properties HSTRCloud::getProperties() const
             cloud["beamGuardViolation" + std::to_string(bin)] = mBeamLevelCounts[kBeamGuardViolation + bin];
         for (uint32_t k = 0; k < 4; ++k)
             cloud["beamLayerCache" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerCache + k];
+        for (uint32_t k = 0; k < 7; ++k)
+            cloud["beamLayerCacheCheck" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerCacheCheck + k];
+        for (uint32_t k = 0; k < 32; ++k)
+            cloud["beamLayerCacheMiss" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerCacheCheck + 8 + k];
         {
             const char* layerNames[8] = {"NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2"};
             for (uint32_t k = 0; k < 8; ++k)

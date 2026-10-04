@@ -53,7 +53,13 @@ import Atmosphere;
 static float gLayerEmptyFrom[kCloudSeaLayers];
 static float gLayerEmptyUntil[kCloudSeaLayers];
 static float gLayerEmptyVoxels[kCloudSeaLayers];
+static float gLayerEmptyAnswer[kCloudSeaLayers]; ///< The exit a lookup inside [from, until) returns (until may end sooner).
 static bool gLayerEmptyTaps; ///< Set around marchBeamLean's rim taps: they sample at the main sample's footprint, so they neither read nor set.
+static bool gLayerCheck;         ///< cloudLayerEmptyCache 2: this lookup is one the cache would have answered (compared, not used).
+static float gLayerCheckUntil;   ///< The cached interval's end it would have answered with.
+static float gLayerCheckVoxels;  ///< The cached voxel size.
+static uint gLayerEmptyKind[kCloudSeaLayers]; ///< What each held interval came from: 0 empty square, 1 outside the asset box, 2 octant box, 3 cell run.
+static uint gLayerCheckKind;     ///< The held interval's kind, for layerCacheCheck.
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
@@ -7360,13 +7366,46 @@ struct HSTRCloudRenderer
     /// its square's exit or its cloud's entry (cloudLayerNoneExit), so no skip passes over another layer's density.
     /// cloudLayerEmptyCache: keeps [from, until) as the interval over which this layer reads nothing, with the voxel size it reported
     /// (negative: none). Not from the rim taps, which read at another sample's footprint.
-    void keepLayerEmpty(uint layer, float from, float until, float voxels)
+    /// DIAGNOSTIC (cloudLayerEmptyCache 2): a lookup the cache would have answered, by what the fresh lookup found (kBeamLayerCacheCheck):
+    /// 0 density, 1 the proxy, 2 empty with the same exit (within 1e-5 relative) and voxel size, 3 an exit within 1e-3, 4 a farther
+    /// exit, 5 a nearer exit, 6 the same exit but another voxel size. kind: 0 density, 1 proxy, 2 empty with exit and voxels.
+    /// Then (kBeamLayerCacheCheck + 8): the farther and nearer exits by the held interval's kind and the fresh one's (4 x 4 each,
+    /// farther first; kinds as gLayerEmptyKind).
+    void layerCacheCheck(uint kind, float exit, float voxels, uint freshKind = 0u)
+    {
+        if (!gLayerCheck)
+            return;
+        gLayerCheck = false;
+        uint bin = kind;
+        uint unused;
+        if (kind == 2u)
+        {
+            const float tolerance = max(abs(gLayerCheckUntil), 1.f);
+            const float d = exit - gLayerCheckUntil;
+            if (abs(d) <= 1e-5f * tolerance)
+                bin = abs(voxels - gLayerCheckVoxels) <= 1e-6f * max(abs(voxels), 1.f) ? 2u : 6u;
+            else if (abs(d) <= 1e-3f * tolerance)
+                bin = 3u;
+            else
+            {
+                bin = d > 0.f ? 4u : 5u;
+                InterlockedAdd(hstrBeamCounts[kBeamLayerCacheCheck + 8u + (d > 0.f ? 0u : 16u) + 4u * gLayerCheckKind + freshKind], 1u, unused);
+            }
+        }
+        InterlockedAdd(hstrBeamCounts[kBeamLayerCacheCheck + bin], 1u, unused);
+    }
+
+    /// until: how far the answer holds; answer: the exit a lookup there returns (an octant box reaching past the asset box answers
+    /// its own exit only while the ray is still inside the asset).
+    void keepLayerEmpty(uint layer, float from, float until, float answer, float voxels, uint kind)
     {
         if (params.cloudLayerEmptyCache == 0u || gLayerEmptyTaps)
             return;
         gLayerEmptyFrom[layer] = from;
         gLayerEmptyUntil[layer] = until;
+        gLayerEmptyAnswer[layer] = answer;
         gLayerEmptyVoxels[layer] = voxels;
+        gLayerEmptyKind[layer] = kind;
     }
 
     float leanExtinctionLayered(CutRay ray, float3 v, float footprint, float tSample, float proxy, inout float fineVoxels, out LeanHit hit,
@@ -7395,11 +7434,21 @@ struct HSTRCloudRenderer
                     InterlockedAdd(hstrBeamCounts[kBeamLayerCache + 2u * layer + 1u], 1u, unused);
             }
 #endif
-            if (params.cloudLayerEmptyCache != 0u && !gLayerEmptyTaps && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
+            gLayerCheck = false;
+            if (params.cloudLayerEmptyCache == 2u && !gLayerEmptyTaps && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
+            {
+                // DIAGNOSTIC: look the layer up anyway and compare (layerCacheCheck below).
+                gLayerCheck = true;
+                gLayerCheckUntil = gLayerEmptyAnswer[layer];
+                gLayerCheckVoxels = gLayerEmptyVoxels[layer];
+                gLayerCheckKind = gLayerEmptyKind[layer];
+            }
+            else if ((params.cloudLayerEmptyCache == 1u || params.cloudLayerEmptyCache == 3u) && !gLayerEmptyTaps &&
+                     tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
             {
                 // Inside the interval this layer's last lookup proved empty: the same answer without the lookup. Its exit is an
                 // absolute ray parameter, so a later sample in the same box or square reads the same one.
-                exit = min(exit, gLayerEmptyUntil[layer]);
+                exit = min(exit, gLayerEmptyAnswer[layer]);
                 if (gLayerEmptyVoxels[layer] > 0.f)
                 {
                     fineVoxels = resolved ? min(fineVoxels, gLayerEmptyVoxels[layer]) : gLayerEmptyVoxels[layer];
@@ -7418,6 +7467,7 @@ struct HSTRCloudRenderer
 #endif
                 if (instance.scale > 0.f)
                 {
+                    layerCacheCheck(1u, 0.f, 0.f);
                     // The proxy answers for this layer, and so for the sample.
                     skipTo = -1.f;
                     hit.entry = kCloudRefNone;
@@ -7431,7 +7481,8 @@ struct HSTRCloudRenderer
 #endif
                 exit = min(exit, none);
                 // An empty square: nothing there until the ray leaves it.
-                keepLayerEmpty(layer, tSample, none, -1.f);
+                layerCacheCheck(2u, none, -1.f, 0u);
+                keepLayerEmpty(layer, tSample, none, none, -1.f, 0u);
                 continue;
             }
             const uint3 dims = hstrCloudAssets[instance.asset].dims;
@@ -7453,7 +7504,8 @@ struct HSTRCloudRenderer
                     const float proxyFootprint = instance.sourceVoxelWorld * pow(2.f, max(instance.proxyLevel - params.cloudLodBias, 0.f));
                     until = min(until, (proxyFootprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength);
                 }
-                keepLayerEmpty(layer, tSample, until, -1.f);
+                layerCacheCheck(2u, until, -1.f, 1u);
+                keepLayerEmpty(layer, tSample, until, until, -1.f, 1u);
                 continue;
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
@@ -7471,6 +7523,7 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[4];
 #endif
+                layerCacheCheck(1u, 0.f, 0.f);
                 skipTo = -1.f;
                 hit.entry = kCloudRefNone;
                 fineVoxels = 1.f;
@@ -7498,13 +7551,44 @@ struct HSTRCloudRenderer
 #endif
                 exit = min(exit, empty);
                 // An empty box: its exit is already cut where the footprint reaches the next level (cloudEmptyExitOf).
-                keepLayerEmpty(layer, tSample, empty, voxels);
+                layerCacheCheck(2u, empty, voxels, sample.cell ? 3u : 2u);
+                // Only a box that holds the sample: one in a skirt zone outside its shrunk octant box gets an exit that depends on
+                // where in the zone it stands, which a later sample in the same zone does not share (layercheck1).
+                // And only up to the ray's exit from the asset box: a coarse brick's octant reaches past the asset's dims (the page
+                // grid rounds up), and a later sample there takes the out-of-box path with another exit (layercheck3: 8.1k farther,
+                // 2.8k nearer of 5.25M answers).
+                // cloudLayerEmptyCache 3: only the out-of-box and empty-square intervals, none of this per-box exit math.
+                if ((params.cloudLayerEmptyCache == 1u || params.cloudLayerEmptyCache == 2u) &&
+                    (sample.cell || (all(x >= sample.lo) && all(x <= sample.hi))))
+                {
+                    const float3 dv = ray.direction * float(params.hstrCellWidth);
+                    const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
+                    float leave = 1e30f;
+                    [unroll]
+                    for (uint a = 0; a < 3; ++a)
+                        if (abs(dx[a]) > 1e-12f)
+                            leave = min(leave, ((dx[a] > 0.f ? float(dims[a]) - 0.5f : -0.5f) - x[a]) / dx[a]);
+                    // And the layer's square: past it cloudInstanceAt picks the neighbouring square's instance (layercheck4).
+                    const float tileVoxels = float(params.cloudTileVoxels);
+                    const float shift = 0.5f * tileVoxels * float(layer);
+                    const float2 squareLo = floor((v.xz + 0.5f - shift) / tileVoxels) * tileVoxels + shift - 0.5f;
+                    [unroll]
+                    for (uint a = 0; a < 2; ++a)
+                    {
+                        const float d = a == 0 ? dv.x : dv.z;
+                        const float p = a == 0 ? v.x : v.z;
+                        if (abs(d) > 1e-12f)
+                            leave = min(leave, ((d > 0.f ? squareLo[a] + tileVoxels : squareLo[a]) - p) / d);
+                    }
+                    keepLayerEmpty(layer, tSample, min(empty, tSample + max(leave, 0.f)), empty, voxels, sample.cell ? 3u : 2u);
+                }
                 continue;
             }
 #if HSTR_LAYER_PROBE
             ++gLayerProbe[3];
             ++denseLayers;
 #endif
+            layerCacheCheck(0u, 0.f, 0.f);
             exit = -1.f; // Density here: no skip.
             const float d = cloudSampleDensity(sample, proxy, scale);
             density += d;

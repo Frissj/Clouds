@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 364;
+static const uint kBeamCountSlots = 404;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -118,6 +118,9 @@ static const uint kBeamGuardViolation = 352;
 /// beamLayerProbe with cloudLayerEmptyCache: per layer (two slots each, layers 0-1), the lean march's main-sample visits of that
 /// layer and the visits its empty interval answered.
 static const uint kBeamLayerCache = 360;
+/// cloudLayerEmptyCache 2: what a fresh lookup found where the cache would have answered (layerCacheCheck): density, proxy, same,
+/// exit within 1e-3, farther, nearer, same exit with another voxel size.
+static const uint kBeamLayerCacheCheck = 364;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.

@@ -42,6 +42,7 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # beamGuardMotion: blocks listed by first failing pyramid level, by the zoom cap; held that the isotropic bound would list.
          tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardRescued", "beamGuardHeld", "beamDirtySkipped", "beamDirtySkippedTravel") +
          tuple(f"beamGuardViolation{bin}" for bin in range(8)) + tuple(f"beamLayerCache{k}" for k in range(4)) +
+         tuple(f"beamLayerCacheCheck{k}" for k in range(7)) + tuple(f"beamLayerCacheMiss{k}" for k in range(32)) +
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, and density samples by layers with density.
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2")) +
          # The navigation probe (kBeamNavProbe in HSTRCloudTypes.slang has the layout).
