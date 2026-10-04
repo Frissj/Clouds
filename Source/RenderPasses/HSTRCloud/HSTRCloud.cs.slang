@@ -63,6 +63,7 @@ static uint gLayerBlockDenseSum; ///< ... whose block has no layer bit at all (+
 static uint gLayerBlockDenseEdge; ///< ... 7+ sea tiles from the ray's origin (+ 12).
 static uint gLayerMissBins[4];    ///< ... by density under 1% / under 1x / over the thin bound, and fading bricks (+ 13 .. 16).
 static uint gLayerMissLevels[4];  ///< ... by brick level 0-1, 2, 3, 4+ (+ 17 .. 20).
+static uint gLayerSplit[16];      ///< kBeamLayerSplit: per layer, visits by what answered; layer 1's after a dense layer 0.
 static bool gLayerPrevTight;
 #endif
 #ifndef HSTR_STRIP
@@ -5341,6 +5342,8 @@ struct HSTRCloudRenderer
             gLayerMissBins[k] = 0;
             gLayerMissLevels[k] = 0;
         }
+        for (uint k = 0; k < 16; ++k)
+            gLayerSplit[k] = 0;
         gLayerPrevTight = false;
 #endif
         CutRay ray;
@@ -5373,6 +5376,15 @@ struct HSTRCloudRenderer
             {
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[kBeamLayerProbe + k], sum, unused);
+            }
+        }
+        for (uint k = 0; k < 16; ++k)
+        {
+            const uint sum = WaveActiveSum(gLayerSplit[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamLayerSplit + k], sum, unused);
             }
         }
         // kBeamLayerSteps: a wave pays its longest lane, so step counts and step cost separate on these.
@@ -7354,6 +7366,7 @@ struct HSTRCloudRenderer
         bool resolved = false;
 #if HSTR_LAYER_PROBE
         uint denseLayers = 0;
+        bool layer0Dense = false;
 #endif
 #if HSTR_LAYER_PROBE
         const bool probeTight = true;
@@ -7466,11 +7479,17 @@ struct HSTRCloudRenderer
 #endif
             if (params.cloudLayerTightSkip >= 2u && layerEmpty)
             {
+#if HSTR_LAYER_PROBE
+                ++gLayerSplit[layer * 7u];
+#endif
                 exit = min(exit, blockExit);
                 continue;
             }
             if (params.cloudLayerTightSkip >= 4u && (voxelMask & (1u << layer)) == 0u)
             {
+#if HSTR_LAYER_PROBE
+                ++gLayerSplit[layer * 7u + 1u];
+#endif
                 const float3 s = seaVoxel(v);
                 const float3 lo = floor(s + 0.5f) - 0.5f;
                 const float3 dv = ray.direction * float(params.hstrCellWidth);
@@ -7490,6 +7509,7 @@ struct HSTRCloudRenderer
             {
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[instance.scale > 0.f ? 4 : 0];
+                ++gLayerSplit[layer * 7u + (instance.scale > 0.f ? 6u : 2u)];
 #endif
                 if (instance.scale > 0.f)
                 {
@@ -7508,6 +7528,7 @@ struct HSTRCloudRenderer
             {
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[1];
+                ++gLayerSplit[layer * 7u + 3u];
 #endif
                 exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
                 continue;
@@ -7523,6 +7544,7 @@ struct HSTRCloudRenderer
             {
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[4];
+                ++gLayerSplit[layer * 7u + 6u];
 #endif
                 skipTo = -1.f;
                 hit.entry = kCloudRefNone;
@@ -7536,6 +7558,8 @@ struct HSTRCloudRenderer
             {
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[2];
+                ++gLayerSplit[layer * 7u + 4u];
+                gLayerSplit[14] += layer == 1u && layer0Dense ? 1u : 0u;
                 // ORACLE: a brick walk that ends empty where the layer's per-voxel bits over the sample's trilinear voxels are clear
                 // - what a voxel-scale layer mask would skip.
                 gLayerVoxelEmpty += (domainVoxelLayers(v) & (1u << layer)) == 0u ? 1u : 0u;
@@ -7545,6 +7569,9 @@ struct HSTRCloudRenderer
             }
 #if HSTR_LAYER_PROBE
             ++gLayerProbe[3];
+            ++gLayerSplit[layer * 7u + 5u];
+            gLayerSplit[15] += layer == 1u && layer0Dense ? 1u : 0u;
+            layer0Dense = layer0Dense || layer == 0u;
             gLayerVoxelDense += (domainVoxelLayers(v) & (1u << layer)) == 0u ? 1u : 0u; // Sanity: must be 0.
             // Density in a block whose layer bit is clear: what cloudLayerTightSkip would drop (must be 0 for it to be exact).
             gLayerBlockDense += (layerMask & (1u << layer)) == 0u ? 1u : 0u;

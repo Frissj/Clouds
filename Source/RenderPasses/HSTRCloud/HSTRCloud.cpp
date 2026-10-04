@@ -1889,6 +1889,12 @@ Properties HSTRCloud::getProperties() const
             cloud["beamLayerBlockDenseEdge"] = mBeamLevelCounts[kBeamLayerSteps + 12];
             for (uint32_t k = 0; k < 8; ++k)
                 cloud["beamLayerMiss" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerSteps + 13 + k];
+            const char* splitNames[7] = {"BlockSkip", "VoxelSkip", "NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy"};
+            for (uint32_t layer = 0; layer < 2; ++layer)
+                for (uint32_t k = 0; k < 7; ++k)
+                    cloud["beamSplit" + std::to_string(layer) + splitNames[k]] = mBeamLevelCounts[kBeamLayerSplit + 7 * layer + k];
+            cloud["beamSplit1EmptyAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 14];
+            cloud["beamSplit1DenseAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 15];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];

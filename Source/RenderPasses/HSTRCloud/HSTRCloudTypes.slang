@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 296;
+static const uint kBeamCountSlots = 312;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -90,6 +90,16 @@ static const uint kBeamLayerProbe = 264;
 /// then ORACLES: brick walks ending empty whose layer's bits over the sample's 2^3 domain voxels are clear, density samples with
 /// them clear (must be 0), and tight-zero samples right after a tight-zero sample.
 static const uint kBeamLayerSteps = 272;
+/// beamLayerProbe, per layer (7 each, layer 0 then 1): leanExtinctionLayered's layer visits by what answered - skipped by the
+/// block's layer bit, skipped by the voxel's, no cloud in the square, outside the asset box, brick empty, density, proxy - then
+/// layer 1's brick-empty and density lookups at samples where layer 0 had density.
+/// MEASURED (split2, 4K sunset walk, cloudLayerTightSkip 4, per frame): layer 0 / 1 - block skip 2.80M / 3.30M, voxel skip 1.17M /
+/// 0.99M, outside the asset 26k / 34k, brick empty 1.29M / 1.09M, density 1.16M / 1.03M, no cloud and proxy 0. Layer 1 is half
+/// the sea's content, not overhead: its 2.15M lookups are 48% density, 51% proving emptiness, as layer 0's. The layers barely
+/// overlap: where layer 0 had density layer 1 was looked up 23k times (6.4k dense). One layer read (cloudLayersRead 1, the
+/// unlayered path): 9.49M lane steps / 11.94M paid against two layers' 7.70M / 10.45M - more steps (no layer-mask run skips), yet
+/// ~1.1 ms cheaper (fused2), so a two-layer step costs ~1.7x: the per-step mask loads and the second layer's brick walks.
+static const uint kBeamLayerSplit = 296;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.

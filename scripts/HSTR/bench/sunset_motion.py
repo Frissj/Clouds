@@ -47,7 +47,11 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2",
                                          "LaneSteps", "PaidSteps", "Warps", "TightZero", "MaskMismatch", "MaskEmpty0", "MaskEmpty1",
                                          "VoxelEmpty", "VoxelDense", "TightRun", "BlockDense", "BlockDenseSum", "BlockDenseEdge",
-                                         "Miss0", "Miss1", "Miss2", "Miss3", "Miss4", "Miss5", "Miss6", "Miss7")))
+                                         "Miss0", "Miss1", "Miss2", "Miss3", "Miss4", "Miss5", "Miss6", "Miss7")) +
+         # ... per layer by what answered, and layer 1's lookups after a dense layer 0.
+         tuple(f"beamSplit{layer}{n}" for layer in (0, 1)
+               for n in ("BlockSkip", "VoxelSkip", "NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy")) +
+         ("beamSplit1EmptyAfterDense", "beamSplit1DenseAfterDense"))
 
 
 def score():
