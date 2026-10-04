@@ -44,7 +44,9 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, density samples by layers with density, and the
          # marches' lane steps, warp-paid steps and warps.
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2",
-                                         "LaneSteps", "PaidSteps", "Warps")))
+                                         "LaneSteps", "PaidSteps", "Warps", "TightZero", "MaskMismatch", "MaskEmpty0", "MaskEmpty1",
+                                         "VoxelEmpty", "VoxelDense", "TightRun", "BlockDense", "BlockDenseSum", "BlockDenseEdge",
+                                         "Miss0", "Miss1", "Miss2", "Miss3", "Miss4", "Miss5", "Miss6", "Miss7")))
 
 
 def score():

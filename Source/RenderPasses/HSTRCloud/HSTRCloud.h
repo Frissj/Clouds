@@ -779,6 +779,7 @@ private:
     // The sea's domain proxy on the GPU (uploadDomainExtinction).
     ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
     ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
+    ref<Texture> mpDomainLayers; ///< Per majorant block: bit L where layer L has density over that support (R8Uint).
     ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).
     ref<Buffer> mpDomainFrame;
     ref<Buffer> mpDomainStaged;  ///< One batch of packed tile volumes, copied from the staging buffers.

@@ -629,6 +629,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayers = std::clamp(uint32_t(value), 1u, uint32_t(kCloudSeaLayers));
             continue;
         }
+        if (key == "cloudLayerTightSkip")
+        {
+            mParams.cloudLayerTightSkip = uint32_t(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1382,6 +1387,7 @@ Properties HSTRCloud::getProperties() const
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
+    props["cloudLayerTightSkip"] = mParams.cloudLayerTightSkip;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -1811,6 +1817,18 @@ Properties HSTRCloud::getProperties() const
             cloud["beamLayerLaneSteps"] = mBeamLevelCounts[kBeamLayerSteps];
             cloud["beamLayerPaidSteps"] = mBeamLevelCounts[kBeamLayerSteps + 1];
             cloud["beamLayerWarps"] = mBeamLevelCounts[kBeamLayerSteps + 2];
+            cloud["beamLayerTightZero"] = mBeamLevelCounts[kBeamLayerSteps + 3];
+            cloud["beamLayerMaskMismatch"] = mBeamLevelCounts[kBeamLayerSteps + 4];
+            cloud["beamLayerMaskEmpty0"] = mBeamLevelCounts[kBeamLayerSteps + 5];
+            cloud["beamLayerMaskEmpty1"] = mBeamLevelCounts[kBeamLayerSteps + 6];
+            cloud["beamLayerVoxelEmpty"] = mBeamLevelCounts[kBeamLayerSteps + 7];
+            cloud["beamLayerVoxelDense"] = mBeamLevelCounts[kBeamLayerSteps + 8];
+            cloud["beamLayerTightRun"] = mBeamLevelCounts[kBeamLayerSteps + 9];
+            cloud["beamLayerBlockDense"] = mBeamLevelCounts[kBeamLayerSteps + 10];
+            cloud["beamLayerBlockDenseSum"] = mBeamLevelCounts[kBeamLayerSteps + 11];
+            cloud["beamLayerBlockDenseEdge"] = mBeamLevelCounts[kBeamLayerSteps + 12];
+            for (uint32_t k = 0; k < 8; ++k)
+                cloud["beamLayerMiss" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerSteps + 13 + k];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
@@ -2926,6 +2944,7 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     ensure(mpDomainVolume, dims, ResourceFormat::RG16Float);
     ensure(mpExtinction, dims, ResourceFormat::R16Float);
     ensure(mpDomainBlocks, blockDims, ResourceFormat::RG16Float);
+    ensure(mpDomainLayers, blockDims, ResourceFormat::R8Uint);
     ensure(mpMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpTightMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpOccupancy, occupancyDims, ResourceFormat::R8Uint);
@@ -2958,7 +2977,8 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
                     var[name] = pResource->asBuffer();
         };
         bind(mpDomainExtinctionPass, {{"hstrDomainStaged", mpDomainStaged}, {"hstrDomainVolumeOutput", mpDomainVolume}, {"hstrExtinctionOutput", mpExtinction}});
-        bind(mpDomainBlocksPass, {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}});
+        bind(mpDomainBlocksPass,
+             {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}, {"hstrDomainLayersOutput", mpDomainLayers}});
         bind(mpDomainMajorantPass, {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorantOutput", mpMajorant}, {"hstrTightMajorantOutput", mpTightMajorant}});
         bind(mpDomainOccupancyPass,
              {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorant", mpMajorant}, {"hstrOccupancyOutput", mpOccupancy}, {"hstrMajorantZeroOutput", mpMajorantZero}});
@@ -4221,6 +4241,12 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrExtinction"] = mpExtinction;
     var["hstrMajorant"] = mpMajorant;
     var["hstrTightMajorant"] = mpTightMajorant;
+    if (mpDomainLayers)
+    {
+        var["hstrDomainLayers"] = mpDomainLayers; // cloudLayerTightSkip.
+        var["hstrDomainBlocks"] = mpDomainBlocks; // Its probe's check that the layer bits agree with the block maxima.
+        var["hstrDomainVolume"] = mpDomainVolume; // Its probe's voxel-scale oracle (domainVoxelLayers).
+    }
     var["hstrOccupancy"] = mpOccupancy;
     var["hstrMajorantZero"] = mpMajorantZero;
     var["hstrTransferProbeOutput"] = mpTransferProbe;

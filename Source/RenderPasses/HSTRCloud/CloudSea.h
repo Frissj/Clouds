@@ -69,7 +69,8 @@ public:
         };
         std::vector<float> mean; ///< Mean density (the residency's visibility reads it).
         /// The GPU upload, converted on the worker, per voxel: float16 mean in the low bits, and above it the float16 conservative
-        /// maximum over the voxel's footprint, rounded up (the RG16 texel layout).
+        /// maximum over the voxel's footprint, rounded up (the RG16 texel layout). Both are non-negative, so their sign bits carry
+        /// which layers have a non-zero maximum there: the mean's layer 0, the maximum's layer 1 (domainExtinction strips them).
         std::vector<uint32_t> packed;
         Upload upload = Upload::Zero;
         int32_t staged = -1;
@@ -132,8 +133,9 @@ private:
 
     Tile makeTile(int2 world, uint32_t layer) const;
     Result rasterize(const Job& job, TileStaging* pStaging) const;
-    /// Adds a cloud's proxy density over the square at squareCorner (a domain slot's) to its voxels' means and maxima.
-    void accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima) const;
+    /// Adds a cloud's proxy density over the square at squareCorner (a domain slot's) to its voxels' means and maxima, and marks its
+    /// layer's bit in layers where its maximum is non-zero.
+    void accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima, std::vector<uint8_t>& layers) const;
     void apply(Result& result);
     void discard(TileVolume& volume);
     void worker();

@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 276;
+static const uint kBeamCountSlots = 296;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -84,7 +84,11 @@ static const uint kBeamLayerProbe = 264;
 /// Caching each layer's last empty interval along the ray is exact (bit-identical on the path-traced gate) but saves no time: it
 /// skips the cheap out-of-box lookups, not the brick walks that end on an empty brick. The second layer costs per step (two
 /// layers 1867 lane steps a warp, one layer 1859), not in extra steps.
-/// beamLayerProbe, over the same marches: lane steps, warp-paid steps (longest lane x active lanes), warps.
+/// beamLayerProbe, over the same marches: lane steps, warp-paid steps (longest lane x active lanes), warps, and the layered samples
+/// whose undilated majorant block is zero (cloudLayerTightSkip's share, counted whether it is on or not), of those whose layer bits
+/// disagree with the block maximum (must be 0), and the layer 0 / 1 visits whose layer bit is clear (cloudLayerTightSkip 2's share);
+/// then ORACLES: brick walks ending empty whose layer's bits over the sample's 2^3 domain voxels are clear, density samples with
+/// them clear (must be 0), and tight-zero samples right after a tight-zero sample.
 static const uint kBeamLayerSteps = 272;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
@@ -1509,6 +1513,22 @@ struct HSTRCloudParams
     uint compareSquaredPad0 = 0;
     uint compareSquaredPad1 = 0;
     uint compareSquaredPad2 = 0;
+    /// The lean layered march reads the layers with density in the sample's undilated majorant block (hstrDomainLayers, from the
+    /// conservative maxima the majorants are built from, widened in CloudSea::accumulate by the coarsest brick level's reach).
+    /// 1: a block with none is empty to its exit, without a lookup. 2: also a layer without its bit is skipped, empty to the
+    /// block's exit. 3: 2, and a block with none skips on through up to 8 more such blocks. 0: off. Shipped at 3
+    /// (IntelCloudSeaHalf.py has the numbers).
+    /// MEASURED (tight3 / tight5, 4K sunset walk, units + query): mode 1 -0.6 to -1.0 ms, mode 2 -1.0 ms; mode 1 alone removes
+    /// 25% of samples' lookups, mode 2 then 96% of the out-of-box ones and 14% of the brick walks that end empty. The 4.86M brick
+    /// walks left end empty inside blocks where their layer has density: finer than the 4-voxel block. 22% of lane steps were
+    /// tight-zero samples right after another (tight8): mode 3 takes 4.84 -> 4.59 ms (tight16).
+    /// Not exact: density samples in blocks whose layer bit is clear (probe BlockDense) 9954 of 2.36M with the maxima's one-voxel
+    /// margin (all at levels 2-4), 1895 with the reach margin, 374 dilated by a voxel more (tight12-14) - see domainBlocks.
+    /// The per-voxel layer bits ride the packed domain upload's float16 sign bits (CloudSea::TileVolume::packed), at no upload cost.
+    uint cloudLayerTightSkip = 0;
+    uint cloudLayerTightSkipPad0 = 0;
+    uint cloudLayerTightSkipPad1 = 0;
+    uint cloudLayerTightSkipPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

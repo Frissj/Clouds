@@ -52,6 +52,18 @@ import Atmosphere;
 #endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
+static uint gLayerTightZero; ///< This thread's layered samples in an undilated zero block (kBeamLayerSteps + 3).
+static uint gLayerMaskMismatch; ///< ... whose layer bits disagree with the block maximum (kBeamLayerSteps + 4; must be 0).
+static uint gLayerMaskEmpty[2]; ///< ... layer visits whose layer bit is clear (kBeamLayerSteps + 5, + 6).
+static uint gLayerVoxelEmpty;   ///< ORACLE: brick walks ending empty whose layer's voxel bits are clear (kBeamLayerSteps + 7).
+static uint gLayerVoxelDense;   ///< ... density samples whose layer's voxel bits are clear (+ 8; must be 0).
+static uint gLayerTightRun;     ///< ORACLE: tight-zero samples right after a tight-zero sample (+ 9).
+static uint gLayerBlockDense;   ///< Density samples whose layer's block bit is clear (+ 10; must be 0).
+static uint gLayerBlockDenseSum; ///< ... whose block has no layer bit at all (+ 11).
+static uint gLayerBlockDenseEdge; ///< ... 7+ sea tiles from the ray's origin (+ 12).
+static uint gLayerMissBins[4];    ///< ... by density under 1% / under 1x / over the thin bound, and fading bricks (+ 13 .. 16).
+static uint gLayerMissLevels[4];  ///< ... by brick level 0-1, 2, 3, 4+ (+ 17 .. 20).
+static bool gLayerPrevTight;
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -350,8 +362,12 @@ struct HSTRCloudRenderer
     Texture3D<uint> hstrOccupancy;      ///< 1 where a 16-voxel block holds any extinction.
     Texture3D<uint> hstrMajorantZero;   ///< 0 where every majorant block of a 16-voxel block is zero (camera marches cross it at once).
     // The sea's domain proxy, built on the GPU (HSTRCloudDomainFrame).
-    Texture3D<float2> hstrDomainVolume;                 ///< Per domain voxel: unscaled mean density and conservative maximum.
+    /// Per domain voxel: unscaled mean density and conservative maximum; their signs are the layers there (bit 0 x, bit 1 y), so
+    /// readers take abs.
+    Texture3D<float2> hstrDomainVolume;
     Texture3D<float2> hstrDomainBlocks;                 ///< Per majorant block: unscaled maximum and mean over its trilinear support.
+    Texture3D<uint> hstrDomainLayers;                   ///< Per majorant block: bit L where layer L has density (cloudLayerTightSkip).
+    RWTexture3D<uint> hstrDomainLayersOutput;
     RWTexture3D<float2> hstrDomainVolumeOutput;
     StructuredBuffer<uint> hstrDomainStaged;            ///< Packed volumes of a batch's slots (CloudSea::TileVolume::packed).
     RWTexture3D<float> hstrExtinctionOutput;
@@ -1611,6 +1627,27 @@ struct HSTRCloudRenderer
         v = seaVoxel(v);
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
         return hstrMajorant.Load(int4(block, 0));
+    }
+
+    /// The layers with density over the 3^3 domain voxels around the one nearest v (the hstrDomainVolume signs). Probe builds only
+    /// (the cloudLayerTightSkip oracle). The 2^3 voxels floor(v) .. floor(v) + 1 were not enough: 2876 density samples had their
+    /// layer's bits clear there (tight7, 0.13%).
+    uint domainVoxelLayers(float3 v)
+    {
+        const int3 base = int3(floor(seaVoxel(v) + 0.5f)) - 1;
+        const int3 dims = int3(params.hstrExtinctionDims);
+        uint layers = 0u;
+        for (uint corner = 0; corner < 27u; ++corner)
+        {
+            int3 p = base + int3(corner % 3u, (corner / 3u) % 3u, corner / 9u);
+            if (p.y < 0 || p.y >= dims.y)
+                continue;
+            p.x = (p.x % dims.x + dims.x) % dims.x;
+            p.z = (p.z % dims.z + dims.z) % dims.z;
+            const float2 value = hstrDomainVolume.Load(int4(p, 0));
+            layers |= (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
+        }
+        return layers;
     }
 
     /// Upper bound on the trilinear extinction inside v's majorant block (for delta and ratio tracking, which re-read it at
@@ -5250,6 +5287,22 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
+        gLayerTightZero = 0;
+        gLayerMaskMismatch = 0;
+        gLayerMaskEmpty[0] = 0;
+        gLayerMaskEmpty[1] = 0;
+        gLayerVoxelEmpty = 0;
+        gLayerVoxelDense = 0;
+        gLayerTightRun = 0;
+        gLayerBlockDense = 0;
+        gLayerBlockDenseSum = 0;
+        gLayerBlockDenseEdge = 0;
+        for (uint k = 0; k < 4; ++k)
+        {
+            gLayerMissBins[k] = 0;
+            gLayerMissLevels[k] = 0;
+        }
+        gLayerPrevTight = false;
 #endif
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
@@ -5286,12 +5339,43 @@ struct HSTRCloudRenderer
         // kBeamLayerSteps: a wave pays its longest lane, so step counts and step cost separate on these.
         const uint laneSteps = WaveActiveSum(steps);
         const uint paidSteps = WaveActiveMax(steps) * WaveActiveCountBits(true);
+        const uint tightZero = WaveActiveSum(gLayerTightZero);
+        const uint mismatch = WaveActiveSum(gLayerMaskMismatch);
+        const uint empty0 = WaveActiveSum(gLayerMaskEmpty[0]);
+        const uint empty1 = WaveActiveSum(gLayerMaskEmpty[1]);
+        const uint voxelEmpty = WaveActiveSum(gLayerVoxelEmpty);
+        const uint voxelDense = WaveActiveSum(gLayerVoxelDense);
+        const uint tightRun = WaveActiveSum(gLayerTightRun);
+        const uint blockDense = WaveActiveSum(gLayerBlockDense);
+        const uint blockDenseSum = WaveActiveSum(gLayerBlockDenseSum);
+        const uint blockDenseEdge = WaveActiveSum(gLayerBlockDenseEdge);
         if (WaveIsFirstLane())
         {
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps], laneSteps, unused);
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 1u], paidSteps, unused);
             InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 2u], 1u, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 3u], tightZero, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 4u], mismatch, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 5u], empty0, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 6u], empty1, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 7u], voxelEmpty, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 8u], voxelDense, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 9u], tightRun, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 10u], blockDense, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 11u], blockDenseSum, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 12u], blockDenseEdge, unused);
+        }
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint bin = WaveActiveSum(gLayerMissBins[k]);
+            const uint level = WaveActiveSum(gLayerMissLevels[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 13u + k], bin, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 17u + k], level, unused);
+            }
         }
 #endif
         return result;
@@ -5471,7 +5555,7 @@ struct HSTRCloudRenderer
         const float3 at = float3(cell + offset);
         if (at.y < 0.f || at.y >= float(params.hstrExtinctionDims.y))
             return false;
-        return hstrDomainVolume.Load(int4(int3(cellViewKey(at)), 0)).y > 0.f;
+        return abs(hstrDomainVolume.Load(int4(int3(cellViewKey(at)), 0)).y) > 0.f;
     }
 
     /// One texel of cell's view in slot: the build camera's ray through it, marched along its chord of the cell.
@@ -5652,7 +5736,7 @@ struct HSTRCloudRenderer
             if (index < params.pushCandidateCapacity)
                 hstrPushCandidates[index] = key.x + dims.x * (key.y + dims.y * key.z);
         }
-        const bool own = occupied && hstrDomainVolume.Load(int4(int3(key), 0)).y > 0.f;
+        const bool own = occupied && abs(hstrDomainVolume.Load(int4(int3(key), 0)).y) > 0.f;
         const uint owned = WaveActiveCountBits(own);
         if (WaveIsFirstLane() && owned != 0u)
         {
@@ -7232,11 +7316,82 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
         uint denseLayers = 0;
 #endif
+#if HSTR_LAYER_PROBE
+        const bool probeTight = true;
+#else
+        const bool probeTight = false;
+#endif
+        // cloudLayerTightSkip: the layers with density in v's undilated majorant block (hstrDomainLayers, from the same conservative
+        // maxima the majorants are built from). 1: none - empty to the block's exit, without a lookup. 2: also each layer without its
+        // bit is empty to the block's exit without its lookup.
+        uint layerMask = ~0u;
+        float blockExit = 1e30f;
+        if (params.cloudLayerTightSkip != 0u || probeTight)
+        {
+            const float3 s = seaVoxel(v);
+            const int3 block = int3(floor(s * 0.25f));
+            if (all(block >= 0) && all(block < int3(params.hstrMajorantDims)))
+            {
+                layerMask = hstrDomainLayers.Load(int4(block, 0));
+#if HSTR_LAYER_PROBE
+                gLayerTightZero += layerMask == 0u ? 1u : 0u;
+                gLayerMaskMismatch += (layerMask == 0u) != (hstrDomainBlocks.Load(int4(block, 0)).x <= 0.f) ? 1u : 0u;
+                // ORACLE: a tight-zero sample right after another, which a skip across consecutive zero blocks would save.
+                gLayerTightRun += layerMask == 0u && gLayerPrevTight ? 1u : 0u;
+                gLayerPrevTight = layerMask == 0u;
+#endif
+                const float3 dv = ray.direction * float(params.hstrCellWidth);
+                const float3 lo = float3(block) * 4.f;
+                float leave = 1e30f;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                    if (abs(dv[a]) > 1e-12f)
+                        leave = min(leave, ((dv[a] > 0.f ? lo[a] + 4.f : lo[a]) - s[a]) / dv[a]);
+                blockExit = tSample + max(leave, 0.f);
+                if (params.cloudLayerTightSkip != 0u && layerMask == 0u)
+                {
+                    fineVoxels = 1.f;
+                    hit.entry = kCloudRefNone;
+                    skipTo = blockExit;
+                    // Mode 3: on through the blocks after it that hold no layer either (up to 8), as majorantZeroExit crosses zero
+                    // majorant blocks: the march's per-step work is paid once for the run.
+                    if (params.cloudLayerTightSkip == 3u)
+                    {
+                        const float nudge = 0.25f / max(length(dv), 1e-9f);
+                        [loop]
+                        for (uint k = 0; k < 8u; ++k)
+                        {
+                            const float3 p = seaVoxel((ray.position + (skipTo + nudge) * ray.direction) * float(params.hstrCellWidth));
+                            const int3 b = int3(floor(p * 0.25f));
+                            if (any(b < 0) || any(b >= int3(params.hstrMajorantDims)) || hstrDomainLayers.Load(int4(b, 0)) != 0u)
+                                break;
+                            const float3 bl = float3(b) * 4.f;
+                            float out = 1e30f;
+                            [unroll]
+                            for (uint a = 0; a < 3; ++a)
+                                if (abs(dv[a]) > 1e-12f)
+                                    out = min(out, ((dv[a] > 0.f ? bl[a] + 4.f : bl[a]) - p[a]) / dv[a]);
+                            skipTo += nudge + max(out, 0.f);
+                        }
+                    }
+                    return 0.f;
+                }
+            }
+        }
         [unroll]
         for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
         {
             if (layer >= params.cloudLayers)
                 break;
+            const bool layerEmpty = (layerMask & (1u << layer)) == 0u;
+#if HSTR_LAYER_PROBE
+            gLayerMaskEmpty[layer] += layerEmpty ? 1u : 0u;
+#endif
+            if (params.cloudLayerTightSkip >= 2u && layerEmpty)
+            {
+                exit = min(exit, blockExit);
+                continue;
+            }
             uint instanceIndex;
             float3 x;
             float footprintLevel;
@@ -7291,16 +7446,42 @@ struct HSTRCloudRenderer
             {
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[2];
+                // ORACLE: a brick walk that ends empty where the layer's per-voxel bits over the sample's trilinear voxels are clear
+                // - what a voxel-scale layer mask would skip.
+                gLayerVoxelEmpty += (domainVoxelLayers(v) & (1u << layer)) == 0u ? 1u : 0u;
 #endif
                 exit = min(exit, cloudEmptyExitOf(ray, tSample, sample, instance));
                 continue;
             }
 #if HSTR_LAYER_PROBE
             ++gLayerProbe[3];
+            gLayerVoxelDense += (domainVoxelLayers(v) & (1u << layer)) == 0u ? 1u : 0u; // Sanity: must be 0.
+            // Density in a block whose layer bit is clear: what cloudLayerTightSkip would drop (must be 0 for it to be exact).
+            gLayerBlockDense += (layerMask & (1u << layer)) == 0u ? 1u : 0u;
+            // ... and of those, the ones whose block has no layer at all (the domain disagrees with the instances, not the bits).
+            gLayerBlockDenseSum += layerMask == 0u ? 1u : 0u;
+            {
+                // ... and of those, the ones 7+ sea tiles from the ray's origin: at the resident window's edge, where a shifted
+                // layer's square reaches into a slot that wraps to the far side's tile.
+                const float tileVoxels = float(params.cloudTileVoxels);
+                const float2 d = abs(floor(v.xz / tileVoxels) - floor(ray.position.xz * float(params.hstrCellWidth) / tileVoxels));
+                gLayerBlockDenseEdge += (layerMask & (1u << layer)) == 0u && max(d.x, d.y) >= float(params.cloudTiles.x / 2u - 1u) ? 1u : 0u;
+            }
             ++denseLayers;
 #endif
             exit = -1.f; // Density here: no skip.
             const float d = cloudSampleDensity(sample, proxy, scale);
+#if HSTR_LAYER_PROBE
+            if ((layerMask & (1u << layer)) == 0u)
+            {
+                // The misses by density against the thin bound (under 1%, under 1x, above) and by whether the brick is fading.
+                const float rel = d / max(scale * thinDensity, 1e-30f);
+                ++gLayerMissBins[rel < 0.01f ? 0 : (rel < 1.f ? 1 : 2)];
+                gLayerMissBins[3] += hstrCloudBricks[sample.entry].fade < 1.f ? 1u : 0u;
+                // ... and by the level of the brick read: 0-1, 2, 3, 4+ (a coarse level's filter reaches 2^L source voxels).
+                ++gLayerMissLevels[min(max(sample.level, 1u), 4u) - 1u];
+            }
+#endif
             density += d;
             if (d > densest)
             {
@@ -13847,12 +14028,14 @@ void domainExtinction(uint3 id: SV_DispatchThreadID)
     else if ((flags & kDomainRegionZero) == 0)
     {
         const uint packed = gHSTRCloud.hstrDomainStaged[(region * r + id.z % r) * frame.dims.y * r + id.x + r * id.y];
+        // The halves' sign bits are the layers with a non-zero maximum here (CloudSea::TileVolume::packed). The volume keeps them as
+        // its components' signs (readers take abs), so domainBlocks can build the per-layer block mask from it.
         value = float2(f16tof32(packed & 0xffff), f16tof32(packed >> 16));
         gHSTRCloud.hstrDomainVolumeOutput[voxel] = value;
     }
     else
         gHSTRCloud.hstrDomainVolumeOutput[voxel] = value;
-    gHSTRCloud.hstrExtinctionOutput[voxel] = value.x * frame.scale;
+    gHSTRCloud.hstrExtinctionOutput[voxel] = abs(value.x) * frame.scale;
 }
 
 /// Block maxima over 4^3 voxels plus the voxels one past the upper faces (trilinear support), for the blocks that read a changed
@@ -13866,17 +14049,25 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
         return;
     float meanValue = 0.f;
     float maxValue = 0.f;
+    uint layers = 0u;
     const uint yLast = min(block.y * kDomainBlock + kDomainBlock, frame.dims.y - 1u);
     for (uint z = 0; z <= kDomainBlock; ++z)
         for (uint y = block.y * kDomainBlock; y <= yLast; ++y)
             for (uint x = 0; x <= kDomainBlock; ++x)
             {
                 const int4 voxel = int4((block.x * kDomainBlock + x) % frame.dims.x, y, (block.z * kDomainBlock + z) % frame.dims.z, 0);
-                const float2 value = gHSTRCloud.hstrDomainVolume.Load(voxel);
+                const float2 signedValue = gHSTRCloud.hstrDomainVolume.Load(voxel);
+                const float2 value = abs(signedValue);
                 meanValue = max(meanValue, value.x);
                 maxValue = max(maxValue, max(value.x, value.y));
+                layers |= (asuint(signedValue.x) >> 31) | ((asuint(signedValue.y) >> 31) << 1);
             }
+    // MEASURED and REMOVED (tight14, 4K sunset walk): the layer bits dilated by one domain voxel. Density samples in blocks whose
+    // layer bit is clear 1895 -> 374 of 2.22M, but the skip's saving 0.75 -> 0.39 ms; the misses stay at brick level 2 under any
+    // margin tried, so they are not a bounded reach (likely the lossy bricks' density outside the source maxima).
     gHSTRCloud.hstrDomainBlocksOutput[block] = float2(maxValue, meanValue);
+    // The layers with a non-zero maximum over the block's trilinear support: a layer without its bit has no density in the block.
+    gHSTRCloud.hstrDomainLayersOutput[block] = layers;
 }
 
 /// The camera majorant (block maxima dilated by one block, wrapping) and the tight one (undilated block means) of the blocks whose

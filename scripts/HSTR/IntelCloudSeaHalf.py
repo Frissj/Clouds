@@ -38,6 +38,15 @@ g.addPass(createPass("HSTRCloud", {
     # The shipping switch mask (11773) with transmittance-scaled steps (bit 32768: behind transmittance T a step grows by up to
     # 1 / sqrt(T), 4x at most): walk 4.14 -> 3.91 ms at 0.425 -> 0.513% (budgetstep1).
     "beamShipMask": 11773 | 32768,
+    # Per-layer occupancy at majorant-block scale (hstrDomainLayers, from the domain build's conservative maxima widened by the
+    # coarsest brick level's reach): a sample in a block with no layer skips to the end of the run of such blocks (up to 8), and a
+    # layer without its bit is skipped without its lookup. 4K sunset walk, units + query ms, two pairs in one launch (tight16): off
+    # 5.97, per-layer skip 4.84, + run skip 4.59 (-23%); over 0.02 in motion 2.33% -> 2.16%. Squared excess against the path trace
+    # 0.020293 -> 0.020163 (sunset_hill_tight15). An explicit approximation: 0.085% of density samples fall in blocks whose layer
+    # bit is clear (tight13; lossy-compressed bricks hold density outside the source maxima) and are dropped. Without the reach
+    # margin it saved ~1.0 ms but dropped 0.41% (tight5 / tight12); jog and sprint were measured on that version: 7.68 -> 6.50
+    # and 6.94 -> 5.67 ms (tight6).
+    "cloudLayerTightSkip": 3,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K

@@ -209,9 +209,11 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
     }
     // Summed over the clouds: the means, and the conservative maxima (a sum of bounds bounds the sum).
     std::vector<float> maxima(voxels, 0.f);
+    std::vector<uint8_t> layers(voxels, 0u);
     const float3 squareCorner = mDesc.origin + float3(float(job.world.x), 0.f, float(job.world.y)) * mDesc.tileWorld;
     for (const Tile& cloud : clouds)
-        accumulate(cloud, squareCorner, volume.mean, maxima);
+        accumulate(cloud, squareCorner, volume.mean, maxima, layers);
+    static_assert(kCloudSeaLayers <= 2, "the packed volume carries one layer bit in each half's sign");
     for (size_t index = 0; index < voxels; ++index)
     {
         const float maximum = maxima[index];
@@ -222,7 +224,8 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
         float16_t maximum16(maximum);
         if (float(maximum16) < maximum)
             maximum16 = float16_t(maximum * (1.f + 1.f / 1024.f));
-        packed[index] = uint32_t(float16_t(volume.mean[index]).toBits()) | uint32_t(maximum16.toBits()) << 16;
+        packed[index] = uint32_t(float16_t(volume.mean[index]).toBits()) | uint32_t(maximum16.toBits()) << 16 |
+                        ((layers[index] & 1u) != 0 ? 0x8000u : 0u) | ((layers[index] & 2u) != 0 ? 0x80000000u : 0u);
         const int32_t y = int32_t((index / r) % mDims.y);
         result.tile.contentLow = result.tile.contentLow < 0 ? y : std::min(result.tile.contentLow, y);
         result.tile.contentHigh = std::max(result.tile.contentHigh, y);
@@ -230,7 +233,7 @@ CloudSea::Result CloudSea::rasterize(const Job& job, TileStaging* pStaging) cons
     return result;
 }
 
-void CloudSea::accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima) const
+void CloudSea::accumulate(const Tile& tile, float3 squareCorner, std::vector<float>& means, std::vector<float>& maxima, std::vector<uint8_t>& layers) const
 {
     const uint32_t r = mDesc.tileVoxels;
     const HSTRCloudInstance& instance = tile.instance;
@@ -267,39 +270,59 @@ void CloudSea::accumulate(const Tile& tile, float3 squareCorner, std::vector<flo
         return value;
     };
 
-    // The instance's bounds with the trilinear margin, clipped to the square (in the square's voxels).
-    const int3 lo = max(int3(floor((tile.worldMin - squareCorner) / mVoxelWorld)) - 2, int3(0));
-    const int3 hi = min(int3(ceil((tile.worldMax - squareCorner) / mVoxelWorld)) + 2, int3(r, mDims.y, r) - 1);
+    // The largest proxy maximum over the source-voxel box [boxLo, boxHi] (0 outside the asset).
+    auto proxyMaxOver = [&](float3 boxLo, float3 boxHi)
+    {
+        boxLo /= proxyScale;
+        boxHi /= proxyScale;
+        if (any(boxHi < 0.f) || any(boxLo >= float3(asset.proxyDims)))
+            return 0.f;
+        const uint3 plo = uint3(max(floor(boxLo), float3(0.f)));
+        const uint3 phi = min(uint3(max(floor(boxHi), float3(0.f))), asset.proxyDims - 1u);
+        float maximum = 0.f;
+        for (uint32_t qz = plo.z; qz <= phi.z; ++qz)
+            for (uint32_t qy = plo.y; qy <= phi.y; ++qy)
+                for (uint32_t qx = plo.x; qx <= phi.x; ++qx)
+                    maximum = std::max(maximum, asset.proxyMax[proxyIndex(uint3(qx, qy, qz))]);
+        return maximum;
+    };
+    // The reach of the coarsest brick level a camera sample reads (below the instance's proxy level), in source voxels.
+    const float coarsest = std::max(std::ceil(instance.proxyLevel) - 1.f, 0.f);
+    const float layerReach = 1.5f * std::exp2(coarsest) + 1.f;
+    // The instance's bounds with the trilinear margin and that reach, clipped to the square (in the square's voxels).
+    const int32_t margin = 2 + int32_t(std::ceil(layerReach * instance.sourceVoxelWorld / mVoxelWorld));
+    const int3 lo = max(int3(floor((tile.worldMin - squareCorner) / mVoxelWorld)) - margin, int3(0));
+    const int3 hi = min(int3(ceil((tile.worldMax - squareCorner) / mVoxelWorld)) + margin, int3(r, mDims.y, r) - 1);
     for (int32_t z = lo.z; z <= hi.z; ++z)
         for (int32_t y = lo.y; y <= hi.y; ++y)
             for (int32_t x = lo.x; x <= hi.x; ++x)
             {
                 const float3 p = float3(float(x), float(y), float(z)) + shift;
-                float mean = 0.f;
-                for (uint32_t sz = 0; sz < subsamples; ++sz)
-                    for (uint32_t sy = 0; sy < subsamples; ++sy)
-                        for (uint32_t sx = 0; sx < subsamples; ++sx)
-                        {
-                            const float3 u = (float3(float(sx), float(sy), float(sz)) + 0.5f) / float(subsamples) - 0.5f;
-                            mean += proxyMean(mul(a, p + u) + b);
-                        }
-                mean /= float(subsamples * subsamples * subsamples);
                 // Conservative maximum over the voxel's footprint plus one source voxel of trilinear support.
                 const float3 centre = mul(a, p) + b;
-                const float3 boxLo = (centre - halfBox - 1.f) / proxyScale;
-                const float3 boxHi = (centre + halfBox + 1.f) / proxyScale;
-                if (any(boxHi < 0.f) || any(boxLo >= float3(asset.proxyDims)))
-                    continue;
-                const uint3 plo = uint3(max(floor(boxLo), float3(0.f)));
-                const uint3 phi = min(uint3(max(floor(boxHi), float3(0.f))), asset.proxyDims - 1u);
-                float maximum = 0.f;
-                for (uint32_t qz = plo.z; qz <= phi.z; ++qz)
-                    for (uint32_t qy = plo.y; qy <= phi.y; ++qy)
-                        for (uint32_t qx = plo.x; qx <= phi.x; ++qx)
-                            maximum = std::max(maximum, asset.proxyMax[proxyIndex(uint3(qx, qy, qz))]);
                 const size_t index = size_t(x) + r * (size_t(y) + size_t(mDims.y) * size_t(z));
-                means[index] += std::min(mean, maximum);
-                maxima[index] += maximum;
+                const float maximum = proxyMaxOver(centre - halfBox - 1.f, centre + halfBox + 1.f);
+                if (maximum > 0.f)
+                {
+                    // The mean only where the maximum allows any (it is clamped to it).
+                    float mean = 0.f;
+                    for (uint32_t sz = 0; sz < subsamples; ++sz)
+                        for (uint32_t sy = 0; sy < subsamples; ++sy)
+                            for (uint32_t sx = 0; sx < subsamples; ++sx)
+                            {
+                                const float3 u = (float3(float(sx), float(sy), float(sz)) + 0.5f) / float(subsamples) - 0.5f;
+                                mean += proxyMean(mul(a, p + u) + b);
+                            }
+                    mean /= float(subsamples * subsamples * subsamples);
+                    means[index] += std::min(mean, maximum);
+                    maxima[index] += maximum;
+                }
+                // The layer bit needs the reach of the coarsest brick level a sample below the proxy level reads: one source voxel
+                // bounds only level 0. A level-L sample filters level voxels spanning 1.5 x 2^L source voxels around it, plus the
+                // brick halo. MEASURED (tight12, 4K sunset walk, cloudLayerTightSkip off, probe): with the one-voxel margin 9954 of
+                // 2.36M density samples fell in blocks whose layer bit was clear - 9536 at level 2, 412 at 3, 6 at 4+, none at 0-1.
+                if (maximum > 0.f || proxyMaxOver(centre - halfBox - layerReach, centre + halfBox + layerReach) > 0.f)
+                    layers[index] |= uint8_t(1u << tile.layer);
             }
 }
 
