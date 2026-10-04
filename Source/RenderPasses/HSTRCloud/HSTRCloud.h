@@ -748,6 +748,8 @@ private:
     uint4 mSunResolveInputs = uint4(0); ///< Sun generation, oldest generation, ancestor reach, resolved buffer it was written to.
     float4 mCloudSunBakeInputs = float4(0.f); ///< Sun direction and density scale the sun generation was last bumped for.
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
+    float mCloudSunBakeStep = -1.f;           ///< cloudSunBakeStep the sun generation was last bumped for.
+    bool mCloudSunBakeStepResets = true;      ///< cloudSunBakeStepResets: a bake step change rebakes everything.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
     bool mCloudSunKeepStale = true;           ///< Outdated sun bakes answer until they rebake (CloudResidency::setSunKeepStale).
@@ -810,7 +812,8 @@ private:
     LazyComputePass mpCheckSkirtMasksPass;    ///< DIAGNOSTIC (cloudSkirtCheck).
     bool mCloudSkirtCheck = false;            ///< DIAGNOSTIC: count stale skirt masks every frame (blocking readback).
     ref<Buffer> mpSkirtCheckCount;
-    ref<Buffer> mpSunBakeProbe; ///< mSunBakeProbe's running totals (gSunBakeProbe).
+    ref<Buffer> mpSunBakeProbe; ///< mSunBakeProbe's counts of the frame's bakes (gSunBakeProbe).
+    std::array<uint64_t, 11> mSunBakeProbeTotals = {}; ///< Their sums since the last log.
     uint32_t mSkirtMaskChecks = 0;            ///< Frames checked (cloudSkirtCheck).
     uint32_t mSkirtMaskMismatches = 0;        ///< Pages whose stored mask differed from this frame's pages, summed over them.
     bool mBeamDirtyStats = false;             ///< DIAGNOSTIC: sum the dirty blocks and units listed per frame (blocking readback).

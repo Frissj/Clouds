@@ -56,6 +56,13 @@ g.addPass(createPass("HSTRCloud", {
     # the 256 anchor alone (one bad chunk decides them), with 128 at 2.9%: no sign of bake lag there either. Parked keeps the
     # full rate, so the backlog still drains when the camera stops.
     "cloudSunBakesMoving": 128,
+    # Sun bake step, level voxels (default 0.5). An explicit approximation. The bake's cost is its density steps: ~92 a texel, 98.5%
+    # of texels marching to the full reach (bake probe, HSTR_SUN_BAKE_PROBE). bakestep4 (4K sunset walk, bakes kept across arms):
+    # bakeCloudSun 0.5 0.557 / 0.412 ms, 1 0.229, 2 0.123. Quality (sunset_hill_bakestep5, every arm fully rebaked, 960 x 540 exact
+    # view against the 0.5 anchor repeated last): step 2 0.063% of pixels over 2/255, p99 1/255, p99.9 2/255, max 11/255; step 4
+    # 0.72%, p99.9 9/255, max 23/255; sanity (constant brick density in the bake) 2.6%, p99.9 40/255, max 79/255. The squared-excess
+    # gate barely sees bakes (0.020159 anchor, 0.020152 step 2, 0.019845 sanity), so the image comparison decides.
+    "cloudSunBakeStep": 2.0,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K

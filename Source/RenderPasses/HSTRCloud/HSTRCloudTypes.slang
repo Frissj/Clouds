@@ -1545,6 +1545,25 @@ struct HSTRCloudParams
     /// 4K sunset walk, 256 bakes, two pairs): bakeCloudSun 1.006 / 0.804 -> 0.952 / 0.669 ms - lower in both, but small: the
     /// outside steps are not where the bake's time goes.
     uint cloudSunBakeExit = 1;
+    /// PROBE (timing knockouts, wrong bakes; compiled only with HSTR_SUN_BAKE_PROBE=1): bakeCloudSun 1 replaces the trilinear density fetch with the brick's stored maximum
+    /// word read (prices the fetch); 2 reuses the texel's first brick lookup for every step (prices the lookup).
+    uint cloudSunBakeCost = 0;
+    /// bakeCloudSun: 1 looks bricks up through the resolved level pages (cloudAssetBrickAtFlat, the lean march's one-word lookup;
+    /// the same sample), 0 through the page, octant test and parent climb (cloudAssetBrickAt). The lookup is the bake's cost
+    /// (bakecost1, 4K sunset walk: reusing the first lookup for every step 0.38-0.62 -> 0.22 ms despite ~2.5x the steps; no
+    /// trilinear fetch 0.40). MEASURED and REJECTED (bakeflat1, two pairs, 128 bakes moving): 0.377 / 0.362 -> 0.413 / 0.406 ms,
+    /// over 0.02 within noise - the page, octant test and parent climb are not the lookup's cost; the cell test it keeps is.
+    uint cloudSunBakeFlat = 0;
+    /// bakeCloudSun: 1 skips the brick lookup for a step still inside the 2-voxel cell of the last dense sample, when that sample
+    /// read a brick of the bake's own level without a skirt (every page under it then maps that level or finer, so any point of
+    /// the cell climbs to the same brick and the same non-empty cell). Exact; the box is shrunk by 1e-3 voxel against rounding.
+    /// MEASURED and REJECTED (kept, off): bakereuse3 (probe, 4K sunset walk, moving windows) - 64% of density steps reused the
+    /// lookup, yet bakereuse1 (two pairs) bakeCloudSun 0.434 / 0.399 -> 0.421 / 0.395 ms. The lookup is not the bake's cost: a
+    /// texel takes ~92 steps (82 dense, 10 empty), 98.5% of texels run to job.reach, 0.5% go opaque.
+    uint cloudSunBakeReuse = 0;
+    /// bakeCloudSun's step in level voxels of the level read (0.5: half a voxel, the march's own). An approximation above 0.5; a
+    /// change rebakes everything (cloudSunBakeStepResets). The sunset launcher ships 2 (IntelCloudSeaHalf.py has the numbers).
+    float cloudSunBakeStep = 0.5f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

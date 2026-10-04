@@ -13807,10 +13807,22 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
     const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
     const float levelScale = float(1u << job.level);
     const float3 start = (job.origin + float3(texel) - 1.f + 0.5f) * levelScale - 0.5f;
+    // What cloudAssetBrickAtFlat reads of an instance, from the asset (as CloudResidency fills instances).
+    HSTRCloudInstance flat = {};
+    flat.asset = job.asset;
+    const uint3 pages = asset.dims / kCloudBrickCore;
+    flat.pageDims = pages.x | (pages.y << 10) | (pages.z << 20);
+    flat.topLevel = asset.topLevel;
+    flat.levelPageBase = asset.levelPageBase;
     float depth = 0.f;
     float u = 0.f;
-    float stepVoxels = 0.5f * levelScale;
+    float stepVoxels = params.cloudSunBakeStep * levelScale;
+    uint reuseEntry = kCloudRefNone;
+    float3 reuseLo = 0.f;
+    float3 reuseHi = 0.f;
 #if HSTR_BAKE_PROBE
+    CloudSample firstSample = {};
+    bool firstFound = false;
     uint probe[9] = { 1, 0, 0, 0, 0, 0, 0, 0, 0 };
 #endif
     [loop]
@@ -13823,14 +13835,49 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
         const float3 x = start + (u + 0.5f * dt) * job.direction;
         CloudSample sample;
         float next = u + dt;
+        // Still in the last dense sample's cell (cloudSunBakeReuse): the same brick, without its lookup.
+        if (reuseEntry != kCloudRefNone && all(x >= reuseLo) && all(x < reuseHi))
+        {
+#if HSTR_BAKE_PROBE
+            ++probe[4];
+            InterlockedAdd(gSunBakeProbe[10], 1u); // Density steps that reused the last lookup.
+#endif
+            depth += gHSTRCloud.cloudBrickDensity(reuseEntry, x, int3(floor(x + 0.5f))) * scale * dt;
+            u = min(next, job.reach);
+            continue;
+        }
         // REJECTED (sunset_bake_ab2, 4K sunset sea, parked, same pose): an ancestral bake - the brick where it holds x, else its
         // nearest ancestor, so no mapping could ever outdate it - at 4.36% of pixels over 0.02 against the classic bake (p99.9 0.29,
         // max 1.16) where rebaking classic again gave 3.38% (0.17, 0.62), and visibly: the low sun's sweep leaves its brick almost
         // at once and reads the parent level, drawing a horizontal band per brick row on the lit faces (as 86fbecd9's coarse field
         // did). The exact narrowing is what stampSunChange does instead: only changes at the bake's level or coarser outdate it.
-        if (gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample))
+#if HSTR_BAKE_PROBE
+        bool found;
+        if (params.cloudSunBakeCost == 2u && k > 0)
         {
-            stepVoxels = 0.5f * float(1u << sample.level);
+            sample = firstSample; // PROBE: the first lookup's answer for every step.
+            found = firstFound;
+        }
+        else
+        {
+            found = params.cloudSunBakeFlat != 0 ? gHSTRCloud.cloudAssetBrickAtFlat(flat, x, job.level, false, 0.f, sample)
+                                                 : gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample);
+            firstSample = sample;
+            firstFound = found;
+        }
+#else
+        const bool found = params.cloudSunBakeFlat != 0 ? gHSTRCloud.cloudAssetBrickAtFlat(flat, x, job.level, false, 0.f, sample)
+                                                        : gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample);
+#endif
+        // cellLo is the cell test's (cloudBrickCellTest), which runs only with cloudEmptySkip.
+        reuseEntry = params.cloudSunBakeReuse != 0 && SHIP(cloudEmptySkip, 1u) != 0 && found && !sample.empty && sample.level == job.level && sample.skirtCut == 0.f
+                         ? sample.entry
+                         : kCloudRefNone;
+        reuseLo = sample.cellLo + 1e-3f;
+        reuseHi = sample.cellLo + 2.f * levelScale - 1e-3f;
+        if (found)
+        {
+            stepVoxels = params.cloudSunBakeStep * float(1u << sample.level);
 #if HSTR_BAKE_PROBE
             ++probe[sample.empty ? 3 : 4];
 #endif
@@ -13842,6 +13889,10 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
                         exit = min(exit, ((job.direction[a] > 0.f ? sample.hi[a] : sample.lo[a]) - x[a]) / job.direction[a]);
                 next = max(next, u + 0.5f * dt + max(exit, 0.f));
             }
+#if HSTR_BAKE_PROBE
+            else if (params.cloudSunBakeCost == 1u)
+                depth += gHSTRCloud.hstrCloudBricks[sample.entry].minValue * (1.f - sample.skirtCut) * scale * dt; // PROBE: no fetch.
+#endif
             else
                 depth += gHSTRCloud.cloudBrickDensity(sample.entry, x, int3(floor(x + 0.5f))) * (1.f - sample.skirtCut) * scale * dt;
         }

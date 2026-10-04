@@ -649,6 +649,31 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunBakeExit = uint32_t(value);
             continue;
         }
+        if (key == "cloudSunBakeCost")
+        {
+            mParams.cloudSunBakeCost = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunBakeFlat")
+        {
+            mParams.cloudSunBakeFlat = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunBakeReuse")
+        {
+            mParams.cloudSunBakeReuse = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunBakeStep")
+        {
+            mParams.cloudSunBakeStep = std::clamp(float(value), 0.125f, 4.f);
+            continue;
+        }
+        if (key == "cloudSunBakeStepResets")
+        {
+            mCloudSunBakeStepResets = bool(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1406,6 +1431,11 @@ Properties HSTRCloud::getProperties() const
     props["cloudLayerTightRun"] = mParams.cloudLayerTightRun;
     props["cloudSunResolveFused"] = mParams.cloudSunResolveFused;
     props["cloudSunBakeExit"] = mParams.cloudSunBakeExit;
+    props["cloudSunBakeCost"] = mParams.cloudSunBakeCost;
+    props["cloudSunBakeFlat"] = mParams.cloudSunBakeFlat;
+    props["cloudSunBakeReuse"] = mParams.cloudSunBakeReuse;
+    props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
+    props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -3216,11 +3246,15 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     // answering; any other change starts one that nothing older answers for (the live march covers the bricks until they rebake).
     const float3 sun = normalize(mParams.sunDirection);
     const float densityScale = mpScene->getGridVolume(0)->getDensityScale() * mParams.densityScale;
-    const bool sunReset = densityScale != mCloudSunBakeInputs.w || mParams.sunNearVoxels != mCloudSunBakeNear;
+    // A bake step change rebakes everything (the gate needs every bake at the arm's step); cloudSunBakeStepResets false keeps the
+    // bakes (a timing A/B, whose arms would otherwise each start from nothing baked).
+    const bool sunReset = densityScale != mCloudSunBakeInputs.w || mParams.sunNearVoxels != mCloudSunBakeNear ||
+                          (mCloudSunBakeStepResets && mParams.cloudSunBakeStep != mCloudSunBakeStep);
     if (sunReset || dot(sun, mCloudSunBakeInputs.xyz()) < std::cos(math::radians(mCloudSunBakeAngle)))
     {
         mCloudSunBakeInputs = float4(sun, densityScale);
         mCloudSunBakeNear = mParams.sunNearVoxels;
+        mCloudSunBakeStep = mParams.cloudSunBakeStep;
         mParams.cloudSunGeneration = (mParams.cloudSunGeneration + 1) & 0x0FFFFFFF;
         if (sunReset)
             mParams.cloudSunOldestGeneration = mParams.cloudSunGeneration;
@@ -3424,14 +3458,13 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             );
         if (mpSunBakeProbe)
         {
-            std::vector<uint32_t> p(10);
-            for (uint32_t k = 0; k < 10; ++k)
-                p[k] = mpSunBakeProbe->getElement<uint32_t>(k);
+            const auto& p = mSunBakeProbeTotals;
             logInfo(
-                "HSTRCloud: sun bake probe: {} texels ({} without a slot), {} steps: outside {}, empty {}, density {}; exits opaque {}, "
-                "512 steps {}, reach {}, left asset {}",
-                p[0], p[9], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
+                "HSTRCloud: sun bake probe (240 frames): {} texels ({} without a slot), {} steps: outside {}, empty {}, density {} ({} "
+                "reused); exits opaque {}, 512 steps {}, reach {}, left asset {}",
+                p[0], p[9], p[1], p[2], p[3], p[4], p[10], p[5], p[6], p[7], p[8]
             );
+            mSunBakeProbeTotals.fill(0);
         }
         const auto& stats = mpCloudResidency->getStats();
         logInfo(
@@ -3533,16 +3566,23 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
         mParams.cloudCommitCount = info.bakeMax;
-        mpBakeCloudSunPass->getProgram()->addDefine("HSTR_BAKE_PROBE", mSunBakeProbe ? "1" : "0");
+        if (mSunBakeProbe && !mpSunBakeProbe)
+        {
+            // Once, before the probe buffer is first bound: new vars for the probe's program, so the residency bindings are redone.
+            mpBakeCloudSunPass->addDefine("HSTR_BAKE_PROBE", "1", true);
+            mResidencyPassesBound.erase(
+                std::remove(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), mpBakeCloudSunPass.get()), mResidencyPassesBound.end()
+            );
+        }
         if (bindResidencyPass(pRenderContext, mpBakeCloudSunPass, true))
             bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
         if (mSunBakeProbe)
         {
             if (!mpSunBakeProbe)
             {
-                const std::vector<uint32_t> zeros(10, 0u);
+                const std::vector<uint32_t> zeros(11, 0u);
                 mpSunBakeProbe = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 10, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    sizeof(uint32_t), 11, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
                     zeros.data(), false
                 );
             }
@@ -3550,6 +3590,13 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         }
         mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * info.bakeMax));
         mParams.cloudCommitCount = 0;
+        if (mpSunBakeProbe)
+        {
+            // Every frame into 64-bit totals (a blocking read; probe only): a 240-frame window passes 2^32 steps.
+            for (uint32_t k = 0; k < mSunBakeProbeTotals.size(); ++k)
+                mSunBakeProbeTotals[k] += mpSunBakeProbe->getElement<uint32_t>(k);
+            pRenderContext->clearUAV(mpSunBakeProbe->getUAV().get(), uint4(0));
+        }
     }
     mBeamReusable = false;
     if (mSunReadbackPending == 0 && !mSunReadbackRecorded)
