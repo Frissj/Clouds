@@ -47,17 +47,11 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
-#ifndef HSTR_LAYER_MASK_COST
-#define HSTR_LAYER_MASK_COST 0 // cloudLayerMaskCost: doubled layer-mask loads (a probe; see HSTRCloudTypes.slang).
-#endif
 #ifndef HSTR_UNIT_START
 #define HSTR_UNIT_START 0 // beamUnitStart: the dirty query records first-density distances, the units start from them.
 #endif
 #ifndef HSTR_LAYER_WRAP_SELECT
 #define HSTR_LAYER_WRAP_SELECT 0 // cloudLayerWrapSelect: domainVoxelLayers wraps by selects (see HSTRCloudTypes.slang).
-#endif
-#ifndef HSTR_LAYER_PACKED
-#define HSTR_LAYER_PACKED 0 // cloudLayerPacked: both layer masks from one packed word (see HSTRCloudTypes.slang).
 #endif
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
@@ -391,9 +385,6 @@ struct HSTRCloudRenderer
     Texture3D<float2> hstrDomainBlocks;                 ///< Per majorant block: unscaled maximum and mean over its trilinear support.
     Texture3D<uint> hstrDomainLayers;                   ///< Per majorant block: bit L where layer L has density (cloudLayerTightSkip).
     RWTexture3D<uint> hstrDomainLayersOutput;
-    /// Per majorant block b: the layer bits (bit 2i + L) of its 64 domain voxels, i = x + 4y + 16z (cloudLayerPacked).
-    Texture3D<uint4> hstrDomainVoxelBits;
-    RWTexture3D<uint4> hstrDomainVoxelBitsOutput;
     RWTexture3D<float2> hstrDomainVolumeOutput;
     StructuredBuffer<uint> hstrDomainStaged;            ///< Packed volumes of a batch's slots (CloudSea::TileVolume::packed).
     RWTexture3D<float> hstrExtinctionOutput;
@@ -514,10 +505,8 @@ struct HSTRCloudRenderer
     Texture2D<float4> hstrFarField;                   ///< Per texel: the far sea's radiance (hazed) less the sky it hides, and its transmittance.
     RWTexture2D<float4> hstrFarFieldOutput;
     Texture2D<float4> hstrFarFieldPrev;               ///< The previous far layer and its opacity-weighted distance, reprojected.
-    /// Per texel: x the opacity-weighted distance, y the first lit sample's distance (seaFarStart; 0: none), z the camera's
-    /// odometer (beamTravel) when that was marched.
-    Texture2D<float4> hstrFarDistancePrev;
-    RWTexture2D<float4> hstrFarDistanceOutput;
+    Texture2D<float> hstrFarDistancePrev;
+    RWTexture2D<float> hstrFarDistanceOutput;
     /// DIAGNOSTIC (seaFarProbe bit 6): marched texels, their iterations, the most any one took, their lit samples, texels at the
     /// iteration cap, occupancy skips, zero-majorant skips, the iterations their waves paid (slowest lane x marching lanes), the
     /// iterations before each texel's first lit sample, and what the waves would pay with those taken in one (a perfect ray start).
@@ -1678,37 +1667,6 @@ struct HSTRCloudRenderer
 #endif
         const float2 value = hstrDomainVolume.Load(int4(p, 0));
         return (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
-    }
-
-    /// cloudLayerPacked: the packed layer bits (hstrDomainVoxelBits) of the 4^3 domain voxels nearest to the samples of the box
-    /// [4 block - 0.5, 4 block + 3.5) holding wrapped voxel position s - the voxel nearest s is floor(s + 0.5), so its block's word
-    /// holds domainVoxelLayers(s) and, ORed, every layer with density anywhere in that box. block is unwrapped (s's frame); false
-    /// above or below the domain (no answer: the layers are looked up).
-    bool domainVoxelBlock(float3 s, out int3 block, out uint4 word)
-    {
-        block = int3(floor(floor(s + 0.5f) * 0.25f));
-        word = 0u;
-        const int3 dims = int3(params.hstrMajorantDims);
-        if (block.y < 0 || block.y >= dims.y)
-            return false;
-        // s is wrapped (seaVoxel), so block x / z lie in [0, dims]: selects, not modulo. MEASURED (packedsrc15, Nsight source
-        // trace, units): the two signed integer modulos took 17.3% of the units kernel's samples (Wait stalls).
-        int3 wrapped = block;
-        wrapped.x = wrapped.x >= dims.x ? wrapped.x - dims.x : (wrapped.x < 0 ? wrapped.x + dims.x : wrapped.x);
-        wrapped.z = wrapped.z >= dims.z ? wrapped.z - dims.z : (wrapped.z < 0 ? wrapped.z + dims.z : wrapped.z);
-        word = hstrDomainVoxelBits.Load(int4(wrapped, 0));
-        return true;
-    }
-
-    /// The ray parameter (in units of dv, the voxel displacement per unit) from s to the exit of the 4-voxel box with lower corner lo.
-    float domainBoxLeave(float3 s, float3 lo, float3 dv)
-    {
-        float leave = 1e30f;
-        [unroll]
-        for (uint a = 0; a < 3; ++a)
-            if (abs(dv[a]) > 1e-12f)
-                leave = min(leave, ((dv[a] > 0.f ? lo[a] + 4.f : lo[a]) - s[a]) / dv[a]);
-        return max(leave, 0.f);
     }
 
     /// Upper bound on the trilinear extinction inside v's majorant block (for delta and ratio tracking, which re-read it at
@@ -3552,9 +3510,8 @@ struct HSTRCloudRenderer
 
     /// The far sea over distances [interval.x, interval.y] along w: its radiance (not hazed), transmittance, and the sum of
     /// transmittance * alpha * distance (for the opacity-weighted distance).
-    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance, out float firstLit)
+    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance)
     {
-        firstLit = 0.f; // The distance along w of the first lit step's start (seaFarStart); 0: none.
         const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0 && (params.seaFarProbe & 2u) == 0;
         const bool withCache = (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0 && (params.seaFarProbe & 3u) == 0;
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
@@ -3646,7 +3603,6 @@ struct HSTRCloudRenderer
                 distance += transmittance * alpha * middle;
                 transmittance *= 1.f - alpha;
                 lead = lit == 0u ? iterations : lead;
-                firstLit = lit == 0u ? s : firstLit;
                 ++lit;
             }
             s += ds;
@@ -3729,7 +3685,7 @@ struct HSTRCloudRenderer
             return 2u;
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
-        const float previousDistance = hstrFarDistancePrev[texel].x;
+        const float previousDistance = hstrFarDistancePrev[texel];
         const float3 q = previousDistance > 0.f ? normalize(origin + previousDistance * w - params.seaFarPrevPosition) : w;
         float2 position;
         const bool off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
@@ -3738,62 +3694,21 @@ struct HSTRCloudRenderer
         return off && (params.seaFarProbe & 16u) == 0 ? 2u : 1u;
     }
 
-    /// A texel this run marches: its far interval (farSeaMarch); nothing for the others. record: what the texel stores for the
-    /// next start (seaFarStart) - the first lit distance and odometer of a march from the interval's start; a hinted march keeps
-    /// its hint's (what it finds lies past its own start), or none if it was lit in its first step.
-    float4 farSeaTexelMarch(uint2 texel, out float distanceSum, out float2 record)
+    /// A texel this run marches: its far interval (farSeaMarch); nothing for the others.
+    float4 farSeaTexelMarch(uint2 texel, out float distanceSum)
     {
         distanceSum = 0.f;
-        record = 0.f;
         float2 uv;
         float2 interval;
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
         if (farSeaDecision(texel, uv) != 2u || !farSeaInterval(origin, w, interval))
             return float4(0.f, 0.f, 0.f, 1.f);
-        float2 hint = 0.f;
-        float start = interval.x;
-        if (params.seaFarStart != 0.f && params.seaFarRefreshAll == 0)
-        {
-            // The previous layer's 2 x 2 texels around this direction, through the camera that made it.
-            float2 position;
-            const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
-            if (farProject(w, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position))
-            {
-                const int2 base = int2(floor(position / float(params.seaFarScale) - 0.5f));
-                float first = 3.4e38f;
-                float odometer = 0.f;
-                [unroll]
-                for (uint k = 0; k < 4; ++k)
-                {
-                    const int2 t = base + int2(k & 1u, k >> 1);
-                    const float4 stored = all(t >= 0) && all(t < int2(dims)) ? hstrFarDistancePrev[uint2(t)] : float4(0.f);
-                    if (stored.y <= 0.f)
-                        first = 0.f;
-                    else if (stored.y < first)
-                    {
-                        first = stored.y;
-                        odometer = stored.z;
-                    }
-                }
-                if (first > 0.f && first < 3.4e38f)
-                {
-                    hint = float2(first, odometer);
-                    start = max(start, first - max(params.beamTravel - odometer, 0.f) - params.seaFarStart * params.seaVoxelSize.x);
-                }
-            }
-        }
-        float firstLit;
-        const float4 far = farSeaMarch(origin, w, float2(start, interval.y), distanceSum, firstLit);
-        if (start <= interval.x)
-            record = firstLit > 0.f ? float2(firstLit, params.beamTravel) : 0.f;
-        else
-            record = firstLit > 0.f && firstLit <= start + 1e-3f * params.seaVoxelSize.x ? float2(0.f) : hint;
-        return far;
+        return farSeaMarch(origin, w, interval, distanceSum);
     }
 
     /// Writes a texel: reprojected, or from its composed segments (radiance, transmittance and distance sum).
-    void farSeaFinish(uint2 texel, float4 far, float distanceSum, float2 record)
+    void farSeaFinish(uint2 texel, float4 far, float distanceSum)
     {
         float2 uv;
         const uint decision = farSeaDecision(texel, uv);
@@ -3807,12 +3722,7 @@ struct HSTRCloudRenderer
         if (decision == 1u)
         {
             hstrFarFieldOutput[texel] = hstrFarFieldPrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-            // The distance bilinear, as before; the start record from the nearest texel (an interpolated first distance or odometer
-            // would mean nothing).
-            const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
-            const uint2 nearest = min(uint2(max(uv * float2(dims), 0.f)), dims - 1u);
-            hstrFarDistanceOutput[texel] = float4(hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f).x,
-                                                  hstrFarDistancePrev[nearest].yz, 0.f);
+            hstrFarDistanceOutput[texel] = hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
             return;
         }
         const float3 w = farTexelDirection(texel);
@@ -3831,7 +3741,7 @@ struct HSTRCloudRenderer
         // Stored as what it adds behind the near march - its radiance less the sky it hides - so the composite is one fetch.
         const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
         hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
-        hstrFarDistanceOutput[texel] = float4(farDistance, record, 0.f);
+        hstrFarDistanceOutput[texel] = farDistance;
     }
 
     /// What the far sea adds behind the near march along camera ray w: its radiance, less the sky it hides. Read by direction, so
@@ -7613,57 +7523,6 @@ struct HSTRCloudRenderer
         uint layerMask = ~0u;
         uint voxelMask = ~0u;
         float blockExit = 1e30f;
-#if HSTR_LAYER_PACKED
-        // cloudLayerPacked: both masks from one load - the word of the 4^3 domain voxels whose nearest-sample regions tile the box
-        // [4 block - 0.5, 4 block + 3.5) around v (domainVoxelBlock). Its bit for the voxel nearest v is mode 4's voxel mask; its OR
-        // is the box's block mask (over 4^3 voxels where hstrDomainLayers ORs the 5^3 of the majorant block's support), so every
-        // skip stays exact and the box's exit replaces the majorant block's.
-        if (params.cloudLayerTightSkip != 0u)
-        {
-            const float3 s = seaVoxel(v);
-            const float3 dv = ray.direction * float(params.hstrCellWidth);
-            int3 block;
-            uint4 word;
-            if (domainVoxelBlock(s, block, word))
-            {
-                const uint held = word.x | word.y | word.z | word.w;
-                layerMask = ((held & 0x55555555u) != 0u ? 1u : 0u) | ((held & 0xaaaaaaaau) != 0u ? 2u : 0u);
-                const uint3 o = uint3(floor(s + 0.5f) - float3(block) * 4.f);
-                const uint i = o.x + 4u * o.y + 16u * o.z;
-                // A select, not word[i >> 4]: a dynamically indexed vector can be lowered to local memory.
-                const uint quarter = i < 32u ? (i < 16u ? word.x : word.y) : (i < 48u ? word.z : word.w);
-                voxelMask = (quarter >> (2u * (i & 15u))) & 3u;
-                blockExit = tSample + domainBoxLeave(s, float3(block) * 4.f - 0.5f, dv);
-#if HSTR_LAYER_PROBE
-                // Packed: beamLayerMaskMismatch counts samples whose packed voxel bits differ from the domain texel's (must be 0).
-                gLayerTightZero += layerMask == 0u ? 1u : 0u;
-                gLayerMaskMismatch += voxelMask != domainVoxelLayers(v) ? 1u : 0u;
-#endif
-                if (layerMask == 0u)
-                {
-                    fineVoxels = 1.f;
-                    hit.entry = kCloudRefNone;
-                    skipTo = blockExit;
-                    // Mode 3: on through the boxes after it that hold no layer either.
-                    if (params.cloudLayerTightSkip >= 3u)
-                    {
-                        const float nudge = 0.25f / max(length(dv), 1e-9f);
-                        [loop]
-                        for (uint k = 0; k < params.cloudLayerTightRun; ++k)
-                        {
-                            const float3 p = seaVoxel((ray.position + (skipTo + nudge) * ray.direction) * float(params.hstrCellWidth));
-                            int3 b;
-                            uint4 next;
-                            if (!domainVoxelBlock(p, b, next) || any(next != 0u))
-                                break;
-                            skipTo += nudge + domainBoxLeave(p, float3(b) * 4.f - 0.5f, dv);
-                        }
-                    }
-                    return 0.f;
-                }
-            }
-        }
-#else
         if (params.cloudLayerTightSkip != 0u || probeTight)
         {
             const float3 s = seaVoxel(v);
@@ -7671,10 +7530,6 @@ struct HSTRCloudRenderer
             if (all(block >= 0) && all(block < int3(params.hstrMajorantDims)))
             {
                 layerMask = hstrDomainLayers.Load(int4(block, 0));
-#if (HSTR_LAYER_MASK_COST & 1) != 0
-                // PROBE (cloudLayerMaskCost): a second, dependent load (R8: bit 31 is never set).
-                layerMask |= hstrDomainLayers.Load(int4(block + int3(layerMask & 1u, 0, 0), 0)) & 0x80000000u;
-#endif
 #if HSTR_LAYER_PROBE
                 gLayerTightZero += layerMask == 0u ? 1u : 0u;
                 gLayerMaskMismatch += (layerMask == 0u) != (hstrDomainBlocks.Load(int4(block, 0)).x <= 0.f) ? 1u : 0u;
@@ -7725,12 +7580,7 @@ struct HSTRCloudRenderer
         if ((params.cloudLayerTightSkip >= 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
         {
             voxelMask = domainVoxelLayers(v);
-#if (HSTR_LAYER_MASK_COST & 2) != 0
-            // PROBE (cloudLayerMaskCost): a second, dependent load (the bits are 0-3, so this ORs in 0).
-            voxelMask |= domainVoxelLayers(v + float3(float(voxelMask & 1u), 0.f, 0.f)) << 31;
-#endif
         }
-#endif
         // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
         // cloudLayerTightRun), each tested, instead of one step per voxel. REJECTED (HSTRCloudTypes.slang cloudLayerTightSkip):
         // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel (why it is slower is not
@@ -8687,9 +8537,7 @@ struct HSTRCloudRenderer
         // and a mark then stands until then.
         // .z: the ray's first-density distance for the units' start (beamUnitStart; 0: none recorded, or no density - no hint).
         // .w: the camera's odometer when it was marched (beamTravel), so a later start can allow for the camera's travel since.
-        // first -2: keep the stored distance and odometer (a hinted beamQueryStart march).
-        const float2 kept = first == -2.f ? hstrBeamLatticeOutput[uint3(texel, 2)].zw : float2(max(first, 0.f), params.beamTravel);
-        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, kept);
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, max(first, 0.f), params.beamTravel);
     }
 
     /// The first-density distance of the march this thread just ran (beamUnitStart), for writeBeamQuery; 0 without HSTR_UNIT_START.
@@ -10804,52 +10652,17 @@ struct HSTRCloudRenderer
         const uint s = params.beamTileSize;
         const uint2 tile = unit / s;
         float first = 3.4e38f;
-        if (params.beamUnitStartWide != 0)
+        [unroll]
+        for (uint k = 0; k < 5; ++k)
         {
-            // The 3 x 3 tiles around it: their 4 x 4 corners, then their 9 centres (off the lattice's edges: no hint).
-            const int2 low = int2(tile) - 1;
-            [loop]
-            for (uint k = 0; k < 25; ++k)
-            {
-                if (k >= 16 && params.beamCentreless != 0)
-                    break;
-                const int2 position = k < 16 ? (low + int2(k & 3u, k >> 2)) * int(s) : (low + int2((k - 16u) % 3u, (k - 16u) / 3u)) * int(s) + int(s / 2u);
-                const bool inside = all(position >= 0) && all(uint2(max(position, 0)) <= params.beamTileDims * s);
-                const float4 stored = inside ? beamLatticeAt(uint2(position), 2) : float4(0.f);
-                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z - max(params.beamTravel - stored.w, 0.f)) : 0.f;
-            }
-        }
-        else
-        {
-            [unroll]
-            for (uint k = 0; k < 5; ++k)
-            {
-                if (k == 4 && params.beamCentreless != 0)
-                    break;
-                const uint2 position = k < 4 ? (tile + uint2(k & 1u, k >> 1)) * s : tile * s + s / 2u;
-                const float4 stored = beamLatticeAt(position, 2);
-                // Less the camera's travel since that point was marched (a kept beamQueryStart distance can be frames old).
-                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z - max(params.beamTravel - stored.w, 0.f)) : 0.f;
-            }
+            if (k == 4 && params.beamCentreless != 0)
+                break;
+            const uint2 position = k < 4 ? (tile + uint2(k & 1u, k >> 1)) * s : tile * s + s / 2u;
+            const float4 stored = beamLatticeAt(position, 2);
+            // Less the camera's travel since that point was marched (a carried lattice point can be frames old).
+            first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z - max(params.beamTravel - stored.w, 0.f)) : 0.f;
         }
         return first > 0.f && first < 3.4e38f ? max(first - params.beamUnitStart * params.seaVoxelSize.x, 0.f) : 0.f;
-#else
-        return 0.f;
-#endif
-    }
-
-    /// beamQueryStart: where a re-marched lattice point may start - its own last march's first-density distance less the margin
-    /// (read before this march replaces it); 0 where it has none.
-    float beamQueryStartDistance(uint2 position)
-    {
-#if HSTR_UNIT_START
-        if (params.beamQueryStart == 0.f)
-            return 0.f;
-        // Less the camera's travel since that march (the first density along this world direction can have come at most that much
-        // closer under translation).
-        const float4 stored = beamLatticeHeldAt(position, 2);
-        const float travel = max(params.beamTravel - stored.w, 0.f);
-        return stored.y > 0.f && stored.z > 0.f ? max(stored.z - travel - params.beamQueryStart * params.seaVoxelSize.x, 0.f) : 0.f;
 #else
         return 0.f;
 #endif
@@ -12718,9 +12531,8 @@ void renderCloudCamera(uint3 dispatchThreadId: SV_DispatchThreadID)
 void renderFarSea(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     float distanceSum;
-    float2 record;
-    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum, record);
-    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum, record);
+    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum);
+    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum);
 }
 
 
@@ -13124,36 +12936,7 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #else
     if (!march)
         return;
-    const float start = gHSTRCloud.beamQueryStartDistance(position);
-#if HSTR_LAYER_PROBE && HSTR_UNIT_START
-    // kBeamQueryStartProbe: the same ray from the segment's start first (probe only), so the hinted march's record stands last.
-    if (start > 0.f)
-    {
-        const BeamSample full = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
-        const float trueFirst = gFirstDistance;
-        const BeamSample hinted = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f), start);
-        const bool missed = trueFirst >= 0.f && trueFirst < start;
-        uint unused;
-        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe], 1u, unused);
-        if (missed)
-        {
-            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 1], 1u, unused);
-            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 2], full.depth - hinted.depth > 0.02f ? 1u : 0u, unused);
-            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 3],
-                           uint(16.f * (start - trueFirst) / gHSTRCloud.params.seaVoxelSize.x), unused);
-        }
-    }
-#endif
-    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f), start);
-#if HSTR_UNIT_START
-    // beamQueryStart: a hinted march dense in its very first step probably began inside a cloud that reaches in front of the
-    // start; it records no distance, so the point marches in full next time instead of ratcheting its start deeper.
-    // Otherwise a hinted march keeps the stored distance and odometer (-2): what it found lies past its own start, and storing
-    // that let a wisp in front of the start push the stored distance deeper every march (qstart2 / 3: misses unchanged by the
-    // first-step rule and by the travel correction). Only a march from the segment's start records.
-    if (start > 0.f)
-        gFirstDistance = gFirstDistance >= 0.f && gFirstDistance <= start + 1e-3f * gHSTRCloud.params.seaVoxelSize.x ? -1.f : -2.f;
-#endif
+    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
 #if HSTR_STRIP != 0
     gHSTRCloud.beamStripSink(ray);
     return;
@@ -14988,7 +14771,6 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
     float meanValue = 0.f;
     float maxValue = 0.f;
     uint layers = 0u;
-    uint4 voxelBits = 0u; // cloudLayerPacked: the block's own 4^3 voxels' layer bits (hstrDomainVoxelBits).
     const uint yLast = min(block.y * kDomainBlock + kDomainBlock, frame.dims.y - 1u);
     for (uint z = 0; z <= kDomainBlock; ++z)
         for (uint y = block.y * kDomainBlock; y <= yLast; ++y)
@@ -14999,14 +14781,7 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
                 const float2 value = abs(signedValue);
                 meanValue = max(meanValue, value.x);
                 maxValue = max(maxValue, max(value.x, value.y));
-                const uint bits = (asuint(signedValue.x) >> 31) | ((asuint(signedValue.y) >> 31) << 1);
-                layers |= bits;
-                const uint yIn = y - block.y * kDomainBlock;
-                if (x < kDomainBlock && yIn < kDomainBlock && z < kDomainBlock)
-                {
-                    const uint i = x + 4u * yIn + 16u * z;
-                    voxelBits[i >> 4] |= bits << (2u * (i & 15u));
-                }
+                layers |= (asuint(signedValue.x) >> 31) | ((asuint(signedValue.y) >> 31) << 1);
             }
     // MEASURED and REMOVED (tight14, 4K sunset walk): the layer bits dilated by one domain voxel. Density samples in blocks whose
     // layer bit is clear 1895 -> 374 of 2.22M, but the skip's saving 0.75 -> 0.39 ms; the misses stay at brick level 2 under any
@@ -15014,7 +14789,6 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
     gHSTRCloud.hstrDomainBlocksOutput[block] = float2(maxValue, meanValue);
     // The layers with a non-zero maximum over the block's trilinear support: a layer without its bit has no density in the block.
     gHSTRCloud.hstrDomainLayersOutput[block] = layers;
-    gHSTRCloud.hstrDomainVoxelBitsOutput[block] = voxelBits;
 }
 
 /// The camera majorant (block maxima dilated by one block, wrapping) and the tight one (undilated block means) of the blocks whose

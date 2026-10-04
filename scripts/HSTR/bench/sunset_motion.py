@@ -58,8 +58,7 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")) +
          # ... and beamUnitStart's misses (kBeamUnitStartProbe).
          ("beamUnitStartHinted", "beamUnitStartMissed", "beamUnitStartLost", "beamUnitStartMissedVoxels16",
-          "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved",
-          "beamQueryStartHinted", "beamQueryStartMissed", "beamQueryStartLost", "beamQueryStartMissedVoxels16") +
+          "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved") +
          # ... and a perfect ray end as well (kBeamTailSteps): trailing empty steps, warp-paid steps with both runs as one step.
          tuple(f"beamTail{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid")) +
          # ... and a per-ray layer hint's (kBeamLayerRayHint): brick walks in layers the ray found no density in, those ray-layers.

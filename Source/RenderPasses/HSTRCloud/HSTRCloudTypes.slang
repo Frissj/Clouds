@@ -116,9 +116,7 @@ static const uint kBeamLeadSteps = 316;
 /// radiance (cache + single, luminance) and in transmittance, the hinted ones without a miss among those, and the full
 /// march's steps over the hinted one's.
 static const uint kBeamUnitStartProbe = 324;
-/// beamLayerProbe with beamQueryStart: dirty-query points given a start, of them those whose own first density (a march from
-/// the segment's start) lies before it, those losing more than 0.02 optical depth, and the missed distance (sixteenths of a voxel).
-static const uint kBeamQueryStartProbe = 332;
+// Slots 332-335 held beamQueryStart's miss probe (removed with it).
 /// ORACLE (beamLayerProbe): steps after a ray's last sample with density (its trailing empty run, rays with density only) and the
 /// warp-paid steps if both its leading and trailing runs were one step each - the dirty query, then the units.
 /// MEASURED (tail1, 4K sunset walk, beamUnitStart 8, per frame; units include the start probe's march from zero): units paid
@@ -1612,34 +1610,19 @@ struct HSTRCloudParams
     /// bakeCloudSun's step in level voxels of the level read (0.5: half a voxel, the march's own). An approximation above 0.5; a
     /// change rebakes everything (cloudSunBakeStepResets). The sunset launcher ships 2 (IntelCloudSeaHalf.py has the numbers).
     float cloudSunBakeStep = 0.5f;
-    /// PROBE (prices loads, changes nothing): leanExtinctionLayered loads its block layer mask (bit 1) and / or its voxel layer
-    /// bits (bit 2) a second time, from an address that depends on the first load's value (the same serial chain), and ORs in a
-    /// bit those textures never hold - the doubled loads' cost, what removing or carrying the masks could save at most. A compile
-    /// define of the dirty passes (HSTR_LAYER_MASK_COST), so 0 is the shipped kernel.
-    /// MEASURED (maskcost1, 4K sunset walk, one pass of 0 / 1 / 2 / 3 / 0, units + query): 4.33 / 4.58 / 4.89 / 5.19 / 4.99 ms. The
-    /// anchor drifted +0.66 ms across the run; corrected linearly by position, one more block-mask load costs ~0.08 ms, one more
-    /// voxel-bits load ~0.23, both ~0.37. So the two loads are worth ~0.3 ms a walk frame at most, most of it the voxel bits (a
-    /// 4-byte texel of the full-resolution domain volume per sample, where the block mask is one byte per 64 voxels).
-    uint cloudLayerMaskCost = 0;
-    /// The lean layered march takes both layer masks from one 16-byte load (hstrDomainVoxelBits, built by domainBlocks): per
-    /// majorant block, its 64 domain voxels' layer bits. The voxel nearest v, floor(s + 0.5), names the word; its bit is mode 4's
-    /// voxel mask, the word's OR the block mask of the box [4 block - 0.5, 4 block + 3.5) its voxels' nearest-sample regions tile
-    /// (4^3 voxels against hstrDomainLayers' 5^3 support, so no skip is lost). One load where there were two dependent ones (the
-    /// block byte, then the voxel's 4-byte domain texel). Not carried across steps in registers: register carries measured slower
-    /// here (leanloads1, the sea tile instance). A compile define of the dirty passes (HSTR_LAYER_PACKED), by pass: bit 0 the unit
-    /// marches, bit 1 the dirty queries, bit 2 the push, cell and span passes, bit 3 the full-build beam passes (15: all). The
-    /// motion score's fresh rebuild runs the bit-3 passes: without it, packed dirty marches were scored against the old kernel.
-    /// MEASURED (4K sunset walk, one launch each): exact - packed2 (beamLayerProbe) 0 voxel-bit mismatches, density lookups 2.28M
-    /// / 2.27M a frame, lane steps 8.02M -> 7.38M. Quality at parity once every pass takes it: packed5 over 0.02 0 / 15 / 0 / 15
-    /// 2.42 / 2.64 / 2.20 / 2.26%, against the sanity arm 8 (packed rebuild, old dirty kernels) 3.88% - the 3.7% of packed1 / 3b
-    /// was that disagreement. But no faster in any run: units + query packed1 4.00 / 4.27 / 3.77 / 4.22 ms, packed3b (select, not
-    /// a dynamic index) 4.03 -> 4.55 / 4.35, packedsplit1 units 2.34 -> 2.47 (bit 0) and query 1.77 -> 1.95 (bit 1), packed5
-    /// 4.12 / 4.28 / 4.35 / 4.86. Not registers or occupancy (packedgfx0 / 1: units 128 registers 16 warps, query 168 / 12, both
-    /// arms), not L1 (units 78% / 78%, query 67% / 66%) or DRAM. The Nsight source trace (packedsrc15) named it: the x / z wrap's
-    /// two signed integer modulos took 17.3% of the units kernel's samples; now selects. After that fix, wrap2 (three interleaved
-    /// triples): ~-0.09 ms against the shipped anchor, within the noise, where the same select fix in the shipped kernel
-    /// (cloudLayerWrapSelect) gives ~-0.2 ms with no extra texture. Off.
-    uint cloudLayerPacked = 0;
+    // MEASURED and REMOVED: cloudLayerMaskCost (3e07e20c), a probe - leanExtinctionLayered loaded its block layer mask (bit 1)
+    // and / or its voxel layer bits (bit 2) a second time, from an address depending on the first load's value, ORing in a bit
+    // those textures never hold: the doubled loads' cost, what removing or carrying the masks could save at most.
+    // MEASURED (maskcost1, 4K sunset walk, one pass of 0 / 1 / 2 / 3 / 0, units + query): 4.33 / 4.58 / 4.89 / 5.19 / 4.99 ms. The
+    // anchor drifted +0.66 ms across the run; corrected linearly by position, one more block-mask load costs ~0.08 ms, one more
+    // voxel-bits load ~0.23, both ~0.37. So the two loads are worth ~0.3 ms a walk frame at most, most of it the voxel bits.
+    // MEASURED and REMOVED: cloudLayerPacked (73595f6c) - the lean layered march took both layer masks from one 16-byte load
+    // (hstrDomainVoxelBits, RGBA32Uint per majorant block: its 64 domain voxels' layer bits, built in domainBlocks; the nearest
+    // voxel's bit the voxel mask, the word's OR the block mask). Exact (packed2: 0 mismatches) and at parity in quality once every
+    // pass took it (packed5), but no faster: units 2.34 -> 2.47, query 1.77 -> 1.95 ms (packedsplit1). Not registers, occupancy,
+    // L1 or DRAM: the Nsight source trace (packedsrc15) found the x / z wrap's two signed integer modulos at 17.3% of the units
+    // kernel's samples. With selects, ~-0.09 ms (wrap2, within the noise), where the same fix in the shipped kernel
+    // (cloudLayerWrapSelect) gives ~-0.2 ms with no extra 12.6 MB texture.
     /// domainVoxelLayers (mode 4's per-sample voxel bits) wraps its voxel's x / z by selects instead of signed integer modulo
     /// (its input is already wrapped by seaVoxel). Exact. A compile define of the dirty and full-build passes (HSTR_LAYER_WRAP_SELECT).
     /// MEASURED (wrap2, 4K sunset walk): units + query ~-0.2 ms (3 of 3 triples below the interpolated anchor). On in the launcher.
@@ -1652,31 +1635,20 @@ struct HSTRCloudParams
     /// The scored hint moves each ray's step positions, and 25-47% of rays (m8 / m2) then differ by > 2% from a march from zero
     /// (ustart4) without missing density - so an A/B whose rebuild lacks the hint reads +0.5-0.8 points over 0.02 (ustart2 / 5).
     float beamUnitStart = 0.f;
-    /// beamUnitStart over the 3 x 3 tiles around the unit's (their 4 x 4 corners and 9 centres) instead of its own tile's 5 points.
-    /// MEASURED (ustart3): misses 55 -> 0 a frame, but units 2.58 / 2.35 (own tile) vs 2.74 / 2.70 ms: the misses were never the
-    /// problem. Off.
-    uint beamUnitStartWide = 0;
-    /// Temporal ray start for the dirty query (an approximation): a re-marched lattice point starts at the first-density distance
-    /// its last march stored (slice 2 .z; the octahedral beam is fixed to world directions, the camera moved since) less
-    /// beamQueryStart sea voxels. 0: off. Needs HSTR_UNIT_START (beamUnitStart != 0), which records the distances.
-    /// MEASURED and REJECTED (kept, off; 4K sunset walk, motion score 2, probe: each hinted point also marched from zero):
-    /// qstart1 query 1.73 / 1.77 / 1.70 -> 1.58 / 1.59 (m8), 1.62 / 1.50 ms (m16), but over 0.02 2.5 / 2.3 / 2.6 -> 5.5 / 6.2 /
-    /// 4.6 / 4.7%: 6.8% / 5.2% of hinted points start past their first density, by ~39 voxels on average (a walk moves the camera
-    /// ~0.4 voxels a frame). Three fixes, none enough: no record after a march dense in its first step (qstart2: misses 2458,
-    /// 37 voxels); less the camera's travel since the march (beamTravel odometer in slice 2 .w; qstart3: 2451); only full
-    /// marches record, hinted ones keep the stored distance (qstart4: 1897 of 48.9k, 30 voxels, over 0.02 4.5%). So the first
-    /// density along a world direction comes closer by tens of voxels, far more than translation allows. Why is unknown - not
-    /// tested: residency (finer bricks streaming in near the camera put density where a coarser level had none).
-    float beamQueryStart = 0.f;
-    float beamTravel = 0.f; ///< The camera's cumulative path length in world units (set per frame; beamQueryStart's odometer).
-    /// Far-sea ray start (an approximation): a refreshed texel starts at the least first-lit distance of the previous layer's 2 x 2
-    /// texels its direction reprojects onto, less the camera's travel since those were marched and seaFarStart sea voxels. 0: off.
-    /// A hinted march keeps its hint's record (no ratchet), none if lit in its first step.
-    /// MEASURED (farstart1, 4K sunset walk, one launch, f0 / f8 / f32 twice): farSea 0.681 / 0.633 -> 0.653 / 0.624 (8),
-    /// 0.637 / 0.601 ms (32); over 0.02 2.47 / 2.37 -> 2.34 / 2.45 (8), 2.38 / 4.34% (32, one score 10.1%); sanity -16 4.02%.
-    /// Iterations before the first lit 36-55 -> 10-18 a texel, all 95-129 -> 60-92, but waves pay 1.41-1.57x their lanes'
-    /// iterations (was 1.30-1.43): the pass is set by its longest rays (max 364-746), which keep their length. ~-0.03 ms. Off.
-    float seaFarStart = 0.f;
+    // MEASURED and REMOVED: beamUnitStartWide (c83f7adc) - beamUnitStart over the 3 x 3 tiles around the unit's (4 x 4 corners,
+    // 9 centres): misses 55 -> 0 a frame, but units 2.58 / 2.35 (own tile) vs 2.74 / 2.70 ms (ustart3). The misses were never
+    // the problem.
+    // MEASURED and REMOVED: beamQueryStart (9ec380ee) - a re-marched dirty-query lattice point started at the first-density
+    // distance its last march stored, less a margin. qstart1 query 1.73 / 1.77 / 1.70 -> 1.58 / 1.59 (m8), 1.62 / 1.50 ms (m16),
+    // but over 0.02 2.5 / 2.3 / 2.6 -> 5.5 / 6.2 / 4.6 / 4.7%: 6.8% / 5.2% of hinted points started past their first density, by
+    // ~39 voxels (a walk moves ~0.4 voxels a frame). No record after a march dense in its first step (qstart2), less the camera's
+    // travel (qstart3), only full marches record (qstart4: 1897 of 48.9k, over 0.02 4.5%): none enough. Why the first density
+    // along a world direction comes closer by tens of voxels is unknown - untested: residency (finer bricks streaming in).
+    float beamTravel = 0.f; ///< The camera's cumulative path length in world units (set per frame; beamUnitStart's odometer).
+    // MEASURED and REMOVED: seaFarStart (b176acba) - a refreshed far texel started at the least first-lit distance of the
+    // previous layer's 2 x 2 texels it reprojects onto, less the travel since and a margin. farstart1: farSea 0.681 / 0.633 ->
+    // 0.653 / 0.624 (8), 0.637 / 0.601 ms (32); over 0.02 2.47 / 2.37 -> 2.34 / 2.45 (8), 2.38 / 4.34% (32). Iterations before
+    // the first lit 36-55 -> 10-18 a texel, but waves paid 1.41-1.57x their lanes' iterations (was 1.30-1.43); ~-0.03 ms.
     /// ORACLE (not a quality setting): a far-sea ray stops after this many iterations (0: the usual 1024). Its time against the cap
     /// says whether the pass follows its longest rays (a latency tail) or its paid wave iterations (throughput).
     uint seaFarCap = 0;
