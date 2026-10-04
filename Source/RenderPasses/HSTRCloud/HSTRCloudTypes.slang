@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 336;
+static const uint kBeamCountSlots = 344;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -119,6 +119,17 @@ static const uint kBeamUnitStartProbe = 324;
 /// beamLayerProbe with beamQueryStart: dirty-query points given a start, of them those whose own first density (a march from
 /// the segment's start) lies before it, those losing more than 0.02 optical depth, and the missed distance (sixteenths of a voxel).
 static const uint kBeamQueryStartProbe = 332;
+/// ORACLE (beamLayerProbe): steps after a ray's last sample with density (its trailing empty run, rays with density only) and the
+/// warp-paid steps if both its leading and trailing runs were one step each - the dirty query, then the units.
+/// MEASURED (tail1, 4K sunset walk, beamUnitStart 8, per frame; units include the start probe's march from zero): units paid
+/// 12.09M, perfect start 9.57M, start and end 8.84M (-7.6% more); query 2.78M / 2.04M / 1.95M (-4%). Trailing empties 0.74M of
+/// 9.1M unit lane steps, 77k in the query: rays end on opacity or inside cloud. Stop rule 10%: no ray-end hint.
+static const uint kBeamTailSteps = 336;
+/// ORACLE (beamLayerProbe): brick walks (empty or dense) in a layer on rays that found no density in that layer - what a per-ray
+/// layer hint would skip - and those ray-layers, for the dirty query, then the units.
+/// MEASURED (layerhint1, 4K sunset walk, per frame): 68k (query) + 280k (units) of 7.26M brick walks (4.8%), 47k ray-layers. A
+/// ray that walks a layer's bricks almost always finds its density. Stop rule 20%: no per-ray layer hint.
+static const uint kBeamLayerRayHint = 340;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1666,6 +1677,12 @@ struct HSTRCloudParams
     /// Iterations before the first lit 36-55 -> 10-18 a texel, all 95-129 -> 60-92, but waves pay 1.41-1.57x their lanes'
     /// iterations (was 1.30-1.43): the pass is set by its longest rays (max 364-746), which keep their length. ~-0.03 ms. Off.
     float seaFarStart = 0.f;
+    /// ORACLE (not a quality setting): a far-sea ray stops after this many iterations (0: the usual 1024). Its time against the cap
+    /// says whether the pass follows its longest rays (a latency tail) or its paid wave iterations (throughput).
+    uint seaFarCap = 0;
+    /// Far-sea density steps at least this times a far texel's footprint (seaFarScale pixels at the step's distance), still inside
+    /// the 4-voxel majorant block (an approximation). 0: off (one sea voxel).
+    float seaFarFootprint = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

@@ -62,6 +62,10 @@ g.addPass(createPass("HSTRCloud", {
     # 117k hinted units a frame start past their first density; 25% of hinted rays differ from a march from zero by > 2% only
     # because the step positions move (the march's own discretisation, neutral against the path trace).
     "beamUnitStart": 8.0,
+    # Far-sea density steps at least two far texels' footprint (past ~6.5k units a texel spans a sea voxel). farfoot2 (4K walk):
+    # farSea 0.650 / 0.636 -> 0.578 (1) / 0.499 (2) / 0.470 ms (8). Path trace, horizon band of sunset_hill_farfoot1 (6.9k px):
+    # rms log 0.1476 / 0.1477 -> 0.1470 (2), p99 0.495 -> 0.502; sanity cap 32 0.1593 / 0.589.
+    "seaFarFootprint": 2.0,
     # Sun bakes a frame while the camera moves (HSTRCloud.cpp's default 256 was tuned on frame time alone, when a bake cost less).
     # 4K sunset walk, bakeCloudSun ms / over 0.02 (motion score 2): bakes1 256 0.73 / 2.52%, 128 0.35 / 2.28%, 64 0.19 / 2.26%,
     # 256 again 0.63 / 2.73%; bakeexit1 256 1.01 / 2.41%, 128 0.50 / 2.25%, 256 again 0.80 / 2.26%. Sprint scores swung 3-11% on

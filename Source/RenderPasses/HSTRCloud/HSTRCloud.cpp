@@ -689,6 +689,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.seaFarStart = float(value);
             continue;
         }
+        if (key == "seaFarCap")
+        {
+            mParams.seaFarCap = uint32_t(value);
+            continue;
+        }
+        if (key == "seaFarFootprint")
+        {
+            mParams.seaFarFootprint = float(value);
+            continue;
+        }
         if (key == "beamQueryStart")
         {
             mParams.beamQueryStart = float(value);
@@ -1492,6 +1502,8 @@ Properties HSTRCloud::getProperties() const
     props["beamUnitStartWide"] = mParams.beamUnitStartWide != 0;
     props["beamQueryStart"] = mParams.beamQueryStart;
     props["seaFarStart"] = mParams.seaFarStart;
+    props["seaFarCap"] = mParams.seaFarCap;
+    props["seaFarFootprint"] = mParams.seaFarFootprint;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -1966,6 +1978,14 @@ Properties HSTRCloud::getProperties() const
             cloud["beamQueryStartMissed"] = mBeamLevelCounts[kBeamQueryStartProbe + 1];
             cloud["beamQueryStartLost"] = mBeamLevelCounts[kBeamQueryStartProbe + 2];
             cloud["beamQueryStartMissedVoxels16"] = mBeamLevelCounts[kBeamQueryStartProbe + 3];
+            cloud["beamTailQueryEmpty"] = mBeamLevelCounts[kBeamTailSteps];
+            cloud["beamTailQueryIdealPaid"] = mBeamLevelCounts[kBeamTailSteps + 1];
+            cloud["beamTailUnitEmpty"] = mBeamLevelCounts[kBeamTailSteps + 2];
+            cloud["beamTailUnitIdealPaid"] = mBeamLevelCounts[kBeamTailSteps + 3];
+            cloud["beamLayerHintQueryWalks"] = mBeamLevelCounts[kBeamLayerRayHint];
+            cloud["beamLayerHintQueryLayers"] = mBeamLevelCounts[kBeamLayerRayHint + 1];
+            cloud["beamLayerHintUnitWalks"] = mBeamLevelCounts[kBeamLayerRayHint + 2];
+            cloud["beamLayerHintUnitLayers"] = mBeamLevelCounts[kBeamLayerRayHint + 3];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
@@ -4645,7 +4665,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         if (!mpFarCounts)
-            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 10);
+            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 23);
         pRenderContext->clearUAV(mpFarCounts->getUAV().get(), uint4(0));
         var["hstrFarCounts"] = mpFarCounts;
     }
@@ -4653,16 +4673,28 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         // DIAGNOSTIC: stalls for the readback.
-        uint32_t c[10];
-        for (uint32_t i = 0; i < 10; ++i)
+        uint32_t c[23];
+        for (uint32_t i = 0; i < 23; ++i)
             c[i] = mpFarCounts->getElement<uint32_t>(i);
         const double n = double(std::max(c[0], 1u));
+        const double paidAll = double(std::max(c[7], 1u));
         logInfo(
             "HSTRCloud: far sea run {} (all {}): {} segments, {:.1f} iterations each, max {}, {:.1f} lit each, {} at the cap; "
             "{:.1f} occupancy skips, {:.1f} zero-majorant skips, {:.1f} density steps each; paid / used iterations {:.2f}; "
-            "{:.1f} before the first lit each, paid with a perfect start {:.2f} of today's.",
+            "{:.1f} before the first lit each, paid with a perfect start {:.2f} of today's; over 128 / 256 / 512 iterations {} / {} / {}; "
+            "of today's paid, capped at 64 / 128 / 256 {:.2f} / {:.2f} / {:.2f}, chunked there and the survivors compacted {:.2f} / {:.2f} / {:.2f}.",
             mFarSeaRuns, mParams.seaFarRefreshAll, c[0], c[1] / n, c[2], c[3] / n, c[4], c[5] / n, c[6] / n,
-            (double(c[1]) - c[5] - c[6]) / n, double(c[7]) / std::max(c[1], 1u), c[8] / n, double(c[9]) / std::max(c[7], 1u)
+            (double(c[1]) - c[5] - c[6]) / n, double(c[7]) / std::max(c[1], 1u), c[8] / n, double(c[9]) / std::max(c[7], 1u),
+            c[10], c[11], c[12], c[13] / paidAll, c[14] / paidAll, c[15] / paidAll, (double(c[13]) + c[16]) / paidAll,
+            (double(c[14]) + c[17]) / paidAll, (double(c[15]) + c[18]) / paidAll
+        );
+        const double nAll = double(std::max(c[1], 1u));
+        logInfo(
+            "HSTRCloud: far sea run {} footprint: a texel spans a sea voxel past {:.0f} (far sea to {:.0f}); iterations there {:.2f} of all, "
+            "density steps there {:.2f} of all density steps; rays over 256 iterations: {:.2f} of all iterations, {:.2f} of theirs past it.",
+            mFarSeaRuns, mParams.seaVoxelSize.x / std::max(mParams.cloudPixelAngle * float(mParams.seaFarScale), 1e-12f),
+            mParams.seaFarDistance, c[19] / nAll, double(c[20]) / std::max(double(c[1]) - c[5] - c[6], 1.0), c[22] / nAll,
+            double(c[21]) / std::max(c[22], 1u)
         );
     }
     mFarRunDeferred = false;
