@@ -5003,6 +5003,23 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// InterlockedAdd(buffer[index], count) for every lane of the wave, one atomic per distinct index (lanes adding 0 add nothing).
+    /// scanSunBakes' bins are few and shared by the whole capacity (every unwanted bake outside the cut is holder bin 0).
+    void sunAddWave(RWStructuredBuffer<uint> buffer, uint index, uint count)
+    {
+        bool pending = count > 0;
+        [loop]
+        while (pending)
+        {
+            const uint target = WaveReadLaneFirst(index);
+            const bool mine = index == target;
+            const uint sum = WaveActiveSum(mine ? count : 0u);
+            if (WaveIsFirstLane())
+                InterlockedAdd(buffer[target], sum);
+            pending = !mine;
+        }
+    }
+
     /// Scan: a mapped brick in the cut drops its stale bakes (keeping their slots for the rebake) and counts the classes still
     /// needing one; every held bake is a holder.
     void scanSunBakes(uint b)
@@ -5017,6 +5034,7 @@ struct HSTRCloudRenderer
         uint needs = 0;
         uint baked = 0;
         uint waiting = 0;
+        uint stale = 0;
         uint staleMask = 0; // Pairs holding an outdated bake that still answers (keepStale).
         if (active)
         {
@@ -5028,7 +5046,6 @@ struct HSTRCloudRenderer
             const uint fineNode = fine ? sunFineNode(s.asset, brick >> (2u - level)) : kCloudRefNone;
             const uint3 dims = sunLevelDims(s.asset, level);
             const uint position = hstrCloudSunFieldLevels[s.asset * kCloudSunFieldLevels + level] + brick.x + dims.x * (brick.y + dims.y * brick.z);
-            uint stale = 0;
             for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
             {
                 const uint held = hstrCloudSunSlotsOutput[2u * (base + k)];
@@ -5056,7 +5073,7 @@ struct HSTRCloudRenderer
                     ++stale;
                 }
             }
-            if (stale > 0)
+            if (stale > 0 && frame.scanWave == 0)
                 InterlockedAdd(hstrCloudSunCounters[5], stale);
             for (uint c = 0; c < frame.classCount; ++c)
             {
@@ -5076,19 +5093,43 @@ struct HSTRCloudRenderer
             }
         }
         uint held = 0;
+        uint holdersWanted = 0;
+        uint holdersUnwanted = 0;
         for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
         {
             const uint key = hstrCloudSunSlotsOutput[2u * (base + k)];
             const bool wanted = active && sunKeyWanted(key, s.flags);
             held += wanted && (staleMask & (1u << k)) == 0 ? 1u : 0u; // An outdated pair is the rebake's own slot, not a holder.
             if (hstrCloudSunSlotsOutput[2u * (base + k) + 1u] != kCloudRefNone)
-                InterlockedAdd(hstrCloudSunHistogram[kCloudSunBins + sunHolderBin(wanted, inCut, s.priority)], 1u);
+            {
+                if (frame.scanWave != 0)
+                {
+                    if (wanted)
+                        ++holdersWanted;
+                    else
+                        ++holdersUnwanted;
+                }
+                else
+                    InterlockedAdd(hstrCloudSunHistogram[kCloudSunBins + sunHolderBin(wanted, inCut, s.priority)], 1u);
+            }
         }
-        if (needs != 0 && held < kCloudSunBakesPerBrick)
-            InterlockedAdd(hstrCloudSunHistogram[sunCandidateBin(s.priority)], 1u);
-        else
+        const bool candidate = needs != 0 && held < kCloudSunBakesPerBrick;
+        if (!candidate)
             needs = 0;
         hstrCloudSunNeeds[b] = needs | (staleMask << 16);
+        if (frame.scanWave != 0)
+        {
+            // The same adds, summed per wave and bin first: every thread of the capacity adds into a few shared bins.
+            sunAddWave(hstrCloudSunHistogram, kCloudSunBins + sunHolderBin(true, inCut, s.priority), holdersWanted);
+            sunAddWave(hstrCloudSunHistogram, kCloudSunBins + sunHolderBin(false, inCut, s.priority), holdersUnwanted);
+            sunAddWave(hstrCloudSunHistogram, sunCandidateBin(s.priority), candidate ? 1u : 0u);
+            sunAddWave(hstrCloudSunCounters, 3u, baked);
+            sunAddWave(hstrCloudSunCounters, 4u, waiting);
+            sunAddWave(hstrCloudSunCounters, 5u, stale);
+            return;
+        }
+        if (candidate)
+            InterlockedAdd(hstrCloudSunHistogram[sunCandidateBin(s.priority)], 1u);
         if (baked > 0)
             InterlockedAdd(hstrCloudSunCounters[3], baked);
         if (waiting > 0)

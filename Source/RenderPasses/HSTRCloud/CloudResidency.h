@@ -205,6 +205,8 @@ public:
     void setSunBakesCap(uint32_t cap) { mSunBakesCap = cap; }
     /// Whether a mapping change outdates only the bakes of its brick's level or finer (HSTRCloudSunFrame::levelStamps).
     void setSunLevelStamps(bool levelStamps) { mSunLevelStamps = levelStamps; }
+    /// Whether scanSunBakes sums its atomics per wave and bin first (HSTRCloudSunFrame::scanWave).
+    void setSunScanWave(bool scanWave) { mSunScanWave = scanWave; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
@@ -515,6 +517,7 @@ private:
     bool mSunKeepStale = true;
     uint32_t mSunBakesCap = 0;
     bool mSunLevelStamps = true;
+    bool mSunScanWave = false;
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.

@@ -750,6 +750,9 @@ private:
     float mCloudSunBakeNear = -1.f;           ///< sunNearVoxels the sun generation was last bumped for.
     float mCloudSunBakeStep = -1.f;           ///< cloudSunBakeStep the sun generation was last bumped for.
     bool mCloudSunBakeStepResets = true;      ///< cloudSunBakeStepResets: a bake step change rebakes everything.
+    /// cloudSunScanWave: scanSunBakes' atomics summed per wave and bin first (HSTRCloudSunFrame::scanWave). Exact. MEASURED
+    /// (scanwave1, 4K sunset walk, two pairs): scan 0.334 / 0.292 -> 0.144 / 0.127 ms, chunk-end counts and scores alike.
+    bool mCloudSunScanWave = true;
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
     bool mCloudSunKeepStale = true;           ///< Outdated sun bakes answer until they rebake (CloudResidency::setSunKeepStale).

@@ -674,6 +674,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudSunBakeStepResets = bool(value);
             continue;
         }
+        if (key == "cloudSunScanWave")
+        {
+            mCloudSunScanWave = bool(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1436,6 +1441,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeReuse"] = mParams.cloudSunBakeReuse;
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
+    props["cloudSunScanWave"] = mCloudSunScanWave;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -3273,6 +3279,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     // the laptop's power management at five times the settled cost rather than the frame.
     mpCloudResidency->setSunKeepStale(mCloudSunKeepStale);
     mpCloudResidency->setSunLevelStamps(mCloudSunLevelStamps);
+    mpCloudResidency->setSunScanWave(mCloudSunScanWave);
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
