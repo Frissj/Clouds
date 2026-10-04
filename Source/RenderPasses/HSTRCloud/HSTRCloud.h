@@ -796,6 +796,8 @@ private:
     ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
     ref<Texture> mpDomainLayers; ///< Per majorant block: bit L where layer L has density over that support (R8Uint).
     ref<Texture> mpDomainVoxelBits; ///< Per majorant block: its 64 domain voxels' layer bits (RGBA32Uint, cloudLayerPacked).
+    float3 mTravelPosition = float3(0.f); ///< beamQueryStart: last frame's camera position (for beamTravel).
+    bool mTravelValid = false;
     ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).
     ref<Buffer> mpDomainFrame;
     ref<Buffer> mpDomainStaged;  ///< One batch of packed tile volumes, copied from the staging buffers.

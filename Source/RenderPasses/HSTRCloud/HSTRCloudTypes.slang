@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 332;
+static const uint kBeamCountSlots = 336;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -116,6 +116,9 @@ static const uint kBeamLeadSteps = 316;
 /// radiance (cache + single, luminance) and in transmittance, the hinted ones without a miss among those, and the full
 /// march's steps over the hinted one's.
 static const uint kBeamUnitStartProbe = 324;
+/// beamLayerProbe with beamQueryStart: dirty-query points given a start, of them those whose own first density (a march from
+/// the segment's start) lies before it, those losing more than 0.02 optical depth, and the missed distance (sixteenths of a voxel).
+static const uint kBeamQueryStartProbe = 332;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1642,8 +1645,19 @@ struct HSTRCloudParams
     /// MEASURED (ustart3): misses 55 -> 0 a frame, but units 2.58 / 2.35 (own tile) vs 2.74 / 2.70 ms: the misses were never the
     /// problem. Off.
     uint beamUnitStartWide = 0;
-    uint beamUnitStartPad0 = 0;
-    uint beamUnitStartPad1 = 0;
+    /// Temporal ray start for the dirty query (an approximation): a re-marched lattice point starts at the first-density distance
+    /// its last march stored (slice 2 .z; the octahedral beam is fixed to world directions, the camera moved since) less
+    /// beamQueryStart sea voxels. 0: off. Needs HSTR_UNIT_START (beamUnitStart != 0), which records the distances.
+    /// MEASURED and REJECTED (kept, off; 4K sunset walk, motion score 2, probe: each hinted point also marched from zero):
+    /// qstart1 query 1.73 / 1.77 / 1.70 -> 1.58 / 1.59 (m8), 1.62 / 1.50 ms (m16), but over 0.02 2.5 / 2.3 / 2.6 -> 5.5 / 6.2 /
+    /// 4.6 / 4.7%: 6.8% / 5.2% of hinted points start past their first density, by ~39 voxels on average (a walk moves the camera
+    /// ~0.4 voxels a frame). Three fixes, none enough: no record after a march dense in its first step (qstart2: misses 2458,
+    /// 37 voxels); less the camera's travel since the march (beamTravel odometer in slice 2 .w; qstart3: 2451); only full
+    /// marches record, hinted ones keep the stored distance (qstart4: 1897 of 48.9k, 30 voxels, over 0.02 4.5%). So the first
+    /// density along a world direction comes closer by tens of voxels, far more than translation allows. Why is unknown - not
+    /// tested: residency (finer bricks streaming in near the camera put density where a coarser level had none).
+    float beamQueryStart = 0.f;
+    float beamTravel = 0.f; ///< The camera's cumulative path length in world units (set per frame; beamQueryStart's odometer).
     uint beamUnitStartPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).

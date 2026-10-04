@@ -8563,7 +8563,10 @@ struct HSTRCloudRenderer
         // image it was written into became the history exactly once; the persistent lattice is cleared when the frame re-anchors
         // and a mark then stands until then.
         // .z: the ray's first-density distance for the units' start (beamUnitStart; 0: none recorded, or no density - no hint).
-        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, max(first, 0.f), 0.f);
+        // .w: the camera's odometer when it was marched (beamTravel), so a later start can allow for the camera's travel since.
+        // first -2: keep the stored distance and odometer (a hinted beamQueryStart march).
+        const float2 kept = first == -2.f ? hstrBeamLatticeOutput[uint3(texel, 2)].zw : float2(max(first, 0.f), params.beamTravel);
+        hstrBeamLatticeOutput[uint3(texel, 2)] = float4(steps, 1.f, kept);
     }
 
     /// The first-density distance of the march this thread just ran (beamUnitStart), for writeBeamQuery; 0 without HSTR_UNIT_START.
@@ -10690,7 +10693,7 @@ struct HSTRCloudRenderer
                 const int2 position = k < 16 ? (low + int2(k & 3u, k >> 2)) * int(s) : (low + int2((k - 16u) % 3u, (k - 16u) / 3u)) * int(s) + int(s / 2u);
                 const bool inside = all(position >= 0) && all(uint2(max(position, 0)) <= params.beamTileDims * s);
                 const float4 stored = inside ? beamLatticeAt(uint2(position), 2) : float4(0.f);
-                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z) : 0.f;
+                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z - max(params.beamTravel - stored.w, 0.f)) : 0.f;
             }
         }
         else
@@ -10702,10 +10705,28 @@ struct HSTRCloudRenderer
                     break;
                 const uint2 position = k < 4 ? (tile + uint2(k & 1u, k >> 1)) * s : tile * s + s / 2u;
                 const float4 stored = beamLatticeAt(position, 2);
-                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z) : 0.f;
+                // Less the camera's travel since that point was marched (a kept beamQueryStart distance can be frames old).
+                first = stored.y > 0.f && stored.z > 0.f ? min(first, stored.z - max(params.beamTravel - stored.w, 0.f)) : 0.f;
             }
         }
         return first > 0.f && first < 3.4e38f ? max(first - params.beamUnitStart * params.seaVoxelSize.x, 0.f) : 0.f;
+#else
+        return 0.f;
+#endif
+    }
+
+    /// beamQueryStart: where a re-marched lattice point may start - its own last march's first-density distance less the margin
+    /// (read before this march replaces it); 0 where it has none.
+    float beamQueryStartDistance(uint2 position)
+    {
+#if HSTR_UNIT_START
+        if (params.beamQueryStart == 0.f)
+            return 0.f;
+        // Less the camera's travel since that march (the first density along this world direction can have come at most that much
+        // closer under translation).
+        const float4 stored = beamLatticeHeldAt(position, 2);
+        const float travel = max(params.beamTravel - stored.w, 0.f);
+        return stored.y > 0.f && stored.z > 0.f ? max(stored.z - travel - params.beamQueryStart * params.seaVoxelSize.x, 0.f) : 0.f;
 #else
         return 0.f;
 #endif
@@ -12979,7 +13000,36 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #else
     if (!march)
         return;
-    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    const float start = gHSTRCloud.beamQueryStartDistance(position);
+#if HSTR_LAYER_PROBE && HSTR_UNIT_START
+    // kBeamQueryStartProbe: the same ray from the segment's start first (probe only), so the hinted march's record stands last.
+    if (start > 0.f)
+    {
+        const BeamSample full = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+        const float trueFirst = gFirstDistance;
+        const BeamSample hinted = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f), start);
+        const bool missed = trueFirst >= 0.f && trueFirst < start;
+        uint unused;
+        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe], 1u, unused);
+        if (missed)
+        {
+            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 1], 1u, unused);
+            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 2], full.depth - hinted.depth > 0.02f ? 1u : 0u, unused);
+            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryStartProbe + 3],
+                           uint(16.f * (start - trueFirst) / gHSTRCloud.params.seaVoxelSize.x), unused);
+        }
+    }
+#endif
+    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f), start);
+#if HSTR_UNIT_START
+    // beamQueryStart: a hinted march dense in its very first step probably began inside a cloud that reaches in front of the
+    // start; it records no distance, so the point marches in full next time instead of ratcheting its start deeper.
+    // Otherwise a hinted march keeps the stored distance and odometer (-2): what it found lies past its own start, and storing
+    // that let a wisp in front of the start push the stored distance deeper every march (qstart2 / 3: misses unchanged by the
+    // first-step rule and by the travel correction). Only a march from the segment's start records.
+    if (start > 0.f)
+        gFirstDistance = gFirstDistance >= 0.f && gFirstDistance <= start + 1e-3f * gHSTRCloud.params.seaVoxelSize.x ? -1.f : -2.f;
+#endif
 #if HSTR_STRIP != 0
     gHSTRCloud.beamStripSink(ray);
     return;

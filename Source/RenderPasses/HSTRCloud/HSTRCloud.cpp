@@ -684,6 +684,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamUnitStart = float(value);
             continue;
         }
+        if (key == "beamQueryStart")
+        {
+            mParams.beamQueryStart = float(value);
+            continue;
+        }
         if (key == "beamUnitStartWide")
         {
             mParams.beamUnitStartWide = bool(value) ? 1u : 0u;
@@ -1480,6 +1485,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudLayerWrapSelect"] = mParams.cloudLayerWrapSelect != 0;
     props["beamUnitStart"] = mParams.beamUnitStart;
     props["beamUnitStartWide"] = mParams.beamUnitStartWide != 0;
+    props["beamQueryStart"] = mParams.beamQueryStart;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -1950,6 +1956,10 @@ Properties HSTRCloud::getProperties() const
             cloud["beamUnitStartTransmittanceOff"] = mBeamLevelCounts[kBeamUnitStartProbe + 5];
             cloud["beamUnitStartOffNoMiss"] = mBeamLevelCounts[kBeamUnitStartProbe + 6];
             cloud["beamUnitStartStepsSaved"] = mBeamLevelCounts[kBeamUnitStartProbe + 7];
+            cloud["beamQueryStartHinted"] = mBeamLevelCounts[kBeamQueryStartProbe];
+            cloud["beamQueryStartMissed"] = mBeamLevelCounts[kBeamQueryStartProbe + 1];
+            cloud["beamQueryStartLost"] = mBeamLevelCounts[kBeamQueryStartProbe + 2];
+            cloud["beamQueryStartMissedVoxels16"] = mBeamLevelCounts[kBeamQueryStartProbe + 3];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
@@ -5470,6 +5480,16 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     mFarSeaActive = mSeaFarField && mParams.seaMode != 0 && mParams.cloudDomain != 0 &&
                     (mParams.debugView == kBeamView || mParams.debugView == kWorldCacheView);
     mParams.seaFadeInverse = mFarSeaActive ? 20.f : 1.f / 0.3f;
+    // beamQueryStart: the camera's cumulative path length. A stored first-density distance along a fixed world direction can have
+    // come closer by at most the distance travelled since it was marched.
+    if (mpScene)
+    {
+        const float3 position = mpScene->getCamera()->getPosition();
+        if (mTravelValid)
+            mParams.beamTravel += length(position - mTravelPosition);
+        mTravelPosition = position;
+        mTravelValid = true;
+    }
     if (!mpScene || !mpPass || (!mpLeafRadiance && !mpCloudSea))
     {
         pRenderContext->clearUAV(color->getUAV().get(), float4(0.f));

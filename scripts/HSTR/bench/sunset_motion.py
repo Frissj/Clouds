@@ -58,7 +58,8 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")) +
          # ... and beamUnitStart's misses (kBeamUnitStartProbe).
          ("beamUnitStartHinted", "beamUnitStartMissed", "beamUnitStartLost", "beamUnitStartMissedVoxels16",
-          "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved"))
+          "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved",
+          "beamQueryStartHinted", "beamQueryStartMissed", "beamQueryStartLost", "beamQueryStartMissedVoxels16"))
 
 
 def score():
