@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 404;
+static const uint kBeamCountSlots = 276;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -78,49 +78,14 @@ static const uint kBeamGuardHeld = 262;
 /// brick. A per-layer majorant mask only skips chains where the layer's whole majorant block is empty, which this cannot see; the
 /// larger target is the 77% of samples in non-empty majorant blocks that find no density at all. Not built.
 static const uint kBeamLayerProbe = 264;
-/// beamLayerProbe, the navigation probe over the same marches (marchBeamLean's main samples, rim taps excluded), from
-/// kBeamNavProbe: 0 empty samples (a skip exit, no density in any layer), 1 samples with density or the proxy, 2 air steps (zero
-/// majorant), 3 empty runs (maximal runs of empty samples, air inside them included), 4 the voxels the empty samples advanced, x4;
-/// 5 lane steps, 6 lane ideal steps (1 + 2 + 3: what a march skipping every empty run in one step would take), 7 warp-paid steps
-/// (longest lane x active lanes), 8 warp-paid ideal steps, 9 warps; 10-17 empty samples by the exit that stopped them (0 cell run,
-/// 1 octant / brick box, 2 a layer's square or asset entry, 3 cloudSkirtBox's box; +4 where the footprint's next level cut it short); 18-25
-/// those of them that advanced no further than the regular step; 26-30 empty runs by length in samples: 1, 2-3, 4-7, 8-15, 16+;
-/// 31-34 the skirt box's empty samples (kinds 3 and 7) by what stopped them: the octant's face, a face shrunk by the skirt reach,
-/// the page's face, the footprint's next level; 35-38 those of them that advanced no further than the regular step; 39-42 the
-/// skirt box's empty samples by mapped level 0, 1, 2, 3+; 43-46 those that advanced one step; 47 the voxels they advanced, x4;
-/// 48-50 the same three for those that used cloudSkirtBox 2's octant-mask box; 51 the empty samples' regular step (dt) in voxels,
-/// x4; 52 empty samples whose skip ran past the segment's end, 53 the voxels cut off there (up to 64 each), x4; 54 marches, 55
-/// their segments' length in voxels, 56-58 marches that ended at the segment's end, on transmittance, on the step limit; 59-60
-/// the octant-mask box samples' regular step in voxels x4 and those cut at the segment's end; 61 box-exit empty samples (exit
-/// kinds 1 and 3) whose box is the one the previous empty sample stopped at, 62-64 their box chord along the ray, the part
-/// behind the sample, the part ahead (voxels x4, up to 256 each), 65 box-exit empty samples; 66-69 the same four for the
-/// octant-mask box; 70-73 empty samples by the Chebyshev distance in 4-voxel majorant blocks to the nearest block with a non-zero
-/// undilated majorant (0, 1, 2, 3+), 74-77 the same for samples with density (sanity: all at 0).
-/// MEASURED (skirtbox7, arms off / octant / off2): no exit bug. The off arm's 38.9% of box exits in the previous sample's box
-/// are skirt-zone samples outside the shrunk box (exit 0, the next sample in the same octant); the octant box has 0.1%. Octant
-/// box samples sit at its entry (0.00 voxels behind) with 0.73 sea voxels ahead: a source voxel is ~0.075 sea voxels, so a
-/// mapped-3 octant spans ~2.4 sea voxels against empty runs of ~45. Asset-hierarchy boxes cannot reach the runs.
-/// MEASURED (skirtbox6, 4K sunset walk, arms off / octant / off2): 0.4% of empty samples are cut at the segment's end; segments
-/// are ~290 voxels and end at their end (38%) or on transmittance (62%), never the step limit. Empty samples' regular step is
-/// 1.74 voxels (the octant box's 1.20), they advance 2.5; empty runs average 18 samples.
-/// MEASURED (skirtbox4, 4K sunset walk, 3 cycles, arms off / on / off2): the skirt box's 4.19M stops were 84% its page face
-/// (97.6% of those one step), 15% the octant face, 1.4% a shrunk face; by mapped level 0 / 1 / 2 / 3+: 0 / 2% / 8% / 90%; 1.73
-/// voxels per sample. The octants are 32+ voxels; the page clip, not the octant, ends the box.
-static const uint kBeamNavProbe = 272;
-static const uint kBeamNavProbeCount = 78;
-/// beamDirtyKeep, per classify: failed blocks held instead of re-marched, and the camera travel since they were built (sea voxels
-/// x16, summed).
-static const uint kBeamDirtySkipped = 350;
-static const uint kBeamDirtySkippedTravel = 351;
-/// beamGuardMotion counters, per classify: verified blocks whose bound failed, by |d| / beamCellRadius: under 1.25, 1.5, 2, 4, 8,
-/// 16, 16 and over, and no radius (a level's nearest depth zero).
-static const uint kBeamGuardViolation = 352;
-/// beamLayerProbe with cloudLayerEmptyCache: per layer (two slots each, layers 0-1), the lean march's main-sample visits of that
-/// layer and the visits its empty interval answered.
-static const uint kBeamLayerCache = 360;
-/// cloudLayerEmptyCache 2: what a fresh lookup found where the cache would have answered (layerCacheCheck): density, proxy, same,
-/// exit within 1e-3, farther, nearer, same exit with another voxel size.
-static const uint kBeamLayerCacheCheck = 364;
+/// MEASURED and REMOVED (4f900bbe navigation probe, ec2c1879 skirt box, fba639c0 per-layer empty cache; the code is in those
+/// commits): perfect empty-run skips would cut warp-paid march steps 2.6x, but empty runs average ~45 sea voxels while the asset
+/// hierarchy's boxes reach ~2.4 (mapped-3 octants; the page clip ends 84% of skirt boxes), so exact empty boxes cannot reach them.
+/// Caching each layer's last empty interval along the ray is exact (bit-identical on the path-traced gate) but saves no time: it
+/// skips the cheap out-of-box lookups, not the brick walks that end on an empty brick. The second layer costs per step (two
+/// layers 1867 lane steps a warp, one layer 1859), not in extra steps.
+/// beamLayerProbe, over the same marches: lane steps, warp-paid steps (longest lane x active lanes), warps.
+static const uint kBeamLayerSteps = 272;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1544,28 +1509,6 @@ struct HSTRCloudParams
     uint compareSquaredPad0 = 0;
     uint compareSquaredPad1 = 0;
     uint compareSquaredPad2 = 0;
-    /// A missing child octant's empty box (cloudAssetBrickAtFlat) is shrunk by the skirt reach only on the faces where its page's
-    /// skirt mask has a neighbour that holds, and clipped to the page, instead of on all six faces. See cloudSkirtFaces.
-    uint cloudSkirtBox = 0;
-    uint cloudSkirtBoxPad0 = 0;
-    uint cloudSkirtBoxPad1 = 0;
-    uint cloudSkirtBoxPad2 = 0;
-    /// PROBE: of the blocks whose guard bound failed (not unverified ones), the share re-marched this build, out of 256, picked by
-    /// hash(block, frame); the rest are held stale. 0: all (off). See classifyBeamGuardCell.
-    uint beamDirtyKeep = 0;
-    uint beamDirtyKeepShift = 0; ///< beamDirtyKeep picks per 2^shift x 2^shift group of guard blocks (0: per block).
-    /// PROBE: a verified block whose bound failed is held while |d| / beamCellRadius stays under this (0: off). Self-limiting:
-    /// the ratio grows with the camera's travel, so the block is re-marched once it passes. See classifyBeamGuardCell.
-    float beamDirtyDefer = 0.f;
-    /// PROBE (wrong image): leanExtinctionLayered treats layers from 1 up as empty once their instance and asset box are tested,
-    /// skipping their brick lookup - splits the second layer's price between the box test and the brick chain.
-    uint cloudLayerCut = 0;
-    /// The lean march remembers, per layer, the ray interval its last lookup proved empty, and skips that layer's lookup while a
-    /// sample lies in it (leanExtinctionLayered). Exact. 0: off.
-    uint cloudLayerEmptyCache = 0;
-    uint cloudLayerCutPad1 = 0;
-    uint cloudLayerCutPad2 = 0;
-    uint beamDirtyKeepPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

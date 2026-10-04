@@ -47,39 +47,11 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
-// cloudLayerEmptyCache: per layer, the ray interval [from, until) over which the lean march's last lookup of that layer proved it
-// empty, and the voxel size it reported (negative: none, the layer read nothing to bound the step). until <= from: nothing held.
-// Only marchBeamLean sets them, and it clears them on entry and exit, so no other march reads a stale interval.
-static float gLayerEmptyFrom[kCloudSeaLayers];
-static float gLayerEmptyUntil[kCloudSeaLayers];
-static float gLayerEmptyVoxels[kCloudSeaLayers];
-static float gLayerEmptyAnswer[kCloudSeaLayers]; ///< The exit a lookup inside [from, until) returns (until may end sooner).
-static bool gLayerEmptyTaps; ///< Set around marchBeamLean's rim taps: they sample at the main sample's footprint, so they neither read nor set.
-static bool gLayerCheck;         ///< cloudLayerEmptyCache 2: this lookup is one the cache would have answered (compared, not used).
-static float gLayerCheckUntil;   ///< The cached interval's end it would have answered with.
-static float gLayerCheckVoxels;  ///< The cached voxel size.
-static uint gLayerEmptyKind[kCloudSeaLayers]; ///< What each held interval came from: 0 empty square, 1 outside the asset box, 2 octant box, 3 cell run.
-static uint gLayerCheckKind;     ///< The held interval's kind, for layerCacheCheck.
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
-static uint gNavProbe[kBeamNavProbeCount]; ///< This thread's kBeamNavProbe counts since its marchBeam began.
-static uint gNavExitKind;   ///< The exit kind of leanExtinctionLayered's last empty sample (kBeamNavProbe + 10).
-static bool gNavClipped;    ///< Whether cloudEmptyExitOf's last exit was cut short by the footprint's next level.
-static uint gNavExitFace;   ///< The box face (2 axis + 1 for the high side) that set cloudEmptyExitOf's last box exit.
-static bool gNavSkirtBox;   ///< Whether cloudAssetBrickAtFlat's last empty octant box was cloudSkirtFaces' (exit kind 3).
-static uint gNavSkirtFaces; ///< cloudSkirtFaces' last box: per face two bits, 0 octant face, 1 shrunk by the reach, 2 page face.
-static uint gNavSkirtMapped; ///< cloudSkirtFaces' last box's mapped level.
-static bool gNavSkirtOctant; ///< Whether cloudSkirtFaces' last box was the octant-mask oracle's (cloudSkirtBox 2).
-static bool gNavSkirtStopOctant; ///< Whether the winning skirt box was the octant-mask oracle's.
-static float gNavBehind;    ///< cloudEmptyExitOf's last box: the ray's t distance back to where it entered it.
-static float gNavWinBehind; ///< The winning box exit's gNavBehind.
-static float4 gNavWinBox;   ///< The winning box: lo.xyz + instance, and hi in gNavWinBoxHi.
-static float3 gNavWinBoxHi;
-static uint gNavSkirtStop;  ///< What stopped the winning skirt box exit (kBeamNavProbe + 31): face class, or 3 the next level.
-static uint gNavSkirtStopMapped; ///< The winning skirt box's mapped level.
 #endif
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -985,25 +957,11 @@ struct HSTRCloudRenderer
     {
         const float3 dv = ray.direction * float(params.hstrCellWidth);
         const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
-#if HSTR_LAYER_PROBE
-        gNavClipped = false;
-        gNavBehind = 1e30f;
-#endif
         float exit = box.cell ? cloudCellRunExit(box, dx) : 1e30f;
         if (!box.cell)
             for (uint a = 0; a < 3; ++a)
                 if (abs(dx[a]) > 1e-12f)
-                {
-                    const float face = ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a];
-#if HSTR_LAYER_PROBE
-                    // The ray's distance back to where it entered the box (the nearest face behind it).
-                    const float back = (box.x[a] - (dx[a] > 0.f ? box.lo[a] : box.hi[a])) / abs(dx[a]);
-                    gNavBehind = min(gNavBehind, back);
-                    if (face < exit)
-                        gNavExitFace = 2u * a + (dx[a] > 0.f ? 1u : 0u);
-#endif
-                    exit = min(exit, face);
-                }
+                    exit = min(exit, ((dx[a] > 0.f ? box.hi[a] : box.lo[a]) - box.x[a]) / dx[a]);
         exit = max(exit, 0.f);
         if (params.cloudPixelAngle > 0.f && ray.worldLength > 0.f)
         {
@@ -1012,11 +970,7 @@ struct HSTRCloudRenderer
             if (nextLevel > footprintLevel)
             {
                 const float footprint = instance.sourceVoxelWorld * pow(2.f, max(nextLevel - params.cloudLodBias, 0.f));
-                const float level = (footprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength - t;
-#if HSTR_LAYER_PROBE
-                gNavClipped = level < exit;
-#endif
-                exit = min(exit, level);
+                exit = min(exit, (footprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength - t);
             }
         }
         return t + max(exit, 0.f);
@@ -1251,91 +1205,6 @@ struct HSTRCloudRenderer
         return keep;
     }
 
-    /// cloudSkirtBox: the empty box of a missing child octant of a level-`mapped` brick for a sample at x (voxel i) whose skirt keep
-    /// is zero but which lies in a skirt zone, within reach R of a face. cloudOctantSkirt's keep at p is positive exactly when some
-    /// combination of the faces p is within reach of has its mask bit set. Keep at x is zero, so every combination of x's faces is
-    /// unset; a point whose faces are x's, or faces no mask bit involves at all, is zero too. So per axis the box takes a face's
-    /// zone only if x is in it or no bit has that face's component, and stops at the other zone otherwise. The mask is the page's:
-    /// its bits straight across a face name the neighbour in the page's own row, so the box is also clipped to the page.
-    /// Before, every face was shrunk, which leaves (2R / 4R)^3 = 1/8 of the octant as box: a sample in the other 7/8 got a box
-    /// that did not hold it and stepped on - nav_probe1, 4K sunset walk: 92% of empty samples stop at this box, 86% of those after
-    /// one regular step; skirtbox2: 85% of empty samples lie outside it.
-    /// MEASURED (skirtbox3, 4K sunset walk, probe on, 3 cycles, arms off / on / noZeroSkip / off2): exact, quality unchanged (over
-    /// 0.02: 2.99% / 2.36% / 2.75% / 2.27%). It takes over the stops (2.97M of 3.50M empty samples stop at it) but 96.6% of them
-    /// still advance one regular step, voxels per empty sample 2.54 -> 2.36, warp-paid / ideal steps 2.57 -> 2.71. Why (skirtbox4,
-    /// kBeamNavProbe + 31..): 84% of its stops are the page clip, 90% of them in octants mapped at level 3+ (32+ voxels).
-    void cloudSkirtFaces(HSTRCloudAsset asset, int3 i, float3 x, uint mapped, out float3 lo, out float3 hi)
-    {
-        const uint3 page = uint3(i) >> 3u;
-        const uint3 pages = asset.dims >> 3u;
-        const uint holds = hstrCloudSkirtMasks[asset.pageOffset + page.x + pages.x * (page.y + pages.y * page.z)];
-        // The mask bits of every direction with a -1 / +1 component on x, y, z (cloudSkirtBit).
-        const uint lowFaces[3] = { 0x925249u, 0xe0e07u, 0x1ffu };
-        const uint highFaces[3] = { 0x2492924u, 0x381c1c0u, 0x3fe0000u };
-        const float reach = float(1u << mapped);
-        const float3 octantLo = float3((uint3(i) >> (mapped + 2u)) << (mapped + 2u)) - 0.5f;
-        const float3 octantHi = octantLo + float(1u << (mapped + 2u));
-        const float3 pageLo = float3(page * 8u) - 0.5f;
-#if HSTR_LAYER_PROBE
-        gNavSkirtFaces = 0u;
-        gNavSkirtMapped = mapped;
-        gNavSkirtOctant = false;
-        // cloudSkirtBox 2, ORACLE (navigation counts only, not timed): the OR of every page's mask in the octant holds for the whole
-        // octant, so where x lies in the octant shrunk on the faces that OR has, that box needs no page clip. Computed here from up
-        // to 512 page masks; a stored per-octant word would be one load.
-        if (params.cloudSkirtBox == 2u && mapped >= 1u && mapped <= 4u)
-        {
-            const uint span = 1u << (mapped - 1u);
-            const uint3 first = (page / span) * span;
-            uint held = 0u;
-            for (uint pz = 0; pz < span; ++pz)
-                for (uint py = 0; py < span; ++py)
-                    for (uint px = 0; px < span; ++px)
-                    {
-                        const uint3 q = first + uint3(px, py, pz);
-                        held |= hstrCloudSkirtMasks[asset.pageOffset + q.x + pages.x * (q.y + pages.y * q.z)];
-                    }
-            float3 octLo, octHi;
-            [unroll]
-            for (uint a = 0; a < 3; ++a)
-            {
-                octLo[a] = octantLo[a] + ((held & lowFaces[a]) != 0 ? reach : 0.f);
-                octHi[a] = octantHi[a] - ((held & highFaces[a]) != 0 ? reach : 0.f);
-            }
-            if (all(x >= octLo) && all(x <= octHi))
-            {
-                lo = octLo;
-                hi = octHi;
-                gNavSkirtOctant = true;
-                [unroll]
-                for (uint a = 0; a < 3; ++a)
-                {
-                    gNavSkirtFaces |= ((held & lowFaces[a]) != 0 ? 1u : 0u) << (4u * a);
-                    gNavSkirtFaces |= ((held & highFaces[a]) != 0 ? 1u : 0u) << (4u * a + 2u);
-                }
-                return;
-            }
-        }
-#endif
-        [unroll]
-        for (uint a = 0; a < 3; ++a)
-        {
-            const bool lowZone = x[a] < octantLo[a] + reach;
-            const bool highZone = x[a] > octantHi[a] - reach; // cloudOctantSkirt's side tests, in octant-box coordinates.
-            const bool lowShrunk = !lowZone && (holds & lowFaces[a]) != 0;
-            const bool highShrunk = !highZone && (holds & highFaces[a]) != 0;
-            const float lowFace = octantLo[a] + (lowShrunk ? reach : 0.f);
-            const float highFace = octantHi[a] - (highShrunk ? reach : 0.f);
-            lo[a] = max(pageLo[a], lowFace);
-            hi[a] = min(pageLo[a] + 8.f, highFace);
-#if HSTR_LAYER_PROBE
-            // Per face (2a low, 2a + 1 high), two bits: 0 the octant's face, 1 shrunk by the reach, 2 the page's face.
-            gNavSkirtFaces |= (pageLo[a] > lowFace ? 2u : (lowShrunk ? 1u : 0u)) << (4u * a);
-            gNavSkirtFaces |= (pageLo[a] + 8.f < highFace ? 2u : (highShrunk ? 1u : 0u)) << (4u * a + 2u);
-#endif
-        }
-    }
-
     /// The bit of direction d (components -1, 0, 1, not all 0) in a skirt mask: the 27 base-3 digits less the centre.
     static uint cloudSkirtBit(int3 d)
     {
@@ -1483,14 +1352,9 @@ struct HSTRCloudRenderer
                 sample.empty = true;
                 sample.lo = float3((uint3(i) >> (mapped + 2u)) << (mapped + 2u)) - 0.5f + reach;
                 sample.hi = sample.lo + float(1u << (mapped + 2u)) - 2.f * reach;
-                // Only where that box does not hold x: inside it, it is the larger box for any brick mapped at level 2 or coarser
-                // (skirtbox1: replacing it everywhere left 96% of empty samples on one step, against 86%).
-                const bool skirtBox = params.cloudSkirtBox != 0 && (any(x < sample.lo) || any(x > sample.hi));
-                if (skirtBox)
-                    cloudSkirtFaces(hstrCloudAssets[instance.asset], i, x, mapped, sample.lo, sample.hi);
-#if HSTR_LAYER_PROBE
-                gNavSkirtBox = skirtBox;
-#endif
+                // MEASURED and REMOVED (ec2c1879, cloudSkirtBox): where this box does not hold x, a box shrunk only on the faces whose
+                // skirt neighbour holds, clipped to the page. Exact; 2.97M of 3.50M empty samples stopped at it, but 96.6% still
+                // advanced one regular step - 84% stopped at the page clip, 90% in octants mapped at level 3+ (skirtbox3 / skirtbox4).
                 sample.level = mapped - 1u;
                 sample.mappedLevel = mapped;
                 return true;
@@ -5386,9 +5250,6 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
-        for (uint k = 0; k < kBeamNavProbeCount; ++k)
-            gNavProbe[k] = 0;
-        gNavExitKind = 3u;
 #endif
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, gScene.getGridVolume(0), ray))
@@ -5422,24 +5283,15 @@ struct HSTRCloudRenderer
                 InterlockedAdd(hstrBeamCounts[kBeamLayerProbe + k], sum, unused);
             }
         }
-        // The warp ceiling: a wave pays its longest lane, so what skipping empty runs can save is what it does to that lane.
-        gNavProbe[5] = steps;
-        gNavProbe[6] = gNavProbe[0] != 0u || gNavProbe[1] != 0u ? gNavProbe[1] + gNavProbe[2] + gNavProbe[3] : steps;
-        const uint lanes = WaveActiveCountBits(true);
-        const uint longest = WaveActiveMax(steps);
-        const uint longestIdeal = WaveActiveMax(gNavProbe[6]);
-        const bool first = WaveIsFirstLane();
-        gNavProbe[7] = first ? longest * lanes : 0u;
-        gNavProbe[8] = first ? longestIdeal * lanes : 0u;
-        gNavProbe[9] = first ? 1u : 0u;
-        for (uint k = 0; k < kBeamNavProbeCount; ++k)
+        // kBeamLayerSteps: a wave pays its longest lane, so step counts and step cost separate on these.
+        const uint laneSteps = WaveActiveSum(steps);
+        const uint paidSteps = WaveActiveMax(steps) * WaveActiveCountBits(true);
+        if (WaveIsFirstLane())
         {
-            const uint sum = WaveActiveSum(gNavProbe[k]);
-            if (WaveIsFirstLane())
-            {
-                uint unused;
-                InterlockedAdd(hstrBeamCounts[kBeamNavProbe + k], sum, unused);
-            }
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps], laneSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 1u], paidSteps, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamLayerSteps + 2u], 1u, unused);
         }
 #endif
         return result;
@@ -7364,50 +7216,11 @@ struct HSTRCloudRenderer
     /// layer) where any layer resolves to it or none has a cloud there; hit is the densest layer's brick. Where every layer is empty
     /// at v the march skips to the nearest of their exits: an empty box's (cloudEmptyExitOf), and for a layer with no cloud there
     /// its square's exit or its cloud's entry (cloudLayerNoneExit), so no skip passes over another layer's density.
-    /// cloudLayerEmptyCache: keeps [from, until) as the interval over which this layer reads nothing, with the voxel size it reported
-    /// (negative: none). Not from the rim taps, which read at another sample's footprint.
-    /// DIAGNOSTIC (cloudLayerEmptyCache 2): a lookup the cache would have answered, by what the fresh lookup found (kBeamLayerCacheCheck):
-    /// 0 density, 1 the proxy, 2 empty with the same exit (within 1e-5 relative) and voxel size, 3 an exit within 1e-3, 4 a farther
-    /// exit, 5 a nearer exit, 6 the same exit but another voxel size. kind: 0 density, 1 proxy, 2 empty with exit and voxels.
-    /// Then (kBeamLayerCacheCheck + 8): the farther and nearer exits by the held interval's kind and the fresh one's (4 x 4 each,
-    /// farther first; kinds as gLayerEmptyKind).
-    void layerCacheCheck(uint kind, float exit, float voxels, uint freshKind = 0u)
-    {
-        if (!gLayerCheck)
-            return;
-        gLayerCheck = false;
-        uint bin = kind;
-        uint unused;
-        if (kind == 2u)
-        {
-            const float tolerance = max(abs(gLayerCheckUntil), 1.f);
-            const float d = exit - gLayerCheckUntil;
-            if (abs(d) <= 1e-5f * tolerance)
-                bin = abs(voxels - gLayerCheckVoxels) <= 1e-6f * max(abs(voxels), 1.f) ? 2u : 6u;
-            else if (abs(d) <= 1e-3f * tolerance)
-                bin = 3u;
-            else
-            {
-                bin = d > 0.f ? 4u : 5u;
-                InterlockedAdd(hstrBeamCounts[kBeamLayerCacheCheck + 8u + (d > 0.f ? 0u : 16u) + 4u * gLayerCheckKind + freshKind], 1u, unused);
-            }
-        }
-        InterlockedAdd(hstrBeamCounts[kBeamLayerCacheCheck + bin], 1u, unused);
-    }
-
-    /// until: how far the answer holds; answer: the exit a lookup there returns (an octant box reaching past the asset box answers
-    /// its own exit only while the ray is still inside the asset).
-    void keepLayerEmpty(uint layer, float from, float until, float answer, float voxels, uint kind)
-    {
-        if (params.cloudLayerEmptyCache == 0u || gLayerEmptyTaps)
-            return;
-        gLayerEmptyFrom[layer] = from;
-        gLayerEmptyUntil[layer] = until;
-        gLayerEmptyAnswer[layer] = answer;
-        gLayerEmptyVoxels[layer] = voxels;
-        gLayerEmptyKind[layer] = kind;
-    }
-
+    /// MEASURED and REMOVED (fba639c0, cloudLayerEmptyCache): each layer's last empty interval along the ray, answering that layer
+    /// without a lookup while the ray stays in it. Exact once its validity ended at the box, asset-box and square exits (sunset 960
+    /// squared excess 0.020293 on and off), but no faster (4K walk off 6.02 / on 5.94 / off 5.98 / on 5.93 ms): it answered 29% /
+    /// 38% of the layers' lookups, mostly the cheap out-of-box ones; the brick walks that end on an empty brick remain.
+    /// MEASURED and REMOVED (04675421, cloudLayerCut, wrong image): layer 1 counted empty after its instance and box test.
     float leanExtinctionLayered(CutRay ray, float3 v, float footprint, float tSample, float proxy, inout float fineVoxels, out LeanHit hit,
                                 out float skipTo)
     {
@@ -7424,38 +7237,6 @@ struct HSTRCloudRenderer
         {
             if (layer >= params.cloudLayers)
                 break;
-#if HSTR_LAYER_PROBE
-            if (!gLayerEmptyTaps)
-            {
-                // kBeamLayerCache: main samples' layer visits per layer, and of those the ones the cache answers (probe builds only).
-                uint unused;
-                InterlockedAdd(hstrBeamCounts[kBeamLayerCache + 2u * layer], 1u, unused);
-                if (params.cloudLayerEmptyCache != 0u && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
-                    InterlockedAdd(hstrBeamCounts[kBeamLayerCache + 2u * layer + 1u], 1u, unused);
-            }
-#endif
-            gLayerCheck = false;
-            if (params.cloudLayerEmptyCache == 2u && !gLayerEmptyTaps && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
-            {
-                // DIAGNOSTIC: look the layer up anyway and compare (layerCacheCheck below).
-                gLayerCheck = true;
-                gLayerCheckUntil = gLayerEmptyAnswer[layer];
-                gLayerCheckVoxels = gLayerEmptyVoxels[layer];
-                gLayerCheckKind = gLayerEmptyKind[layer];
-            }
-            else if ((params.cloudLayerEmptyCache == 1u || params.cloudLayerEmptyCache == 3u) && !gLayerEmptyTaps &&
-                     tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
-            {
-                // Inside the interval this layer's last lookup proved empty: the same answer without the lookup. Its exit is an
-                // absolute ray parameter, so a later sample in the same box or square reads the same one.
-                exit = min(exit, gLayerEmptyAnswer[layer]);
-                if (gLayerEmptyVoxels[layer] > 0.f)
-                {
-                    fineVoxels = resolved ? min(fineVoxels, gLayerEmptyVoxels[layer]) : gLayerEmptyVoxels[layer];
-                    resolved = true;
-                }
-                continue;
-            }
             uint instanceIndex;
             float3 x;
             float footprintLevel;
@@ -7467,52 +7248,27 @@ struct HSTRCloudRenderer
 #endif
                 if (instance.scale > 0.f)
                 {
-                    layerCacheCheck(1u, 0.f, 0.f);
                     // The proxy answers for this layer, and so for the sample.
                     skipTo = -1.f;
                     hit.entry = kCloudRefNone;
                     fineVoxels = 1.f;
                     return proxy;
                 }
-                const float none = cloudLayerNoneExit(ray, tSample, v, layer, instance);
-#if HSTR_LAYER_PROBE
-                if (none < exit)
-                    gNavExitKind = 2u;
-#endif
-                exit = min(exit, none);
-                // An empty square: nothing there until the ray leaves it.
-                layerCacheCheck(2u, none, -1.f, 0u);
-                keepLayerEmpty(layer, tSample, none, none, -1.f, 0u);
+                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
                 continue;
             }
             const uint3 dims = hstrCloudAssets[instance.asset].dims;
             const int3 i = int3(floor(x + 0.5f));
-            if (any(i < 0) || any(i >= int3(dims)) || (params.cloudLayerCut != 0u && layer >= 1u))
+            if (any(i < 0) || any(i >= int3(dims)))
             {
-                const float none = cloudLayerNoneExit(ray, tSample, v, layer, instance);
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[1];
-                if (none < exit)
-                    gNavExitKind = 2u;
 #endif
-                exit = min(exit, none);
-                // Outside the asset box: nothing until the box entry or the square's exit - or until the footprint grows to the
-                // instance's proxy level, where cloudInstanceAt hands the sample to the proxy instead.
-                float until = none;
-                if (params.cloudPixelAngle > 0.f && ray.worldLength > 0.f)
-                {
-                    const float proxyFootprint = instance.sourceVoxelWorld * pow(2.f, max(instance.proxyLevel - params.cloudLodBias, 0.f));
-                    until = min(until, (proxyFootprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength);
-                }
-                layerCacheCheck(2u, until, -1.f, 1u);
-                keepLayerEmpty(layer, tSample, until, until, -1.f, 1u);
+                exit = min(exit, cloudLayerNoneExit(ray, tSample, v, layer, instance));
                 continue;
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
             CloudSample sample;
-#if HSTR_LAYER_PROBE
-            gNavSkirtBox = false;
-#endif
 #if (HSTR_SHIP & 2048) != 0
             const bool found = cloudAssetBrickAtFlat(instance, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
 #else
@@ -7523,7 +7279,6 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[4];
 #endif
-                layerCacheCheck(1u, 0.f, 0.f);
                 skipTo = -1.f;
                 hit.entry = kCloudRefNone;
                 fineVoxels = 1.f;
@@ -7534,61 +7289,16 @@ struct HSTRCloudRenderer
             resolved = true;
             if (sample.empty)
             {
-                const float empty = cloudEmptyExitOf(ray, tSample, sample, instance);
 #if HSTR_LAYER_PROBE
                 ++gLayerProbe[2];
-                if (empty < exit)
-                {
-                    gNavExitKind = (sample.cell ? 0u : (gNavSkirtBox ? 3u : 1u)) | (gNavClipped ? 4u : 0u);
-                    // A skirt box's stop: 3 the footprint's next level, else the stopping face's class (cloudSkirtFaces).
-                    gNavSkirtStop = gNavClipped ? 3u : (gNavSkirtFaces >> (2u * gNavExitFace)) & 3u;
-                    gNavSkirtStopMapped = gNavSkirtMapped;
-                    gNavSkirtStopOctant = gNavSkirtOctant;
-                    gNavWinBehind = gNavBehind;
-                    gNavWinBox = float4(sample.lo, float(sample.instance));
-                    gNavWinBoxHi = sample.hi;
-                }
 #endif
-                exit = min(exit, empty);
-                // An empty box: its exit is already cut where the footprint reaches the next level (cloudEmptyExitOf).
-                layerCacheCheck(2u, empty, voxels, sample.cell ? 3u : 2u);
-                // Only a box that holds the sample: one in a skirt zone outside its shrunk octant box gets an exit that depends on
-                // where in the zone it stands, which a later sample in the same zone does not share (layercheck1).
-                // And only up to the ray's exit from the asset box: a coarse brick's octant reaches past the asset's dims (the page
-                // grid rounds up), and a later sample there takes the out-of-box path with another exit (layercheck3: 8.1k farther,
-                // 2.8k nearer of 5.25M answers).
-                // cloudLayerEmptyCache 3: only the out-of-box and empty-square intervals, none of this per-box exit math.
-                if ((params.cloudLayerEmptyCache == 1u || params.cloudLayerEmptyCache == 2u) &&
-                    (sample.cell || (all(x >= sample.lo) && all(x <= sample.hi))))
-                {
-                    const float3 dv = ray.direction * float(params.hstrCellWidth);
-                    const float3 dx = float3(dot(instance.row0.xyz, dv), dot(instance.row1.xyz, dv), dot(instance.row2.xyz, dv));
-                    float leave = 1e30f;
-                    [unroll]
-                    for (uint a = 0; a < 3; ++a)
-                        if (abs(dx[a]) > 1e-12f)
-                            leave = min(leave, ((dx[a] > 0.f ? float(dims[a]) - 0.5f : -0.5f) - x[a]) / dx[a]);
-                    // And the layer's square: past it cloudInstanceAt picks the neighbouring square's instance (layercheck4).
-                    const float tileVoxels = float(params.cloudTileVoxels);
-                    const float shift = 0.5f * tileVoxels * float(layer);
-                    const float2 squareLo = floor((v.xz + 0.5f - shift) / tileVoxels) * tileVoxels + shift - 0.5f;
-                    [unroll]
-                    for (uint a = 0; a < 2; ++a)
-                    {
-                        const float d = a == 0 ? dv.x : dv.z;
-                        const float p = a == 0 ? v.x : v.z;
-                        if (abs(d) > 1e-12f)
-                            leave = min(leave, ((d > 0.f ? squareLo[a] + tileVoxels : squareLo[a]) - p) / d);
-                    }
-                    keepLayerEmpty(layer, tSample, min(empty, tSample + max(leave, 0.f)), empty, voxels, sample.cell ? 3u : 2u);
-                }
+                exit = min(exit, cloudEmptyExitOf(ray, tSample, sample, instance));
                 continue;
             }
 #if HSTR_LAYER_PROBE
             ++gLayerProbe[3];
             ++denseLayers;
 #endif
-            layerCacheCheck(0u, 0.f, 0.f);
             exit = -1.f; // Density here: no skip.
             const float d = cloudSampleDensity(sample, proxy, scale);
             density += d;
@@ -7798,16 +7508,6 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
-        [unroll]
-        for (uint k = 0; k < kCloudSeaLayers; ++k)
-            gLayerEmptyUntil[k] = -1e30f; // cloudLayerEmptyCache: nothing held for a new ray.
-        gLayerEmptyTaps = false;
-#if HSTR_LAYER_PROBE
-        uint navRun = 0; // Samples in the empty run the march is in (0: none).
-        bool navBoxed = false; // Whether the previous empty sample stopped at a box (navBox, navBoxHi).
-        float4 navBox = 0.f;
-        float3 navBoxHi = 0.f;
-#endif
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
@@ -7834,9 +7534,6 @@ struct HSTRCloudRenderer
             ++countSteps;
             countZero += majorant > 0.f ? 0u : 1u;
 #endif
-#if HSTR_LAYER_PROBE
-            gNavProbe[2] += majorant > 0.f ? 0u : 1u;
-#endif
             if (majorant > 0.f)
             {
                 const float tSample = t + 0.5f * dt;
@@ -7856,8 +7553,6 @@ struct HSTRCloudRenderer
                     {
                         const float sub = dt / float(taps);
                         float sum = 0.f;
-                        // The taps read at the main sample's footprint: they neither use nor keep the layers' empty intervals.
-                        gLayerEmptyTaps = true;
                         for (uint o = 0; o < taps; ++o)
                         {
                             const float to = t + (float(o) + 0.5f) * sub;
@@ -7865,96 +7560,10 @@ struct HSTRCloudRenderer
                             float tapSkip, tapVoxels;
                             sum += leanExtinction(ray, (ray.position + to * ray.direction) * cellWidth, footprint, to, tapVoxels, tapHit, tapSkip);
                         }
-                        gLayerEmptyTaps = false;
                         sigma = sum / float(taps);
                     }
                 }
                 const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
-#if HSTR_LAYER_PROBE
-                {
-                    // ORACLE: the Chebyshev distance, in 4-voxel majorant blocks (up to 3), from the sample's block to the nearest
-                    // block whose undilated majorant is non-zero - how far any static sea-space empty structure could reach.
-                    const int3 home = clamp(int3(floor(seaVoxel(midpoint) * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
-                    uint reachBlocks = 3u;
-                    for (uint r = 0; r < 3u && reachBlocks == 3u; ++r)
-                        for (int bz = -int(r); bz <= int(r) && reachBlocks == 3u; ++bz)
-                            for (int by = -int(r); by <= int(r) && reachBlocks == 3u; ++by)
-                                for (int bx = -int(r); bx <= int(r); ++bx)
-                                {
-                                    const int3 b = home + int3(bx, by, bz);
-                                    if (max(abs(bx), max(abs(by), abs(bz))) != int(r) || any(b < 0) || any(b >= int3(params.hstrMajorantDims)))
-                                        continue;
-                                    if (hstrTightMajorant.Load(int4(b, 0)) > 0.f)
-                                    {
-                                        reachBlocks = r;
-                                        break;
-                                    }
-                                }
-                    ++gNavProbe[(skipTo >= 0.f ? 70u : 74u) + reachBlocks];
-                }
-                if (skipTo >= 0.f)
-                {
-                    const float advanced = min(max(next, skipTo), segment.y) - t;
-                    const bool segmentCut = skipTo > segment.y;
-                    const uint lost = segmentCut ? uint(4.f * min((skipTo - segment.y) * voxelsPerUnit, 64.f) + 0.5f) : 0u;
-                    ++gNavProbe[0];
-                    gNavProbe[4] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
-                    gNavProbe[51] += uint(4.f * dt * voxelsPerUnit + 0.5f);
-                    gNavProbe[52] += segmentCut ? 1u : 0u;
-                    gNavProbe[53] += lost;
-                    ++gNavProbe[10 + gNavExitKind];
-                    gNavProbe[18 + gNavExitKind] += skipTo <= next ? 1u : 0u;
-                    if ((gNavExitKind & 3u) == 3u)
-                    {
-                        const uint mappedBin = min(gNavSkirtStopMapped, 3u);
-                        ++gNavProbe[31 + gNavSkirtStop];
-                        gNavProbe[35 + gNavSkirtStop] += skipTo <= next ? 1u : 0u;
-                        ++gNavProbe[39 + mappedBin];
-                        gNavProbe[43 + mappedBin] += skipTo <= next ? 1u : 0u;
-                        gNavProbe[47] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
-                        if (gNavSkirtStopOctant)
-                        {
-                            ++gNavProbe[48];
-                            gNavProbe[49] += skipTo <= next ? 1u : 0u;
-                            gNavProbe[50] += uint(4.f * advanced * voxelsPerUnit + 0.5f);
-                            gNavProbe[59] += uint(4.f * dt * voxelsPerUnit + 0.5f);
-                            gNavProbe[60] += segmentCut ? 1u : 0u;
-                        }
-                    }
-                    const uint boxKind = gNavExitKind & 3u;
-                    if (boxKind == 1u || boxKind == 3u)
-                    {
-                        // A box exit: did the previous empty sample stop at this same box, and where along its chord is this one?
-                        const bool revisit = navRun != 0u && navBoxed && all(gNavWinBox == navBox) && all(gNavWinBoxHi == navBoxHi);
-                        const float behind = min(gNavWinBehind * voxelsPerUnit, 256.f);
-                        const float ahead = min((skipTo - tSample) * voxelsPerUnit, 256.f);
-                        ++gNavProbe[65];
-                        gNavProbe[61] += revisit ? 1u : 0u;
-                        gNavProbe[62] += uint(4.f * (behind + ahead) + 0.5f);
-                        gNavProbe[63] += uint(4.f * behind + 0.5f);
-                        gNavProbe[64] += uint(4.f * ahead + 0.5f);
-                        if (boxKind == 3u && gNavSkirtStopOctant)
-                        {
-                            gNavProbe[66] += revisit ? 1u : 0u;
-                            gNavProbe[67] += uint(4.f * (behind + ahead) + 0.5f);
-                            gNavProbe[68] += uint(4.f * behind + 0.5f);
-                            gNavProbe[69] += uint(4.f * ahead + 0.5f);
-                        }
-                        navBox = gNavWinBox;
-                        navBoxHi = gNavWinBoxHi;
-                    }
-                    navBoxed = boxKind == 1u || boxKind == 3u;
-                    gNavProbe[3] += navRun == 0u ? 1u : 0u;
-                    ++navRun;
-                }
-                else
-                {
-                    ++gNavProbe[1];
-                    if (navRun != 0u)
-                        ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
-                    navRun = 0;
-                }
-#endif
 #if (HSTR_SHIP & 4096) != 0
                 countEmpty += skipTo >= 0.f ? 1u : 0u;
                 countProxy += hit.entry == kCloudRefNone && skipTo < 0.f ? 1u : 0u;
@@ -8028,21 +7637,6 @@ struct HSTRCloudRenderer
             t = next;
             ++steps;
         }
-        [unroll]
-        for (uint k = 0; k < kCloudSeaLayers; ++k)
-            gLayerEmptyUntil[k] = -1e30f; // No other march may read this ray's intervals.
-#if HSTR_LAYER_PROBE
-        if (navRun != 0u)
-            ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
-        ++gNavProbe[54];
-        gNavProbe[55] += uint(max(segment.y - segment.x, 0.f) * voxelsPerUnit + 0.5f);
-        if (t >= segment.y)
-            ++gNavProbe[56];
-        else if (transmittance <= params.cloudMinTransmittance)
-            ++gNavProbe[57];
-        else
-            ++gNavProbe[58];
-#endif
 #if (HSTR_SHIP & 262144) != 0
         if (spanKept)
         {
@@ -9570,11 +9164,7 @@ struct HSTRCloudRenderer
         const uint2 block = tile * ts / max(params.beamDirtyBlockEdge, 1u); // A tile lies in one block.
         const bool own = all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] != 0xFFFFFFFFu;
         // The block's certificate, once for the tile rather than once per unit: it walks the depth pyramid.
-        // A block the dirty probe held (beamDirtyProbeHolds) is held here too.
-        const bool certified = failed && !own &&
-                               (beamCellCertified(block) ||
-                                ((params.beamDirtyKeep != 0u || params.beamDirtyDefer > 0.f) && hstrBeamGuardDepth[block] != 0xFFFFFFFFu &&
-                                 hstrBeamGuardCamera[block].w >= 0.5f && beamDirtyProbeHolds(block)));
+        const bool certified = failed && !own && beamCellCertified(block);
         // Two words: an 8-texel tile has 64 units. One word lost units 32-63 (1u << k past 31), so a moving 8-texel build never
         // re-marched the lower half of a failed tile (tile8_frames: stale stripes, 7.6% of pixels over 0.02 against 2.8% at 4).
         uint2 mask = 0;
@@ -11206,12 +10796,9 @@ struct HSTRCloudRenderer
         hstrBeamCoarse[coarse] = (previous & kBeamCoarseDropped) != 0 ? float4(0.f) : float4(anchor, radius);
     }
 
-    /// PROBE: whether beamDirtyKeep / beamDirtyDefer hold a verified block whose bound failed. classifyBeamGuardCell leaves it off
-    /// the list and listBeamFailedTileUnits keeps its units as if certified, so a held block is held in both places.
-    /// beamDirtyKeep: kept for re-marching when hash(group, frame) falls under the keep fraction (per 2^beamDirtyKeepShift group).
-    /// beamDirtyDefer: held while the camera's travel since its build is under beamDirtyDefer times its radius.
-    /// MEASURED (4K sunset walk 2 u/frame, HSTR_MOTION_SCORE 2, 3 cycles; units + query ms and over 0.02 against the anchors'
-    /// mean in the same run):
+    /// MEASURED and REMOVED (04675421, beamDirtyKeep / beamDirtyDefer): a budgeted refresh, holding verified blocks whose bound
+    /// failed (left off the list and kept in the tile stage as if certified). 4K sunset walk 2 u/frame, HSTR_MOTION_SCORE 2,
+    /// 3 cycles; units + query ms and over 0.02 against the anchors' mean in the same run:
     /// - dirtykeep1 (random per block, held blocks counted as held by the policy, not held in the tile stage): keep 50 / 25 /
     ///   12.5%: -0.1 / -0.5 / -1.0 ms for +1.1 / +3.8 / +4.6 points; apron units 0.8k -> 56k / 91k / 86k (every listed block
     ///   bordered stale ones), and the policy saw sprint as slow (tolerance 1.0 -> 0, tiles 8.5k -> 24k: sprint slower than all).
@@ -11221,17 +10808,6 @@ struct HSTRCloudRenderer
     ///   +0.77 / +1.10 / +1.87 / +5.07 points (1.6-2.0 points a ms); grouped keep 25% -2.11 ms +2.34 (1.1 a ms); beamGuardMotion 1
     ///   p4 -1.02 ms +0.36 (0.35 a ms). Holding a failed block costs 3-6x the error per ms of mode 1's tighter bound, and ordering
     ///   by violation is no better than random groups: |d| / radius does not predict which held blocks show.
-    bool beamDirtyProbeHolds(uint2 cell)
-    {
-        if (params.beamDirtyDefer > 0.f)
-        {
-            const float radius = beamCellRadius(cell);
-            if (radius > 0.f && length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) < params.beamDirtyDefer * radius)
-                return true;
-        }
-        const uint2 group = cell >> params.beamDirtyKeepShift;
-        return params.beamDirtyKeep != 0u && (hashUint(group.x ^ (group.y << 16) ^ hashUint(params.frameIndex)) & 255u) >= params.beamDirtyKeep;
-    }
 
     /// Lists the block if translation could have invalidated anything in it, and says whether it did.
     bool classifyBeamGuardCell(uint2 thread)
@@ -11258,17 +10834,6 @@ struct HSTRCloudRenderer
                 beamCellMotionCertified(cell, min(params.beamGuardMotion & 3u, 2u), failed);
                 if (failed < kBeamGuardFailLevels)
                     InterlockedAdd(hstrBeamCounts[kBeamGuardFailLevel + failed], 1u, unused);
-                // How far past its isotropic radius a verified failed block has moved: |d| / radius, binned (kBeamGuardViolation).
-                // A quota that defers the least violated blocks first can only defer cheaply what sits in the low bins.
-                if (hstrBeamGuardDepth[cell] != 0xFFFFFFFFu && hstrBeamGuardCamera[cell].w >= 0.5f)
-                {
-                    const float radius = beamCellRadius(cell);
-                    const float ratio = length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) / max(radius, 1e-30f);
-                    const uint bin = radius <= 0.f ? 7u
-                                                   : (ratio < 1.25f ? 0u : ratio < 1.5f ? 1u : ratio < 2.f ? 2u : ratio < 4.f ? 3u
-                                                                                                  : ratio < 8.f ? 4u : ratio < 16.f ? 5u : 6u);
-                    InterlockedAdd(hstrBeamCounts[kBeamGuardViolation + bin], 1u, unused);
-                }
             }
         }
         if (certified)
@@ -11286,25 +10851,6 @@ struct HSTRCloudRenderer
         {
             uint unused;
             InterlockedAdd(hstrBeamCounts[kBeamDirtyUnverified], 1u, unused);
-        }
-        // PROBE (beamDirtyKeep, out of 256; 0 off): a block whose bound failed is re-marched only when hash(block, frame) falls
-        // under the keep fraction, else it is held as if certified - stale, read through the warp, failing again next frame. An
-        // unverified block has no values to hold and is always listed. Asks whether invalid blocks may wait a few frames.
-        // beamDirtyKeepShift: the choice is made per 2^shift x 2^shift group of blocks, so refreshed blocks border each other.
-        if (!unverified && beamDirtyProbeHolds(cell))
-        {
-            uint unused;
-            InterlockedAdd(hstrBeamCounts[kBeamDirtySkipped], 1u, unused);
-            // How far the camera has moved since the block was built, in sea voxels x16 (its staleness).
-            const float travel = length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) / max(params.seaVoxelSize.x, 1e-6f);
-            InterlockedAdd(hstrBeamCounts[kBeamDirtySkippedTravel], uint(min(travel * 16.f, 1e6f)), unused);
-            const uint held = WaveActiveCountBits(true);
-            if (WaveIsFirstLane())
-            {
-                InterlockedAdd(hstrBeamDirtyCount[2], held);
-                InterlockedAdd(hstrBeamDirtyCount[3], held);
-            }
-            return false;
         }
         uint slot;
         InterlockedAdd(hstrBeamDirtyCount[0], 1u, slot);
@@ -13389,10 +12935,7 @@ void decideBeamPolicy()
         gHSTRCloud.hstrBeamWarpArgs[9] = share >= p.beamWarpAuto ? 1u : 0u;
     if (p.beamPolicy != 0)
     {
-        // The policy measures motion: blocks beamDirtyKeep held although their bound failed count as listed.
-        const uint skipped = gHSTRCloud.hstrBeamDirtyCount[3];
-        const float moving = held + listed == 0 ? 1.f : float(held - min(skipped, held)) / float(held + listed);
-        const float s = saturate((p.beamPolicyHeldHigh - moving) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
+        const float s = saturate((p.beamPolicyHeldHigh - share) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
         gHSTRCloud.hstrBeamWarpArgs[11] = asuint(lerp(p.beamTolerance, p.beamPolicyTolerance, s));
     }
 }
