@@ -542,7 +542,7 @@ private:
     ref<Texture> mpBeamDirtyMark;  ///< Per guard block: its first dirty-list slot this build (hstrBeamDirtyMark).
     ref<Buffer> mpBeamDirtyUnits;  ///< The dirty march's compacted units (hstrBeamDirtyUnits).
     /// The HSTR_SUN_LIVE and HSTR_SHIP a dirty march pass compiles with: those of every other beam march.
-    void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass);
+    void setBeamDirtyMarchDefines(const ref<ComputePass>& pPass, uint32_t packedBit = 4u);
     LazyComputePass mpBeamDirtyTilePass;
     LazyComputePass mpBeamDirtyTileDensePass;
     LazyComputePass mpBeamRefreshListPass;
@@ -795,6 +795,7 @@ private:
     ref<Texture> mpDomainVolume; ///< Per domain voxel: unscaled mean density and conservative maximum (RG16).
     ref<Texture> mpDomainBlocks; ///< Per majorant block: unscaled maximum and mean over its trilinear support (RG16).
     ref<Texture> mpDomainLayers; ///< Per majorant block: bit L where layer L has density over that support (R8Uint).
+    ref<Texture> mpDomainVoxelBits; ///< Per majorant block: its 64 domain voxels' layer bits (RGBA32Uint, cloudLayerPacked).
     ref<Buffer> mpDomainRegions; ///< Changed slots, flagged (kDomainRegionZero, kDomainRegionKeep).
     ref<Buffer> mpDomainFrame;
     ref<Buffer> mpDomainStaged;  ///< One batch of packed tile volumes, copied from the staging buffers.

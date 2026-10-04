@@ -50,6 +50,9 @@ import Atmosphere;
 #ifndef HSTR_LAYER_MASK_COST
 #define HSTR_LAYER_MASK_COST 0 // cloudLayerMaskCost: doubled layer-mask loads (a probe; see HSTRCloudTypes.slang).
 #endif
+#ifndef HSTR_LAYER_PACKED
+#define HSTR_LAYER_PACKED 0 // cloudLayerPacked: both layer masks from one packed word (see HSTRCloudTypes.slang).
+#endif
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
@@ -373,6 +376,9 @@ struct HSTRCloudRenderer
     Texture3D<float2> hstrDomainBlocks;                 ///< Per majorant block: unscaled maximum and mean over its trilinear support.
     Texture3D<uint> hstrDomainLayers;                   ///< Per majorant block: bit L where layer L has density (cloudLayerTightSkip).
     RWTexture3D<uint> hstrDomainLayersOutput;
+    /// Per majorant block b: the layer bits (bit 2i + L) of its 64 domain voxels, i = x + 4y + 16z (cloudLayerPacked).
+    Texture3D<uint4> hstrDomainVoxelBits;
+    RWTexture3D<uint4> hstrDomainVoxelBitsOutput;
     RWTexture3D<float2> hstrDomainVolumeOutput;
     StructuredBuffer<uint> hstrDomainStaged;            ///< Packed volumes of a batch's slots (CloudSea::TileVolume::packed).
     RWTexture3D<float> hstrExtinctionOutput;
@@ -496,7 +502,7 @@ struct HSTRCloudRenderer
     Texture2D<float> hstrFarDistancePrev;
     RWTexture2D<float> hstrFarDistanceOutput;
     /// DIAGNOSTIC (seaFarProbe bit 6): marched texels, their iterations, the most any one took, their lit samples, texels at the
-    /// iteration cap.
+    /// iteration cap, occupancy skips, zero-majorant skips, and the iterations their waves paid (slowest lane x marching lanes).
     RWStructuredBuffer<uint> hstrFarCounts;
     // Beam view: exact queries on the lattice of all tile corners and centres, slice 0 (cache rgb, optical depth), slice 1
     // (single scatter without phase, unused); the level that finalised every finest tile (beamLevels: marched per pixel);
@@ -1648,6 +1654,35 @@ struct HSTRCloudRenderer
         p.z = (p.z % dims.z + dims.z) % dims.z;
         const float2 value = hstrDomainVolume.Load(int4(p, 0));
         return (asuint(value.x) >> 31) | ((asuint(value.y) >> 31) << 1);
+    }
+
+    /// cloudLayerPacked: the packed layer bits (hstrDomainVoxelBits) of the 4^3 domain voxels nearest to the samples of the box
+    /// [4 block - 0.5, 4 block + 3.5) holding wrapped voxel position s - the voxel nearest s is floor(s + 0.5), so its block's word
+    /// holds domainVoxelLayers(s) and, ORed, every layer with density anywhere in that box. block is unwrapped (s's frame); false
+    /// above or below the domain (no answer: the layers are looked up).
+    bool domainVoxelBlock(float3 s, out int3 block, out uint4 word)
+    {
+        block = int3(floor(floor(s + 0.5f) * 0.25f));
+        word = 0u;
+        const int3 dims = int3(params.hstrMajorantDims);
+        if (block.y < 0 || block.y >= dims.y)
+            return false;
+        int3 wrapped = block;
+        wrapped.x = (wrapped.x % dims.x + dims.x) % dims.x;
+        wrapped.z = (wrapped.z % dims.z + dims.z) % dims.z;
+        word = hstrDomainVoxelBits.Load(int4(wrapped, 0));
+        return true;
+    }
+
+    /// The ray parameter (in units of dv, the voxel displacement per unit) from s to the exit of the 4-voxel box with lower corner lo.
+    float domainBoxLeave(float3 s, float3 lo, float3 dv)
+    {
+        float leave = 1e30f;
+        [unroll]
+        for (uint a = 0; a < 3; ++a)
+            if (abs(dv[a]) > 1e-12f)
+                leave = min(leave, ((dv[a] > 0.f ? lo[a] + 4.f : lo[a]) - s[a]) / dv[a]);
+        return max(leave, 0.f);
     }
 
     /// Upper bound on the trilinear extinction inside v's majorant block (for delta and ratio tracking, which re-read it at
@@ -3522,6 +3557,8 @@ struct HSTRCloudRenderer
         float s = interval.x;
         uint iterations = 0;
         uint lit = 0;
+        uint occupancySkips = 0; // seaFarProbe bit 6: iterations that jumped an empty 16-voxel block, a zero majorant block.
+        uint zeroSkips = 0;
         // MEASURED and REMOVED (far4, walk 4K): a 2D max-cloud-top pyramid over the columns, skipping any cell the ray passes wholly
         // above or below - exact (identical scores) but 10.5 -> 13.3 ms. The horizon rays skim among the cloud tops, not above them:
         // every coarse cell holds a tall cloud, so the traversal descended to single columns, two tests per 20 units instead of one.
@@ -3534,6 +3571,7 @@ struct HSTRCloudRenderer
             if (hstrOccupancy.Load(int4(clamp(int3(floor(wrapped / 16.f)), int3(0), groups), 0)) == 0)
             {
                 s += farBlockExit(v, inverse, 16.f) + 1e-3f;
+                ++occupancySkips;
                 continue;
             }
             // The near march's density fade is saturate((1 - distance / seaViewDistance) * seaFadeInverse); the far sea takes the rest.
@@ -3546,6 +3584,7 @@ struct HSTRCloudRenderer
             if (majorant <= 0.f)
             {
                 s += exit;
+                ++zeroSkips;
                 continue;
             }
             // Optical depth 0.25 a step against the block's majorant, at least a domain voxel and at most the rest of the block.
@@ -3581,6 +3620,12 @@ struct HSTRCloudRenderer
             InterlockedMax(hstrFarCounts[2], iterations, unused);
             InterlockedAdd(hstrFarCounts[3], lit, unused);
             InterlockedAdd(hstrFarCounts[4], iterations >= 1024u ? 1u : 0u, unused);
+            InterlockedAdd(hstrFarCounts[5], occupancySkips, unused);
+            InterlockedAdd(hstrFarCounts[6], zeroSkips, unused);
+            // What the wave pays: its slowest marching lane's iterations for each of its marching lanes.
+            const uint paid = WaveActiveMax(iterations) * WaveActiveCountBits(true);
+            if (WaveIsFirstLane())
+                InterlockedAdd(hstrFarCounts[7], paid, unused);
         }
         return float4(radiance, transmittance);
     }
@@ -7388,7 +7433,59 @@ struct HSTRCloudRenderer
         // maxima the majorants are built from). 1: none - empty to the block's exit, without a lookup. 2: also each layer without its
         // bit is empty to the block's exit without its lookup.
         uint layerMask = ~0u;
+        uint voxelMask = ~0u;
         float blockExit = 1e30f;
+#if HSTR_LAYER_PACKED
+        // cloudLayerPacked: both masks from one load - the word of the 4^3 domain voxels whose nearest-sample regions tile the box
+        // [4 block - 0.5, 4 block + 3.5) around v (domainVoxelBlock). Its bit for the voxel nearest v is mode 4's voxel mask; its OR
+        // is the box's block mask (over 4^3 voxels where hstrDomainLayers ORs the 5^3 of the majorant block's support), so every
+        // skip stays exact and the box's exit replaces the majorant block's.
+        if (params.cloudLayerTightSkip != 0u)
+        {
+            const float3 s = seaVoxel(v);
+            const float3 dv = ray.direction * float(params.hstrCellWidth);
+            int3 block;
+            uint4 word;
+            if (domainVoxelBlock(s, block, word))
+            {
+                const uint held = word.x | word.y | word.z | word.w;
+                layerMask = ((held & 0x55555555u) != 0u ? 1u : 0u) | ((held & 0xaaaaaaaau) != 0u ? 2u : 0u);
+                const uint3 o = uint3(floor(s + 0.5f) - float3(block) * 4.f);
+                const uint i = o.x + 4u * o.y + 16u * o.z;
+                // A select, not word[i >> 4]: a dynamically indexed vector can be lowered to local memory.
+                const uint quarter = i < 32u ? (i < 16u ? word.x : word.y) : (i < 48u ? word.z : word.w);
+                voxelMask = (quarter >> (2u * (i & 15u))) & 3u;
+                blockExit = tSample + domainBoxLeave(s, float3(block) * 4.f - 0.5f, dv);
+#if HSTR_LAYER_PROBE
+                // Packed: beamLayerMaskMismatch counts samples whose packed voxel bits differ from the domain texel's (must be 0).
+                gLayerTightZero += layerMask == 0u ? 1u : 0u;
+                gLayerMaskMismatch += voxelMask != domainVoxelLayers(v) ? 1u : 0u;
+#endif
+                if (layerMask == 0u)
+                {
+                    fineVoxels = 1.f;
+                    hit.entry = kCloudRefNone;
+                    skipTo = blockExit;
+                    // Mode 3: on through the boxes after it that hold no layer either.
+                    if (params.cloudLayerTightSkip >= 3u)
+                    {
+                        const float nudge = 0.25f / max(length(dv), 1e-9f);
+                        [loop]
+                        for (uint k = 0; k < params.cloudLayerTightRun; ++k)
+                        {
+                            const float3 p = seaVoxel((ray.position + (skipTo + nudge) * ray.direction) * float(params.hstrCellWidth));
+                            int3 b;
+                            uint4 next;
+                            if (!domainVoxelBlock(p, b, next) || any(next != 0u))
+                                break;
+                            skipTo += nudge + domainBoxLeave(p, float3(b) * 4.f - 0.5f, dv);
+                        }
+                    }
+                    return 0.f;
+                }
+            }
+        }
+#else
         if (params.cloudLayerTightSkip != 0u || probeTight)
         {
             const float3 s = seaVoxel(v);
@@ -7447,7 +7544,6 @@ struct HSTRCloudRenderer
         }
         // Mode 4: also the layer bits of the domain voxel nearest v (its footprint, widened by the brick reach in CloudSea): a layer
         // with its block bit but not this one is empty to the voxel's exit, without its lookup.
-        uint voxelMask = ~0u;
         if ((params.cloudLayerTightSkip >= 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
         {
             voxelMask = domainVoxelLayers(v);
@@ -7456,6 +7552,7 @@ struct HSTRCloudRenderer
             voxelMask |= domainVoxelLayers(v + float3(float(voxelMask & 1u), 0.f, 0.f)) << 31;
 #endif
         }
+#endif
         // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
         // cloudLayerTightRun), each tested, instead of one step per voxel. REJECTED (HSTRCloudTypes.slang cloudLayerTightSkip):
         // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel (why it is slower is not
@@ -14568,6 +14665,7 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
     float meanValue = 0.f;
     float maxValue = 0.f;
     uint layers = 0u;
+    uint4 voxelBits = 0u; // cloudLayerPacked: the block's own 4^3 voxels' layer bits (hstrDomainVoxelBits).
     const uint yLast = min(block.y * kDomainBlock + kDomainBlock, frame.dims.y - 1u);
     for (uint z = 0; z <= kDomainBlock; ++z)
         for (uint y = block.y * kDomainBlock; y <= yLast; ++y)
@@ -14578,7 +14676,14 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
                 const float2 value = abs(signedValue);
                 meanValue = max(meanValue, value.x);
                 maxValue = max(maxValue, max(value.x, value.y));
-                layers |= (asuint(signedValue.x) >> 31) | ((asuint(signedValue.y) >> 31) << 1);
+                const uint bits = (asuint(signedValue.x) >> 31) | ((asuint(signedValue.y) >> 31) << 1);
+                layers |= bits;
+                const uint yIn = y - block.y * kDomainBlock;
+                if (x < kDomainBlock && yIn < kDomainBlock && z < kDomainBlock)
+                {
+                    const uint i = x + 4u * yIn + 16u * z;
+                    voxelBits[i >> 4] |= bits << (2u * (i & 15u));
+                }
             }
     // MEASURED and REMOVED (tight14, 4K sunset walk): the layer bits dilated by one domain voxel. Density samples in blocks whose
     // layer bit is clear 1895 -> 374 of 2.22M, but the skip's saving 0.75 -> 0.39 ms; the misses stay at brick level 2 under any
@@ -14586,6 +14691,7 @@ void domainBlocks(uint3 id: SV_DispatchThreadID)
     gHSTRCloud.hstrDomainBlocksOutput[block] = float2(maxValue, meanValue);
     // The layers with a non-zero maximum over the block's trilinear support: a layer without its bit has no density in the block.
     gHSTRCloud.hstrDomainLayersOutput[block] = layers;
+    gHSTRCloud.hstrDomainVoxelBitsOutput[block] = voxelBits;
 }
 
 /// The camera majorant (block maxima dilated by one block, wrapping) and the tight one (undilated block means) of the blocks whose

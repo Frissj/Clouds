@@ -1491,6 +1491,12 @@ struct HSTRCloudParams
     float seaFarDistance = 20000.f;
     /// DIAGNOSTIC: bit 0 the far sea without the cache, bit 1 without any lighting; bit 3 no scheduled refresh, bit 4 no recompute
     /// where the reprojection leaves the layer, bit 5 an empty pass, bit 6 counters (hstrFarCounts, logged per run).
+    /// MEASURED (farsplit1, 4K sunset walk, one launch, farSea / units / query ms): base 0.688 / 2.88 / 1.92, bit 3 (reprojection
+    /// only) 0.087 / 3.00 / 1.93, bit 0 0.593, bit 1 (unlit) 0.591, overlap off 0.693 / 2.71 / 1.81, base again 0.682 / 2.71 / 1.89.
+    /// So the scheduled refresh march is ~0.6 ms of it, its lighting ~0.1, and the overlap hides none of it (units are no faster
+    /// serial). Bit 5 is not an empty pass: the texels still march, only the write is dropped (0.694 ms). Counters: a refresh
+    /// marches ~33k texels (1 / 8 of 266k), 72-132 iterations each but up to ~900, ~20 of them lit - iteration-bound on the
+    /// longest horizon rays, which is why refresh 16 (half the texels) saved only ~0.16 ms (far1).
     uint seaFarProbe = 0;
     /// 1 / the width of the near march's density fade before seaViewDistance, as a fraction of it: 0.3 alone (tiles entering the
     /// window never pop in), 0.05 with the far sea (which shows those tiles; set per frame).
@@ -1587,7 +1593,22 @@ struct HSTRCloudParams
     /// voxel-bits load ~0.23, both ~0.37. So the two loads are worth ~0.3 ms a walk frame at most, most of it the voxel bits (a
     /// 4-byte texel of the full-resolution domain volume per sample, where the block mask is one byte per 64 voxels).
     uint cloudLayerMaskCost = 0;
-    uint cloudLayerMaskCostPad0 = 0;
+    /// The lean layered march takes both layer masks from one 16-byte load (hstrDomainVoxelBits, built by domainBlocks): per
+    /// majorant block, its 64 domain voxels' layer bits. The voxel nearest v, floor(s + 0.5), names the word; its bit is mode 4's
+    /// voxel mask, the word's OR the block mask of the box [4 block - 0.5, 4 block + 3.5) its voxels' nearest-sample regions tile
+    /// (4^3 voxels against hstrDomainLayers' 5^3 support, so no skip is lost). One load where there were two dependent ones (the
+    /// block byte, then the voxel's 4-byte domain texel). Not carried across steps in registers: register carries measured slower
+    /// here (leanloads1, the sea tile instance). A compile define of the dirty passes (HSTR_LAYER_PACKED), by pass: bit 0 the unit
+    /// marches, bit 1 the dirty queries, bit 2 the push, cell and span passes, bit 3 the full-build beam passes (15: all). The
+    /// motion score's fresh rebuild runs the bit-3 passes: without it, packed dirty marches were scored against the old kernel.
+    /// MEASURED (4K sunset walk, one launch each): exact - packed2 (beamLayerProbe) 0 voxel-bit mismatches, density lookups 2.28M
+    /// / 2.27M a frame, lane steps 8.02M -> 7.38M. Quality at parity once every pass takes it: packed5 over 0.02 0 / 15 / 0 / 15
+    /// 2.42 / 2.64 / 2.20 / 2.26%, against the sanity arm 8 (packed rebuild, old dirty kernels) 3.88% - the 3.7% of packed1 / 3b
+    /// was that disagreement. But no faster in any run: units + query packed1 4.00 / 4.27 / 3.77 / 4.22 ms, packed3b (select, not
+    /// a dynamic index) 4.03 -> 4.55 / 4.35, packedsplit1 units 2.34 -> 2.47 (bit 0) and query 1.77 -> 1.95 (bit 1), packed5
+    /// 4.12 / 4.28 / 4.35 / 4.86. Not registers or occupancy (packedgfx0 / 1: units 128 registers 16 warps, query 168 / 12, both
+    /// arms), not L1 (units 78% / 78%, query 67% / 66%) or DRAM. Why each step costs more is not yet measured. Off.
+    uint cloudLayerPacked = 0;
     uint cloudLayerMaskCostPad1 = 0;
     uint cloudLayerMaskCostPad2 = 0;
 };

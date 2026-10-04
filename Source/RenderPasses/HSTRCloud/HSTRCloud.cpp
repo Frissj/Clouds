@@ -669,6 +669,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayerMaskCost = uint32_t(value);
             continue;
         }
+        if (key == "cloudLayerPacked")
+        {
+            mParams.cloudLayerPacked = uint32_t(value);
+            continue;
+        }
         if (key == "cloudSunBakeStep")
         {
             mParams.cloudSunBakeStep = std::clamp(float(value), 0.125f, 4.f);
@@ -1456,6 +1461,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeReuse"] = mParams.cloudSunBakeReuse;
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
     props["cloudLayerMaskCost"] = mParams.cloudLayerMaskCost;
+    props["cloudLayerPacked"] = mParams.cloudLayerPacked;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -3027,6 +3033,7 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     ensure(mpExtinction, dims, ResourceFormat::R16Float);
     ensure(mpDomainBlocks, blockDims, ResourceFormat::RG16Float);
     ensure(mpDomainLayers, blockDims, ResourceFormat::R8Uint);
+    ensure(mpDomainVoxelBits, blockDims, ResourceFormat::RGBA32Uint);
     ensure(mpMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpTightMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpOccupancy, occupancyDims, ResourceFormat::R8Uint);
@@ -3060,7 +3067,8 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         };
         bind(mpDomainExtinctionPass, {{"hstrDomainStaged", mpDomainStaged}, {"hstrDomainVolumeOutput", mpDomainVolume}, {"hstrExtinctionOutput", mpExtinction}});
         bind(mpDomainBlocksPass,
-             {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}, {"hstrDomainLayersOutput", mpDomainLayers}});
+             {{"hstrDomainVolume", mpDomainVolume}, {"hstrDomainBlocksOutput", mpDomainBlocks}, {"hstrDomainLayersOutput", mpDomainLayers},
+              {"hstrDomainVoxelBitsOutput", mpDomainVoxelBits}});
         bind(mpDomainMajorantPass, {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorantOutput", mpMajorant}, {"hstrTightMajorantOutput", mpTightMajorant}});
         bind(mpDomainOccupancyPass,
              {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorant", mpMajorant}, {"hstrOccupancyOutput", mpOccupancy}, {"hstrMajorantZeroOutput", mpMajorantZero}});
@@ -4374,6 +4382,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     if (mpDomainLayers)
     {
         var["hstrDomainLayers"] = mpDomainLayers; // cloudLayerTightSkip.
+        var["hstrDomainVoxelBits"] = mpDomainVoxelBits; // cloudLayerPacked.
         var["hstrDomainBlocks"] = mpDomainBlocks; // Its probe's check that the layer bits agree with the block maxima.
         var["hstrDomainVolume"] = mpDomainVolume; // Its probe's voxel-scale oracle (domainVoxelLayers).
     }
@@ -4586,7 +4595,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         if (!mpFarCounts)
-            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 5);
+            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 8);
         pRenderContext->clearUAV(mpFarCounts->getUAV().get(), uint4(0));
         var["hstrFarCounts"] = mpFarCounts;
     }
@@ -4594,12 +4603,15 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         // DIAGNOSTIC: stalls for the readback.
-        uint32_t c[5];
-        for (uint32_t i = 0; i < 5; ++i)
+        uint32_t c[8];
+        for (uint32_t i = 0; i < 8; ++i)
             c[i] = mpFarCounts->getElement<uint32_t>(i);
+        const double n = double(std::max(c[0], 1u));
         logInfo(
-            "HSTRCloud: far sea run {} (all {}): {} segments, {:.1f} iterations each, max {}, {:.1f} lit each, {} at the cap.", mFarSeaRuns,
-            mParams.seaFarRefreshAll, c[0], double(c[1]) / std::max(c[0], 1u), c[2], double(c[3]) / std::max(c[0], 1u), c[4]
+            "HSTRCloud: far sea run {} (all {}): {} segments, {:.1f} iterations each, max {}, {:.1f} lit each, {} at the cap; "
+            "{:.1f} occupancy skips, {:.1f} zero-majorant skips, {:.1f} density steps each; paid / used iterations {:.2f}.",
+            mFarSeaRuns, mParams.seaFarRefreshAll, c[0], c[1] / n, c[2], c[3] / n, c[4], c[5] / n, c[6] / n,
+            (double(c[1]) - c[5] - c[6]) / n, double(c[7]) / std::max(c[1], 1u)
         );
     }
     mFarRunDeferred = false;
@@ -4997,7 +5009,7 @@ void HSTRCloud::updateBeamOctFrame(const uint2& frameDim, const CameraData& came
         mParams.beamScreenBounds = float4(0.f, 0.f, imageDim.x, imageDim.y);
 }
 
-void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
+void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass, uint32_t packedBit)
 {
     // The same march program as every other beam march. Without HSTR_SHIP the dirty passes compiled every switch as a live branch:
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
@@ -5006,6 +5018,8 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_STRIP", "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_MASK_COST", std::to_string(mParams.cloudLayerMaskCost));
+    // cloudLayerPacked by pass (packedBit): 1 the unit marches, 2 the dirty queries, 4 the rest (push, cell and span passes).
+    pPass->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & packedBit) != 0 ? "1" : "0");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -6256,6 +6270,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         // cloudSunLiveMarch whenever it changed.
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & 8u) != 0 ? "1" : "0");
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -6318,6 +6333,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
 
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & 8u) != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
                     for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                     {
@@ -6420,6 +6436,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // only carry and queue; the queued points are marched below, one list of similar cost per dispatch.
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & 8u) != 0 ? "1" : "0");
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                             // Launch over the screen box, not the whole beam image. beamPointOnScreen keeps a point while any
@@ -6783,7 +6800,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                             mpBeamOrderProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 21);
                                         pRenderContext->clearUAV(mpBeamOrderProbe->getUAV().get(), uint4(0));
                                     }
-                                    setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                                    setBeamDirtyMarchDefines(mpBeamDirtyQueryPass, 2u);
                                     if (mBeamRepairProbe)
                                     {
                                         if (!mpBeamLatticeSnapshot || mpBeamLatticeSnapshot->getWidth() != mpBeamLattice->getWidth() ||
@@ -6814,7 +6831,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                     {
                                         // PROBE, before the real pass so it sees the same points needing a march; writes nothing.
                                         FALCOR_PROFILE(pRenderContext, "queryStrip");
-                                        setBeamDirtyMarchDefines(mpBeamDirtyQueryStripPass);
+                                        setBeamDirtyMarchDefines(mpBeamDirtyQueryStripPass, 2u);
                                         mpBeamDirtyQueryStripPass->getProgram()->addDefine("HSTR_STRIP", std::to_string(mBeamStripProbe));
                                         bindRenderer(pRenderContext, mpBeamDirtyQueryStripPass);
                                         mpBeamDirtyQueryStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
@@ -6839,6 +6856,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 writeBeamQueueArgs(pRenderContext, 1);
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & 8u) != 0 ? "1" : "0");
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
@@ -7089,6 +7107,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             unitMarch ? mpBeamUnitMarchPass : (queued ? mpBeamQueuePixelPass : (gridMarch ? mpBeamGridMarchPass : mpBeamMarchPass));
         pMarch->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
         pMarch->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
+        pMarch->getProgram()->addDefine("HSTR_LAYER_PACKED", (mParams.cloudLayerPacked & 8u) != 0 ? "1" : "0");
         auto bindMarch = [&]()
         {
             bindRenderer(pRenderContext, pMarch);
@@ -7151,7 +7170,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             dirtyVar["hstrBeamWarpArgs"] = ref<Buffer>();
                     };
                     mpBeamDirtyMarchPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", mBeamRepairProbe ? "1" : "0");
-                    setBeamDirtyMarchDefines(mpBeamDirtyMarchPass);
+                    setBeamDirtyMarchDefines(mpBeamDirtyMarchPass, 1u);
                     if (mBeamRepairProbe)
                     {
                         const ref<Texture>& pPixels = mpBeamPixels[0];
@@ -7208,7 +7227,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits && !mBeamFusedOverlap ? "1" : "0");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_RAYS_ONLY", mBeamFusedRaysOnly ? "1" : "0");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_TILES_ONLY", mBeamFusedOverlap ? "1" : "0");
-                        setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);
+                        setBeamDirtyMarchDefines(mpBeamDirtyFusedPass, 1u);
                         const uint32_t rb = std::max(mParams.beamDirtyPointStride, 1u);
                         const uint32_t perBlock = rb * rb * (mParams.beamCentreless != 0 ? 1u : 2u);
                         if (mBeamFusedInline && 32u % perBlock == 0)
@@ -7222,7 +7241,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", "0");
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "2");
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
-                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass, 2u);
                             bindChain(mpBeamDirtyQueryPass);
                             mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "0");
@@ -7236,7 +7255,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_BEAM_DIRTY_SLICES", "0");
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", "0");
                             mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "1");
-                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                            setBeamDirtyMarchDefines(mpBeamDirtyQueryPass, 2u);
                             bindChain(mpBeamDirtyQueryPass);
                             mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                             // No UAV barrier between them: the tile waves wait on the queue slots the query writes.
@@ -7296,7 +7315,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         // PROBE: the same units, stripped, writing nothing (see mBeamStripProbe).
                         FALCOR_PROFILE(pRenderContext, "unitsStrip");
                         mpBeamDirtyMarchStripPass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
-                        setBeamDirtyMarchDefines(mpBeamDirtyMarchStripPass);
+                        setBeamDirtyMarchDefines(mpBeamDirtyMarchStripPass, 1u);
                         mpBeamDirtyMarchStripPass->getProgram()->addDefine("HSTR_STRIP", std::to_string(mBeamStripProbe));
                         bindDirty(mpBeamDirtyMarchStripPass);
                         mpBeamDirtyMarchStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
@@ -7321,7 +7340,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         if (mBeamUnitRefill)
                         {
                             pUnits->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
-                            setBeamDirtyMarchDefines(pUnits);
+                            setBeamDirtyMarchDefines(pUnits, 1u);
                             if (!mpBeamRefill)
                                 mpBeamRefill = mpDevice->createStructuredBuffer(
                                     sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
