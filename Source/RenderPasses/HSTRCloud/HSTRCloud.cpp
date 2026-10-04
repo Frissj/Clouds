@@ -627,6 +627,38 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSkirtBox = uint32_t(value);
             continue;
         }
+        if (key == "beamDirtyKeep")
+        {
+            mParams.beamDirtyKeep = std::min(uint32_t(value), 256u);
+            continue;
+        }
+        // PROBE: the sea's cloud layers the shaders read (set from CloudSeaDesc::layers at load; residency still streams them all).
+        // Prices the second layer: a wrong image, a real floor on cost.
+        if (key == "cloudLayersRead")
+        {
+            mParams.cloudLayers = std::clamp(uint32_t(value), 1u, uint32_t(kCloudSeaLayers));
+            continue;
+        }
+        if (key == "cloudLayerEmptyCache")
+        {
+            mParams.cloudLayerEmptyCache = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudLayerCut")
+        {
+            mParams.cloudLayerCut = uint32_t(value);
+            continue;
+        }
+        if (key == "beamDirtyDefer")
+        {
+            mParams.beamDirtyDefer = std::max(float(value), 0.f);
+            continue;
+        }
+        if (key == "beamDirtyKeepShift")
+        {
+            mParams.beamDirtyKeepShift = std::min(uint32_t(value), 8u);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1379,6 +1411,9 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardMotion"] = mBeamGuardMotion;
     props["beamLayerProbe"] = mBeamLayerProbe;
     props["cloudSkirtBox"] = mParams.cloudSkirtBox;
+    props["beamDirtyKeep"] = mParams.beamDirtyKeep;
+    props["beamDirtyKeepShift"] = mParams.beamDirtyKeepShift;
+    props["beamDirtyDefer"] = mParams.beamDirtyDefer;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -1801,6 +1836,12 @@ Properties HSTRCloud::getProperties() const
             cloud["beamGuardFail" + std::to_string(level)] = mBeamLevelCounts[kBeamGuardFailLevel + level];
         cloud["beamGuardRescued"] = mBeamLevelCounts[kBeamGuardRescued];
         cloud["beamGuardHeld"] = mBeamLevelCounts[kBeamGuardHeld];
+        cloud["beamDirtySkipped"] = mBeamLevelCounts[kBeamDirtySkipped];
+        cloud["beamDirtySkippedTravel"] = mBeamLevelCounts[kBeamDirtySkippedTravel];
+        for (uint32_t bin = 0; bin < 8; ++bin)
+            cloud["beamGuardViolation" + std::to_string(bin)] = mBeamLevelCounts[kBeamGuardViolation + bin];
+        for (uint32_t k = 0; k < 4; ++k)
+            cloud["beamLayerCache" + std::to_string(k)] = mBeamLevelCounts[kBeamLayerCache + k];
         {
             const char* layerNames[8] = {"NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2"};
             for (uint32_t k = 0; k < 8; ++k)
@@ -5878,8 +5919,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-                // Blocks listed, units to march, blocks held.
-                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3);
+                // Blocks listed, units to march, blocks held, of those the failed ones beamDirtyKeep held (not for the policy).
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 4);
                 if (!mpBeamWarpArgs)
                 {
                     // Warp on, step scale 1, the set tolerance, until a translating build decides (decideBeamPolicy).

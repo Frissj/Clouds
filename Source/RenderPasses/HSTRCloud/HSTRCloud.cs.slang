@@ -47,6 +47,13 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
+// cloudLayerEmptyCache: per layer, the ray interval [from, until) over which the lean march's last lookup of that layer proved it
+// empty, and the voxel size it reported (negative: none, the layer read nothing to bound the step). until <= from: nothing held.
+// Only marchBeamLean sets them, and it clears them on entry and exit, so no other march reads a stale interval.
+static float gLayerEmptyFrom[kCloudSeaLayers];
+static float gLayerEmptyUntil[kCloudSeaLayers];
+static float gLayerEmptyVoxels[kCloudSeaLayers];
+static bool gLayerEmptyTaps; ///< Set around marchBeamLean's rim taps: they sample at the main sample's footprint, so they neither read nor set.
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
@@ -7351,6 +7358,17 @@ struct HSTRCloudRenderer
     /// layer) where any layer resolves to it or none has a cloud there; hit is the densest layer's brick. Where every layer is empty
     /// at v the march skips to the nearest of their exits: an empty box's (cloudEmptyExitOf), and for a layer with no cloud there
     /// its square's exit or its cloud's entry (cloudLayerNoneExit), so no skip passes over another layer's density.
+    /// cloudLayerEmptyCache: keeps [from, until) as the interval over which this layer reads nothing, with the voxel size it reported
+    /// (negative: none). Not from the rim taps, which read at another sample's footprint.
+    void keepLayerEmpty(uint layer, float from, float until, float voxels)
+    {
+        if (params.cloudLayerEmptyCache == 0u || gLayerEmptyTaps)
+            return;
+        gLayerEmptyFrom[layer] = from;
+        gLayerEmptyUntil[layer] = until;
+        gLayerEmptyVoxels[layer] = voxels;
+    }
+
     float leanExtinctionLayered(CutRay ray, float3 v, float footprint, float tSample, float proxy, inout float fineVoxels, out LeanHit hit,
                                 out float skipTo)
     {
@@ -7367,6 +7385,28 @@ struct HSTRCloudRenderer
         {
             if (layer >= params.cloudLayers)
                 break;
+#if HSTR_LAYER_PROBE
+            if (!gLayerEmptyTaps)
+            {
+                // kBeamLayerCache: main samples' layer visits per layer, and of those the ones the cache answers (probe builds only).
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamLayerCache + 2u * layer], 1u, unused);
+                if (params.cloudLayerEmptyCache != 0u && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
+                    InterlockedAdd(hstrBeamCounts[kBeamLayerCache + 2u * layer + 1u], 1u, unused);
+            }
+#endif
+            if (params.cloudLayerEmptyCache != 0u && !gLayerEmptyTaps && tSample >= gLayerEmptyFrom[layer] && tSample < gLayerEmptyUntil[layer])
+            {
+                // Inside the interval this layer's last lookup proved empty: the same answer without the lookup. Its exit is an
+                // absolute ray parameter, so a later sample in the same box or square reads the same one.
+                exit = min(exit, gLayerEmptyUntil[layer]);
+                if (gLayerEmptyVoxels[layer] > 0.f)
+                {
+                    fineVoxels = resolved ? min(fineVoxels, gLayerEmptyVoxels[layer]) : gLayerEmptyVoxels[layer];
+                    resolved = true;
+                }
+                continue;
+            }
             uint instanceIndex;
             float3 x;
             float footprintLevel;
@@ -7390,11 +7430,13 @@ struct HSTRCloudRenderer
                     gNavExitKind = 2u;
 #endif
                 exit = min(exit, none);
+                // An empty square: nothing there until the ray leaves it.
+                keepLayerEmpty(layer, tSample, none, -1.f);
                 continue;
             }
             const uint3 dims = hstrCloudAssets[instance.asset].dims;
             const int3 i = int3(floor(x + 0.5f));
-            if (any(i < 0) || any(i >= int3(dims)))
+            if (any(i < 0) || any(i >= int3(dims)) || (params.cloudLayerCut != 0u && layer >= 1u))
             {
                 const float none = cloudLayerNoneExit(ray, tSample, v, layer, instance);
 #if HSTR_LAYER_PROBE
@@ -7403,6 +7445,15 @@ struct HSTRCloudRenderer
                     gNavExitKind = 2u;
 #endif
                 exit = min(exit, none);
+                // Outside the asset box: nothing until the box entry or the square's exit - or until the footprint grows to the
+                // instance's proxy level, where cloudInstanceAt hands the sample to the proxy instead.
+                float until = none;
+                if (params.cloudPixelAngle > 0.f && ray.worldLength > 0.f)
+                {
+                    const float proxyFootprint = instance.sourceVoxelWorld * pow(2.f, max(instance.proxyLevel - params.cloudLodBias, 0.f));
+                    until = min(until, (proxyFootprint / params.cloudPixelAngle - ray.entryDistance) / ray.worldLength);
+                }
+                keepLayerEmpty(layer, tSample, until, -1.f);
                 continue;
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
@@ -7446,6 +7497,8 @@ struct HSTRCloudRenderer
                 }
 #endif
                 exit = min(exit, empty);
+                // An empty box: its exit is already cut where the footprint reaches the next level (cloudEmptyExitOf).
+                keepLayerEmpty(layer, tSample, empty, voxels);
                 continue;
             }
 #if HSTR_LAYER_PROBE
@@ -7661,6 +7714,10 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
+        [unroll]
+        for (uint k = 0; k < kCloudSeaLayers; ++k)
+            gLayerEmptyUntil[k] = -1e30f; // cloudLayerEmptyCache: nothing held for a new ray.
+        gLayerEmptyTaps = false;
 #if HSTR_LAYER_PROBE
         uint navRun = 0; // Samples in the empty run the march is in (0: none).
         bool navBoxed = false; // Whether the previous empty sample stopped at a box (navBox, navBoxHi).
@@ -7715,6 +7772,8 @@ struct HSTRCloudRenderer
                     {
                         const float sub = dt / float(taps);
                         float sum = 0.f;
+                        // The taps read at the main sample's footprint: they neither use nor keep the layers' empty intervals.
+                        gLayerEmptyTaps = true;
                         for (uint o = 0; o < taps; ++o)
                         {
                             const float to = t + (float(o) + 0.5f) * sub;
@@ -7722,6 +7781,7 @@ struct HSTRCloudRenderer
                             float tapSkip, tapVoxels;
                             sum += leanExtinction(ray, (ray.position + to * ray.direction) * cellWidth, footprint, to, tapVoxels, tapHit, tapSkip);
                         }
+                        gLayerEmptyTaps = false;
                         sigma = sum / float(taps);
                     }
                 }
@@ -7884,6 +7944,9 @@ struct HSTRCloudRenderer
             t = next;
             ++steps;
         }
+        [unroll]
+        for (uint k = 0; k < kCloudSeaLayers; ++k)
+            gLayerEmptyUntil[k] = -1e30f; // No other march may read this ray's intervals.
 #if HSTR_LAYER_PROBE
         if (navRun != 0u)
             ++gNavProbe[26 + min(firstbithigh(navRun), 4u)];
@@ -9423,7 +9486,11 @@ struct HSTRCloudRenderer
         const uint2 block = tile * ts / max(params.beamDirtyBlockEdge, 1u); // A tile lies in one block.
         const bool own = all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] != 0xFFFFFFFFu;
         // The block's certificate, once for the tile rather than once per unit: it walks the depth pyramid.
-        const bool certified = failed && !own && beamCellCertified(block);
+        // A block the dirty probe held (beamDirtyProbeHolds) is held here too.
+        const bool certified = failed && !own &&
+                               (beamCellCertified(block) ||
+                                ((params.beamDirtyKeep != 0u || params.beamDirtyDefer > 0.f) && hstrBeamGuardDepth[block] != 0xFFFFFFFFu &&
+                                 hstrBeamGuardCamera[block].w >= 0.5f && beamDirtyProbeHolds(block)));
         // Two words: an 8-texel tile has 64 units. One word lost units 32-63 (1u << k past 31), so a moving 8-texel build never
         // re-marched the lower half of a failed tile (tile8_frames: stale stripes, 7.6% of pixels over 0.02 against 2.8% at 4).
         uint2 mask = 0;
@@ -11055,6 +11122,33 @@ struct HSTRCloudRenderer
         hstrBeamCoarse[coarse] = (previous & kBeamCoarseDropped) != 0 ? float4(0.f) : float4(anchor, radius);
     }
 
+    /// PROBE: whether beamDirtyKeep / beamDirtyDefer hold a verified block whose bound failed. classifyBeamGuardCell leaves it off
+    /// the list and listBeamFailedTileUnits keeps its units as if certified, so a held block is held in both places.
+    /// beamDirtyKeep: kept for re-marching when hash(group, frame) falls under the keep fraction (per 2^beamDirtyKeepShift group).
+    /// beamDirtyDefer: held while the camera's travel since its build is under beamDirtyDefer times its radius.
+    /// MEASURED (4K sunset walk 2 u/frame, HSTR_MOTION_SCORE 2, 3 cycles; units + query ms and over 0.02 against the anchors'
+    /// mean in the same run):
+    /// - dirtykeep1 (random per block, held blocks counted as held by the policy, not held in the tile stage): keep 50 / 25 /
+    ///   12.5%: -0.1 / -0.5 / -1.0 ms for +1.1 / +3.8 / +4.6 points; apron units 0.8k -> 56k / 91k / 86k (every listed block
+    ///   bordered stale ones), and the policy saw sprint as slow (tolerance 1.0 -> 0, tiles 8.5k -> 24k: sprint slower than all).
+    /// - dirtykeep2 (policy fixed; per 4 x 4 group): 25% -2.3 ms +3.7 points, apron 53k. violation1: failed blocks' |d| / radius
+    ///   on the walk 31% under 1.25, 84% under 2, none past 4; sprint 30% under 2, 29% past 16.
+    /// - defer2 (held in the tile stage too, apron back to 1-4k): defer 1.25 / 1.5 / 2 / 4: -0.38 / -0.60 / -1.17 / -3.04 ms for
+    ///   +0.77 / +1.10 / +1.87 / +5.07 points (1.6-2.0 points a ms); grouped keep 25% -2.11 ms +2.34 (1.1 a ms); beamGuardMotion 1
+    ///   p4 -1.02 ms +0.36 (0.35 a ms). Holding a failed block costs 3-6x the error per ms of mode 1's tighter bound, and ordering
+    ///   by violation is no better than random groups: |d| / radius does not predict which held blocks show.
+    bool beamDirtyProbeHolds(uint2 cell)
+    {
+        if (params.beamDirtyDefer > 0.f)
+        {
+            const float radius = beamCellRadius(cell);
+            if (radius > 0.f && length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) < params.beamDirtyDefer * radius)
+                return true;
+        }
+        const uint2 group = cell >> params.beamDirtyKeepShift;
+        return params.beamDirtyKeep != 0u && (hashUint(group.x ^ (group.y << 16) ^ hashUint(params.frameIndex)) & 255u) >= params.beamDirtyKeep;
+    }
+
     /// Lists the block if translation could have invalidated anything in it, and says whether it did.
     bool classifyBeamGuardCell(uint2 thread)
     {
@@ -11080,6 +11174,17 @@ struct HSTRCloudRenderer
                 beamCellMotionCertified(cell, min(params.beamGuardMotion & 3u, 2u), failed);
                 if (failed < kBeamGuardFailLevels)
                     InterlockedAdd(hstrBeamCounts[kBeamGuardFailLevel + failed], 1u, unused);
+                // How far past its isotropic radius a verified failed block has moved: |d| / radius, binned (kBeamGuardViolation).
+                // A quota that defers the least violated blocks first can only defer cheaply what sits in the low bins.
+                if (hstrBeamGuardDepth[cell] != 0xFFFFFFFFu && hstrBeamGuardCamera[cell].w >= 0.5f)
+                {
+                    const float radius = beamCellRadius(cell);
+                    const float ratio = length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) / max(radius, 1e-30f);
+                    const uint bin = radius <= 0.f ? 7u
+                                                   : (ratio < 1.25f ? 0u : ratio < 1.5f ? 1u : ratio < 2.f ? 2u : ratio < 4.f ? 3u
+                                                                                                  : ratio < 8.f ? 4u : ratio < 16.f ? 5u : 6u);
+                    InterlockedAdd(hstrBeamCounts[kBeamGuardViolation + bin], 1u, unused);
+                }
             }
         }
         if (certified)
@@ -11092,10 +11197,30 @@ struct HSTRCloudRenderer
         }
         // Split the reason, because the two have opposite fixes: a block the guard knows nothing about is one whose points never
         // reached the code that vouches for them, and a block whose bound failed is doing its job.
-        if (hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f)
+        const bool unverified = hstrBeamGuardDepth[cell] == 0xFFFFFFFFu || hstrBeamGuardCamera[cell].w < 0.5f;
+        if (unverified)
         {
-            uint unverified;
-            InterlockedAdd(hstrBeamCounts[kBeamDirtyUnverified], 1u, unverified);
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamDirtyUnverified], 1u, unused);
+        }
+        // PROBE (beamDirtyKeep, out of 256; 0 off): a block whose bound failed is re-marched only when hash(block, frame) falls
+        // under the keep fraction, else it is held as if certified - stale, read through the warp, failing again next frame. An
+        // unverified block has no values to hold and is always listed. Asks whether invalid blocks may wait a few frames.
+        // beamDirtyKeepShift: the choice is made per 2^shift x 2^shift group of blocks, so refreshed blocks border each other.
+        if (!unverified && beamDirtyProbeHolds(cell))
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamDirtySkipped], 1u, unused);
+            // How far the camera has moved since the block was built, in sea voxels x16 (its staleness).
+            const float travel = length(gScene.camera.data.posW - hstrBeamGuardCamera[cell].xyz) / max(params.seaVoxelSize.x, 1e-6f);
+            InterlockedAdd(hstrBeamCounts[kBeamDirtySkippedTravel], uint(min(travel * 16.f, 1e6f)), unused);
+            const uint held = WaveActiveCountBits(true);
+            if (WaveIsFirstLane())
+            {
+                InterlockedAdd(hstrBeamDirtyCount[2], held);
+                InterlockedAdd(hstrBeamDirtyCount[3], held);
+            }
+            return false;
         }
         uint slot;
         InterlockedAdd(hstrBeamDirtyCount[0], 1u, slot);
@@ -13180,7 +13305,10 @@ void decideBeamPolicy()
         gHSTRCloud.hstrBeamWarpArgs[9] = share >= p.beamWarpAuto ? 1u : 0u;
     if (p.beamPolicy != 0)
     {
-        const float s = saturate((p.beamPolicyHeldHigh - share) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
+        // The policy measures motion: blocks beamDirtyKeep held although their bound failed count as listed.
+        const uint skipped = gHSTRCloud.hstrBeamDirtyCount[3];
+        const float moving = held + listed == 0 ? 1.f : float(held - min(skipped, held)) / float(held + listed);
+        const float s = saturate((p.beamPolicyHeldHigh - moving) / max(p.beamPolicyHeldHigh - p.beamPolicyHeldLow, 1e-6f));
         gHSTRCloud.hstrBeamWarpArgs[11] = asuint(lerp(p.beamTolerance, p.beamPolicyTolerance, s));
     }
 }
