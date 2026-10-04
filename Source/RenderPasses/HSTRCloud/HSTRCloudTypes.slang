@@ -1540,7 +1540,11 @@ struct HSTRCloudParams
     /// class from them (exact: the same slot and baked brick as cloudSunSlotUp per class); 0 searches the keys once per class.
     /// MEASURED (fused2, 4K sunset walk, two pairs): resolveCloudSun 0.388 / 0.388 -> 0.122 / 0.121 ms, scores within noise.
     uint cloudSunResolveFused = 1;
-    uint cloudLayerTightSkipPad2 = 0;
+    /// bakeCloudSun: 1 ends a texel's march where it has left the asset's box for good (exact: only the asset's own bricks are
+    /// read); 0 steps on outside to job.reach or 512 steps, the full slant path through the layer at a low sun. MEASURED (bakeexit1,
+    /// 4K sunset walk, 256 bakes, two pairs): bakeCloudSun 1.006 / 0.804 -> 0.952 / 0.669 ms - lower in both, but small: the
+    /// outside steps are not where the bake's time goes.
+    uint cloudSunBakeExit = 1;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

@@ -13774,6 +13774,15 @@ void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
     }
 }
 
+#ifndef HSTR_BAKE_PROBE
+#define HSTR_BAKE_PROBE 0 // cloudSunBakeProbe: count bakeCloudSun's texels, steps by kind and exits by reason (gSunBakeProbe).
+#endif
+#if HSTR_BAKE_PROBE
+/// Running totals: texels, steps, steps outside the asset or in an unmapped page, empty skips, density steps; exits opaque (cap),
+/// at 512 steps, at job.reach, leaving the asset (cloudSunBakeExit); texels of jobs without a slot.
+RWStructuredBuffer<uint> gSunBakeProbe;
+#endif
+
 /// Sun bakes of this frame (cloudCommitOffset, cloudCommitCount): for every atlas texel of a brick, the optical depth (in source
 /// voxel lengths, density scale applied) along the sun over job.reach source voxels, on the asset's own bricks at the brick's level
 /// (the density sunDepthAt's live march reads for a camera sample at that level), skipping exactly empty cells and octants.
@@ -13787,7 +13796,12 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
         return;
     const HSTRCloudSunBake job = gHSTRCloud.hstrCloudSunBakes[params.cloudCommitOffset + local];
     if (job.slot == kCloudRefNone)
+    {
+#if HSTR_BAKE_PROBE
+        InterlockedAdd(gSunBakeProbe[9], 1u); // Texels of dispatched jobs without a slot.
+#endif
         return; // A GPU-scheduled entry that found no slot (or no candidate).
+    }
     const uint3 texel = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudBrickEdge);
     const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[job.asset];
     const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
@@ -13796,9 +13810,15 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
     float depth = 0.f;
     float u = 0.f;
     float stepVoxels = 0.5f * levelScale;
+#if HSTR_BAKE_PROBE
+    uint probe[9] = { 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+#endif
     [loop]
     for (uint k = 0; k < 512 && u < job.reach && depth <= job.cap; ++k)
     {
+#if HSTR_BAKE_PROBE
+        ++probe[1];
+#endif
         const float dt = min(stepVoxels, job.reach - u);
         const float3 x = start + (u + 0.5f * dt) * job.direction;
         CloudSample sample;
@@ -13811,6 +13831,9 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
         if (gHSTRCloud.cloudAssetBrickAt(asset, x, job.level, false, sample))
         {
             stepVoxels = 0.5f * float(1u << sample.level);
+#if HSTR_BAKE_PROBE
+            ++probe[sample.empty ? 3 : 4];
+#endif
             if (sample.empty)
             {
                 float exit = 1e30f;
@@ -13823,9 +13846,40 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
                 depth += gHSTRCloud.cloudBrickDensity(sample.entry, x, int3(floor(x + 0.5f))) * (1.f - sample.skirtCut) * scale * dt;
         }
         else
-            stepVoxels = 4.f * levelScale; // Outside the asset: no density until the march re-enters it.
+        {
+            // Outside the asset (or in an unmapped page): no density until the march re-enters it. Outside the asset's box on an axis
+            // it is not moving back along, it never does - the bake reads only this asset - so every step after is zero: done
+            // (cloudSunBakeExit; exact, the depth is unchanged).
+#if HSTR_BAKE_PROBE
+            ++probe[2];
+#endif
+            if (params.cloudSunBakeExit != 0)
+            {
+                bool leaving = false;
+                for (uint a = 0; a < 3; ++a)
+                    leaving = leaving || (x[a] < -0.5f && job.direction[a] <= 0.f) || (x[a] >= float(asset.dims[a]) - 0.5f && job.direction[a] >= 0.f);
+                if (leaving)
+                {
+#if HSTR_BAKE_PROBE
+                    probe[8] = 1;
+#endif
+                    break;
+                }
+            }
+            stepVoxels = 4.f * levelScale;
+        }
         u = min(next, job.reach);
     }
+#if HSTR_BAKE_PROBE
+    if (probe[8] == 0)
+        ++probe[depth > job.cap ? 5 : (u >= job.reach ? 7 : 6)];
+    for (uint p = 0; p < 9; ++p)
+    {
+        const uint sum = WaveActiveSum(probe[p]);
+        if (WaveIsFirstLane())
+            InterlockedAdd(gSunBakeProbe[p], sum);
+    }
+#endif
     gHSTRCloud.hstrCloudSunAtlasOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
         params.cloudSunAtlas8 != 0 ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth;
 }

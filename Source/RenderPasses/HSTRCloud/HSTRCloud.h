@@ -369,6 +369,9 @@ private:
     float mBeamGuardParallax = 8.f; ///< Texels of parallax a guard block may accumulate before it is re-marched (with beamWarp).
     uint32_t mBeamGuardMotion = 0;  ///< beamGuardMotion: the motion-aware certificate (HSTRCloudTypes.slang).
     bool mBeamLayerProbe = false;   ///< beamLayerProbe: count the layered lookups by outcome (HSTR_LAYER_PROBE).
+    /// HSTR_SUN_BAKE_PROBE=1 in the environment (fixed from the first bake, so the pass compiles once): count bakeCloudSun's steps
+    /// and exits (HSTR_BAKE_PROBE), logged every 240 frames.
+    const bool mSunBakeProbe = std::getenv("HSTR_SUN_BAKE_PROBE") != nullptr;
     bool mBeamWarp = true;        ///< The resolve reads a held block where its capture camera saw the content (HSTR_BEAM_WARP).
     /// beamOverlapResolve: the resolve's pixel pass runs without barriers behind the dirty unit march, filling that march's tail
     /// (ngfx8: the dirty passes fill the SMs at launch and then only drain, the last third on a few long rays). The pixel pass reads
@@ -807,6 +810,7 @@ private:
     LazyComputePass mpCheckSkirtMasksPass;    ///< DIAGNOSTIC (cloudSkirtCheck).
     bool mCloudSkirtCheck = false;            ///< DIAGNOSTIC: count stale skirt masks every frame (blocking readback).
     ref<Buffer> mpSkirtCheckCount;
+    ref<Buffer> mpSunBakeProbe; ///< mSunBakeProbe's running totals (gSunBakeProbe).
     uint32_t mSkirtMaskChecks = 0;            ///< Frames checked (cloudSkirtCheck).
     uint32_t mSkirtMaskMismatches = 0;        ///< Pages whose stored mask differed from this frame's pages, summed over them.
     bool mBeamDirtyStats = false;             ///< DIAGNOSTIC: sum the dirty blocks and units listed per frame (blocking readback).

@@ -644,6 +644,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunResolveFused = uint32_t(value);
             continue;
         }
+        if (key == "cloudSunBakeExit")
+        {
+            mParams.cloudSunBakeExit = uint32_t(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1400,6 +1405,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudLayerTightSkip"] = mParams.cloudLayerTightSkip;
     props["cloudLayerTightRun"] = mParams.cloudLayerTightRun;
     props["cloudSunResolveFused"] = mParams.cloudSunResolveFused;
+    props["cloudSunBakeExit"] = mParams.cloudSunBakeExit;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
@@ -3416,6 +3422,17 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 "HSTRCloud: layer octant probe: {} layer bits set, {:.2f}% of their octants empty", bits,
                 100.0 * double(mpCloudSea->probeLayerOctantsEmpty()) / (8.0 * double(bits))
             );
+        if (mpSunBakeProbe)
+        {
+            std::vector<uint32_t> p(10);
+            for (uint32_t k = 0; k < 10; ++k)
+                p[k] = mpSunBakeProbe->getElement<uint32_t>(k);
+            logInfo(
+                "HSTRCloud: sun bake probe: {} texels ({} without a slot), {} steps: outside {}, empty {}, density {}; exits opaque {}, "
+                "512 steps {}, reach {}, left asset {}",
+                p[0], p[9], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
+            );
+        }
         const auto& stats = mpCloudResidency->getStats();
         logInfo(
             "HSTRCloud: sea frame {}: {} desired, {} loaded, {} mapped, {} pending bricks, {} tiles pending, {:.0f} MB resident, cut {:.2f} ms; "
@@ -3516,8 +3533,21 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
         mParams.cloudCommitCount = info.bakeMax;
+        mpBakeCloudSunPass->getProgram()->addDefine("HSTR_BAKE_PROBE", mSunBakeProbe ? "1" : "0");
         if (bindResidencyPass(pRenderContext, mpBakeCloudSunPass, true))
             bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
+        if (mSunBakeProbe)
+        {
+            if (!mpSunBakeProbe)
+            {
+                const std::vector<uint32_t> zeros(10, 0u);
+                mpSunBakeProbe = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 10, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    zeros.data(), false
+                );
+            }
+            mpBakeCloudSunPass->getRootVar()["gSunBakeProbe"] = mpSunBakeProbe;
+        }
         mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * info.bakeMax));
         mParams.cloudCommitCount = 0;
     }

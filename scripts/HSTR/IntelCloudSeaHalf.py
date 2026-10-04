@@ -50,6 +50,12 @@ g.addPass(createPass("HSTRCloud", {
     # squared excess 0.020163 -> 0.020175 (sunset_hill_tight17), motion over 0.02 within the arms' spread. It catches 72% of the
     # brick walks that end empty, and drops 0.27% of density samples (probe VoxelDense, against 0.08% at block scale).
     "cloudLayerTightSkip": 4,
+    # Sun bakes a frame while the camera moves (HSTRCloud.cpp's default 256 was tuned on frame time alone, when a bake cost less).
+    # 4K sunset walk, bakeCloudSun ms / over 0.02 (motion score 2): bakes1 256 0.73 / 2.52%, 128 0.35 / 2.28%, 64 0.19 / 2.26%,
+    # 256 again 0.63 / 2.73%; bakeexit1 256 1.01 / 2.41%, 128 0.50 / 2.25%, 256 again 0.80 / 2.26%. Sprint scores swung 3-11% on
+    # the 256 anchor alone (one bad chunk decides them), with 128 at 2.9%: no sign of bake lag there either. Parked keeps the
+    # full rate, so the backlog still drains when the camera stops.
+    "cloudSunBakesMoving": 128,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
