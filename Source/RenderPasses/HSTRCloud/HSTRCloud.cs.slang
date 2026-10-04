@@ -47,6 +47,9 @@ import Atmosphere;
 #ifndef HSTR_DIRTY_FUSED
 #define HSTR_DIRTY_FUSED 0 // The fused dirty chain's program (runBeamDirtyFused): coherent lattice and unit list, see there.
 #endif
+#ifndef HSTR_LAYER_MASK_COST
+#define HSTR_LAYER_MASK_COST 0 // cloudLayerMaskCost: doubled layer-mask loads (a probe; see HSTRCloudTypes.slang).
+#endif
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
@@ -7393,6 +7396,10 @@ struct HSTRCloudRenderer
             if (all(block >= 0) && all(block < int3(params.hstrMajorantDims)))
             {
                 layerMask = hstrDomainLayers.Load(int4(block, 0));
+#if (HSTR_LAYER_MASK_COST & 1) != 0
+                // PROBE (cloudLayerMaskCost): a second, dependent load (R8: bit 31 is never set).
+                layerMask |= hstrDomainLayers.Load(int4(block + int3(layerMask & 1u, 0, 0), 0)) & 0x80000000u;
+#endif
 #if HSTR_LAYER_PROBE
                 gLayerTightZero += layerMask == 0u ? 1u : 0u;
                 gLayerMaskMismatch += (layerMask == 0u) != (hstrDomainBlocks.Load(int4(block, 0)).x <= 0.f) ? 1u : 0u;
@@ -7442,7 +7449,13 @@ struct HSTRCloudRenderer
         // with its block bit but not this one is empty to the voxel's exit, without its lookup.
         uint voxelMask = ~0u;
         if ((params.cloudLayerTightSkip >= 4u || probeTight) && layerMask != 0u && layerMask != ~0u)
+        {
             voxelMask = domainVoxelLayers(v);
+#if (HSTR_LAYER_MASK_COST & 2) != 0
+            // PROBE (cloudLayerMaskCost): a second, dependent load (the bits are 0-3, so this ORs in 0).
+            voxelMask |= domainVoxelLayers(v + float3(float(voxelMask & 1u), 0.f, 0.f)) << 31;
+#endif
+        }
         // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
         // cloudLayerTightRun), each tested, instead of one step per voxel. REJECTED (HSTRCloudTypes.slang cloudLayerTightSkip):
         // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel (why it is slower is not

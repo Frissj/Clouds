@@ -1578,6 +1578,18 @@ struct HSTRCloudParams
     /// bakeCloudSun's step in level voxels of the level read (0.5: half a voxel, the march's own). An approximation above 0.5; a
     /// change rebakes everything (cloudSunBakeStepResets). The sunset launcher ships 2 (IntelCloudSeaHalf.py has the numbers).
     float cloudSunBakeStep = 0.5f;
+    /// PROBE (prices loads, changes nothing): leanExtinctionLayered loads its block layer mask (bit 1) and / or its voxel layer
+    /// bits (bit 2) a second time, from an address that depends on the first load's value (the same serial chain), and ORs in a
+    /// bit those textures never hold - the doubled loads' cost, what removing or carrying the masks could save at most. A compile
+    /// define of the dirty passes (HSTR_LAYER_MASK_COST), so 0 is the shipped kernel.
+    /// MEASURED (maskcost1, 4K sunset walk, one pass of 0 / 1 / 2 / 3 / 0, units + query): 4.33 / 4.58 / 4.89 / 5.19 / 4.99 ms. The
+    /// anchor drifted +0.66 ms across the run; corrected linearly by position, one more block-mask load costs ~0.08 ms, one more
+    /// voxel-bits load ~0.23, both ~0.37. So the two loads are worth ~0.3 ms a walk frame at most, most of it the voxel bits (a
+    /// 4-byte texel of the full-resolution domain volume per sample, where the block mask is one byte per 64 voxels).
+    uint cloudLayerMaskCost = 0;
+    uint cloudLayerMaskCostPad0 = 0;
+    uint cloudLayerMaskCostPad1 = 0;
+    uint cloudLayerMaskCostPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

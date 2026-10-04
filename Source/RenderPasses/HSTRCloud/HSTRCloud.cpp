@@ -664,6 +664,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudSunBakeReuse = uint32_t(value);
             continue;
         }
+        if (key == "cloudLayerMaskCost")
+        {
+            mParams.cloudLayerMaskCost = uint32_t(value);
+            continue;
+        }
         if (key == "cloudSunBakeStep")
         {
             mParams.cloudSunBakeStep = std::clamp(float(value), 0.125f, 4.f);
@@ -1450,6 +1455,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakeFlat"] = mParams.cloudSunBakeFlat;
     props["cloudSunBakeReuse"] = mParams.cloudSunBakeReuse;
     props["cloudSunBakeStep"] = mParams.cloudSunBakeStep;
+    props["cloudLayerMaskCost"] = mParams.cloudLayerMaskCost;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -4999,6 +5005,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
     pPass->getProgram()->addDefine("HSTR_STRIP", "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_LAYER_MASK_COST", std::to_string(mParams.cloudLayerMaskCost));
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
