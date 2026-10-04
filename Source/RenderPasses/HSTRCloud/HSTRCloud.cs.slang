@@ -7379,7 +7379,8 @@ struct HSTRCloudRenderer
             voxelMask = domainVoxelLayers(v);
         // Mode 5: where the nearest voxel holds no layer, on through the voxels after it that hold none either (up to
         // cloudLayerTightRun), each tested, instead of one step per voxel. REJECTED (HSTRCloudTypes.slang cloudLayerTightSkip):
-        // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel's registers.
+        // compiled only with HSTR_LAYER_TIGHT_VOXEL_RUN, so its loop cannot weigh on the shipped kernel (why it is slower is not
+        // yet measured).
 #ifndef HSTR_LAYER_TIGHT_VOXEL_RUN
 #define HSTR_LAYER_TIGHT_VOXEL_RUN 0
 #endif
@@ -13694,6 +13695,76 @@ void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
     gHSTRCloud.hstrCloudBricks.GetDimensions(bricks, stride);
     if (id.x >= bricks)
         return;
+    if (gHSTRCloud.params.cloudSunResolveFused != 0)
+    {
+        // cloudSunSlotUp for every class at once: each level's keys are read once, and the classes still unresolved climb together
+        // (they share the climb: each stops at the same level for the same reasons), so every answer is cloudSunSlotUp's.
+        const uint generation = gHSTRCloud.params.cloudSunGeneration;
+        uint resolvedSlot[kCloudSunClasses];
+        uint resolvedEntry[kCloudSunClasses]; // The baked brick | its level << 24.
+        [unroll]
+        for (uint c = 0; c < kCloudSunClasses; ++c)
+        {
+            resolvedSlot[c] = kCloudRefNone;
+            resolvedEntry[c] = 0;
+        }
+        uint pending = (1u << kCloudSunClasses) - 1u;
+        uint entry = id.x;
+        uint packedEntry = 0;
+        for (uint level = 0;; ++level)
+        {
+            const HSTRCloudBrick brick = gHSTRCloud.hstrCloudBricks[entry];
+            packedEntry = entry | ((brick.info & 15u) << 24);
+            uint found[kCloudSunClasses];
+            uint best[kCloudSunClasses];
+            uint bestGeneration[kCloudSunClasses];
+            [unroll]
+            for (uint c = 0; c < kCloudSunClasses; ++c)
+            {
+                found[c] = kCloudRefNone;
+                best[c] = kCloudRefNone;
+                bestGeneration[c] = 0;
+            }
+            const uint base = entry * 2u * kCloudSunBakesPerBrick;
+            for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
+            {
+                const uint key = gHSTRCloud.hstrCloudSunSlots[base + 2u * k];
+                const uint slot = gHSTRCloud.hstrCloudSunSlots[base + 2u * k + 1u];
+                const uint keyGeneration = key >> 4;
+                const bool older = key != kCloudRefNone && keyGeneration >= gHSTRCloud.params.cloudSunOldestGeneration &&
+                                   keyGeneration < generation;
+                [unroll]
+                for (uint c = 0; c < kCloudSunClasses; ++c)
+                {
+                    found[c] = key == ((generation << 4) | c) ? slot : found[c];
+                    const bool better = older && (key & 15u) == c && (best[c] == kCloudRefNone || keyGeneration > bestGeneration[c]);
+                    best[c] = better ? slot : best[c];
+                    bestGeneration[c] = better ? keyGeneration : bestGeneration[c];
+                }
+            }
+            [unroll]
+            for (uint c = 0; c < kCloudSunClasses; ++c)
+            {
+                const uint slot = found[c] != kCloudRefNone ? found[c] : best[c];
+                const bool settle = (pending & (1u << c)) != 0 && slot != kCloudRefNone;
+                resolvedSlot[c] = settle ? slot : resolvedSlot[c];
+                resolvedEntry[c] = settle ? packedEntry : resolvedEntry[c];
+                pending &= settle ? ~(1u << c) : ~0u;
+            }
+            if (pending == 0 || level >= gHSTRCloud.params.cloudSunAncestors || brick.parent == kCloudRefNone)
+                break;
+            entry = brick.parent;
+        }
+        // Classes no level answers: cloudSunSlotUp's kCloudRefNone at the last brick it climbed to.
+        [unroll]
+        for (uint c = 0; c < kCloudSunClasses; ++c)
+        {
+            const bool none = (pending & (1u << c)) != 0;
+            gHSTRCloud.hstrCloudSunResolvedOutput[id.x * kCloudSunClasses + c] =
+                uint2(resolvedSlot[c], none ? packedEntry : resolvedEntry[c]);
+        }
+        return;
+    }
     for (uint c = 0; c < kCloudSunClasses; ++c)
     {
         uint entry = id.x;

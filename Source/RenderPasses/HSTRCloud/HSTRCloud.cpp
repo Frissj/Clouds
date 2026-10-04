@@ -639,6 +639,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.cloudLayerTightRun = std::min(uint32_t(value), 256u);
             continue;
         }
+        if (key == "cloudSunResolveFused")
+        {
+            mParams.cloudSunResolveFused = uint32_t(value);
+            continue;
+        }
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
@@ -1394,6 +1399,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudLayersRead"] = mParams.cloudLayers;
     props["cloudLayerTightSkip"] = mParams.cloudLayerTightSkip;
     props["cloudLayerTightRun"] = mParams.cloudLayerTightRun;
+    props["cloudSunResolveFused"] = mParams.cloudSunResolveFused;
     props["beamWarp"] = mBeamWarp;
     props["beamOverlapResolve"] = mBeamOverlapResolve;
     props["beamWarpAuto"] = mBeamWarpAuto;
