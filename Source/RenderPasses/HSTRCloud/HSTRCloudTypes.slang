@@ -1793,6 +1793,11 @@ struct HSTRCloudParams
     /// resolve-side and listing-side repair measured, the OR guard stays off.
     uint beamGuardNeighbour = 0;
     uint beamPathCode = 0; ///< Set by the host for a beamPathDump frame: classify and resolve record why and how (see there).
+    /// beamEdgeTolerance (0: off): the tile test's tolerance on cloud outlines - tiles whose corner transmittance range passes
+    /// beamEdgeRange - where tolerance 0.4 accepted coarse tiles across the edge (straight tile-diagonal facets; 0.2 everywhere
+    /// removed them for +0.47 ms on the walk, qualfront / tol02 in IntelCloudSeaHalf.py). The interior keeps beamTolerance.
+    float beamEdgeTolerance = 0.f;
+    float beamEdgeRange = 0.1f;
     /// MEASURED (pathattr1, 4K sunset walk, HSTR_MOTION_PATH; path_attr.py in HSTR_results; bad = |log lum| over 0.05 against
     /// the fresh rebuild; per frame): iso p8 ~35k / 27k bad pixels, OR ~70k. Blocks the OR alone holds: 0.48M pixels, ~16k bad
     /// (L1 tiles 9.5%, L0 1.2%; iso-held blocks in the iso arms 2.2% / 0.08%). Blocks iso would hold too, and listed ones,
@@ -1800,6 +1805,12 @@ struct HSTRCloudParams
     /// the far count equal to the iso arms' total). Dark-chip pixels are few (~50 a frame) and as common in the iso arms.
     /// The OR-held blocks are not a stale-state bug but simply staler (the bound's own trade), and their error spreads about a
     /// block into their neighbours through shared lattice corners and the interpolated warp.
+    /// MEASURED (delta_oracle.py on pathattr1, per 16 px screen tile >25% OR-held, bad pixels left / removed): none 27.1k;
+    /// one-sample constant -29%; two samples linear along the radial axis -16%; four samples bilinear 25%; the tile's ideal
+    /// constant 21%; best radial shift (oracle) 15%; best 2D shift 21%; 2D shift + ideal constant 40%. Control, the iso arm's
+    /// 4300 worst iso-held tiles: -54% / -40% / 8% / 12% / 24% / 31% / 40%, and the same best-shift histogram (mean |shift|
+    /// 1.0 px, radial component +0.1 px, a third each way). No correction from a few probe rays, and no shift or offset, is
+    /// specific to the OR-held blocks: they lack new radiance and visibility, not alignment. Probe-and-correct is not built.
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

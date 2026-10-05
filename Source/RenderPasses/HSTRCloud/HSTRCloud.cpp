@@ -662,6 +662,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamGuardLevelScale = float(value);
             continue;
         }
+        if (key == "beamEdgeTolerance")
+        {
+            mParams.beamEdgeTolerance = float(value);
+            continue;
+        }
+        if (key == "beamEdgeRange")
+        {
+            mParams.beamEdgeRange = float(value);
+            continue;
+        }
         if (key == "beamPathDump")
         {
             mBeamPathDump = value.operator std::string();
@@ -1545,6 +1555,8 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardLevelScale"] = mParams.beamGuardLevelScale;
     props["beamWarpHistory"] = mParams.beamWarpHistory;
     props["beamGuardNeighbour"] = mParams.beamGuardNeighbour;
+    props["beamEdgeTolerance"] = mParams.beamEdgeTolerance;
+    props["beamEdgeRange"] = mParams.beamEdgeRange;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;

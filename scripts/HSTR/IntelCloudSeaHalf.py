@@ -33,6 +33,19 @@ g.addPass(createPass("HSTRCloud", {
     # Doubled (2026-09-25, 4K, one settle, against the exact march; the gate is under 1% of pixels over 0.02): walk 5.73 -> 4.14
     # ms at 0.137 -> 0.425%, sprint 7.15 -> 5.36 at 0.028 -> 0.127% (budgetstep1). 3x fails walk (2.94%). A deliberate
     # approximation: it spends the gate's headroom on the step, with beamOctScale 0.5 and the warp below.
+    # MEASURED (2026-10-06; quality: squared log excess against the 326-spp path trace of sunset_hill 960x540, noise subtracted,
+    # anchor 0.020228; time: 4K sunset walk units + query, interleaved anchors 3.81 / 3.62 / 3.71 / 4.07 ms, qualtime3):
+    # minStepVoxels 5 + beamTolerance 0.6: +1.5% excess, 2.97 / 3.05 ms (-0.79 ms), motion 2.61 / 2.49% over 0.02 against
+    # anchors ~2.04%. minStepVoxels 6 + tolerance 0.6: +3.6%, 2.61 ms (-1.2 ms), motion 3.35%. Alone (qualfront1/2): step 5
+    # +0.5%, step 6 +2.4%, tolerance 0.6 +0.6%, 0.8 +3.2%; beamOctScale 0.42 +4.1%, 0.35 +7.4%, 0.25 +18.7%. The 8 x 8 block
+    # gate scores every one of these 0.000% (blind); not shipped - a quality trade for the owner to take.
+    # Images (qualfront2/3 compare_zoom*.png): tolerance 0.6 cuts silhouettes into straight tile-diagonal edges (a coarse tile
+    # accepted across the edge); the step alone does not. Step alone, interleaved (qualtime4, anchors 3.96 / 3.74 / 4.19 ms):
+    # step 5 3.58 / 3.48 ms (-0.43 ms), motion 3.19 (one 4.2% chunk) / 2.45% against ~2.1%; step 6 3.07 ms (-0.9 ms), motion
+    # 4.02% - the longer step also costs motion stability.
+    # Tolerance 0.2 (no visible tile blocks; tol02 / tol02time, anchors 4.20 / 3.95 / 3.93 / 4.11 ms, motion ~2.05%): alone
+    # 4.52 ms (+0.47), excess -0.8%, motion 2.19%; + step 5 3.81 ms (-0.24), excess +0.0%, motion 3.83%; + step 6 3.77 ms
+    # (-0.28), +1.5%, motion 3.34%; tolerance 0.3 + step 6 +1.6%. The step pays for the tolerance but costs motion stability.
     "minStepVoxels": 4.0,
     "maxStepVoxels": 2.0,
     # The shipping switch mask (11773) with transmittance-scaled steps (bit 32768: behind transmittance T a step grows by up to

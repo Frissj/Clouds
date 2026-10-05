@@ -9568,11 +9568,17 @@ struct HSTRCloudRenderer
         // 3.73 -> 2.81 / 2.71, units 5.10 / 4.59 -> 4.57 / 4.76. Fewer rays saved less than half the query: the corners' rays
         // cost more than the centres' or the dispatch tail holds. (The 4K timings ran the launcher's edge contrast, then 0.2; the
         // hill views 0.5. Edge contrast 0.95 is now the launcher's: IntelCloudSeaHalf.py has its numbers.)
+        // beamEdgeTolerance: a tile whose transmittance range over its corners passes beamEdgeRange lies on a cloud outline, where
+        // a coarse tile accepted across the edge shows as a straight tile-diagonal facet; it is tested at the stricter tolerance.
+        const bool edgeAware = params.beamEdgeTolerance > 0.f;
+        const float range = edgeAware ? beamTransmittanceRange(level, tile, sparse) : 0.f;
+        const float tolerance = edgeAware && range > params.beamEdgeRange ? min(beamPolicyTolerance(), params.beamEdgeTolerance)
+                                                                          : beamPolicyTolerance();
         if (centreless)
         {
-            bool refine = beamCornerCurvature(tile, sparse) > beamPolicyTolerance();
+            bool refine = beamCornerCurvature(tile, sparse) > tolerance;
             if (!refine && params.beamEdgeContrast > 0.f)
-                refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
+                refine = (edgeAware ? range : beamTransmittanceRange(level, tile, sparse)) > params.beamEdgeContrast;
             return refine;
         }
         // beamCacheTolerance, default 4: the cache in-scatter tested apart, against beamTolerance x k (its error measured on top of
@@ -9613,7 +9619,7 @@ struct HSTRCloudRenderer
         // failing only this test, and 9.15M passing all: cache rescues 225k (11.8%) but breaks 200k, sun 117k / 90k, cache + sun
         // 288k (15.1%) / 246k, all three with depth identical: net ~2%. Neighbouring corners do not predict the centre; the
         // failing structure is below the corner spacing, so no corner basis removes it.
-        bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
+        bool refine = maxComponent(abs(log(1.f + max(predictedCentre, 0.f)) - log(1.f + exactCentre))) > tolerance;
         if (params.beamCacheTolerance != 0.f)
         {
             // The rest with the exact cache against beamTolerance; the cache's own error (the interpolated cache over the exact rest)
@@ -9621,17 +9627,17 @@ struct HSTRCloudRenderer
             const bool sunApart = params.beamSunTolerance != 0.f;
             const float3 rest = beamRadiance(ac.rgb, sunApart ? bc.rgb : bp.rgb, ap.a, wc, albedo);
             const float3 cache = beamRadiance(ap.rgb, bc.rgb, ac.a, wc, albedo);
-            refine = maxComponent(abs(log(1.f + max(rest, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance();
+            refine = maxComponent(abs(log(1.f + max(rest, 0.f)) - log(1.f + exactCentre))) > tolerance;
             if (!refine && params.beamCacheTolerance > 0.f)
-                refine = maxComponent(abs(log(1.f + max(cache, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance() * params.beamCacheTolerance;
+                refine = maxComponent(abs(log(1.f + max(cache, 0.f)) - log(1.f + exactCentre))) > tolerance * params.beamCacheTolerance;
             if (!refine && params.beamSunTolerance > 0.f)
             {
                 const float3 sun = beamRadiance(ac.rgb, bp.rgb, ac.a, wc, albedo);
-                refine = maxComponent(abs(log(1.f + max(sun, 0.f)) - log(1.f + exactCentre))) > beamPolicyTolerance() * params.beamSunTolerance;
+                refine = maxComponent(abs(log(1.f + max(sun, 0.f)) - log(1.f + exactCentre))) > tolerance * params.beamSunTolerance;
             }
         }
         if (!refine && params.beamEdgeContrast > 0.f)
-            refine = beamTransmittanceRange(level, tile, sparse) > params.beamEdgeContrast;
+            refine = (edgeAware ? range : beamTransmittanceRange(level, tile, sparse)) > params.beamEdgeContrast;
         if (!refine && (params.beamGuide == 1 || (params.beamGuide == 2 && level + 1 < params.beamLevels)))
             refine = beamTileGuideFails(level, tile);
         return refine;
