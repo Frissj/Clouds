@@ -1719,6 +1719,42 @@ struct HSTRCloudParams
     /// own units cost. Together with warpfold1 / 2 (no warp fixes missing data) and guardwarp2 (bounding the block's near-to-far
     /// parallax keeps quality and loses the gain), the OR guard's -1 ms on the walk is not available at today's motion quality.
     float beamWarpEdge = 0.f;
+    /// beamWarpGap (texels; 0: off): sparse, signed disocclusion repair. Per lattice edge of a held block, the warp offsets say how
+    /// far its two sides' content moved apart under the current camera; where an edge with a depth break (10%; sky infinitely
+    /// far) opens by more than this, the strip it opened - against the near side's new position, opening + 1 texels wide - is
+    /// marched from this camera into a transient overlay (hstrBeamRepair, a bit per texel in hstrBeamGapBits) that this build's
+    /// resolve reads unwarped. Closing edges and smooth stretch are left to the warp; the persistent image is not touched.
+    /// MEASURED and REJECTED (warpgap1, 4K sunset walk, OR guard, 4 cycles): units / query ms, over 0.02, repair units - iso p8
+    /// 2.11 / 1.76, 2.23%; OR 1.61 / 1.49, 3.62%; gap 0.5 4.24 / 1.46, 3.04%, 108k; gap 1 3.81 / 1.49, 3.40%, 90k; iso p8 2.12 /
+    /// 1.71, 2.28%. Scattered repair units cost ~2x a listed unit and quality only half returns: the chips are not openings.
+    /// They are near cloud sliding OVER far cloud (dark far content where the rebuild has near cloud): the backward warp takes
+    /// a pixel's offset from its own (far) captured depth, so it fetches the far content. beamWarpCover addresses that.
+    float beamWarpGap = 0.f;
+    /// beamWarpCover (lattice points; 0: off): occlusion-aware warp field. After buildBeamWarpField, each lattice point looks at
+    /// the points within this radius that hold nearer content (sky infinitely far); where one's content, carried to the current
+    /// camera (q - o_q), now lands within half a lattice step of this point, the point takes that neighbour's offset (the nearest
+    /// such content wins) - near cloud slides over far cloud as the sky fallback already lets it slide over sky.
+    /// MEASURED (warpcover1, 4K sunset walk, 4 cycles; over 0.02, units + query ms, warpCover ms): iso p8 2.27% 3.87; OR 3.01%
+    /// 3.20; OR + cover 1 2.93% 3.08 + 0.21; OR + cover 2 2.99% 3.02 + 0.49; iso p8 + cover 2 2.15% 3.61 + 0.49; iso p8 2.20%
+    /// 3.93. The cover barely moves the OR's excess and costs its gain. Crops of the worst tiles: the chips are block-shaped
+    /// patches of far content held inside a near puff that moved over them - the held block's own pixels are stale, which no
+    /// warp field can correct. The guard, not the warp, decides them (beamGuardModeLevels).
+    uint beamWarpCover = 0;
+    /// beamGuardModeLevels (0: all): the directional shift (beamGuardMotion 1/2) only at pyramid levels below this; levels at
+    /// or above it use the isotropic |d|. Tests whether the OR guard's stale blocks are invaded from beyond the 3 x 3.
+    /// MEASURED (modelevels1, 4K sunset walk, OR guard = mode 1 p4 | iso p8, 4 cycles; over 0.02, units + query ms, blocks a
+    /// frame): iso p8 2.84% (one 4.37% chunk) 3.86 14.96k; OR all levels 3.08% 3.08 11.66k; OR level 0 only 2.02% 3.92 14.72k;
+    /// OR levels 0-1 2.76% 3.51 12.51k; iso p8 2.14% 14.64k. The OR's whole gain and its error are levels >= 1 (guard fails at
+    /// level 1: 177 a frame with all levels, 4264 with level 0 only). A level-L budget of 2^(L-1) block angles lets the
+    /// ring's content move a block; iso's |d| hides that by being ~10x conservative there, mode 1's exact shift does not.
+    uint beamGuardModeLevels = 0;
+    /// beamGuardLevelScale (1: today): scales the level >= 1 budgets (2^(L-1) block angles) - how far ring content may move.
+    /// MEASURED (levelscale1, 4K sunset walk, 4 cycles; over 0.02, units + query ms, blocks a frame): iso p8 2.17% 3.85 15.4k;
+    /// OR scale 1 3.39% 3.18 12.3k (one chunk is a rebuild-side change - a dark cumulus the moving frame lacks); OR 0.5 2.48%
+    /// 3.72 13.8k; OR 0.25 1.38% 4.58 19.5k; OR 0.5 + cover 2 2.79% 3.50 + 0.49 warpCover; iso p8 2.09% 3.76 14.8k. Every
+    /// scale sits on the iso p8 / p4 frontier: the blocks the OR saves are the blocks whose neighbours' near content moves in.
+    /// Crops: the remaining chips are single finest-tile diamonds of far content inside a near puff, with or without the cover.
+    float beamGuardLevelScale = 1.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

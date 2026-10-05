@@ -389,6 +389,11 @@ private:
     bool mBeamOverlapResolve = true;
     LazyComputePass mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     LazyComputePass mpBeamWarpEdgePass;  ///< beamWarpEdge: held blocks' disoccluded edge tiles re-marched (repairBeamWarpEdge).
+    LazyComputePass mpBeamWarpGapPass;   ///< beamWarpGap: held blocks' opened gap strips listed for repair (repairBeamWarpGap).
+    LazyComputePass mpBeamWarpCoverPass; ///< beamWarpCover: the warp field corrected where nearer content covers a point.
+    ref<Texture> mpBeamWarpFieldCover;   ///< beamWarpCover: the spare field texture it writes (swapped with mpBeamWarpField).
+    ref<Texture> mpBeamGapBits;          ///< beamWarpGap: this build's repair texels, a bit each (R32Uint, 32 along x a word).
+    ref<Texture> mpBeamRepair;           ///< beamWarpGap: their radiance from this camera (RGBA16Float, beam image size).
     ref<Texture> mpBeamWarpField;         ///< Lattice-sized, RG16Float: offsets are a few texels, so half precision holds them.
     /// beamWarpAuto: the warp runs only while at least this share of the on-screen guard blocks this build classified are held
     /// (certified, so read from an older camera). 0 = always, as beamWarp alone. Sprint expires every block, so the field and the

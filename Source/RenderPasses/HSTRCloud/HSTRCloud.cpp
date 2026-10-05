@@ -642,6 +642,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamWarpEdge = float(value);
             continue;
         }
+        if (key == "beamWarpGap")
+        {
+            mParams.beamWarpGap = float(value);
+            continue;
+        }
+        if (key == "beamWarpCover")
+        {
+            mParams.beamWarpCover = uint32_t(value);
+            continue;
+        }
+        if (key == "beamGuardModeLevels")
+        {
+            mParams.beamGuardModeLevels = uint32_t(value);
+            continue;
+        }
+        if (key == "beamGuardLevelScale")
+        {
+            mParams.beamGuardLevelScale = float(value);
+            continue;
+        }
         // PROBE: the sea's cloud layers the shaders read (set from CloudSeaDesc::layers at load; residency still streams them all).
         // Prices the second layer: a wrong image, a real floor on cost.
         if (key == "cloudLayersRead")
@@ -1503,6 +1523,10 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardWarpParallax"] = mBeamGuardWarpParallax;
     props["beamWarpFold"] = mParams.beamWarpFold;
     props["beamWarpEdge"] = mParams.beamWarpEdge;
+    props["beamWarpGap"] = mParams.beamWarpGap;
+    props["beamWarpCover"] = mParams.beamWarpCover;
+    props["beamGuardModeLevels"] = mParams.beamGuardModeLevels;
+    props["beamGuardLevelScale"] = mParams.beamGuardLevelScale;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
@@ -2235,6 +2259,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamResolvePass = createPass("resolveBeam");
     mpBeamWarpFieldPass = createPass("buildBeamWarpField");
     mpBeamWarpEdgePass = createPass("repairBeamWarpEdge");
+    mpBeamWarpGapPass = createPass("repairBeamWarpGap");
+    mpBeamWarpCoverPass = createPass("coverBeamWarpField");
     mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
     mpBeamPolicyPass = createPass("decideBeamPolicy");
     mpBeamResolveWarpPass = createPass("resolveBeam");
@@ -4594,6 +4620,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
     var["hstrBeamSpan"] = mpBeamSpan;
+    var["hstrBeamGapBits"] = mpBeamGapBits;
+    var["hstrBeamRepair"] = mpBeamRepair;
     var["hstrBeamPageTable"] = mpBeamPageTable;
     var["hstrBeamGuardDepth"] = mpBeamGuardDepth;
     var["hstrBeamGuardFar"] = mpBeamGuardFar;
@@ -7166,6 +7194,61 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     bindRenderer(pRenderContext, mpBeamWarpFieldPass);
                     bindOutput(mpBeamWarpFieldPass, "hstrBeamWarpFieldOutput", mpBeamWarpField, "hstrBeamWarpField");
                     mpBeamWarpFieldPass->execute(pRenderContext, uint3(end - origin, 1));
+                }
+            }
+            // beamWarpCover: the field corrected where nearer content now covers a point, into the spare texture, which then
+            // becomes the field everything after reads.
+            if (warp && early && !fusedChain && mParams.beamWarpCover > 0 && mpBeamWarpField)
+            {
+                if (!mpBeamWarpFieldCover || mpBeamWarpFieldCover->getWidth() != mpBeamWarpField->getWidth() ||
+                    mpBeamWarpFieldCover->getHeight() != mpBeamWarpField->getHeight())
+                    mpBeamWarpFieldCover = mpDevice->createTexture2D(
+                        mpBeamWarpField->getWidth(), mpBeamWarpField->getHeight(), ResourceFormat::RG16Float, 1, 1, nullptr,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                    );
+                const float step = float(std::max(mParams.beamLatticeStep, 1u));
+                const float4 bounds = mParams.beamScreenBounds;
+                const uint2 origin(uint32_t(std::max(std::floor(bounds.x / step) - 2.f, 0.f)), uint32_t(std::max(std::floor(bounds.y / step) - 2.f, 0.f)));
+                const uint2 end(std::min(uint32_t(std::ceil(bounds.z / step) + 2.f), mParams.beamLatticeDims.x),
+                                std::min(uint32_t(std::ceil(bounds.w / step) + 2.f), mParams.beamLatticeDims.y));
+                if (end.x > origin.x && end.y > origin.y)
+                {
+                    FALCOR_PROFILE(pRenderContext, "warpCover");
+                    bindRenderer(pRenderContext, mpBeamWarpCoverPass);
+                    mpBeamWarpCoverPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamWarpField"] = mpBeamWarpField;
+                    mpBeamWarpCoverPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamWarpFieldOutput"] = mpBeamWarpFieldCover;
+                    mpBeamWarpCoverPass->execute(pRenderContext, uint3(end - origin, 1));
+                    std::swap(mpBeamWarpField, mpBeamWarpFieldCover);
+                }
+            }
+            // beamWarpGap: the repair bits are this build's only (cleared whenever the resolve runs, so a build without the pass
+            // reads none), and the opened strips of held blocks join the unit march as overlay repairs.
+            if (warp && early && mParams.beamWarpGap > 0.f)
+            {
+                const uint2 beamDim = mParams.beamFrameDim;
+                const auto gapFlags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+                if (!mpBeamGapBits || mpBeamGapBits->getHeight() != beamDim.y || mpBeamGapBits->getWidth() != (beamDim.x + 31u) / 32u)
+                {
+                    mpBeamGapBits = mpDevice->createTexture2D((beamDim.x + 31u) / 32u, beamDim.y, ResourceFormat::R32Uint, 1, 1, nullptr, gapFlags);
+                    mpBeamRepair = mpDevice->createTexture2D(beamDim.x, beamDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, gapFlags);
+                }
+                pRenderContext->clearUAV(mpBeamGapBits->getUAV().get(), uint4(0u));
+                if (!fusedChain && mBeamDirtyActive && mBeamGuardDriven)
+                {
+                    FALCOR_PROFILE(pRenderContext, "warpGap");
+                    uint2 origin, end;
+                    {
+                        const float step = float(std::max(mParams.beamLatticeStep, 1u));
+                        const float4 bounds = mParams.beamScreenBounds;
+                        origin = uint2(uint32_t(std::max(std::floor(bounds.x / step) - 2.f, 0.f)), uint32_t(std::max(std::floor(bounds.y / step) - 2.f, 0.f)));
+                        end = uint2(std::min(uint32_t(std::ceil(bounds.z / step) + 2.f), mParams.beamLatticeDims.x),
+                                    std::min(uint32_t(std::ceil(bounds.w / step) + 2.f), mParams.beamLatticeDims.y));
+                    }
+                    if (end.x > origin.x && end.y > origin.y)
+                    {
+                        bindRenderer(pRenderContext, mpBeamWarpGapPass);
+                        mpBeamWarpGapPass->execute(pRenderContext, uint3(end - origin, 1));
+                    }
                 }
             }
             // beamWarpEdge: held blocks' edge tiles the warp cannot carry join this build's unit march (listed before its arguments

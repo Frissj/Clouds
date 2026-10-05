@@ -98,6 +98,7 @@ static float gSpanSkipOrigin;
 static uint gSpanJumps;
 #endif
 #endif
+static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched is a disocclusion repair (overlay only).
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
@@ -650,6 +651,9 @@ struct HSTRCloudRenderer
     RWTexture2DArray<float4> hstrBeamLatticeOutput;
     /// beamUnitSpan: per lattice point, its ray's depth-span record (writeBeamQuery): bins with density, origin, odometer.
     RWTexture2D<uint4> hstrBeamSpan;
+    /// beamWarpGap: this build's repair units, a bit per beam texel (32 to a word along x), and their marched radiance.
+    RWTexture2D<uint> hstrBeamGapBits;
+    RWTexture2D<float4> hstrBeamRepair;
     /// beamWarp: per lattice point, the offset from its image position to where its content was captured (buildBeamWarpField).
     Texture2D<float2> hstrBeamWarpField;
     RWTexture2D<float2> hstrBeamWarpFieldOutput;
@@ -10186,12 +10190,125 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// beamWarpGap: whether this build marched beam texel `unit` into the repair overlay.
+    bool beamGapMarked(uint2 unit)
+    {
+        return params.beamWarpGap > 0.f && all(unit < params.beamFrameDim) &&
+               (hstrBeamGapBits[uint2(unit.x >> 5, unit.y)] & (1u << (unit.x & 31u))) != 0u;
+    }
+
+    /// beamWarpGap, one edge of the lattice: points a (left / top) and b (right / bottom) `step` texels apart along `axis`, with
+    /// warp offsets o (capture position - current position) and depths z (0: sky, infinitely far). Content at a now sits at
+    /// a - o_a, so the edge opens by g = o_a[axis] - o_b[axis] when that is positive: the current image holds g texels there that
+    /// neither side's capture saw. Closing edges (g < 0, near content sliding over far) cost nothing. The opened strip lies against
+    /// the near side's new position, on the side facing the far point; its units (g + 1 texels wide, the cell's height across)
+    /// are marked once each and appended to the unit march as repairs.
+    void beamGapEdge(float2 pa, float2 oa, float za, float2 pb, float2 ob, float zb, uint axis, float step)
+    {
+        const float g = oa[axis] - ob[axis];
+        if (!(g > params.beamWarpGap))
+            return;
+        const float fa = za > 0.f ? za : 3.4e38f;
+        const float fb = zb > 0.f ? zb : 3.4e38f;
+        if (!(max(fa, fb) > 1.1f * min(fa, fb)))
+            return; // Smooth depth: the opening is perspective stretch, which the warp's interpolation carries.
+        const bool nearA = fa < fb;
+        const float2 nearNow = nearA ? pa - oa : pb - ob;
+        const float width = min(g, 8.f) + 1.f;
+        const uint other = 1u - axis;
+        float2 lo, hi;
+        lo[axis] = nearA ? nearNow[axis] : nearNow[axis] - width;
+        hi[axis] = nearA ? nearNow[axis] + width : nearNow[axis];
+        lo[other] = nearNow[other] - 0.5f * step;
+        hi[other] = nearNow[other] + 0.5f * step;
+        const int2 first = max(int2(floor(lo)), 0);
+        const int2 end = min(int2(ceil(hi)), int2(params.beamFrameDim));
+        uint added = 0;
+        for (int y = first.y; y < end.y; ++y)
+            for (int x = first.x; x < end.x; ++x)
+            {
+                const uint bit = 1u << (uint(x) & 31u);
+                uint previous;
+                InterlockedOr(hstrBeamGapBits[uint2(uint(x) >> 5, uint(y))], bit, previous);
+                if ((previous & bit) != 0u)
+                    continue;
+                uint at;
+                InterlockedAdd(hstrBeamDirtyCount[1], 1u, at);
+                hstrBeamDirtyUnits[at] = uint(x) | (uint(y) << 16) | 0x80000000u;
+                ++added;
+            }
+        if (added != 0u)
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamWarpEdgeUnits], added, unused);
+        }
+    }
+
+    /// beamWarpGap: one on-screen lattice point of a held block, its edges to the right and below (beamGapEdge).
+    void repairBeamWarpGapAt(uint2 thread)
+    {
+        if (params.beamWarpAuto > 0.f && hstrBeamWarpArgs[9] != 1u)
+            return;
+        uint2 origin, end;
+        beamWarpFieldBox(origin, end);
+        const uint2 texel = origin + thread;
+        if (any(texel + 1u >= end))
+            return;
+        const uint step = max(params.beamLatticeStep, 1u);
+        const uint2 position = texel * step;
+        const uint2 block = beamGuardCell(position);
+        if (any(block >= params.beamGuardDims) || hstrBeamDirtyMark[block] != 0xFFFFFFFFu || hstrBeamGuardCamera[block].w < 0.5f)
+            return; // Re-marched this build, or never verified: nothing held to open.
+        const float2 p = float2(position);
+        const float2 o = hstrBeamWarpField[texel];
+        const float z = beamLatticeAt(position, 1).w;
+        const uint2 right = texel + uint2(1, 0), below = texel + uint2(0, 1);
+        beamGapEdge(p, o, z, p + float2(step, 0.f), hstrBeamWarpField[right], beamLatticeAt(right * step, 1).w, 0u, float(step));
+        beamGapEdge(p, o, z, p + float2(0.f, step), hstrBeamWarpField[below], beamLatticeAt(below * step, 1).w, 1u, float(step));
+    }
+
     /// beamWarpEdge: whether the resolve reads this beam position unwarped (its tile was repaired from this camera).
     bool beamWarpEdgeRepaired(float2 position)
     {
         return params.beamWarpEdge > 0.f &&
                hstrBeamLevel[min(uint2(max(position, 0.f)), params.beamFrameDim - 1u) / beamTileEdge(params.beamLevels - 1)] ==
                    params.beamLevels + 2u;
+    }
+
+    /// beamWarpCover: the nearer-content correction of one lattice point of the warp field (see HSTRCloudTypes.slang). Reads
+    /// buildBeamWarpField's field (hstrBeamWarpField) and writes the corrected one (hstrBeamWarpFieldOutput, another texture).
+    void coverBeamWarpFieldAt(uint2 thread)
+    {
+        uint2 origin, end;
+        beamWarpFieldBox(origin, end);
+        const uint2 texel = origin + thread;
+        if (any(texel >= end))
+            return;
+        const uint step = max(params.beamLatticeStep, 1u);
+        const float2 p = float2(texel * step);
+        float2 offset = hstrBeamWarpField[texel];
+        const float own = beamLatticeAt(texel * step, 1).w;
+        float best = own > 0.f ? own : 3.4e38f;
+        const int r = int(params.beamWarpCover);
+        for (int y = -r; y <= r; ++y)
+            for (int x = -r; x <= r; ++x)
+            {
+                const int2 n = int2(texel) + int2(x, y);
+                if ((x == 0 && y == 0) || any(n < int2(origin)) || any(n >= int2(end)))
+                    continue;
+                const float z = beamLatticeAt(uint2(n) * step, 1).w;
+                if (!(z > 0.f) || !(z < 0.9f * best))
+                    continue;
+                const float2 o = hstrBeamWarpField[uint2(n)];
+                // Where n's content is drawn now; it covers this point if it lands within half a step.
+                const float2 landing = float2(uint2(n) * step) - o;
+                if (all(abs(landing - p) <= 0.5f * float(step)))
+                {
+                    best = z;
+                    offset = o;
+                }
+            }
+        hstrBeamWarpFieldOutput[texel] = offset;
     }
 
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
@@ -10245,6 +10362,10 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
 #if HSTR_BEAM_WARP
+        // beamWarpGap: a texel this build marched into the repair overlay is resolved after the unit march (the residual pass),
+        // since this pass may run beside it.
+        if (beamGapMarked(uint2(beamPosition)))
+            return params.beamRefFrame != 0;
         if (!beamWarpEdgeRepaired(beamPosition))
         {
             beamPosition = beamWarpedPosition(beamPosition);
@@ -10297,6 +10418,11 @@ struct HSTRCloudRenderer
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return;
 #if HSTR_BEAM_WARP
+        if (beamGapMarked(uint2(beamPosition)))
+        {
+            color[pixel] = float4(hstrBeamRepair[uint2(beamPosition)].rgb, 1.f);
+            return;
+        }
         if (!beamWarpEdgeRepaired(beamPosition))
             beamPosition = beamWarpedPosition(beamPosition);
 #endif
@@ -11044,6 +11170,13 @@ struct HSTRCloudRenderer
         beamStripSink(exact);
         return;
 #endif
+        if (gUnitRepair)
+        {
+            // beamWarpGap: this camera's view of an opened gap, for this build's resolve only - the persistent image and the
+            // guard keep what the block was captured with.
+            hstrBeamRepair[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
+            return;
+        }
         hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
@@ -11445,9 +11578,11 @@ struct HSTRCloudRenderer
             }
             if (nearest < 3.4e38f)
             {
-                const float budget = level == 0 ? params.beamGuardParallaxAngle : float(1u << (level - 1u)) * blockAngle;
+                const float budget = level == 0 ? params.beamGuardParallaxAngle
+                                                : float(1u << (level - 1u)) * blockAngle * params.beamGuardLevelScale;
                 const float reach = 2.8285f * span * texelReach; // The 3 x 3's farthest point from the block's centre.
-                const float shift = mode == 0 ? m : min(m, p + reach * m);
+                const bool directional = mode != 0 && (params.beamGuardModeLevels == 0 || level < params.beamGuardModeLevels);
+                const float shift = directional ? min(m, p + reach * m) : m;
                 // beamGuardIsoParallaxAngle: level 0 also passes on the isotropic bound at its own (larger) budget.
                 const bool iso = level == 0 && params.beamGuardIsoParallaxAngle > 0.f && m <= params.beamGuardIsoParallaxAngle * (nearest - m);
                 if (!(shift <= budget * (nearest - m)) && !iso)
@@ -11790,7 +11925,9 @@ struct HSTRCloudRenderer
 #else
         const uint packed = hstrBeamDirtyUnits[thread];
 #endif
-        marchBeamUnitExact(uint2(packed & 0xFFFFu, packed >> 16));
+        // beamWarpGap: bit 31 marks a disocclusion repair unit (repairBeamWarpGapAt), marched into the transient overlay.
+        gUnitRepair = (packed >> 31) != 0u;
+        marchBeamUnitExact(uint2(packed & 0xFFFFu, (packed >> 16) & 0x7FFFu));
     }
 
     /// marchBeamUnitExact's writes for a marched unit.
@@ -13986,6 +14123,20 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_
 /// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
 /// a 4K frame has 129,600 resolve groups.
 static const uint kResidualRow = 32768;
+
+/// beamWarpCover: one thread per lattice point of the warp field's box, right after the field.
+[numthreads(8, 8, 1)]
+void coverBeamWarpField(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.coverBeamWarpFieldAt(dispatchThreadId.xy);
+}
+
+/// beamWarpGap: one thread per lattice point of the warp field's box, after the field and before the unit march's arguments.
+[numthreads(8, 8, 1)]
+void repairBeamWarpGap(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.repairBeamWarpGapAt(dispatchThreadId.xy);
+}
 
 /// beamWarpEdge: one thread per level-0 tile, after the warp field and before the unit march's arguments.
 [numthreads(8, 8, 1)]
