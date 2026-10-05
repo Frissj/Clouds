@@ -317,6 +317,7 @@ private:
     ref<Texture> mpBeamPixelsSnapshot;  ///< beamRepairProbe: the residual units before the dirty march.
     ref<Texture> mpBeamLatticeSnapshot; ///< beamRepairProbe: the lattice before the dirty query.
     ref<Texture> mpBeamGuardCameraSnapshot; ///< beamRepairProbe: the guard cameras before the dirty query.
+    ref<Texture> mpBeamLevelSnapshot;       ///< beamWarpHistory: the level map before the dirty query.
     ref<Texture> mpBeamProbeAccept;         ///< beamRepairProbe: per block, the witness policies that would have carried it.
     uint32_t mBeamInvalidatedBuilds = 0; ///< Builds that invalidated blocks for changed content, cumulative (cloudStats).
     LazyComputePass mpBeamInvalidatePass;

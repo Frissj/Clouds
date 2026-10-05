@@ -99,6 +99,10 @@ static uint gSpanJumps;
 #endif
 #endif
 static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched is a disocclusion repair (overlay only).
+#ifndef HSTR_BEAM_HISTORY
+#define HSTR_BEAM_HISTORY 0
+#endif
+static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
@@ -583,6 +587,7 @@ struct HSTRCloudRenderer
     /// beamRepairProbe: each block's guard camera before this build, i.e. where its old values were marched from, and the witness
     /// policies that would have carried it (kBeamProbeAcceptSignatures), for the unit march to score its residual against.
     Texture2D<float4> hstrBeamGuardCameraSnapshot;
+    Texture2D<uint> hstrBeamLevelSnapshot; ///< beamWarpHistory: the level map before this build's dirty query.
     RWTexture2D<uint> hstrBeamProbeAccept;
     /// Cell views (cellViews, see buildCellViewTexel): per domain cell (wrapped into the domain), its view's slot plus one (0: none); per
     /// cell, the cellViewFrame + 1 it was last queued for a build in; the views; their texels in an atlas of cellViewEdge^2 tiles,
@@ -8569,9 +8574,58 @@ struct HSTRCloudRenderer
 #if HSTR_DIRTY_FUSED
     // The fused chain writes the lattice as it reads it, so it reads the output (bound in place of the input), coherently.
     float4 beamLatticeAt(uint2 position, uint slice) { return gFusedLattice[beamLatticeTexel(position, slice)]; }
+#elif HSTR_BEAM_HISTORY
+    float4 beamLatticeAt(uint2 position, uint slice)
+    {
+        const uint3 texel = beamLatticeTexel(position, slice);
+        return gHistory ? hstrBeamLatticeSnapshot[texel] : hstrBeamLattice[texel];
+    }
 #else
     float4 beamLatticeAt(uint2 position, uint slice) { return hstrBeamLattice[beamLatticeTexel(position, slice)]; }
 #endif
+
+    /// beamWarpHistory: the level map, beam pixels and guard cameras the resolve reads - before this build's dirty query and
+    /// march while gHistory is set, otherwise the live ones.
+    uint beamLevelRead(uint2 tile)
+    {
+#if HSTR_BEAM_HISTORY
+        if (gHistory)
+            return hstrBeamLevelSnapshot[tile];
+#endif
+        return hstrBeamLevel[tile];
+    }
+    float4 beamPixelRead(uint2 unit)
+    {
+#if HSTR_BEAM_HISTORY
+        if (gHistory)
+            return hstrBeamPixelsSnapshot[unit];
+#endif
+        return hstrBeamPixels[unit];
+    }
+    float4 beamGuardCameraRead(uint2 cell)
+    {
+#if HSTR_BEAM_HISTORY
+        if (gHistory)
+            return hstrBeamGuardCameraSnapshot[cell];
+#endif
+        return hstrBeamGuardCamera[cell];
+    }
+
+    /// beamWarpHistory: whether the resolve of beam position p reads the pre-build state. Only when this build took the
+    /// snapshots, and only for a held block's pixel: a block listed this build was re-marched from this camera, so its live
+    /// values need no warp, while a held one's warp lands on its neighbours' content as it was captured - which the build may
+    /// just have overwritten.
+    bool beamHistoryHeld(float2 p)
+    {
+#if HSTR_BEAM_HISTORY
+        if (params.beamHistoryLive == 0)
+            return false;
+        const uint2 block = beamGuardCell(uint2(clamp(p, 0.f, float2(params.beamFrameDim - 1u))));
+        return all(block < params.beamGuardDims) && hstrBeamDirtyMark[block] == 0xFFFFFFFFu;
+#else
+        return false;
+#endif
+    }
 
     /// Pixel-corner position of query q. Per level: the current pass level, over the lists refined this frame. Temporal: every
     /// level in one dispatch, level 0 first, then each finer level over the tiles refined last frame.
@@ -9977,14 +10031,14 @@ struct HSTRCloudRenderer
     float3 beamUnitRadiance(uint2 unit)
     {
         const uint finest = beamTileEdge(params.beamLevels - 1);
-        const uint level = hstrBeamLevel[unit / finest];
+        const uint level = beamLevelRead(unit / finest);
         const float2 p = float2(unit) + 0.5f;
         const float3 w = beamRayDirection(p);
         if (level == params.beamLevels + 1u)
             return beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo);
         if (level >= params.beamLevels)
         {
-            const float4 held = hstrBeamPixels[unit];
+            const float4 held = beamPixelRead(unit);
             if (held.a >= 0.f)
                 return held.rgb;
             // A failed tile's unit the residual has not reached - outside the on-screen box it marches. Its finest basis
@@ -10017,16 +10071,16 @@ struct HSTRCloudRenderer
                 break;
             const uint2 lattice = min(uint2(round(max(position, 0.f) / float(step))) * step, last);
             const uint2 cell = beamGuardCell(lattice);
-            const float4 held = hstrBeamGuardCamera[cell];
+            const float4 held = beamGuardCameraRead(cell);
             if (held.w < 0.5f)
                 return;
             float z = beamLatticeAt(lattice, 1).w;
             if (fine)
             {
                 const uint2 unit = min(uint2(max(position, 0.f)), params.beamFrameDim - 1u);
-                if (hstrBeamLevel[unit / beamTileEdge(params.beamLevels - 1)] >= params.beamLevels)
+                if (beamLevelRead(unit / beamTileEdge(params.beamLevels - 1)) >= params.beamLevels)
                 {
-                    const float4 marched = hstrBeamPixels[unit];
+                    const float4 marched = beamPixelRead(unit);
                     if (marched.a > 0.f)
                         z = marched.a;
                 }
@@ -10127,6 +10181,8 @@ struct HSTRCloudRenderer
         if (any(texel >= end))
             return;
         const float2 position = float2(texel * max(params.beamLatticeStep, 1u));
+        // beamWarpHistory: the field is for held pixels, whose content is where the snapshots say it was captured.
+        gHistory = HSTR_BEAM_HISTORY != 0 && params.beamHistoryLive != 0;
         float2 warped = position;
         float3 read;
         beamWarpPosition(beamRayDirection(position), warped, read);
@@ -10284,12 +10340,14 @@ struct HSTRCloudRenderer
         const uint2 texel = origin + thread;
         if (any(texel >= end))
             return;
+        gHistory = HSTR_BEAM_HISTORY != 0 && params.beamHistoryLive != 0; // beamWarpHistory: the snapshot depths, as the field.
         const uint step = max(params.beamLatticeStep, 1u);
         const float2 p = float2(texel * step);
         float2 offset = hstrBeamWarpField[texel];
         const float own = beamLatticeAt(texel * step, 1).w;
         float best = own > 0.f ? own : 3.4e38f;
         const int r = int(params.beamWarpCover);
+        bool nearer = false, changed = false;
         for (int y = -r; y <= r; ++y)
             for (int x = -r; x <= r; ++x)
             {
@@ -10299,6 +10357,7 @@ struct HSTRCloudRenderer
                 const float z = beamLatticeAt(uint2(n) * step, 1).w;
                 if (!(z > 0.f) || !(z < 0.9f * best))
                     continue;
+                nearer = true;
                 const float2 o = hstrBeamWarpField[uint2(n)];
                 // Where n's content is drawn now; it covers this point if it lands within half a step.
                 const float2 landing = float2(uint2(n) * step) - o;
@@ -10306,9 +10365,19 @@ struct HSTRCloudRenderer
                 {
                     best = z;
                     offset = o;
+                    changed = true;
                 }
             }
         hstrBeamWarpFieldOutput[texel] = offset;
+        const uint pointCount = WaveActiveCountBits(true), nearerCount = WaveActiveCountBits(nearer),
+                   changedCount = WaveActiveCountBits(changed);
+        if (WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamCoverPoints], pointCount, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamCoverNearer], nearerCount, unused);
+            InterlockedAdd(hstrBeamCounts[kBeamCoverChanged], changedCount, unused);
+        }
     }
 
     /// beamPolicy's tile tolerance for this build (decideBeamPolicy); off, the parameter as set.
@@ -10366,14 +10435,37 @@ struct HSTRCloudRenderer
         // since this pass may run beside it.
         if (beamGapMarked(uint2(beamPosition)))
             return params.beamRefFrame != 0;
-        if (!beamWarpEdgeRepaired(beamPosition))
+        // beamWarpHistory: a listed block's pixel reads its live, freshly marched values unwarped; a held one is warped through
+        // the field built from the snapshots and reads them.
+        gHistory = beamHistoryHeld(beamPosition);
+        if (!beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
         {
             beamPosition = beamWarpedPosition(beamPosition);
             w = beamRayDirection(beamPosition);
         }
+#if HSTR_BEAM_HISTORY
+        {
+            // beamWarpHistory counters: does a held pixel's warp land on content this build overwrote?
+            const uint2 source = min(uint2(max(beamPosition, 0.f)), params.beamFrameDim - 1u);
+            const uint2 sourceBlock = beamGuardCell(source);
+            const bool landed = gHistory && all(sourceBlock < params.beamGuardDims) && hstrBeamDirtyMark[sourceBlock] != 0xFFFFFFFFu;
+            const uint step = max(params.beamLatticeStep, 1u);
+            const uint3 corner = beamLatticeTexel(source / step * step, 0);
+            const bool changed = gHistory && any(hstrBeamLatticeSnapshot[corner] != hstrBeamLattice[corner]);
+            const uint held = WaveActiveCountBits(gHistory), landedCount = WaveActiveCountBits(landed),
+                       changedCount = WaveActiveCountBits(changed);
+            if (WaveIsFirstLane() && held != 0u)
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamHistoryHeld], held, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHistoryLanded], landedCount, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHistoryChanged], changedCount, unused);
+            }
+        }
+#endif
 #endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
-        const uint level = hstrBeamLevel[uint2(beamPosition) / finest];
+        const uint level = beamLevelRead(uint2(beamPosition) / finest);
         if (level == params.beamLevels + 1u)
         {
             color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
@@ -10423,7 +10515,8 @@ struct HSTRCloudRenderer
             color[pixel] = float4(hstrBeamRepair[uint2(beamPosition)].rgb, 1.f);
             return;
         }
-        if (!beamWarpEdgeRepaired(beamPosition))
+        gHistory = beamHistoryHeld(beamPosition); // As resolveBeamPixel decided for this pixel.
+        if (!beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
             beamPosition = beamWarpedPosition(beamPosition);
 #endif
         const float2 texel = beamPosition - 0.5f;
@@ -11840,7 +11933,32 @@ struct HSTRCloudRenderer
         // only if the build would have touched it.
         if (!beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
             return false;
-        const bool certified = beamCellCertified(cell);
+        bool certified = beamCellCertified(cell);
+        // beamGuardNeighbour: a held block whose neighbour holds content >10% nearer is listed too when that neighbour is listed
+        // (1) or always (2) - the near content sliding in is in no image the resolve can read (beamWarpHistory, beamWarpCover).
+        if (certified && params.beamGuardNeighbour != 0)
+        {
+            const uint2 dims = params.beamGuardDims;
+            const float own = hstrBeamGuardPyramid[cell.y * dims.x + cell.x];
+            const float far = own > 0.f ? own : 3.4e38f;
+            for (int y = -1; y <= 1 && certified; ++y)
+                for (int x = -1; x <= 1 && certified; ++x)
+                {
+                    const int2 n = int2(cell) + int2(x, y);
+                    if ((x == 0 && y == 0) || any(n < 0) || any(n >= int2(dims)))
+                        continue;
+                    const float z = hstrBeamGuardPyramid[uint(n.y) * dims.x + uint(n.x)];
+                    if (!(z > 0.f) || !(z < 0.9f * far))
+                        continue;
+                    if (params.beamGuardNeighbour >= 2 || !beamCellCertified(uint2(n)))
+                        certified = false;
+                }
+            if (!certified)
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamGuardNeighbourListed], 1u, unused);
+            }
+        }
         // beamGuardMotion's counters: why a block was listed (its first failing level), and how many held blocks the isotropic
         // bound would have listed.
         if (params.beamGuardMotion != 0 && params.beamOct != 0 && params.beamGuard != 0 && params.beamRefFrame != 0 &&

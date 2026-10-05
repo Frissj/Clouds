@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 354;
+static const uint kBeamCountSlots = 361;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -140,6 +140,16 @@ static const uint kBeamRunSkip = 344;
 static const uint kBeamUnitSpanProbe = 348;
 /// beamWarpEdge: units its repaired edge tiles added to the unit march (always counted).
 static const uint kBeamWarpEdgeUnits = 353;
+/// beamWarpHistory (always counted with it): held pixels resolved from the snapshots; of those, the ones whose warped source
+/// lies in a block listed this build; and the ones whose source lattice corner the build overwrote (snapshot != live).
+static const uint kBeamHistoryHeld = 354;
+static const uint kBeamHistoryLanded = 355;
+static const uint kBeamHistoryChanged = 356;
+/// beamWarpCover: lattice points it ran on, ones with a nearer neighbour (by 10%) within the radius, and ones it re-pointed.
+static const uint kBeamCoverPoints = 357;
+static const uint kBeamCoverNearer = 358;
+static const uint kBeamCoverChanged = 359;
+static const uint kBeamGuardNeighbourListed = 360; ///< beamGuardNeighbour: certified blocks it listed.
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1739,6 +1749,11 @@ struct HSTRCloudParams
     /// 3.93. The cover barely moves the OR's excess and costs its gain. Crops of the worst tiles: the chips are block-shaped
     /// patches of far content held inside a near puff that moved over them - the held block's own pixels are stale, which no
     /// warp field can correct. The guard, not the warp, decides them (beamGuardModeLevels).
+    /// MEASURED (cover2, OR guard, 4 cycles; over 0.02, warpCover ms, a build: points with a nearer neighbour / re-pointed):
+    /// OR 3.10%; cover 2 3.33% 0.58, 1.38M / 16.0k; cover 4 3.31% 1.75, 1.46M / 17.7k; history + cover 4 3.57% 1.81, 1.47M /
+    /// 44.7k. (Its point count read waves, not points, in that run: one lane counted inside WaveIsFirstLane; fixed since.) The
+    /// cover fires - ~1% of the points with nearer content in range land a neighbour on themselves - and re-pointing them makes
+    /// the image worse, wider radius or not.
     uint beamWarpCover = 0;
     /// beamGuardModeLevels (0: all): the directional shift (beamGuardMotion 1/2) only at pyramid levels below this; levels at
     /// or above it use the isotropic |d|. Tests whether the OR guard's stale blocks are invaded from beyond the 3 x 3.
@@ -1755,6 +1770,28 @@ struct HSTRCloudParams
     /// scale sits on the iso p8 / p4 frontier: the blocks the OR saves are the blocks whose neighbours' near content moves in.
     /// Crops: the remaining chips are single finest-tile diamonds of far content inside a near puff, with or without the cover.
     float beamGuardLevelScale = 1.f;
+    /// beamWarpHistory (0: off; ORACLE, full copies): the dirty query, rebuild and unit march overwrite a re-marched block's
+    /// lattice, level map, guard camera and beam pixels before the resolve runs, so a held neighbour whose warp should land on
+    /// that block's old (near) content finds this camera's instead. On: all four are copied before the dirty query, the warp
+    /// field (and cover) is built from the copies, and a held block's pixel resolves from them; a listed block's pixel reads its
+    /// live values unwarped.
+    /// MEASURED (history1 / history2, 4K sunset walk, 4 cycles, one settle each; over 0.02): history1 iso p8 2.65% (one 4.50%
+    /// chunk), OR 2.87%, OR + history 3.22% (one 2.00%-of-frame rebuild-side chunk), OR + history + cover 2 3.15%, iso +
+    /// history 1.89%, iso p8 1.86%; history2 iso p8 2.33%, OR 3.15%, OR + history 2.82%, OR + history + cover 2 3.03%. Copies
+    /// 0.56 ms, resolve pixels +0.3 ms. Counters (OR + history, a build): 4.12M held pixels resolved from the snapshots, 281k
+    /// (6.8%) warped into a block listed this build, 69k (1.7%) onto a lattice corner the build overwrote. The hazard is real
+    /// but restoring those reads moves the OR's error by less than the runs' +-0.3 noise: the near content a chip lacks is in
+    /// neither the old nor the new image - a held pixel's backward warp has no test that something nearer now covers it.
+    uint beamWarpHistory = 0;
+    uint beamHistoryLive = 0; ///< Set by the host: this build took beamWarpHistory's snapshots.
+    /// beamGuardNeighbour (0: off): a certified block is listed when a 3 x 3 neighbour's nearest depth is >10% nearer than its own
+    /// and that neighbour is listed this build (1), or whatever the neighbour's state (2: the ceiling).
+    /// MEASURED (neighbour1, 4K sunset walk, 4 cycles; over 0.02, units + query ms, blocks a build, blocks it added): iso p8
+    /// 2.61% (one 4.17% chunk) 4.53 14.5k; OR 3.15% 3.29 11.6k; OR + 1 3.02% 3.68 12.5k +841; OR + 2 3.16% (one 4.48% chunk)
+    /// 3.82 13.8k +1638; iso p8 2.45% 3.94 14.9k. Even listing every far block beside nearer content leaves the OR's error:
+    /// the chips are not invasion from a 3 x 3 neighbour by the guard pyramid's depth. Unknown what they are; with every
+    /// resolve-side and listing-side repair measured, the OR guard stays off.
+    uint beamGuardNeighbour = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

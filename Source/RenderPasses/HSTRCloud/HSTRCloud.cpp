@@ -662,6 +662,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamGuardLevelScale = float(value);
             continue;
         }
+        if (key == "beamGuardNeighbour")
+        {
+            mParams.beamGuardNeighbour = uint32_t(value);
+            continue;
+        }
+        if (key == "beamWarpHistory")
+        {
+            mParams.beamWarpHistory = uint32_t(value);
+            continue;
+        }
         // PROBE: the sea's cloud layers the shaders read (set from CloudSeaDesc::layers at load; residency still streams them all).
         // Prices the second layer: a wrong image, a real floor on cost.
         if (key == "cloudLayersRead")
@@ -1527,6 +1537,8 @@ Properties HSTRCloud::getProperties() const
     props["beamWarpCover"] = mParams.beamWarpCover;
     props["beamGuardModeLevels"] = mParams.beamGuardModeLevels;
     props["beamGuardLevelScale"] = mParams.beamGuardLevelScale;
+    props["beamWarpHistory"] = mParams.beamWarpHistory;
+    props["beamGuardNeighbour"] = mParams.beamGuardNeighbour;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
@@ -2036,6 +2048,13 @@ Properties HSTRCloud::getProperties() const
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
         cloud["beamWarpEdgeUnits"] = mBeamLevelCounts[kBeamWarpEdgeUnits];
+        cloud["beamHistoryHeld"] = mBeamLevelCounts[kBeamHistoryHeld];
+        cloud["beamHistoryLanded"] = mBeamLevelCounts[kBeamHistoryLanded];
+        cloud["beamHistoryChanged"] = mBeamLevelCounts[kBeamHistoryChanged];
+        cloud["beamCoverPoints"] = mBeamLevelCounts[kBeamCoverPoints];
+        cloud["beamCoverNearer"] = mBeamLevelCounts[kBeamCoverNearer];
+        cloud["beamCoverChanged"] = mBeamLevelCounts[kBeamCoverChanged];
+        cloud["beamGuardNeighbourListed"] = mBeamLevelCounts[kBeamGuardNeighbourListed];
         cloud["beamDirtyApronMarched"] = mBeamLevelCounts[kBeamDirtyApronMarched];
         cloud["beamClassifyCells"] = mBeamClassifyCells;
         cloud["beamWarpHeld"] = mBeamWarpHeld;
@@ -4662,6 +4681,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrPushShareAges"] = mpPushShareAges;
     var["hstrPushBrickVisits"] = mpPushBrickVisits;
     var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
+    var["hstrBeamLevelSnapshot"] = mpBeamLevelSnapshot;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamOrderProbe"] = mpBeamOrderProbe;
@@ -6775,6 +6795,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             // because its scored steps re-applied beamRefFrame, which re-anchored and rebuilt the image.
                             const bool turned = any(cameraTarget != mBeamCameraTarget);
                             mBeamDirtyActive = false;
+                            mParams.beamHistoryLive = 0;
                             if (guardDriven)
                             {
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
@@ -6985,6 +7006,27 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         pRenderContext->clearUAV(mpBeamOrderProbe->getUAV().get(), uint4(0));
                                     }
                                     setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
+                                    // beamWarpHistory (ORACLE): the beam state the held blocks' warp reads, before this build's
+                                    // query, rebuild, tile pass and unit march overwrite the listed blocks' share of it.
+                                    if (mParams.beamWarpHistory != 0 && !mBeamRepairProbe)
+                                    {
+                                        FALCOR_PROFILE(pRenderContext, "history");
+                                        auto snapshot = [&](ref<Texture>& pCopy, const ref<Texture>& pSource)
+                                        {
+                                            if (!pCopy || pCopy->getWidth() != pSource->getWidth() || pCopy->getHeight() != pSource->getHeight() ||
+                                                pCopy->getArraySize() != pSource->getArraySize())
+                                                pCopy = mpDevice->createTexture2D(
+                                                    pSource->getWidth(), pSource->getHeight(), pSource->getFormat(), pSource->getArraySize(), 1,
+                                                    nullptr, ResourceBindFlags::ShaderResource
+                                                );
+                                            pRenderContext->copyResource(pCopy.get(), pSource.get());
+                                        };
+                                        snapshot(mpBeamLatticeSnapshot, mpBeamLattice);
+                                        snapshot(mpBeamGuardCameraSnapshot, mpBeamGuardCamera);
+                                        snapshot(mpBeamLevelSnapshot, mpBeamLevel);
+                                        snapshot(mpBeamPixelsSnapshot, mpBeamPixels[0]);
+                                        mParams.beamHistoryLive = 1;
+                                    }
                                     if (mBeamRepairProbe)
                                     {
                                         if (!mpBeamLatticeSnapshot || mpBeamLatticeSnapshot->getWidth() != mpBeamLattice->getWidth() ||
@@ -7157,6 +7199,21 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mParams.beamWarpAuto = warpAuto ? mBeamWarpAuto : 0.f;
             pResolve->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
+            // beamWarpHistory: compiled into the programs that read the snapshots only, so nothing else carries the branches.
+            const char* history = warp && mParams.beamWarpHistory != 0 ? "1" : "0";
+            pResolve->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+            mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+            if (warpAuto)
+            {
+                mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+                mpBeamResidualResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+            }
+            if (warp)
+            {
+                mpBeamWarpFieldPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+                if (mParams.beamWarpCover > 0)
+                    mpBeamWarpCoverPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+            }
             if (warp && early)
             {
                 const uint2 latticeDims = mParams.beamLatticeDims;

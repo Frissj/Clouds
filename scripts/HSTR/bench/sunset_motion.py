@@ -36,7 +36,7 @@ CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))
 DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm's state.
 
 
-DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpEdgeUnits", "beamWarpHeld", "beamWarpListed",
+DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpEdgeUnits", "beamHistoryHeld", "beamHistoryLanded", "beamHistoryChanged", "beamCoverPoints", "beamCoverNearer", "beamCoverChanged", "beamGuardNeighbourListed", "beamWarpHeld", "beamWarpListed",
          "beamWarpOn", "beamPolicyToleranceNow", "beamFrameDim") + tuple(
          f"beamProbe{kind}{name}" for kind in ("Rays", "Units", "RaySteps", "UnitSteps")
          for name in ("Scored", "InPlace", "Reprojected", "Either")) + (  # beamRepairProbe: per build, so counted (HSTR_MOTION_COUNT)
