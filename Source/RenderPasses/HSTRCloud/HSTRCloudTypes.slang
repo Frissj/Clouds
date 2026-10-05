@@ -1792,6 +1792,14 @@ struct HSTRCloudParams
     /// the chips are not invasion from a 3 x 3 neighbour by the guard pyramid's depth. Unknown what they are; with every
     /// resolve-side and listing-side repair measured, the OR guard stays off.
     uint beamGuardNeighbour = 0;
+    uint beamPathCode = 0; ///< Set by the host for a beamPathDump frame: classify and resolve record why and how (see there).
+    /// MEASURED (pathattr1, 4K sunset walk, HSTR_MOTION_PATH; path_attr.py in HSTR_results; bad = |log lum| over 0.05 against
+    /// the fresh rebuild; per frame): iso p8 ~35k / 27k bad pixels, OR ~70k. Blocks the OR alone holds: 0.48M pixels, ~16k bad
+    /// (L1 tiles 9.5%, L0 1.2%; iso-held blocks in the iso arms 2.2% / 0.08%). Blocks iso would hold too, and listed ones,
+    /// carry the rest of the excess, and all of it within a block of an OR-held block (r16 px: 10-12k bad near, 18-20k far,
+    /// the far count equal to the iso arms' total). Dark-chip pixels are few (~50 a frame) and as common in the iso arms.
+    /// The OR-held blocks are not a stale-state bug but simply staler (the bound's own trade), and their error spreads about a
+    /// block into their neighbours through shared lattice corners and the interpolated warp.
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

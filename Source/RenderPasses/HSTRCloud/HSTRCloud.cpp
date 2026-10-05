@@ -662,6 +662,12 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamGuardLevelScale = float(value);
             continue;
         }
+        if (key == "beamPathDump")
+        {
+            mBeamPathDump = value.operator std::string();
+            mParams.beamPathCode = mBeamPathDump.empty() ? 0u : 1u;
+            continue;
+        }
         if (key == "beamGuardNeighbour")
         {
             mParams.beamGuardNeighbour = uint32_t(value);
@@ -4682,6 +4688,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrPushBrickVisits"] = mpPushBrickVisits;
     var["hstrBeamGuardCameraSnapshot"] = mpBeamGuardCameraSnapshot;
     var["hstrBeamLevelSnapshot"] = mpBeamLevelSnapshot;
+    var["hstrBeamGuardWhy"] = mpBeamGuardWhy;
+    var["hstrBeamPathCode"] = mpBeamPathCode;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamOrderProbe"] = mpBeamOrderProbe;
@@ -6801,6 +6809,17 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
                                 pRenderContext->clearUAV(mpBeamDirtyCount->getUAV().get(), uint4(0));
                                 pRenderContext->clearUAV(mpBeamDirtyMark->getUAV().get(), uint4(0xFFFFFFFFu));
+                                if (mParams.beamPathCode != 0)
+                                {
+                                    // beamPathDump: blocks classify does not reach read 0xFF (the shader masks to 8 bits).
+                                    if (!mpBeamGuardWhy || mpBeamGuardWhy->getWidth() != mpBeamDirtyMark->getWidth() ||
+                                        mpBeamGuardWhy->getHeight() != mpBeamDirtyMark->getHeight())
+                                        mpBeamGuardWhy = mpDevice->createTexture2D(
+                                            mpBeamDirtyMark->getWidth(), mpBeamDirtyMark->getHeight(), ResourceFormat::R32Uint, 1, 1, nullptr,
+                                            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                                        );
+                                    pRenderContext->clearUAV(mpBeamGuardWhy->getUAV().get(), uint4(0xFFFFFFFFu));
+                                }
                                 pRenderContext->clearUAV(mpBeamFusedState->getUAV().get(), uint4(0)); // Its stats, either way.
                                 pRenderContext->clearUAV(mpBeamDescendCount->getUAV().get(), uint4(0));
                                 // Cell views are requested and built by pushEval (runPushProbe); this path only unmaps changed ones.
@@ -7202,6 +7221,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             // beamWarpHistory: compiled into the programs that read the snapshots only, so nothing else carries the branches.
             const char* history = warp && mParams.beamWarpHistory != 0 ? "1" : "0";
             pResolve->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+            // beamPathDump: only on the frame it is asked for (a define: the resolve's registers are measured, see above).
+            const char* path = mParams.beamPathCode != 0 && mpBeamGuardWhy ? "1" : "0";
+            pResolve->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+            if (warpAuto)
+                mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+            if (late && mParams.beamPathCode != 0)
+            {
+                if (!mpBeamPathCode || mpBeamPathCode->getWidth() != mParams.frameDim.x || mpBeamPathCode->getHeight() != mParams.frameDim.y)
+                    mpBeamPathCode = mpDevice->createTexture2D(
+                        mParams.frameDim.x, mParams.frameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                    );
+                pRenderContext->clearUAV(mpBeamPathCode->getUAV().get(), uint4(0xFFFFFFFFu));
+            }
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
             if (warpAuto)
             {
@@ -7697,6 +7730,25 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         }
         if (mParams.beamRefFrame != 0)
             resolve(!overlapResolve, true);
+        // beamPathDump: width, height, then one uint per pixel (0xFFFFFFFF: not resolved by resolveBeamPixel).
+        if (!mBeamPathDump.empty())
+        {
+            if (mpBeamPathCode && mpBeamGuardWhy)
+            {
+                const std::vector<uint8_t> data = pRenderContext->readTextureSubresource(mpBeamPathCode.get(), 0);
+                if (FILE* file = std::fopen(mBeamPathDump.c_str(), "wb"))
+                {
+                    const uint32_t dims[2] = {mpBeamPathCode->getWidth(), mpBeamPathCode->getHeight()};
+                    std::fwrite(dims, sizeof(dims), 1, file);
+                    std::fwrite(data.data(), 1, data.size(), file);
+                    std::fclose(file);
+                }
+            }
+            else
+                logWarning("HSTRCloud: beamPathDump - no guard build this frame, nothing written to '{}'.", mBeamPathDump);
+            mBeamPathDump.clear();
+            mParams.beamPathCode = 0;
+        }
     }
     else
     {

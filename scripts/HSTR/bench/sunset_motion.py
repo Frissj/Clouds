@@ -80,6 +80,10 @@ def score():
     fresh = os.environ.get("HSTR_MOTION_SCORE") == "2"
     saved = {k: hstr.properties[k] for k in REFERENCE if k in hstr.properties}
     hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
+    # HSTR_MOTION_PATH (with HSTR_MOTION_OUT): the moving frame's per-pixel resolve path beside its image (beamPathDump).
+    if os.environ.get("HSTR_MOTION_PATH") and os.environ.get("HSTR_MOTION_OUT"):
+        n = getattr(score, "taken", 0) + 1
+        hstr.set_properties({"beamPathDump": os.path.join(os.environ["HSTR_MOTION_OUT"], f"sunset_motion_score{n}_path.bin")})
     m.renderFrame()
     # HSTR_MOTION_OUT: the frame in flight and, below, what it is scored against, numbered per score.
     score.taken = getattr(score, "taken", 0) + 1

@@ -102,6 +102,9 @@ static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched
 #ifndef HSTR_BEAM_HISTORY
 #define HSTR_BEAM_HISTORY 0
 #endif
+#ifndef HSTR_BEAM_PATH
+#define HSTR_BEAM_PATH 0
+#endif
 static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
@@ -588,6 +591,9 @@ struct HSTRCloudRenderer
     /// policies that would have carried it (kBeamProbeAcceptSignatures), for the unit march to score its residual against.
     Texture2D<float4> hstrBeamGuardCameraSnapshot;
     Texture2D<uint> hstrBeamLevelSnapshot; ///< beamWarpHistory: the level map before this build's dirty query.
+    /// beamPathDump: per block, why this build held or listed it (beamGuardWhy); per frame pixel, the path its resolve took.
+    RWTexture2D<uint> hstrBeamGuardWhy;
+    RWTexture2D<uint> hstrBeamPathCode;
     RWTexture2D<uint> hstrBeamProbeAccept;
     /// Cell views (cellViews, see buildCellViewTexel): per domain cell (wrapped into the domain), its view's slot plus one (0: none); per
     /// cell, the cellViewFrame + 1 it was last queued for a build in; the views; their texels in an atlas of cellViewEdge^2 tiles,
@@ -10430,6 +10436,9 @@ struct HSTRCloudRenderer
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
+#if HSTR_BEAM_PATH
+        const float2 destination = beamPosition;
+#endif
 #if HSTR_BEAM_WARP
         // beamWarpGap: a texel this build marched into the repair overlay is resolved after the unit march (the residual pass),
         // since this pass may run beside it.
@@ -10466,6 +10475,21 @@ struct HSTRCloudRenderer
 #endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = beamLevelRead(uint2(beamPosition) / finest);
+#if HSTR_BEAM_PATH
+        {
+            // beamPathDump: bits 0-7 the destination block's beamGuardWhy, 8-15 the warp source block's, 16-19 the level read
+            // (beamLevels: residual, beamLevels + 1: sky, else the tile level), bit 20 warped by over half a texel, bit 21 the
+            // source in another block than the destination.
+            const uint2 dst = min(uint2(max(destination, 0.f)), params.beamFrameDim - 1u);
+            const uint2 src = min(uint2(max(beamPosition, 0.f)), params.beamFrameDim - 1u);
+            const uint2 dstBlock = beamGuardCell(dst), srcBlock = beamGuardCell(src);
+            const uint dstWhy = all(dstBlock < params.beamGuardDims) ? (hstrBeamGuardWhy[dstBlock] & 0xFFu) : 0xFFu;
+            const uint srcWhy = all(srcBlock < params.beamGuardDims) ? (hstrBeamGuardWhy[srcBlock] & 0xFFu) : 0xFFu;
+            hstrBeamPathCode[pixel] = dstWhy | (srcWhy << 8) | (min(level, 15u) << 16) |
+                                      (any(abs(beamPosition - destination) > 0.5f) ? (1u << 20) : 0u) |
+                                      (any(dstBlock != srcBlock) ? (1u << 21) : 0u);
+        }
+#endif
         if (level == params.beamLevels + 1u)
         {
             color[pixel] = float4(beamRadiance(0.f, 0.f, 0.f, w, gScene.getGridVolume(0).data.albedo), 1.f);
@@ -11974,6 +11998,14 @@ struct HSTRCloudRenderer
                 if (failed < kBeamGuardFailLevels)
                     InterlockedAdd(hstrBeamCounts[kBeamGuardFailLevel + failed], 1u, unused);
             }
+        }
+        if (params.beamPathCode != 0)
+        {
+            // beamPathDump: bits 0-1 listed (0) / held with the isotropic bound passing too (1) / held by the directional bound
+            // alone (2); bits 2-5 the isotropic bound's first failing level (kBeamGuardFailLevels: passes, 0xF: never verified).
+            uint isoFailed;
+            const bool iso = beamCellMotionCertified(cell, 0u, isoFailed);
+            hstrBeamGuardWhy[cell] = (certified ? (iso ? 1u : 2u) : 0u) | (min(isoFailed, 0xFu) << 2);
         }
         if (certified)
         {

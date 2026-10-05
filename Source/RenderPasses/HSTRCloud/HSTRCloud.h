@@ -605,6 +605,9 @@ private:
                                                         ///< per-pixel march list. Eight queries per entry, so these are what the
                                                         ///< query pass costs.
     std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.
+    std::string mBeamPathDump;   ///< beamPathDump: when set, this frame's per-pixel resolve path is written to <path> (raw R32Uint).
+    ref<Texture> mpBeamPathCode; ///< beamPathDump: the per-pixel code (resolveBeamPixel).
+    ref<Texture> mpBeamGuardWhy; ///< beamPathDump: per guard block, why it was held or listed (classifyBeamGuardCell).
     std::string mLoadReferencePath;    ///< When set, the reference sums are read from <path>_s<slice>.exr at the start of the frame.
     float3 mReferencePosition = float3(0.f);
     uint32_t mReferenceBandRows = 0; ///< Rows per separately submitted band of a path-traced sample (0: the whole frame).
