@@ -51,9 +51,11 @@ if args.nsys or args.ngfx:
     elevate(__file__, ROOT)  # nsys / ngfx need admin for GPU counters; see elevate.py. Mogwai stays --headless.
 from sea_config import REFERENCE  # noqa: E402
 
+# --env before the sweep loads: a sweep that picks its arms from the environment (e.g. HSTR_PACKED_SWEEP) sees it in the elevated
+# copy too, which inherits nothing (sunpacked7 ran the default arms).
+os.environ.update(dict(item.split("=", 1) for item in args.env))
 tests = runpy.run_path(args.sweep)["TESTS"] if args.harness != "sunset" else []
 env = dict(os.environ, HSTR_TAG=args.tag, HSTR_BASE=json.dumps(REFERENCE), HSTR_TESTS=json.dumps(tests))
-env.update(dict(item.split("=", 1) for item in args.env))
 for suffix in ("_test.txt", "_test.jsonl"):
     (RESULTS / f"{args.tag}{suffix}").unlink(missing_ok=True)
 if args.harness == "ab":

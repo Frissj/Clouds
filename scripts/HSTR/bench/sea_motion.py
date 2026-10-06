@@ -196,6 +196,9 @@ while int(hstr.properties["worldCacheSampleCount"]) < 64:
     m.renderFrame()
 # The resident set is frozen once settled: otherwise every camera change re-runs the CPU residency cut (100+ ms), the GPU idles into a
 # lower power state and the timings measure that instead of the frame.
+# WARNING (sprintimg2, 2026-10-06): with the world cache frozen too, the sea tiles a sprint streams in are never lit - black
+# clouds, different in the scored frame and its reference - so the "sprint 20 0" ERROR columns (13% over 0.02 in every arm) are
+# not a beam measurement; its timings still compare within a run. Judge motion quality with sunset_motion (HSTR_MOTION_SCORE 2).
 hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": os.environ.get("HSTR_FREEZE", "1") != "0"})
 settled = stats()
 log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun baked {settled.get('sunBaked', 0)}, waiting "
@@ -282,7 +285,11 @@ for motion, forward, yaw, *rest in MOTIONS:
             hstr.set_properties(dict(BASE, compareReference=False, compareExact=False))
             m.renderFrame()  # As before, the reference view renders once before the frame that is compared.
             capture(f"{motion}_{test}_step{step}_reference")
-            far = {k: stats().get(k, -1) for k in ("farSeaActive", "farLayerValid", "farSeaField", "farSeaRuns")}
+            # And the sun bakes' state (sprintimg1: unlit black clouds, different ones in the two frames, at 13% over 0.02 where
+            # the same settle and 64 tile changes scored 0.028% in September).
+            far = {k: stats().get(k, -1) for k in ("farSeaActive", "farLayerValid", "farSeaField", "farSeaRuns", "sunBakesFrame",
+                                                   "sunWaiting", "sunStale", "sunSlotsFree", "sunBaked", "worldCacheBakes",
+                                                   "seaTilesChanged")}
             log(f"{motion:7s} {test:16s} far sea: arm frame {json.dumps({k: s.get(k, -1) for k in far})}, reference frame "
                 f"{json.dumps(far)}")
             hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})

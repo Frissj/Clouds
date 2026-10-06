@@ -207,16 +207,24 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     // so the extra slots are extra layers and no lookup changes.
     const uint32_t sunScale = std::clamp(mDesc.sunPoolScale, 1u, 3u);
     const uint32_t sunSlots = slots * sunScale;
+    // sunPacked 1: the sun atlas itself is RG8 - the 8-bit bake in r, its brick's density in g - and is also the packed atlas, so the
+    // packed read costs no memory over today's R16F sun atlas (two bytes a texel either way). sunPacked 2 is a second RG16F atlas.
+    // MEASURED (sunpacked12, IntelCloudSeaHalf 4K): settle 3,911 MB - the same as with no packed atlas (lists1), against 4,427 with
+    // a second RG8 atlas and 4,942 with RG16F; walk units 1.53 -> 1.51 / 1.52 ms with cloudSunPackedRead, sprint 1.57 -> 1.55 / 1.55
+    // (three arms of that run disturbed - the sanity arm read 1.59 where it reads 1.31 - so only the undisturbed pairs count);
+    // over 0.02 arm for arm as at RG16F (walk 3.87 / 3.74 / 3.89 / 3.97%) though every arm now reads the 8-bit sun.
     mpSunAtlas = mpDevice->createTexture3D(
         mpAtlas->getWidth(),
         mpAtlas->getHeight(),
         mpAtlas->getDepth() * sunScale,
-        mDesc.sunAtlas8 ? ResourceFormat::R8Unorm : ResourceFormat::R16Float,
+        mDesc.sunPacked == 1 ? ResourceFormat::RG8Unorm : (mDesc.sunAtlas8 ? ResourceFormat::R8Unorm : ResourceFormat::R16Float),
         1,
         nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
-    if (mDesc.sunPacked != 0)
+    if (mDesc.sunPacked == 1)
+        mpSunPacked = mpSunAtlas;
+    else if (mDesc.sunPacked != 0)
         mpSunPacked = mpDevice->createTexture3D(
             mpSunAtlas->getWidth(),
             mpSunAtlas->getHeight(),

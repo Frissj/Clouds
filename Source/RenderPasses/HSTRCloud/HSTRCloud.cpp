@@ -1805,6 +1805,7 @@ Properties HSTRCloud::getProperties() const
         cloud["farLayerValid"] = mFarLayerValid;
         cloud["farSeaField"] = mParams.seaFarField;
         cloud["farSeaRuns"] = mFarSeaRuns;
+        cloud["worldCacheBakes"] = mWorldCacheBakes; // sprintimg1: did the cache follow the sea's new tiles?
         const float2 video = hstrcloud::queryVideoMemoryMB(mpDevice);
         cloud["videoUsedMB"] = video.x;
         cloud["videoBudgetMB"] = video.y;

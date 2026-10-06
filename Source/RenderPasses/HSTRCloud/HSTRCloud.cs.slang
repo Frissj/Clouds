@@ -329,10 +329,15 @@ struct LeanHit
     /// against reload in the same run (sunhit4): walk 2.066 / 2.033 -> 2.047 / 2.000 ms, sprint 2.414 / 2.416 -> 2.403 / 2.393.
     float scale;
     float near;
-#if HSTR_SUN_PACKED
-    float sun; ///< The bake as cloudPackedDensity read it with the density (the packed atlas' r), or -1: leanSunDepth's own lookup.
-#endif
 };
+/// LeanHit::levels with HSTR_SUN_PACKED: x.x holds the bake cloudPackedDensity read with the density (the packed atlas' r), which
+/// leanSunDepth takes in place of its own lookup - x is only read on that lookup's path, so the bake costs no register.
+/// MEASURED (packgfx1 / packgfx2, 4K walk GPU traces, units): a float of its own in LeanHit took the units kernel's warps active
+/// 29.1-29.4% -> 22.3-23.2% (register-allocation launch stalls 24.9 -> 25.8-26.4%; instructions unchanged) - an occupancy step,
+/// while the fused fetch cut DRAM reads 26.5 -> 18.2 (nsys, sunpacked6 / 9). With the bake in x.x (sunpacked10, 4K, one launch):
+/// walk units 1.53 / 1.53 -> 1.50 / 1.48 ms, sprint 1.56 / 1.57 -> 1.54 / 1.54, query 2.01 / 1.99 -> 2.01 / 1.98 (it sits at
+/// 168 registers / 12 warps either way); errors within run noise (walk 3.86 / 3.89 -> 3.74 / 3.97% over 0.02).
+static const uint kLeanHitPackedSun = 1u << 31;
 
 /// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
 /// 15 unbounded.
@@ -1694,6 +1699,9 @@ struct HSTRCloudRenderer
     static const float kCloudSunCodeRange = 3.6636f; // log(1 + kCloudSunDepthOpaque / kCloudSeaMinScale / kCloudSunCodeKnee)
     static float cloudSunEncode(float assetDepth) { return saturate(log(1.f + assetDepth / kCloudSunCodeKnee) / kCloudSunCodeRange); }
     static float cloudSunDecode(float code) { return kCloudSunCodeKnee * (exp(code * kCloudSunCodeRange) - 1.f); }
+    /// Whether the sun atlas holds that 8-bit code: cloudSunAtlas8, or the RG8 packed atlas, which IS the sun atlas (cloudSunPacked
+    /// 1: the bake in r, its brick's density in g; one atlas at R16F's two bytes a texel).
+    bool cloudSun8() { return params.cloudSunAtlas8 != 0 || params.cloudSunPackedAtlas == 1u; }
 
     /// cloudBrickSun for a baked brick of known level: the sun optical depth (world) for an instance of the given source voxel
     /// size and scale (its voxel size over the asset's).
@@ -1707,7 +1715,7 @@ struct HSTRCloudRenderer
         const uint3 slot = uint3(sunSlot & mask, (sunSlot >> shift) & mask, sunSlot >> (2u * shift));
         const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + local;
         const float stored = hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudSunAtlasInvSize, 0.f);
-        return params.cloudSunAtlas8 != 0 ? cloudSunDecode(stored) * instanceScale : stored * instanceVoxelWorld;
+        return cloudSun8() ? cloudSunDecode(stored) * instanceScale : stored * instanceVoxelWorld;
     }
 
     float cameraExtinctionAtVoxel(float3 v, float footprint)
@@ -7680,9 +7688,6 @@ struct HSTRCloudRenderer
         float densest = -1.f;
         float exit = 1e30f;
         bool resolved = false;
-#if HSTR_SUN_PACKED
-        hit.sun = -1.f;
-#endif
 #if HSTR_LAYER_PROBE
         uint denseLayers = 0;
         bool layer0Dense = false;
@@ -7972,7 +7977,11 @@ struct HSTRCloudRenderer
                 hit.scale = instance.sourceVoxelWorld;
                 hit.near = instance.scale;
 #if HSTR_SUN_PACKED
-                hit.sun = layerSun;
+                if (layerSun >= 0.f)
+                {
+                    hit.x.x = layerSun;
+                    hit.levels |= kLeanHitPackedSun;
+                }
 #endif
             }
         }
@@ -8004,9 +8013,6 @@ struct HSTRCloudRenderer
         hit.x = 0.f;
         hit.scale = 0.f;
         hit.near = 0.f;
-#if HSTR_SUN_PACKED
-        hit.sun = -1.f;
-#endif
         skipTo = -1.f;
         fineVoxels = 1.f;
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
@@ -8047,7 +8053,13 @@ struct HSTRCloudRenderer
         const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
         const int3 i = int3(floor(x + 0.5f));
 #if HSTR_SUN_PACKED
-        float density = cloudPackedDensity(sample.entry, sample.level, x, instance.sunClass, hit.sun) * scale;
+        float packedSun;
+        float density = cloudPackedDensity(sample.entry, sample.level, x, instance.sunClass, packedSun) * scale;
+        if (packedSun >= 0.f)
+        {
+            hit.x.x = packedSun;
+            hit.levels |= kLeanHitPackedSun;
+        }
 #else
         float density = cloudBrickDensity(sample.entry, x, i) * scale;
 #endif
@@ -8069,12 +8081,14 @@ struct HSTRCloudRenderer
             const float sourceVoxelWorld = hit.scale;
             const float near = params.sunNearVoxels * hit.near;
 #if HSTR_SUN_PACKED
-            if (hit.sun >= 0.f)
+            if ((hit.levels & kLeanHitPackedSun) != 0u)
             {
-                // The bake came with the density (cloudPackedDensity): no resolved lookup, no bake fetch - the far field alone.
+                // The bake came with the density (cloudPackedDensity, in hit.x.x): no resolved lookup, no bake fetch - the far field
+                // alone.
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
                 const float farDepth = fineSunAt(far);
-                const float baked = params.cloudSunPackedAtlas == 1u ? cloudSunDecode(hit.sun) * hit.near : hit.sun * sourceVoxelWorld;
+                const float stored = hit.x.x;
+                const float baked = params.cloudSunPackedAtlas == 1u ? cloudSunDecode(stored) * hit.near : stored * sourceVoxelWorld;
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
 #endif
@@ -8732,12 +8746,12 @@ struct HSTRCloudRenderer
                     if ((HSTR_SPAN_LOOP & 128) != 0)
                         bakedDepth = 0.f;
                     else if (packedSpan)
-                        bakedDepth = params.cloudSunAtlas8 != 0 ? cloudSunDecode(packedSun) * instance.scale : packedSun * instance.sourceVoxelWorld;
+                        bakedDepth = cloudSun8() ? cloudSunDecode(packedSun) * instance.scale : packedSun * instance.sourceVoxelWorld;
                     else if (resolvedLoop)
                     {
                         const float3 local = clamp(sunStart + float(j) * sunStep, -0.5f, 7.5f);
                         const float stored = hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, (sunBase + local) * params.cloudSunAtlasInvSize, 0.f);
-                        bakedDepth = params.cloudSunAtlas8 != 0 ? cloudSunDecode(stored) * instance.scale : stored * instance.sourceVoxelWorld;
+                        bakedDepth = cloudSun8() ? cloudSunDecode(stored) * instance.scale : stored * instance.sourceVoxelWorld;
                     }
                     else
                         bakedDepth = cloudBrickSunAt(sunLevel, resolved.x, x, instance.sourceVoxelWorld, instance.scale);
@@ -8756,9 +8770,6 @@ struct HSTRCloudRenderer
                     hit.x = x;
                     hit.scale = instance.sourceVoxelWorld;
                     hit.near = instance.scale;
-#if HSTR_SUN_PACKED
-                    hit.sun = -1.f;
-#endif
                     depth = leanSunDepth(v, footprint, hit);
                     fallback += pass;
                 }
@@ -9317,9 +9328,6 @@ struct HSTRCloudRenderer
                             hit.x = x0 + (t - first) * dx;
                             hit.scale = instance.sourceVoxelWorld;
                             hit.near = instance.scale;
-#if HSTR_SUN_PACKED
-                            hit.sun = -1.f;
-#endif
                             depths[q] = leanSunDepth((position + t * direction) * cellWidth, footprint, hit);
                             ++fallback;
                         }
@@ -16180,8 +16188,10 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
             InterlockedAdd(gSunBakeProbe[p], sum);
     }
 #endif
-    gHSTRCloud.hstrCloudSunAtlasOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
-        params.cloudSunAtlas8 != 0 ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth;
+    // With the RG8 packed atlas the sun atlas is that texture: the packed write below fills both channels.
+    if (params.cloudSunPackedAtlas != 1u)
+        gHSTRCloud.hstrCloudSunAtlasOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
+            params.cloudSunAtlas8 != 0 ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth;
     if (params.cloudSunPackedAtlas != 0u)
     {
         // The packed atlas: the bake beside its brick's density, the apron taking the nearest core texel (cloudPackedDensity).

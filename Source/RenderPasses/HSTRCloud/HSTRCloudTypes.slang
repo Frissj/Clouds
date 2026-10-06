@@ -1852,8 +1852,10 @@ struct HSTRCloudParams
     /// excess is not usable from this run: the two identical iso arms scored 3.46% / 1.97% over 0.02 (pathattr1 2.30 / 2.20 with 4
     /// cycles) - two cycles put the arms on different stretches of the walk.
     uint beamGuardFarProbe = 0;
-    /// The packed sun atlas the residency keeps (cloudSunPacked; 0 none, 1 RG8, 2 RG16F; set by the host): bakeCloudSun writes it
-    /// beside the sun atlas, and with HSTR_SUN_PACKED (cloudSunPackedRead) the beam marches read density and bake from it.
+    /// The packed sun atlas the residency keeps (cloudSunPacked; set by the host): 0 none; 1 RG8, which IS the sun atlas (the
+    /// 8-bit bake in r, its brick's density in g - cloudSun8 - at R16F's memory); 2 a second RG16F atlas beside it. bakeCloudSun
+    /// writes it, and with HSTR_SUN_PACKED (cloudSunPackedRead) the beam marches read density and bake from it. Off by default:
+    /// ~-0.02 ms of units (sunpacked12), not yet measured on the sunset launcher.
     uint cloudSunPackedAtlas = 0;
     /// The far layer's reprojection (seaFarBand, seaFarSourceDistance). A texel whose march lit the near / far fade (stored with
     /// its distance negative) marches again every run: the fade moves with the camera, so no reprojection carries that content. A

@@ -100,4 +100,39 @@ FAREDGE = [
     ("march again", FAR),
     ("sanity: no sun term", dict(FAR, hstComponents=1 | 4 | 8)),
 ]
-TESTS = {"lists": LISTS, "image": IMAGE, "speckle": SPECKLE, "farsea": FARSEA, "farfix": FARFIX, "faredge": FAREDGE}.get(os.environ.get("HSTR_PACKED_SWEEP"), TESTS)
+# sunpacked6 (--nsys, walk): only a launch's FIRST capture holds the DX12 workload ranges (later reports: GPU_METRICS, no
+# DX12_WORKLOAD), so per-scope metrics need the arm first. Plain march, first: units 3.07 ms/f, SMs active 98.4, issue 47.0,
+# warps in flight 29.8, unallocated 68.6, DRAM read 26.5; query 4.53, 92.7 / 31.2 / 18.1 / 74.6 / 33.4.
+# HSTR_PACKED_SWEEP=packedfirst: the packed arm first, for its own report.
+PACKEDFIRST = [("march packed", dict(MARCH, cloudSunPackedRead=True))]
+# MEASURED (sunpacked9 packed first, against sunpacked6 plain first; units under GPU metrics): warps in flight 29.8 -> 23.1,
+# unallocated 68.6 -> 75.5, SM issue 47.0 -> 42.6, DRAM read 26.5 -> 18.2. The fetch saves DRAM traffic, and the kernel loses a
+# fifth of its warps: an occupancy step (registers), not the fetch. Query unchanged (18.1 / 18.2 warps).
+# HSTR_PACKED_SWEEP=plainonly / packedfirst with --ngfx: one arm a launch, for each kernel's # Reg.
+# MEASURED (packgfx1 / packgfx2 traces, units): warps active 29.1-29.4% -> 22.3-23.2%, register-allocation launch stalls 24.9 ->
+# 25.8-26.4%, instructions unchanged - the LeanHit::sun float. Moved into hit.x.x (kLeanHitPackedSun), sunpacked10 (4K, default
+# TESTS): walk units 1.53 / 1.53 -> packed 1.50 / 1.48 ms, sprint 1.56 / 1.57 -> 1.54 / 1.54, query unchanged; errors unchanged.
+# MEASURED (sunpacked11, cloudSunPacked 1 = RG8, half the atlas: settle 4,427 MB against 4,942 at RG16F): walk units 1.53 / 1.53
+# -> 1.50 / 1.48, sprint 1.57 / 1.57 -> 1.52 / 1.54, query 2.01 / 2.00 -> 2.01 / 1.97; over 0.02 walk 3.86 / 3.89 -> 3.73 / 3.96%
+# (RG16F's 3.74 / 3.97) - the 8-bit sun costs nothing visible here, so RG8 is the packed format to keep.
+# MEASURED (sunpacked12, cloudSunPacked 1 now the sun atlas itself, RG8 - no second atlas): settle 3,911 MB, as with no packed
+# atlas; walk units 1.53 -> 1.51 / 1.52, sprint 1.57 -> 1.55 / 1.55 (walk again 1.79, walk sanity 1.59 and sprint march 1.76 were
+# disturbed - outside load), errors arm for arm unchanged. Noted beside the atlas in CloudResidency.cpp.
+PLAINONLY = [("march", MARCH)]
+# sprintimg1 (sprint, image arms): 13.3% over 0.02 (p99.9 0.819) in every arm, sanity too; PNG 26% of the frame over 0.02 across
+# every cloud row; both frames show unlit black clouds, different ones in each. September's sprint (leantstep1) scored 0.028% from
+# the same settle (270,336 bakes, 125,832 waiting, 0 slots free) and the same 64 sea tiles changed. sea_motion freezes the world
+# cache (worldCacheUpdates 0) after the settle. HSTR_PACKED_SWEEP=sprint: ORACLE - the cache left updating through the arm.
+SPRINT = [
+    ("march", dict(MARCH, worldCacheUpdates=0)),
+    ("march cache live", dict(MARCH, worldCacheUpdates=1)),
+    ("sanity: no sun term", dict(MARCH, worldCacheUpdates=0, hstComponents=1 | 4 | 8)),
+]
+# MEASURED (sprintimg2): frozen cache 13.28% over 0.02 (PNG 26.0%; dark pixels below the horizon arm 20.7% / reference 22.5%),
+# cache live 16.85% (PNG 13.2%; dark 0.7% / 0.0%) at 5.96 -> 7.11 ms, sanity 19.26%. Bakes identical in both frames (0 a frame,
+# 125,832 waiting, worldCacheBakes 77 frozen): the black clouds are the sea tiles streamed in during the sprint, which the frozen
+# cache never lit; live, the cache bakes between the two frames (150 -> 151) and they part again. sea_motion's sprint ERROR is
+# not a beam measurement - judge motion quality with sunset_motion (HSTR_MOTION_SCORE 2, live residency). Why September's
+# sprint scored 0.028% from the same settle is unknown (its settle logged world cache samples 1187, today 64).
+TESTS = {"lists": LISTS, "image": IMAGE, "speckle": SPECKLE, "farsea": FARSEA, "farfix": FARFIX, "faredge": FAREDGE,
+         "packedfirst": PACKEDFIRST, "plainonly": PLAINONLY, "sprint": SPRINT}.get(os.environ.get("HSTR_PACKED_SWEEP"), TESTS)
