@@ -137,6 +137,44 @@ SPAN = [
     ("span probe", dict(DSUN, spanProbe=True)),
     ("march dsun again", DSUN),
 ]
+# The span evaluator with batched independent loads (spanGather 1: eight samples' loads before their composite; 2: and the next
+# span's header ahead), against the plain evaluator in the same run. Every arm sets spanProbe and spanGather.
+GATHER = [
+    ("march dsun", dict(DSUN, spanProbe=False, spanGather=0)),
+    ("span plain", dict(DSUN, spanProbe=True, spanGather=0)),
+    ("span gather8", dict(DSUN, spanProbe=True, spanGather=1)),
+    ("span gather8 prefetch", dict(DSUN, spanProbe=True, spanGather=2)),
+    ("span gather8 sanity (no sun, must mismatch)", dict(DSUN, spanProbe=True, spanGather=3)),
+    ("span headers only (floor, no samples)", dict(DSUN, spanProbe=True, spanGather=4)),
+    ("span plain again", dict(DSUN, spanProbe=True, spanGather=0)),
+    ("march dsun again", dict(DSUN, spanProbe=False, spanGather=0)),
+]
+# MEASURED (spangather6, HSTR_RES=1920x1080, --steps 1; at 4K the probe pushes VRAM to 11.7 of 12.3 GB and every pass slows 4-6x):
+# march query + units 0.73 + 0.70 / 0.69 + 0.68 ms; spans plain 0.613, gather8 0.620, prefetch 0.613, sanity 0.613 (light
+# mismatches 6.1k -> 101.8k), headers only 0.257, plain again 0.613. Batched loads buy nothing on the real evaluator: samples
+# 0.356 ms for 1.87M (~5.2 G/s). See evaluateSpanRayGather.
+# Where the span evaluator's sample time goes, and whether spans can share transfers. spanEval: one thread a span (each from
+# T = 1, composed per ray afterwards: "spans" + "spanCompose"), listed in ray order (load balance alone), grouped by brick
+# (cache locality) or scrambled (sanity: must be slower); spanLoop 1 decodes the brick's atlas addresses once a span, 2 skips the
+# sun fetches (the density / sun split - its light is wrong by design). spanShare (untimed, every arm): spans keyed by brick, entry
+# cell, direction class and sun class, each served its key's first (L, T) - spanShareBad* against spanBad* (the exact evaluator,
+# same 0.02 test) is the quality of a transfer cache, spanShareBin* its reuse. spanTimedMismatch: per-span results != per-ray.
+# Stop rules: an order or loop arm must cut "spans" (+ compose) by >= 30% of the samples' ~0.356 ms; sharing must leave
+# spanShareBad* within ~2x spanBad*.
+SPANORDER = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=True)),
+    ("span per span ray order", dict(DSUN, spanProbe=True, spanGather=0, spanEval=1, spanLoop=0, spanShare=True)),
+    ("span per span brick order", dict(DSUN, spanProbe=True, spanGather=0, spanEval=2, spanLoop=0, spanShare=True)),
+    ("span per span scrambled (sanity, must slow)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=3, spanLoop=0, spanShare=True)),
+    ("span resolved loop", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1, spanShare=True)),
+    ("span resolved loop brick order", dict(DSUN, spanProbe=True, spanGather=0, spanEval=2, spanLoop=1, spanShare=True)),
+    ("span no sun fetch (cost split)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=2, spanShare=True)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=True)),
+]
+# MEASURED (spanorder1, HSTR_RES=1920x1080, --steps 1): spans [+ compose] per ray 0.60 / 0.61, per span ray order 0.47 + 0.11,
+# brick order 0.56 + 0.12, scrambled 1.52 + 0.11 (sanity), resolved loop 0.60, resolved + brick 0.61 + 0.14, no sun fetch 0.39 ms.
+# Every order and loop arm misses the 30% rule; the sun fetches are a third of the evaluator. Sharing: 1.52 spans a key, bad rays
+# 5.7k -> 20.3k (T), 4.8k -> 52.1k (light) - fails both rules. See evaluateSpan.
 # MEASURED (leanspan1, 4K): walk march 3.65 / 3.62 ms (query + units) -> spans 1.77 ms for 80% of 673k rays (20.5% past 12 spans,
 # skipped: ~2.2 ms for all), sprint 4.51 / 4.54 -> 2.24. 3.6 samples a span, ~5.1 G samples/s; 0.2-0.3% of rays not bit-exact.
 # Gate A (<= 0.7 ms) FAILED: the direct-span evaluator buys ~1.7-2x with spans free, not the ~5x the dirty passes need.

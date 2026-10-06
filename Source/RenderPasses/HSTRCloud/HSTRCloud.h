@@ -544,6 +544,22 @@ private:
     LazyComputePass mpSpanArgsPass;
     LazyComputePass mpSpanEvalPass;
     LazyComputePass mpSpanCheckPass;
+    /// spanEval / spanShare (HSTRCloudParams): the per-span evaluation's list and outputs, and the shared-transfer oracle's table.
+    ref<Buffer> mpSpanOut;
+    ref<Buffer> mpSpanList;
+    ref<Buffer> mpSpanBuckets;
+    ref<Buffer> mpSpanListArgs;
+    ref<Buffer> mpSpanShareKeys;
+    ref<Buffer> mpSpanShareCounts;
+    ref<Buffer> mpSpanShareValues;
+    LazyComputePass mpSpanCountPass;
+    LazyComputePass mpSpanScanPass;
+    LazyComputePass mpSpanScatterPass;
+    LazyComputePass mpSpanListedPass;
+    LazyComputePass mpSpanComposePass;
+    LazyComputePass mpSpanShareInsertPass;
+    LazyComputePass mpSpanShareCheckPass;
+    LazyComputePass mpSpanShareCountPass;
     void runSpanProbe(RenderContext* pRenderContext);
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.

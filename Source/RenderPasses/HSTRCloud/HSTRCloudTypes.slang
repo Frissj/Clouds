@@ -1823,6 +1823,19 @@ struct HSTRCloudParams
     /// needing a march (>2% bad): today 19-32%, best-of-two 35-45% at h 2 and 45-55% at h 8, against a capture every 2h / 2 frames.
     /// A capture ahead does not supply what the dirty march supplies: two-sided visibility does not make looser holding valid.
     uint beamGuardHoldAll = 0;
+    /// spanGather (span probe only, 0: off): the recorded spans integrated with batched independent loads (evaluateSpanRayGather):
+    /// 1 eight samples' loads before their composite, 2 that plus the next span's header fetched ahead.
+    uint spanGather = 0;
+    /// spanEval (span probe only, 0: one thread a ray): one thread a span instead, each span's own (L, T) from T = 1, composed per ray
+    /// afterwards (composeSpans) - the order the spans are listed in: 1 ray order, 2 grouped by brick, 3 scrambled (sanity).
+    uint spanEval = 0;
+    /// spanLoop (span probe only, bits): 1 the brick's atlas address and the sun bake's decoded once per span and advanced affinely
+    /// (evaluateSpan), 2 no sun fetches at all (density only; the light no longer matches - a cost split, not an evaluator). The span
+    /// passes compile it in (HSTR_SPAN_LOOP), so the plain evaluator carries none of it.
+    uint spanLoop = 0;
+    /// spanShare (span probe only): each brick span keyed by (brick, entry cell, source direction class, sun class); every span of
+    /// a key served the first one's (L, T) and the ray recomposed from them, against the march (kSpanShare*).
+    uint spanShare = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
@@ -1981,7 +1994,28 @@ static const uint kSpanBaked = 9;
 static const uint kSpanMaxDT = 10;
 static const uint kSpanMaxDL = 11;
 static const uint kSpanFallback = 12;
-static const uint kSpanCountTotal = 16;
+/// spanEval: spans listed; rays whose timed (per-span, composed) result differs from the per-ray check's.
+static const uint kSpanListed = 13;
+static const uint kSpanTimedMismatch = 14;
+/// Rays whose evaluated T / relative light differ from the march's by more than 0.02 (the exact evaluator), and the same with the
+/// spans served from their key (spanShare).
+static const uint kSpanBadT = 15;
+static const uint kSpanBadL = 16;
+static const uint kSpanShareBadT = 17;
+static const uint kSpanShareBadL = 18;
+/// spanShare: distinct keys, brick spans keyed, keys that ran out of probes, spans served by another span (not their key's first).
+static const uint kSpanShareKeys = 19;
+static const uint kSpanShareSpans = 20;
+static const uint kSpanShareFull = 21;
+static const uint kSpanShareServed = 22;
+/// spanShare: spans whose key has 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ spans (each span counted once).
+static const uint kSpanShareHistogram = 23;
+static const uint kSpanShareBins = 7;
+static const uint kSpanCountTotal = 32;
+/// spanShare's table (open addressing, 32-bit key hashes: distinct keys sharing a hash alias, ~40 at 1080p's ~1M spans).
+static const uint kSpanShareSlots = 1u << 22;
+/// spanEval's buckets (a counting sort): rays, bricks or scrambled keys, masked to this many.
+static const uint kSpanBuckets = 1u << 21;
 
 /// Per-tile camera basis: L(x, y) = C0 + Cx x + Cy y + Cxy x y + Cb 16 x (1 - x) y (1 - y) over the tile's unit square.
 /// rgb is premultiplied cloud radiance and a is opacity, so a pixel reconstructs its source radiance as L.rgb / L.a and

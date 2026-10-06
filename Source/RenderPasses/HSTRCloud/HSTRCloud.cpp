@@ -507,6 +507,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mSpanProbe = bool(value);
             continue;
         }
+        if (key == "spanGather")
+        {
+            mParams.spanGather = uint32_t(value);
+            continue;
+        }
+        if (key == "spanEval")
+        {
+            mParams.spanEval = uint32_t(value);
+            continue;
+        }
+        if (key == "spanLoop")
+        {
+            mParams.spanLoop = uint32_t(value);
+            continue;
+        }
+        if (key == "spanShare")
+        {
+            mParams.spanShare = bool(value) ? 1u : 0u;
+            continue;
+        }
         if (key == "rtSpanProbe")
         {
             mRtSpanProbe = bool(value);
@@ -1573,6 +1593,10 @@ Properties HSTRCloud::getProperties() const
     props["beamEdgeTolerance"] = mParams.beamEdgeTolerance;
     props["beamEdgeRange"] = mParams.beamEdgeRange;
     props["beamGuardHoldAll"] = mParams.beamGuardHoldAll != 0;
+    props["spanGather"] = mParams.spanGather;
+    props["spanEval"] = mParams.spanEval;
+    props["spanLoop"] = mParams.spanLoop;
+    props["spanShare"] = mParams.spanShare != 0;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
@@ -1818,6 +1842,18 @@ Properties HSTRCloud::getProperties() const
             cloud["spanFallback"] = span[kSpanFallback];
             cloud["spanMaxDT"] = double(reinterpret_cast<const float&>(span[kSpanMaxDT]));
             cloud["spanMaxDL"] = double(reinterpret_cast<const float&>(span[kSpanMaxDL]));
+            cloud["spanListed"] = span[kSpanListed];
+            cloud["spanTimedMismatch"] = span[kSpanTimedMismatch];
+            cloud["spanBadT"] = span[kSpanBadT];
+            cloud["spanBadL"] = span[kSpanBadL];
+            cloud["spanShareBadT"] = span[kSpanShareBadT];
+            cloud["spanShareBadL"] = span[kSpanShareBadL];
+            cloud["spanShareKeys"] = span[kSpanShareKeys];
+            cloud["spanShareSpans"] = span[kSpanShareSpans];
+            cloud["spanShareFull"] = span[kSpanShareFull];
+            cloud["spanShareServed"] = span[kSpanShareServed];
+            for (uint32_t b = 0; b < kSpanShareBins; ++b)
+                cloud["spanShareBin" + std::to_string(b)] = span[kSpanShareHistogram + b];
         }
         // beamPushProbe: the last probed frame's counters (a readback, so only when asked for), and the list's footprint.
         if (mPushProbe && mpPushCounts)
@@ -2354,6 +2390,14 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpSpanArgsPass = createPass("writeSpanArgs");
     mpSpanEvalPass = createPass("evaluateSpans");
     mpSpanCheckPass = createPass("checkSpans");
+    mpSpanCountPass = createPass("countSpanBuckets");
+    mpSpanScanPass = createPass("scanSpanBuckets");
+    mpSpanScatterPass = createPass("scatterSpans");
+    mpSpanListedPass = createPass("evaluateListedSpans");
+    mpSpanComposePass = createPass("composeSpans");
+    mpSpanShareInsertPass = createPass("insertSpanShares");
+    mpSpanShareCheckPass = createPass("checkSpanShares");
+    mpSpanShareCountPass = createPass("countSpanShares");
     mpCellArgsPass = createPass("writeCellViewArgs");
     mpCellBuildPass = createPass("buildCellViews");
     mpCellInvalidatePass = createPass("invalidateCellViews");
@@ -4720,6 +4764,13 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrSpanRecords"] = mpSpanRecords;
     var["hstrSpanCounts"] = mpSpanCounts;
     var["hstrSpanArgs"] = mpSpanArgs;
+    var["hstrSpanOut"] = mpSpanOut;
+    var["hstrSpanList"] = mpSpanList;
+    var["hstrSpanBuckets"] = mpSpanBuckets;
+    var["hstrSpanListArgs"] = mpSpanListArgs;
+    var["hstrSpanShareKeys"] = mpSpanShareKeys;
+    var["hstrSpanShareCounts"] = mpSpanShareCounts;
+    var["hstrSpanShareValues"] = mpSpanShareValues;
     var["hstrPushShareRays"] = mpPushShareRays;
     var["hstrPushShareEntries"] = mpPushShareEntries;
     var["hstrPushShareAges"] = mpPushShareAges;
@@ -5473,19 +5524,73 @@ void HSTRCloud::runPushProbe(RenderContext* pRenderContext)
 void HSTRCloud::runSpanProbe(RenderContext* pRenderContext)
 {
     // The recorded rays, integrated from their spans alone: timed ("spans"), then again untimed against the march ("spanCheck").
+    // spanEval: one thread a span, listed in ray, brick or scrambled order by an untimed counting sort; spanShare: the
+    // shared-transfer table. Allocated on first use (1.3M rays: list 62 MB, outputs 250 MB; table 4M slots, 100 MB).
+    const auto spanFlags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const uint32_t spanSlots = mpSpanRays->getElementCount() / kSpanRayWords * kSpanPerRay;
+    if (mParams.spanEval != 0 && !mpSpanOut)
+    {
+        mpSpanOut = mpDevice->createStructuredBuffer(sizeof(uint4), spanSlots, spanFlags);
+        mpSpanList = mpDevice->createStructuredBuffer(sizeof(uint32_t), spanSlots, spanFlags);
+        mpSpanBuckets = mpDevice->createStructuredBuffer(sizeof(uint32_t), kSpanBuckets, spanFlags);
+        mpSpanListArgs = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3, spanFlags | ResourceBindFlags::IndirectArg);
+    }
+    if (mParams.spanShare != 0 && !mpSpanShareKeys)
+    {
+        mpSpanShareKeys = mpDevice->createStructuredBuffer(sizeof(uint32_t), kSpanShareSlots, spanFlags);
+        mpSpanShareCounts = mpDevice->createStructuredBuffer(sizeof(uint2), kSpanShareSlots, spanFlags);
+        mpSpanShareValues = mpDevice->createStructuredBuffer(sizeof(uint4), kSpanShareSlots, spanFlags);
+    }
+    const auto spanPass = [&](const ref<ComputePass>& pPass)
+    {
+        setBeamDirtyMarchDefines(pPass);
+        pPass->getProgram()->addDefine("HSTR_SPAN_LOOP", std::to_string(mParams.spanLoop));
+        bindRenderer(pRenderContext, pPass);
+    };
     bindRenderer(pRenderContext, mpSpanArgsPass);
     mpSpanArgsPass->execute(pRenderContext, uint3(1));
+    if (mParams.spanEval != 0)
+    {
+        pRenderContext->clearUAV(mpSpanBuckets->getUAV().get(), uint4(0));
+        spanPass(mpSpanCountPass);
+        mpSpanCountPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+        spanPass(mpSpanScanPass);
+        mpSpanScanPass->execute(pRenderContext, uint3(1024, 1, 1));
+        spanPass(mpSpanScatterPass);
+        mpSpanScatterPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+        {
+            FALCOR_PROFILE(pRenderContext, "spans");
+            spanPass(mpSpanListedPass);
+            mpSpanListedPass->executeIndirect(pRenderContext, mpSpanListArgs.get(), 0);
+        }
+        {
+            FALCOR_PROFILE(pRenderContext, "spanCompose");
+            spanPass(mpSpanComposePass);
+            mpSpanComposePass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+        }
+    }
+    else
     {
         FALCOR_PROFILE(pRenderContext, "spans");
-        setBeamDirtyMarchDefines(mpSpanEvalPass);
-        bindRenderer(pRenderContext, mpSpanEvalPass);
+        spanPass(mpSpanEvalPass);
         mpSpanEvalPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
     }
     {
         FALCOR_PROFILE(pRenderContext, "spanCheck");
-        setBeamDirtyMarchDefines(mpSpanCheckPass);
-        bindRenderer(pRenderContext, mpSpanCheckPass);
+        spanPass(mpSpanCheckPass);
         mpSpanCheckPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+    }
+    if (mParams.spanShare != 0)
+    {
+        FALCOR_PROFILE(pRenderContext, "spanShare");
+        pRenderContext->clearUAV(mpSpanShareKeys->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mpSpanShareCounts->getUAV().get(), uint4(0));
+        spanPass(mpSpanShareInsertPass);
+        mpSpanShareInsertPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+        spanPass(mpSpanShareCheckPass);
+        mpSpanShareCheckPass->executeIndirect(pRenderContext, mpSpanArgs.get(), 0);
+        spanPass(mpSpanShareCountPass);
+        mpSpanShareCountPass->execute(pRenderContext, uint3(kSpanShareSlots, 1, 1));
     }
 }
 
