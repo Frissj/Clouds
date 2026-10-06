@@ -31,7 +31,9 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "densityChangedFrames", "cuts", "cutTotalMs", "cutPops", "skirtMaskChecks", "skirtMaskMismatches",
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits")
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
-          "beamMarchTiles", "bindCpuMs")
+          "beamMarchTiles", "bindCpuMs") + tuple(  # rtSpanProbe's last frame (present only while it is on).
+          f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
+          f"rtProbeBin{b}" for b in range(8))
 CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))
 DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm's state.
 
@@ -108,6 +110,50 @@ def score():
 
 
 COUNT = int(os.environ.get("HSTR_MOTION_COUNT", "0"))
+# HSTR_MOTION_CAPTURE_ORACLE: comma list of capture offsets h in world units along the motion (+ ahead, - behind). At each of
+# HSTR_MOTION_ORACLE_STOPS cameras P on the first flight (CHUNK frames apart) the beam is rebuilt from nothing at P and stored, then
+# for each h rebuilt from nothing at P + h * direction, the camera put back at P and one frame resolved with every block held
+# (beamGuardHoldAll): P's view synthesized from one capture h away, scored against the fresh rebuild at P. Residency is frozen
+# throughout so every capture sees P's resident set. With HSTR_MOTION_OUT each image is saved for the two-capture pick offline.
+ORACLE = [float(v) for v in os.environ.get("HSTR_MOTION_CAPTURE_ORACLE", "").split(",") if v.strip()]
+
+
+def place(p):
+    cam.position = p
+    cam.target = p + VIEW
+
+
+def capture_oracle():
+    here = position[0]
+    frozen = hstr.properties["cloudResidencyFrozen"]
+    n = capture_oracle.taken = getattr(capture_oracle, "taken", 0) + 1
+    hstr.set_properties({"cloudResidencyFrozen": True, "beamReset": True})
+    for _ in range(4):
+        m.renderFrame()
+    hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
+    m.renderFrame()
+    capture(f"oracle{n}_fresh")
+    hstr.set_properties({"storeExact": False, "compareReference": False, "compareExact": False})
+    rows = {}
+    for h in ORACLE:
+        place(here + float3(*DIRECTION) * h)
+        hstr.set_properties({"beamReset": True})
+        for _ in range(4):
+            m.renderFrame()
+        place(here)
+        hstr.set_properties({"beamGuardHoldAll": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
+        m.renderFrame()
+        p, s = hstr.properties, cloud_stats()
+        rows[h] = {"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]),
+                   "max": float(p["referenceLogMax"]), "dirtyBlocks": s.get("beamDirtyBlocks"),
+                   "unverified": s.get("beamDirtyUnverified"), "warpHeld": s.get("beamWarpHeld"), "warpOn": s.get("beamWarpOn")}
+        capture(f"oracle{n}_h{h:g}")
+        hstr.set_properties({"beamGuardHoldAll": False, "compareReference": False, "compareExact": False})
+    # Back to a fresh beam at P, so the flight continues as if it had been parked here.
+    hstr.set_properties({"cloudResidencyFrozen": frozen, "beamReset": True})
+    for _ in range(4):
+        m.renderFrame()
+    return rows
 
 
 def counted(frames, speed):
@@ -250,6 +296,14 @@ for speed in speeds:
     for i in sorted(range(len(walls)), key=lambda i: -walls[i])[:10]:
         print(f"MOTION {tag}   frame {i}: {walls[i]:.2f} ms {delta(prev[i], per_frame[i])} {levels(per_frame[i])}", flush=True)
     profile(f"{tag} live", 60, speed)
+    if ORACLE:
+        # Today's moving frame (score) and the capture oracle at the same cameras; no arms.
+        for stop in range(int(os.environ.get("HSTR_MOTION_ORACLE_STOPS", "3"))):
+            fly(CHUNK, speed)
+            if SCORE:
+                print(f"MOTION {tag} oracle stop {stop} moving {score()}", flush=True)
+            print(f"MOTION {tag} oracle stop {stop} capture {capture_oracle()}", flush=True)
+        continue
     # Arms alternating along the continued path; the first DROP frames of each chunk carry the previous arm's backlog and are dropped.
     arm_walls = {name: [] for name, _ in ARMS}
     arm_counts = {name: {} for name, _ in ARMS}

@@ -11964,6 +11964,10 @@ struct HSTRCloudRenderer
         if (!beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
             return false;
         bool certified = beamCellCertified(cell);
+        // beamGuardHoldAll (diagnostic): hold every block that has a capture, wherever it was taken from.
+        if (params.beamGuardHoldAll != 0 && params.beamGuard != 0 && params.beamRefFrame != 0 && params.beamHistoryValid != 0 &&
+            hstrBeamGuardDepth[cell] != 0xFFFFFFFFu && hstrBeamGuardCamera[cell].w >= 0.5f)
+            certified = true;
         // beamGuardNeighbour: a held block whose neighbour holds content >10% nearer is listed too when that neighbour is listed
         // (1) or always (2) - the near content sliding in is in no image the resolve can read (beamWarpHistory, beamWarpCover).
         if (certified && params.beamGuardNeighbour != 0)

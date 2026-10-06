@@ -507,6 +507,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mSpanProbe = bool(value);
             continue;
         }
+        if (key == "rtSpanProbe")
+        {
+            mRtSpanProbe = bool(value);
+            continue;
+        }
+        if (key == "rtSpanProbeSpans")
+        {
+            mRtTraceSpans = uint32_t(value);
+            continue;
+        }
         if (key == "beamShadowCarry")
         {
             mParams.beamShadowCarry = uint32_t(value);
@@ -670,6 +680,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamEdgeRange")
         {
             mParams.beamEdgeRange = float(value);
+            continue;
+        }
+        if (key == "beamGuardHoldAll")
+        {
+            mParams.beamGuardHoldAll = bool(value) ? 1u : 0u;
             continue;
         }
         if (key == "beamPathDump")
@@ -1557,6 +1572,7 @@ Properties HSTRCloud::getProperties() const
     props["beamGuardNeighbour"] = mParams.beamGuardNeighbour;
     props["beamEdgeTolerance"] = mParams.beamEdgeTolerance;
     props["beamEdgeRange"] = mParams.beamEdgeRange;
+    props["beamGuardHoldAll"] = mParams.beamGuardHoldAll != 0;
     props["beamLayerProbe"] = mBeamLayerProbe;
     // Read back so sweeps can restore it (sunset_hill's arms restore what they set from these; unexported, it leaked).
     props["cloudLayersRead"] = mParams.cloudLayers;
@@ -1778,6 +1794,16 @@ Properties HSTRCloud::getProperties() const
         const char* cellNames[] = {"Rays", "Hits", "EmptyHits", "Exact", "Cells", "Requests", "Built", "Steps"};
         for (uint32_t k = 0; k < 8; ++k)
             cloud[std::string("cellView") + cellNames[k]] = mBeamLevelCounts[kCellViewRays + k];
+        // rtSpanProbe: the last probe frame's counts (HSTRCloudRtProbe.cs.slang gProbeStats).
+        if (mRtSpanProbe && !mRtStats.empty())
+        {
+            const char* names[] = {"Boxes", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered", "Unused"};
+            for (uint32_t k = 0; k < 8; ++k)
+                cloud[std::string("rtProbe") + names[k]] = mRtStats[k];
+            for (uint32_t k = 0; k < 8; ++k)
+                cloud["rtProbeBin" + std::to_string(k)] = mRtStats[8 + k];
+            cloud["rtProbeInstances"] = mRtInstances;
+        }
         // spanProbe: the last frame's span counters (a readback, only while the probe is on).
         if (mSpanProbe && mpSpanCounts)
         {
@@ -7900,7 +7926,230 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         saveReference(pRenderContext, mSaveReferencePath);
         mSaveReferencePath.clear();
     }
+    if (mRtSpanProbe && mpCloudResidency && mpCloudSea && mpScene)
+        runRtSpanProbe(pRenderContext);
     ++mParams.frameIndex;
+}
+
+void HSTRCloud::runRtSpanProbe(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "rtProbe");
+    const hstrcloud::CloudResidency& residency = *mpCloudResidency;
+    const uint32_t assetCount = residency.getAssetCount();
+    const char* file = "RenderPasses/HSTRCloud/HSTRCloudRtProbe.cs.slang";
+    auto create = [&](const char* entry)
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary(file).csEntry(entry);
+        desc.setShaderModel(ShaderModel::SM6_5);
+        return ComputePass::create(mpDevice, desc);
+    };
+    if (!mpRtBoxesPass)
+    {
+        mpRtBoxesPass = create("buildRtBoxes");
+        mpRtTracePass = create("traceRtProbe");
+        mpRtReducePass = create("reduceRtProbe");
+    }
+    // One box slot per virtual page of every asset, and one bottom-level structure per asset over its slots: fixed sizes, made once.
+    if (!mpRtBoxes)
+    {
+        uint32_t slots = 0;
+        for (uint32_t a = 0; a < assetCount; ++a)
+        {
+            mRtBoxOffset.push_back(slots);
+            const uint3 pages = residency.getAssetDims(a) / 8u;
+            slots += pages.x * pages.y * pages.z;
+        }
+        mpRtBoxes = mpDevice->createStructuredBuffer(24u, slots, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpRtStats = mpDevice->createStructuredBuffer(sizeof(uint32_t), 16u, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        uint64_t resultBytes = 0, scratchBytes = 0;
+        for (uint32_t a = 0; a < assetCount; ++a)
+        {
+            const uint3 pages = residency.getAssetDims(a) / 8u;
+            RtGeometryDesc geometry = {};
+            geometry.type = RtGeometryType::ProcedurePrimitives;
+            geometry.flags = RtGeometryFlags::NoDuplicateAnyHitInvocation;
+            geometry.content.proceduralAABBs.count = uint64_t(pages.x) * pages.y * pages.z;
+            geometry.content.proceduralAABBs.data = mpRtBoxes->getGpuAddress() + uint64_t(mRtBoxOffset[a]) * 24u;
+            geometry.content.proceduralAABBs.stride = 24u;
+            RtAccelerationStructureBuildInputs inputs = {};
+            inputs.kind = RtAccelerationStructureKind::BottomLevel;
+            inputs.flags = RtAccelerationStructureBuildFlags::PreferFastTrace;
+            inputs.descCount = 1;
+            inputs.geometryDescs = &geometry;
+            const RtAccelerationStructurePrebuildInfo info = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+            mRtBlasOffset.push_back(resultBytes);
+            mRtBlasScratchOffset.push_back(scratchBytes);
+            resultBytes += align_to(256ull, info.resultDataMaxSize);
+            scratchBytes += align_to(256ull, info.scratchDataSize);
+        }
+        mpRtBlasBuffer = mpDevice->createBuffer(resultBytes, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+        mpRtBlasScratch = mpDevice->createBuffer(scratchBytes, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+        for (uint32_t a = 0; a < assetCount; ++a)
+        {
+            RtAccelerationStructure::Desc desc;
+            desc.setKind(RtAccelerationStructureKind::BottomLevel);
+            const uint64_t end = a + 1 < assetCount ? mRtBlasOffset[a + 1] : resultBytes;
+            desc.setBuffer(mpRtBlasBuffer, mRtBlasOffset[a], end - mRtBlasOffset[a]);
+            mRtBlas.push_back(RtAccelerationStructure::create(mpDevice, desc));
+        }
+        logInfo("HSTRCloud: rtSpanProbe {} box slots, {:.1f} MB of bottom-level structures, {:.1f} MB scratch.", slots,
+                double(resultBytes) / (1 << 20), double(scratchBytes) / (1 << 20));
+    }
+    const uint2 frameDim = mParams.frameDim;
+    if (!mpRtCount || mpRtCount->getWidth() != frameDim.x || mpRtCount->getHeight() != frameDim.y)
+    {
+        const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+        mpRtCount = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr, flags);
+        mpRtSpan = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr, flags);
+    }
+    pRenderContext->clearUAV(mpRtStats->getUAV().get(), uint4(0));
+
+    {
+        FALCOR_PROFILE(pRenderContext, "boxes");
+        auto var = mpRtBoxesPass->getRootVar();
+        var["gPages"] = residency.getPages();
+        var["gBricks"] = residency.getBricks();
+        var["gSkirtMasks"] = residency.getSkirtMasks();
+        var["gBoxes"] = mpRtBoxes;
+        var["gProbeStats"] = mpRtStats;
+        for (uint32_t a = 0; a < assetCount; ++a)
+        {
+            const uint3 pages = residency.getAssetDims(a) / 8u;
+            var["RtProbeCB"]["gPageDims"] = pages;
+            var["RtProbeCB"]["gPageOffset"] = residency.getAssetPageOffset(a);
+            var["RtProbeCB"]["gBoxOffset"] = mRtBoxOffset[a];
+            mpRtBoxesPass->execute(pRenderContext, pages);
+        }
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "blas");
+        pRenderContext->uavBarrier(mpRtBoxes.get());
+        for (uint32_t a = 0; a < assetCount; ++a)
+        {
+            const uint3 pages = residency.getAssetDims(a) / 8u;
+            RtGeometryDesc geometry = {};
+            geometry.type = RtGeometryType::ProcedurePrimitives;
+            geometry.flags = RtGeometryFlags::NoDuplicateAnyHitInvocation;
+            geometry.content.proceduralAABBs.count = uint64_t(pages.x) * pages.y * pages.z;
+            geometry.content.proceduralAABBs.data = mpRtBoxes->getGpuAddress() + uint64_t(mRtBoxOffset[a]) * 24u;
+            geometry.content.proceduralAABBs.stride = 24u;
+            RtAccelerationStructure::BuildDesc build = {};
+            build.inputs.kind = RtAccelerationStructureKind::BottomLevel;
+            build.inputs.flags = RtAccelerationStructureBuildFlags::PreferFastTrace;
+            build.inputs.descCount = 1;
+            build.inputs.geometryDescs = &geometry;
+            build.dest = mRtBlas[a].get();
+            build.scratchData = mpRtBlasScratch->getGpuAddress() + mRtBlasScratchOffset[a];
+            pRenderContext->buildAccelerationStructure(build, 0, nullptr);
+        }
+        pRenderContext->uavBarrier(mpRtBlasBuffer.get());
+    }
+    // Instances: each occupied sea tile slot at its tile copy nearest the camera, asset source voxels to sea voxels. The shader's
+    // instance tile test (cloudInstanceAt) maps v to x = R (v - offset) + t, so the object-to-world transform is R^-1 (x - t) + offset.
+    const CameraData& camera = mpScene->getCamera()->getData();
+    const float3 cameraVoxel = (camera.posW - mParams.seaOrigin) / mParams.seaVoxelSize - 0.5f;
+    std::vector<RtInstanceDesc> instances;
+    {
+        const auto& desc = mpCloudSea->getDesc();
+        const auto& records = residency.getInstanceRecords();
+        const int tiles = int(desc.tiles);
+        const float tileVoxels = float(desc.tileVoxels);
+        for (uint32_t index = 0; index < records.size(); ++index)
+        {
+            const HSTRCloudInstance& r = records[index];
+            if (!(r.scale > 0.f))
+                continue;
+            const uint32_t layer = index / uint32_t(tiles * tiles);
+            const int sx = int(index % uint32_t(tiles)), sz = int((index / uint32_t(tiles)) % uint32_t(tiles));
+            const float shift = 0.5f * tileVoxels * float(layer);
+            const float cx = std::floor((cameraVoxel.x + 0.5f - shift) / tileVoxels);
+            const float cz = std::floor((cameraVoxel.z + 0.5f - shift) / tileVoxels);
+            const float wx = float(sx) + float(tiles) * std::round((cx - float(sx)) / float(tiles));
+            const float wz = float(sz) + float(tiles) * std::round((cz - float(sz)) / float(tiles));
+            float3x3 rotation;
+            rotation.setRow(0, r.row0.xyz());
+            rotation.setRow(1, r.row1.xyz());
+            rotation.setRow(2, r.row2.xyz());
+            const float3x3 inverse = math::inverse(rotation);
+            const float3 offset(wx * tileVoxels + shift, 0.f, wz * tileVoxels + shift);
+            const float3 translation = offset - math::mul(inverse, float3(r.row0.w, r.row1.w, r.row2.w));
+            RtInstanceDesc instance = {};
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int column = 0; column < 3; ++column)
+                    instance.transform[row][column] = inverse[row][column];
+                instance.transform[row][3] = translation[row];
+            }
+            instance.instanceID = mRtBoxOffset[r.asset];
+            instance.instanceMask = 0xFF;
+            instance.accelerationStructure = mRtBlas[r.asset]->getGpuAddress();
+            instances.push_back(instance);
+        }
+    }
+    mRtInstances = uint32_t(instances.size());
+    {
+        FALCOR_PROFILE(pRenderContext, "tlas");
+        RtAccelerationStructureBuildInputs inputs = {};
+        inputs.kind = RtAccelerationStructureKind::TopLevel;
+        inputs.flags = RtAccelerationStructureBuildFlags::PreferFastTrace;
+        inputs.descCount = std::max(mRtInstances, 1u);
+        if (!mRtTlas || mRtTlasCapacity < inputs.descCount)
+        {
+            const RtAccelerationStructurePrebuildInfo info = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+            mpRtTlasBuffer = mpDevice->createBuffer(info.resultDataMaxSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+            mpRtTlasScratch = mpDevice->createBuffer(info.scratchDataSize, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+            RtAccelerationStructure::Desc desc;
+            desc.setKind(RtAccelerationStructureKind::TopLevel);
+            desc.setBuffer(mpRtTlasBuffer, 0, info.resultDataMaxSize);
+            mRtTlas = RtAccelerationStructure::create(mpDevice, desc);
+            mRtTlasCapacity = inputs.descCount;
+        }
+        if (instances.empty())
+            instances.push_back({}); // An instance with no structure (null address) hits nothing.
+        GpuMemoryHeap::Allocation allocation = mpDevice->getUploadHeap()->allocate(instances.size() * sizeof(RtInstanceDesc), sizeof(RtInstanceDesc));
+        std::memcpy(allocation.pData, instances.data(), instances.size() * sizeof(RtInstanceDesc));
+        RtAccelerationStructure::BuildDesc build = {};
+        build.inputs = inputs;
+        build.inputs.instanceDescs = allocation.getGpuAddress();
+        build.dest = mRtTlas.get();
+        build.scratchData = mpRtTlasScratch->getGpuAddress();
+        pRenderContext->buildAccelerationStructure(build, 0, nullptr);
+        mpDevice->getUploadHeap()->release(allocation);
+        pRenderContext->uavBarrier(mpRtTlasBuffer.get());
+    }
+    const float bottom = std::max(mParams.seaOrigin.y, mParams.seaContentY.x);
+    const float top = std::min(mParams.seaOrigin.y + float(mParams.hstrExtinctionDims.y) * mParams.seaVoxelSize.y, mParams.seaContentY.y);
+    const uint3 groups = uint3(frameDim, 1u);
+    {
+        FALCOR_PROFILE(pRenderContext, "trace");
+        auto var = mpRtTracePass->getRootVar();
+        var["RtProbeCB"]["gFrameDim"] = frameDim;
+        var["RtProbeCB"]["gCameraVoxel"] = cameraVoxel;
+        var["RtProbeCB"]["gCameraU"] = camera.cameraU;
+        var["RtProbeCB"]["gCameraV"] = camera.cameraV;
+        var["RtProbeCB"]["gCameraW"] = camera.cameraW;
+        var["RtProbeCB"]["gInvVoxelSize"] = 1.f / mParams.seaVoxelSize;
+        var["RtProbeCB"]["gSlabY"] = float2(bottom, top);
+        var["RtProbeCB"]["gViewDistance"] = mParams.seaViewDistance;
+        var["RtProbeCB"]["gCameraY"] = camera.posW.y;
+        var["RtProbeCB"]["gTraceSpans"] = mRtTraceSpans;
+        var["gBoxesRead"] = mpRtBoxes;
+        var["gTlas"].setAccelerationStructure(mRtTlas);
+        var["gProbeCount"] = mpRtCount;
+        var["gProbeSpan"] = mpRtSpan;
+        mpRtTracePass->execute(pRenderContext, groups);
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "reduce");
+        auto var = mpRtReducePass->getRootVar();
+        var["RtProbeCB"]["gFrameDim"] = frameDim;
+        var["gProbeCount"] = mpRtCount;
+        var["gProbeSpan"] = mpRtSpan;
+        var["gProbeStats"] = mpRtStats;
+        mpRtReducePass->execute(pRenderContext, groups);
+    }
+    mRtStats = mpRtStats->getElements<uint32_t>(0, 16);
 }
 
 /// Writes the reference (per component and half: rgb mean, a sample count) as one EXR per slice, so an expensive path-traced

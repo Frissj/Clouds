@@ -1811,6 +1811,18 @@ struct HSTRCloudParams
     /// 4300 worst iso-held tiles: -54% / -40% / 8% / 12% / 24% / 31% / 40%, and the same best-shift histogram (mean |shift|
     /// 1.0 px, radial component +0.1 px, a third each way). No correction from a few probe rays, and no shift or offset, is
     /// specific to the OR-held blocks: they lack new radiance and visibility, not alignment. Probe-and-correct is not built.
+    /// beamGuardHoldAll (diagnostic, 0: off): every verified block is held whatever its certificate says, so one frame shows what
+    /// the resolve's warp makes of a beam captured somewhere else. The capture oracle (sunset_motion.py HSTR_MOTION_CAPTURE_ORACLE)
+    /// captures the beam ahead of or behind the camera and scores this frame against a fresh rebuild at the camera.
+    /// MEASURED (capture_oracle1, 4K sunset walk 2 u/frame, 3 stops, residency frozen, over 0.02 against the fresh rebuild; h = 0
+    /// control 0.002-0.22%, every block held, warp on): today's moving frame 2.83 / 2.63 / 2.26%; one capture h behind / ahead,
+    /// h 2: 5.0 / 5.3, 4.0 / 4.0, 4.2 / 4.3%; h 8: 7.4 / 8.0, 6.4 / 6.6, 6.9 / 7.2%; h 32: 14-20%; sanity h -400 8.4 / 6.7 / 6.9%
+    /// (forward-axis offsets mostly magnify; images in HSTR_results/capture_oracle1). Two captures, best per pixel (offline,
+    /// capture_oracle.py, 8-bit proxy reading ~2.5x the engine): best-of-two removes 35-45% of a single capture's bad pixels at
+    /// every h and stays above today's moving frame from h 2; 35-60% of bad pixels are bad from both sides. 16 px tiles still
+    /// needing a march (>2% bad): today 19-32%, best-of-two 35-45% at h 2 and 45-55% at h 8, against a capture every 2h / 2 frames.
+    /// A capture ahead does not supply what the dirty march supplies: two-sided visibility does not make looser holding valid.
+    uint beamGuardHoldAll = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

@@ -213,6 +213,11 @@ public:
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
     const ref<Buffer>& getLevelPages() const { return mpLevelPages; }
+    /// The instance records as last uploaded (one per sea tile slot) and each asset's page table: for rtSpanProbe.
+    const std::vector<HSTRCloudInstance>& getInstanceRecords() const { return mInstances; }
+    uint32_t getAssetCount() const { return uint32_t(mAssets.size()); }
+    uint3 getAssetDims(uint32_t asset) const { return mAssetRecords[asset]->dims; }
+    uint32_t getAssetPageOffset(uint32_t asset) const { return mAssets[asset].pageOffset; }
     const ref<Buffer>& getSkirtMasks() const { return mpSkirtMasks; }
     uint32_t getPageCount() const { return uint32_t(mPages.size()); }
     const ref<Buffer>& getSunResolved() const { return mpSunResolved; }

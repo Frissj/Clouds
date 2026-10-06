@@ -511,6 +511,30 @@ private:
     LazyComputePass mpPushComparePass;
     /// pushShare: after the dirty passes, count what the push lists' cell x tile interactions could share (see countPushShare).
     bool mPushShare = false;
+    /// rtSpanProbe (DIAGNOSTIC): each frame, boxes of every asset's mapped bricks, a bottom-level acceleration structure per asset, a
+    /// top-level one over the sea instances, and every pixel's camera ray gathered through them with RayQuery (HSTRCloudRtProbe).
+    void runRtSpanProbe(RenderContext* pRenderContext);
+    bool mRtSpanProbe = false;
+    uint32_t mRtTraceSpans = 0; ///< rtSpanProbeSpans: 0 gathers every box in one query, n > 0 asks n ordered nearest-box queries.
+    ref<ComputePass> mpRtBoxesPass;
+    ref<ComputePass> mpRtTracePass;
+    ref<ComputePass> mpRtReducePass;
+    ref<Buffer> mpRtBoxes;
+    ref<Buffer> mpRtStats;
+    ref<Buffer> mpRtBlasBuffer;
+    ref<Buffer> mpRtBlasScratch;
+    ref<Buffer> mpRtTlasBuffer;
+    ref<Buffer> mpRtTlasScratch;
+    ref<Texture> mpRtCount;
+    ref<Texture> mpRtSpan;
+    std::vector<ref<RtAccelerationStructure>> mRtBlas;
+    std::vector<uint64_t> mRtBlasOffset;  ///< Per asset: its structure's byte offset in mpRtBlasBuffer.
+    std::vector<uint64_t> mRtBlasScratchOffset;
+    std::vector<uint32_t> mRtBoxOffset;   ///< Per asset: its first box slot (one per virtual page).
+    ref<RtAccelerationStructure> mRtTlas;
+    uint32_t mRtTlasCapacity = 0;
+    std::vector<uint32_t> mRtStats;       ///< Last probe frame's gProbeStats (HSTRCloudRtProbe.cs.slang slots).
+    uint32_t mRtInstances = 0;            ///< Instances in the last top-level structure.
     /// spanProbe: the dirty march records its rays as spans (HSTR_SHIP bit 262144) and evaluateSpans integrates them alone.
     bool mSpanProbe = false;
     ref<Buffer> mpSpanRays;
