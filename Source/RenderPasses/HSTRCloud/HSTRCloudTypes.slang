@@ -1831,11 +1831,24 @@ struct HSTRCloudParams
     uint spanEval = 0;
     /// spanLoop (span probe only, bits): 1 the brick's atlas address and the sun bake's decoded once per span and advanced affinely
     /// (evaluateSpan), 2 no sun fetches at all (density only; the light no longer matches - a cost split, not an evaluator). The span
-    /// passes compile it in (HSTR_SPAN_LOOP), so the plain evaluator carries none of it.
+    /// passes compile it in (HSTR_SPAN_LOOP), so the plain evaluator carries none of it. Oracles (quality only): 4 the sun depth
+    /// interpolated linearly between a span's first and last lit samples, 8 the first lit sample's held over the span.
     uint spanLoop = 0;
     /// spanShare (span probe only): each brick span keyed by (brick, entry cell, source direction class, sun class); every span of
     /// a key served the first one's (L, T) and the ray recomposed from them, against the march (kSpanShare*).
     uint spanShare = 0;
+    /// beamGuardFarProbe (DIAGNOSTIC): keep hstrBeamGuardFar (each guard block's farthest hit since it was cleared) without
+    /// beamGuardWarpParallax, which alone decides with it, so beamPathDump can record each pixel's depth spread (bits 22-29).
+    /// MEASURED (spreadattr1, 4K sunset walk 2 u/frame, HSTR_MOTION_SCORE 2, 2 cycles, arms iso p8 / OR / iso p8 as pathattr1,
+    /// HSTR_results/spread_attr.py, bad = |log luminance| > 0.05 against the fresh rebuild, per frame): the question was whether the
+    /// OR guard's error sits where a block mixes near and far content - what a two-layer (or moment) beam would separate. In the
+    /// blocks only the OR holds, 9,620 bad pixels: by the block's farthest / nearest hit 0 (no hit) / < 1.19x / 1.41x / 1.68x / 2x /
+    /// 2.4x / 2.8x+: 848 / 3,798 / 1,730 / 1,406 / 896 / 882 / 61 - 9.8% at 2x or more, though that ratio only ever grows since
+    /// the block was cleared, so it overstates the spread; by the 3 x 3 blocks' nearest depths 1.8%. The OR-held error is in
+    /// depth-uniform blocks: a second depth layer has nothing to separate there. Stop rule (>= 50% at 2x): FAILED. The cross-arm
+    /// excess is not usable from this run: the two identical iso arms scored 3.46% / 1.97% over 0.02 (pathattr1 2.30 / 2.20 with 4
+    /// cycles) - two cycles put the arms on different stretches of the walk.
+    uint beamGuardFarProbe = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
@@ -2011,7 +2024,35 @@ static const uint kSpanShareServed = 22;
 /// spanShare: spans whose key has 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ spans (each span counted once).
 static const uint kSpanShareHistogram = 23;
 static const uint kSpanShareBins = 7;
-static const uint kSpanCountTotal = 32;
+/// Spans by their sun evaluations (0, 1, 2, 3, 4, 5-8, 9+; the plain evaluator's lit samples), and the evaluations one held
+/// (lit - 1) or two interpolated (lit - 2) a span would leave out.
+static const uint kSpanLitHistogram = 30;
+static const uint kSpanLitBins = 7;
+static const uint kSpanLitSaveHold = 37;
+static const uint kSpanLitSaveLinear = 38;
+/// The recording's brick crossings (one brick and instance, any step: a recorded span ends wherever the step changes, which the
+/// transmittance makes it do after every lit sample), their samples, the evaluations one held or two interpolated sun depths a
+/// crossing would leave out, and the crossings by lit samples (0, 1, 2, 3, 4, 5-8, 9+).
+static const uint kSpanCrossings = 39;
+static const uint kSpanCrossSamples = 40;
+static const uint kSpanCrossSaveHold = 41;
+static const uint kSpanCrossSaveLinear = 42;
+static const uint kSpanCrossLitHistogram = 43;
+/// The evaluated rays' proxy samples (spanProxyStats): all, lit (alpha > 1e-6), dense (alpha > 1e-3), the proxy cells (hstrExtinction
+/// voxels) their spans cross, rays with proxy samples, rays whose proxy spans carry > 2% of their light or take > 0.02 of their
+/// transmittance, proxy samples behind the ray's last brick span, and proxy samples by distance (fraction of seaViewDistance:
+/// < 0.25, < 0.5, < 0.7, < 0.95, beyond).
+static const uint kSpanProxySamples = 50;
+static const uint kSpanProxyLit = 51;
+static const uint kSpanProxyDense = 52;
+static const uint kSpanProxyCells = 53;
+static const uint kSpanProxyRays = 54;
+static const uint kSpanProxyLightRays = 55;
+static const uint kSpanProxyTauRays = 56;
+static const uint kSpanProxyBehind = 57;
+static const uint kSpanProxyDistance = 58;
+static const uint kSpanProxyDistanceBins = 5;
+static const uint kSpanCountTotal = 64;
 /// spanShare's table (open addressing, 32-bit key hashes: distinct keys sharing a hash alias, ~40 at 1080p's ~1M spans).
 static const uint kSpanShareSlots = 1u << 22;
 /// spanEval's buckets (a counting sort): rays, bricks or scrambled keys, masked to this many.

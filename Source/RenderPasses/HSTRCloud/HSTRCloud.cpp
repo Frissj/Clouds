@@ -707,6 +707,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamGuardHoldAll = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "beamGuardFarProbe")
+        {
+            mParams.beamGuardFarProbe = bool(value) ? 1u : 0u;
+            continue;
+        }
         if (key == "beamPathDump")
         {
             mBeamPathDump = value.operator std::string();
@@ -1593,6 +1598,7 @@ Properties HSTRCloud::getProperties() const
     props["beamEdgeTolerance"] = mParams.beamEdgeTolerance;
     props["beamEdgeRange"] = mParams.beamEdgeRange;
     props["beamGuardHoldAll"] = mParams.beamGuardHoldAll != 0;
+    props["beamGuardFarProbe"] = mParams.beamGuardFarProbe != 0;
     props["spanGather"] = mParams.spanGather;
     props["spanEval"] = mParams.spanEval;
     props["spanLoop"] = mParams.spanLoop;
@@ -1854,6 +1860,26 @@ Properties HSTRCloud::getProperties() const
             cloud["spanShareServed"] = span[kSpanShareServed];
             for (uint32_t b = 0; b < kSpanShareBins; ++b)
                 cloud["spanShareBin" + std::to_string(b)] = span[kSpanShareHistogram + b];
+            for (uint32_t b = 0; b < kSpanLitBins; ++b)
+                cloud["spanLitBin" + std::to_string(b)] = span[kSpanLitHistogram + b];
+            cloud["spanLitSaveHold"] = span[kSpanLitSaveHold];
+            cloud["spanLitSaveLinear"] = span[kSpanLitSaveLinear];
+            cloud["spanCrossings"] = span[kSpanCrossings];
+            cloud["spanCrossSamples"] = span[kSpanCrossSamples];
+            cloud["spanCrossSaveHold"] = span[kSpanCrossSaveHold];
+            cloud["spanCrossSaveLinear"] = span[kSpanCrossSaveLinear];
+            for (uint32_t b = 0; b < kSpanLitBins; ++b)
+                cloud["spanCrossLitBin" + std::to_string(b)] = span[kSpanCrossLitHistogram + b];
+            cloud["spanProxySamples"] = span[kSpanProxySamples];
+            cloud["spanProxyLit"] = span[kSpanProxyLit];
+            cloud["spanProxyDense"] = span[kSpanProxyDense];
+            cloud["spanProxyCells"] = span[kSpanProxyCells];
+            cloud["spanProxyRays"] = span[kSpanProxyRays];
+            cloud["spanProxyLightRays"] = span[kSpanProxyLightRays];
+            cloud["spanProxyTauRays"] = span[kSpanProxyTauRays];
+            cloud["spanProxyBehind"] = span[kSpanProxyBehind];
+            for (uint32_t b = 0; b < kSpanProxyDistanceBins; ++b)
+                cloud["spanProxyDistance" + std::to_string(b)] = span[kSpanProxyDistance + b];
         }
         // beamPushProbe: the last probed frame's counters (a readback, so only when asked for), and the list's footprint.
         if (mPushProbe && mpPushCounts)

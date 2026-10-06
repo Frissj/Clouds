@@ -175,6 +175,42 @@ SPANORDER = [
 # brick order 0.56 + 0.12, scrambled 1.52 + 0.11 (sanity), resolved loop 0.60, resolved + brick 0.61 + 0.14, no sun fetch 0.39 ms.
 # Every order and loop arm misses the 30% rule; the sun fetches are a third of the evaluator. Sharing: 1.52 spans a key, bad rays
 # 5.7k -> 20.3k (T), 4.8k -> 52.1k (light) - fails both rules. See evaluateSpan.
+# Span-level sun: the anchor's spanLitBin* / spanLitSaveHold / spanLitSaveLinear are the ceiling (sun evaluations one held or two
+# interpolated per span would leave out); spanLoop 4 interpolates the sun depth linearly between a span's first and last lit
+# samples, 8 holds the first one's (quality oracles - their time includes a first pass and means nothing). spanBad* / spanMismatchL
+# against the anchor's are the quality; no sun fetch (2) is the sanity arm (light must break). Stop rules: linear must leave out
+# >= 30% of the anchor's sun evaluations and keep spanBadL within 1.2x the anchor's.
+SUNSPAN = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+    ("span sun linear", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=4, spanShare=False)),
+    ("span sun held", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=8, spanShare=False)),
+    ("span no sun fetch (sanity)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=2, spanShare=False)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+]
+# MEASURED (sunspan1, HSTR_RES=1920x1080, --steps 1): VACUOUS - every recorded span holds 0 or 1 lit sample (spanLitBin0 409,293,
+# spanLitBin1 568,812 = spanBaked, nothing above), so linear / held left out nothing (spanBaked 568,812 in every arm, spanBad*
+# unchanged at 5,730 / 4,753). A recorded span ends where the step changes and the step follows the transmittance, so a span is a
+# run of equal steps, not a brick crossing. The crossing's lit samples are counted in the recording instead (spanCross*, CROSS).
+# Sanity: no sun fetch, spans 0.39 ms and light mismatches 6,059 -> 121,811.
+CROSS = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+]
+# The proxy's share of the dirty rays: spanLoop 16 skips the proxy spans, 32 the brick spans (cost split only - each changes the
+# light, so both are their own sanity arms); spanProxy* (the anchor's counting pass) say what the proxy samples are and whether
+# they matter. Question: is the proxy (smooth, closed-form integrable per cell, cheap to reuse) where the evaluator's time goes?
+PROXY = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+    ("span bricks only (proxy skipped)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=16, spanShare=False)),
+    ("span proxy only (bricks skipped)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=32, spanShare=False)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+]
+# MEASURED (proxyspan1, HSTR_RES=1920x1080, --steps 1): spans 0.601 / 0.603 ms, proxy skipped 0.597, bricks skipped 0.248 (the
+# floor). 1.25M of 1.87M samples are proxy samples, 0.5% of them lit: the proxy is free in the evaluator, the 617k brick samples
+# (92% lit) are all of its sample time. See spanProxyStats.
+# MEASURED (crossspan1, HSTR_RES=1920x1080, --steps 1, both arms identical): 590k brick crossings, 1.28 samples each; lit samples
+# per crossing 0 / 1 / 2 / 3: 36k / 409k / 141k / 3.2k. Held per crossing leaves out ~21% of sun evaluations, interpolated 0.5%:
+# no ceiling for a span-level sun. See spanCrossing.
 # MEASURED (leanspan1, 4K): walk march 3.65 / 3.62 ms (query + units) -> spans 1.77 ms for 80% of 673k rays (20.5% past 12 spans,
 # skipped: ~2.2 ms for all), sprint 4.51 / 4.54 -> 2.24. 3.6 samples a span, ~5.1 G samples/s; 0.2-0.3% of rays not bit-exact.
 # Gate A (<= 0.7 ms) FAILED: the direct-span evaluator buys ~1.7-2x with spans free, not the ~5x the dirty passes need.
