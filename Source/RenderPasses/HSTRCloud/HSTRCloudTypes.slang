@@ -1538,7 +1538,9 @@ struct HSTRCloudParams
     uint seaFarField = 0;
     float seaFarDistance = 20000.f;
     /// DIAGNOSTIC: bit 0 the far sea without the cache, bit 1 without any lighting; bit 3 no scheduled refresh, bit 4 no recompute
-    /// where the reprojection leaves the layer, bit 5 an empty pass, bit 6 counters (hstrFarCounts, logged per run).
+    /// where the reprojection leaves the layer, bit 5 an empty pass, bit 6 counters (hstrFarCounts, logged per run); PROBES of the
+    /// speckle under mid-distance clouds (farsea3, REJECTED - see seaFarBand): bit 9 reprojects nearest (no bilinear chain), bit
+    /// 10 marches texels reprojected from an opacity edge. (Bits 7 / 8 were the probes that became seaFarSourceDistance / seaFarBand.)
     /// MEASURED (farsplit1, 4K sunset walk, one launch, farSea / units / query ms): base 0.688 / 2.88 / 1.92, bit 3 (reprojection
     /// only) 0.087 / 3.00 / 1.93, bit 0 0.593, bit 1 (unlit) 0.591, overlap off 0.693 / 2.71 / 1.81, base again 0.682 / 2.71 / 1.89.
     /// So the scheduled refresh march is ~0.6 ms of it, its lighting ~0.1, and the overlap hides none of it (units are no faster
@@ -1832,7 +1834,8 @@ struct HSTRCloudParams
     /// spanLoop (span probe only, bits): 1 the brick's atlas address and the sun bake's decoded once per span and advanced affinely
     /// (evaluateSpan), 2 no sun fetches at all (density only; the light no longer matches - a cost split, not an evaluator). The span
     /// passes compile it in (HSTR_SPAN_LOOP), so the plain evaluator carries none of it. Oracles (quality only): 4 the sun depth
-    /// interpolated linearly between a span's first and last lit samples, 8 the first lit sample's held over the span.
+    /// interpolated linearly between a span's first and last lit samples, 8 the first lit sample's held over the span. Cost splits
+    /// (the result is then wrong): 16 proxy spans skipped, 32 brick spans skipped, 64 no far-field sun fetch, 128 no bake fetch.
     uint spanLoop = 0;
     /// spanShare (span probe only): each brick span keyed by (brick, entry cell, source direction class, sun class); every span of
     /// a key served the first one's (L, T) and the ray recomposed from them, against the march (kSpanShare*).
@@ -1849,6 +1852,25 @@ struct HSTRCloudParams
     /// excess is not usable from this run: the two identical iso arms scored 3.46% / 1.97% over 0.02 (pathattr1 2.30 / 2.20 with 4
     /// cycles) - two cycles put the arms on different stretches of the walk.
     uint beamGuardFarProbe = 0;
+    /// The packed sun atlas the residency keeps (cloudSunPacked; 0 none, 1 RG8, 2 RG16F; set by the host): bakeCloudSun writes it
+    /// beside the sun atlas, and with HSTR_SUN_PACKED (cloudSunPackedRead) the beam marches read density and bake from it.
+    uint cloudSunPackedAtlas = 0;
+    /// The far layer's reprojection (seaFarBand, seaFarSourceDistance). A texel whose march lit the near / far fade (stored with
+    /// its distance negative) marches again every run: the fade moves with the camera, so no reprojection carries that content. A
+    /// reprojected texel goes through its source's distance (one fixed-point step), not its own, which reprojected a far cloud
+    /// edge moving into a sky texel by direction alone.
+    /// MEASURED (farsea2 / farsea3, IntelCloudSeaHalf 4K walk, beam against the exact view; farSea ms / over 0.02 / p99.9 /
+    /// PNG band under mid-distance clouds): neither 0.46 / 4.95% / 0.290 / 12.5%; source distance 0.46 / 4.39% / 0.244 / 8.1%;
+    /// band 0.46 / 3.96% / 0.172 / 3.4%; both 0.47-0.48 / 3.74-3.97% / 0.145 / 3.2% (the band marches 45-63k texels again a run
+    /// beside the ~120k scheduled, rays that start in cloud and end soon). Both on. REJECTED beside them (seaFarProbe bits 9 / 10):
+    /// nearest reprojection 7.48% (the residue is not bilinear blur), opacity-edge texels marched 3.82% for +0.12 ms. What remains
+    /// grows with a texel's age: both with seaFarRefresh 4 0.52 ms / 3.37%, refresh 2 alone 0.67 / 2.80%.
+    /// MEASURED (farsun1, sunset launcher 4K live, HSTR_MOTION_SCORE 2, 4 cycles; over 0.02 mean (worst) / farSea ms): walk fixed
+    /// 2.44% (2.88) / 0.542, old 2.57% (2.89) / 0.490, fixed + refresh 4 2.14% (2.29) / 0.603, no far sea 1.55%; sprint fixed 3.64%
+    /// (4.83, p99.9 0.82) / 0.581, old 16.20% (43.04, p99.9 1.38) / 0.520, fixed + refresh 4 5.21% (11.92) / 0.629, no far sea
+    /// 12.52%. The sprint's old speckle is most of its error; ~+0.05 ms. Refresh 4 not taken: +0.06 ms more, no sprint gain.
+    uint seaFarBand = 1;
+    uint seaFarSourceDistance = 1;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
@@ -2052,7 +2074,19 @@ static const uint kSpanProxyTauRays = 56;
 static const uint kSpanProxyBehind = 57;
 static const uint kSpanProxyDistance = 58;
 static const uint kSpanProxyDistanceBins = 5;
-static const uint kSpanCountTotal = 64;
+/// The recording's RT restarts: per dirty ray with brick samples, the runs of brick samples an RT query would have to find with a
+/// block walk between - a new run wherever the next brick sample is more than 1.5 steps (strict: any gap, proxy samples
+/// included) or 16 steps (loose: a walk through a few empty bricks) past the previous one. Rays, the restart sums, and rays by
+/// restarts (0 unused, 1, 2, 3, 4, 5-8, 9+) for each.
+static const uint kSpanRestartRays = 63;
+static const uint kSpanRestartStrict = 64;
+static const uint kSpanRestartLoose = 65;
+static const uint kSpanRestartStrictHistogram = 66;
+static const uint kSpanRestartLooseHistogram = 73;
+static const uint kSpanRestartBins = 7;
+/// Samples in spans spanLoop 256 reads from the packed density + bake texture (spanPackable), whichever arm runs.
+static const uint kSpanPackedSamples = 80;
+static const uint kSpanCountTotal = 96;
 /// spanShare's table (open addressing, 32-bit key hashes: distinct keys sharing a hash alias, ~40 at 1080p's ~1M spans).
 static const uint kSpanShareSlots = 1u << 22;
 /// spanEval's buckets (a counting sort): rays, bricks or scrambled keys, masked to this many.

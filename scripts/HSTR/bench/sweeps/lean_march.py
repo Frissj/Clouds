@@ -205,6 +205,48 @@ PROXY = [
     ("span proxy only (bricks skipped)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=32, spanShare=False)),
     ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
 ]
+# Two ceilings in one run. RT + block walking: spanRestart* (the recording) counts per dirty ray the runs of brick samples an RT
+# query would have to find, strict (any gap, proxy samples included) and loose (gaps of up to 16 steps walked); stop if the mean
+# is much above ~2-2.5 a ray (rtprobe1: ~0.13 ms a query over the walk's dirty rays at 4K). Density + bake in one fetch: its
+# ceiling is what skipping the bake fetch saves (128); 64 skips the far-field fetch instead, 2 both (the sun split, against
+# spanorder1's 0.39); stop if 128 saves < ~0.1 ms of the 0.35 ms of brick samples.
+RESTART = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+    ("span no bake fetch", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=128, spanShare=False)),
+    ("span no far-field fetch", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=64, spanShare=False)),
+    ("span no sun fetch", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=2, spanShare=False)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+]
+# Density + bake in one fetch, the wasteful oracle: spanLoop 256 reads every packable span (the bake resolved at the brick's own
+# level: spanPackedSamples) from an RG texture laid out like the sun atlas, density beside each bake, packed untimed every frame.
+# Against the plain evaluator and its ceiling (no bake fetch, 128). Light mismatches against the anchor's say how much the one
+# shared clamp moves the sun. Stop rule: spans must fall by >= ~0.1 ms (half the bake's 0.22).
+PACKED = [
+    ("span per ray", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+    ("span packed density + bake", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=256, spanShare=False)),
+    ("span packed, density's clamp", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=256 | 512, spanShare=False)),
+    ("span no bake fetch (ceiling)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=128, spanShare=False)),
+    ("span packed again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=256, spanShare=False)),
+    ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
+]
+# MEASURED (packed2, edge density replicated into the apron, read at the sun's clamp): spans 0.601 / again 0.604, packed 0.533
+# (-0.07), no bake fetch 0.380; light off by > 0.02 4,753 -> 4,791, T 5,730 -> 5,716: exact now, but half packed1's saving.
+# MEASURED (packed3, both clamps in one run): spans 0.586 / again 0.587, packed (sun's clamp, exact) 0.492 / again 0.492 (-0.094),
+# packed at the density's clamp 0.473 (-0.113, light bad 22,960), no bake fetch 0.383 (-0.203). The wider read costs ~0.02 ms;
+# packed2's -0.07 was the packed arm's run-to-run spread (0.533 there, 0.492 here). The exact one-fetch evaluator saves ~0.094 ms
+# of 0.586 (16%), ~45% of the bake fetch's ceiling, with the light unchanged (4,792 against 4,753): at the ~0.1 ms line.
+# MEASURED (packed1, HSTR_RES=1920x1080, --steps 1): spans per ray 0.623 / again 0.623 ms, packed 0.490 (-0.133), no bake fetch
+# 0.400 (-0.223, the ceiling); 603,395 of the ~617k brick samples packable. Time: PASSES (>= 0.1 ms). Quality: rays off the march
+# by > 0.02 in T 5,730 -> 5,715 (density unchanged at that test; mismatches > 1e-4 10,359 -> 28,096 from the packed texture's
+# other size moving the filter's sub-texel rounding), in light 4,753 -> 22,957 - the one fetch takes the density's clamp (0-7)
+# for the sun, whose own is -0.5-7.5. Fix to test: replicate each brick's edge density into its apron in the packed copy and
+# fetch both at the sun's clamp (per axis that is exactly the density's clamp). The fill (untimed) costs ~10 ms a frame.
+# MEASURED (restart1, HSTR_RES=1920x1080, --steps 1): spans per ray 0.584 / again 0.584 ms, no bake fetch 0.360, no far-field
+# fetch 0.584, no sun fetch 0.347 (light mismatches 6,062 -> 102k / 119k / 122k: every arm reaches the code). The bake fetch is
+# the whole sun cost (0.22 ms); the far field is free. With the bake free the brick samples cost ~0.11 ms over the 0.248 floor:
+# the packed density + bake ceiling passes. Restarts: 132,999 of 215,229 rays have brick samples; strict 190,985 runs (1.44 a
+# ray; 1 / 2 / 3 / 4 / 5-8: 92.8k / 27.5k / 9.0k / 2.8k / 1.0k), loose 138,967 (1.04; 127k / 5.9k / 21). With a final miss
+# query a ray asks ~1.9 (strict) / ~1.65 (loose) queries: passes the ~2-2.5 rule. See spanRestarts.
 # MEASURED (proxyspan1, HSTR_RES=1920x1080, --steps 1): spans 0.601 / 0.603 ms, proxy skipped 0.597, bricks skipped 0.248 (the
 # floor). 1.25M of 1.87M samples are proxy samples, 0.5% of them lit: the proxy is free in the evaluator, the 617k brick samples
 # (92% lit) are all of its sample time. See spanProxyStats.

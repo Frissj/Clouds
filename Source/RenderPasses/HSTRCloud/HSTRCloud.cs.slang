@@ -53,6 +53,9 @@ import Atmosphere;
 #ifndef HSTR_UNIT_START
 #define HSTR_UNIT_START 0 // beamUnitStart: the dirty query records first-density distances, the units start from them.
 #endif
+#ifndef HSTR_SUN_PACKED
+#define HSTR_SUN_PACKED 0 // cloudSunPackedRead: the beam marches read density and sun bake from hstrCloudSunPacked in one fetch.
+#endif
 #ifndef HSTR_SPAN_LOOP
 #define HSTR_SPAN_LOOP 0 // spanLoop: the span probe's evaluator variants (evaluateSpan), compiled in only on the span passes.
 #endif
@@ -326,6 +329,9 @@ struct LeanHit
     /// against reload in the same run (sunhit4): walk 2.066 / 2.033 -> 2.047 / 2.000 ms, sprint 2.414 / 2.416 -> 2.403 / 2.393.
     float scale;
     float near;
+#if HSTR_SUN_PACKED
+    float sun; ///< The bake as cloudPackedDensity read it with the density (the packed atlas' r), or -1: leanSunDepth's own lookup.
+#endif
 };
 
 /// 4-bit bound on the stored density a brick cell's trilinear samples can read: 0 exactly zero, q in 1-14 at most 2^(2q - 30),
@@ -465,6 +471,10 @@ struct HSTRCloudRenderer
     // Baked sun optical depth per atlas texel (same slots as the density atlas) and this frame's bakes (bakeCloudSun).
     Texture3D<float> hstrCloudSunAtlas;
     RWTexture3D<float> hstrCloudSunAtlasOutput;
+    /// cloudSunPacked: the sun atlas' slots, r the bake (as the sun atlas holds it, or its 8-bit code), g the bake's brick density
+    /// (the density atlas' unorm value, its apron repeating the edge so it reads at the bake's clamp as at its own).
+    Texture3D<float2> hstrCloudSunPacked;
+    RWTexture3D<float2> hstrCloudSunPackedOutput;
     StructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakes;
     StructuredBuffer<uint> hstrCloudSunSlots; ///< Per GPU brick, kCloudSunBakesPerBrick pairs (key, sun atlas slot).
     /// Per GPU brick and orientation class (resolveCloudSunSlots, every frame): cloudSunSlotUp's answer - the sun atlas slot, and the
@@ -642,6 +652,10 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrSpanShareKeys;
     RWStructuredBuffer<uint2> hstrSpanShareCounts;
     RWStructuredBuffer<uint4> hstrSpanShareValues;
+    /// spanLoop 256 (oracle): the sun atlas' layout with each bake's brick density beside it (r density, g sun), packed untimed
+    /// every frame by packSpanBricks, so a span reads both from one filtered fetch.
+    Texture3D<float2> hstrSpanPacked;
+    RWTexture3D<float2> hstrSpanPackedOutput;
     /// pushShare: the lattice points the dirty query marched this frame (packed beam position), and per list entry (cell x tile)
     /// the dirty rays that crossed it and the march steps they spent inside it. See countPushShare.
     RWStructuredBuffer<uint> hstrPushShareRays;
@@ -1167,6 +1181,35 @@ struct HSTRCloudRenderer
             density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, sample.x, i) * densityScale : proxy, density, brick.fade);
         return density * (1.f - sample.skirtCut);
     }
+
+#if HSTR_SUN_PACKED
+    /// cloudBrickDensity of brick entry (at its level) at x, read with the instance's sun bake from hstrCloudSunPacked in one fetch
+    /// where that bake is resolved at the brick's own level (bakeCloudSun packed the brick's density beside it): sun gets the bake as
+    /// the packed atlas holds it, or -1 where the bake is another level's or the brick constant (then the density atlas, and
+    /// leanSunDepth's own lookup). The read is at the bake's clamp (-0.5-7.5); the packed density's apron repeats its edge, so per
+    /// axis that is the density atlas' value at its own clamp (0-7). The brick record and the resolved bake load side by side.
+    /// MEASURED (sunpacked5, 4K, cloudSunPacked 2, 8,389 of 11,227 MB): walk march/units 1.53 / 1.53 -> packed 1.69 / 1.67 ms, sprint
+    /// 1.57 / 1.57 -> 1.61 / 1.61, beamDirty/query 2.02 unchanged in both; errors unchanged. Slower where the 1080p span probe saved
+    /// 16% (packed3); the cost is not yet located (only the units pass moves: its registers / occupancy are the first suspect).
+    float cloudPackedDensity(uint entry, uint level, float3 x, uint sunClass, out float sun)
+    {
+        sun = -1.f;
+        const HSTRCloudBrick brick = hstrCloudBricks[entry];
+        const uint2 resolved = hstrCloudSunResolved[entry * kCloudSunClasses + sunClass];
+        const int3 i = int3(floor(x + 0.5f));
+        if (resolved.x == kCloudRefNone || (resolved.y >> 24) != level || (brick.info & kCloudBrickConstant) != 0u)
+            return cloudBrickDensity(entry, x, i);
+        const float3 levelPosition = (x + 0.5f) / float(1u << level) - 0.5f;
+        const float3 local = clamp(levelPosition - float3(((i >> int(level)) >> 3) * 8), -0.5f, 7.5f);
+        const uint shift = params.cloudAtlasShift;
+        const uint mask = (1u << shift) - 1u;
+        const uint3 slot = uint3(resolved.x & mask, (resolved.x >> shift) & mask, resolved.x >> (2u * shift));
+        const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + local;
+        const float2 stored = hstrCloudSunPacked.SampleLevel(hstrLinearClampSampler, texel * params.cloudSunAtlasInvSize, 0.f);
+        sun = stored.x;
+        return brick.minValue + brick.range * stored.y * stored.y;
+    }
+#endif
 
     /// Where a march at v standing in layers that read nothing there may skip to, for a layer that has no density at v
     /// (kCloudLayerNone): the ray's exit from the layer's square at v, or its entry into the asset of the square's cloud if sooner.
@@ -3564,8 +3607,9 @@ struct HSTRCloudRenderer
 
     /// The far sea over distances [interval.x, interval.y] along w: its radiance (not hazed), transmittance, and the sum of
     /// transmittance * alpha * distance (for the opacity-weighted distance).
-    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance)
+    float4 farSeaMarch(float3 origin, float3 w, float2 interval, out float distance, out bool banded)
     {
+        banded = false; // A lit sample inside the near / far fade (before seaViewDistance): this texel depends on where the camera is.
         const bool withSingle = (params.hstComponents & kComponentSunSingle) != 0 && (params.seaFarProbe & 2u) == 0;
         const bool withCache = (params.hstComponents & (kComponentSunMultiple | kComponentSkyScattered)) != 0 && (params.seaFarProbe & 3u) == 0;
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
@@ -3655,6 +3699,7 @@ struct HSTRCloudRenderer
                     source += fastCache ? farCacheRadiance(vm, depth, weights, rings, ring0, ring1) : worldCacheRadiance(vm, w);
                 radiance += transmittance * alpha * albedo * source;
                 distance += transmittance * alpha * middle;
+                banded = banded || middle < params.seaViewDistance;
                 transmittance *= 1.f - alpha;
                 lead = lit == 0u ? iterations : lead;
                 ++lit;
@@ -3664,6 +3709,7 @@ struct HSTRCloudRenderer
         if ((params.seaFarProbe & 64u) != 0)
         {
             uint unused;
+            InterlockedAdd(hstrFarCounts[23], banded ? 1u : 0u, unused);
             InterlockedAdd(hstrFarCounts[0], 1u, unused);
             InterlockedAdd(hstrFarCounts[1], iterations, unused);
             InterlockedMax(hstrFarCounts[2], iterations, unused);
@@ -3724,6 +3770,10 @@ struct HSTRCloudRenderer
     float3 farTexelDirection(uint2 texel) { return cameraRayDirection((float2(texel) + 0.5f) * float(params.seaFarScale)); }
 
     /// What this run does with a texel: 0 nothing (outside the layer), 1 reprojects it from the previous layer at uv, 2 marches it.
+    /// MEASURED (farsea1, IntelCloudSeaHalf 4K walk, beam against the exact view, both compositing the far sea): the reprojected
+    /// texels draw blocky speckle sheets in the gaps under mid-distance clouds - seaFarRefresh 8 / 2 / 1: farSea 0.45 / 0.64 / 1.14
+    /// ms, walk over 0.02 4.95 / 2.79 / 2.74% (p99.9 0.290 / 0.086 / 0.086); the far sea off in both, 1.30% (speckle1). Not yet
+    /// located: the distance read at this texel rather than the source's, or a cloud cut at an older near/far boundary.
     uint farSeaDecision(uint2 texel, out float2 uv)
     {
         uv = 0.f;
@@ -3740,34 +3790,73 @@ struct HSTRCloudRenderer
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
         const float previousDistance = hstrFarDistancePrev[texel];
-        const float3 q = previousDistance > 0.f ? normalize(origin + previousDistance * w - params.seaFarPrevPosition) : w;
+        // seaFarBand: a texel whose last march lit the near / far fade (its distance stored negative) marches again every run -
+        // its content moves with the camera's fade, which no reprojection carries (measured beside seaFarBand).
+        if (params.seaFarBand != 0 && previousDistance < 0.f)
+            return 2u;
+        float3 q = previousDistance != 0.f ? normalize(origin + abs(previousDistance) * w - params.seaFarPrevPosition) : w;
         float2 position;
-        const bool off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
-                         any(position >= float2(params.frameDim));
+        bool off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
+                   any(position >= float2(params.frameDim));
+        // seaFarSourceDistance: the source texel's distance, not this one's - one fixed-point step. Where a far cloud's edge
+        // moves into a texel that held sky (distance 0), this texel's distance reprojects by direction alone and keeps the sky.
+        if (params.seaFarSourceDistance != 0 && !off)
+        {
+            const float sourceDistance = abs(hstrFarDistancePrev[min(uint2(position / float(params.seaFarScale)), dims - 1u)]);
+            q = sourceDistance > 0.f ? normalize(origin + sourceDistance * w - params.seaFarPrevPosition) : w;
+            off = !farProject(q, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position) || any(position < 0.f) ||
+                  any(position >= float2(params.frameDim));
+        }
         uv = position / (float2(dims) * float(params.seaFarScale));
+        // PROBE (seaFarProbe bit 10): a texel reprojected from an opacity edge (its source's neighbours differ by over 0.25 in the
+        // far layer's transmittance) marches instead - the blur a chain of bilinear reprojections leaves at far clouds' edges.
+        if ((params.seaFarProbe & 1024u) != 0 && !off)
+        {
+            const int2 source = int2(min(uint2(position / float(params.seaFarScale)), dims - 1u));
+            float lo = 1.f;
+            float hi = 0.f;
+            [unroll]
+            for (uint k = 0; k < 5; ++k)
+            {
+                const int2 offset = k == 0 ? int2(0) : (k == 1 ? int2(1, 0) : (k == 2 ? int2(-1, 0) : (k == 3 ? int2(0, 1) : int2(0, -1))));
+                const float a = hstrFarFieldPrev[uint2(clamp(source + offset, int2(0), int2(dims) - 1))].a;
+                lo = min(lo, a);
+                hi = max(hi, a);
+            }
+            if (hi - lo > 0.25f)
+                return 2u;
+        }
         return off && (params.seaFarProbe & 16u) == 0 ? 2u : 1u;
     }
 
     /// A texel this run marches: its far interval (farSeaMarch); nothing for the others.
-    float4 farSeaTexelMarch(uint2 texel, out float distanceSum)
+    float4 farSeaTexelMarch(uint2 texel, out float distanceSum, out bool banded)
     {
         distanceSum = 0.f;
+        banded = false;
         float2 uv;
         float2 interval;
         const float3 origin = gScene.camera.data.posW;
         const float3 w = farTexelDirection(texel);
         if (farSeaDecision(texel, uv) != 2u || !farSeaInterval(origin, w, interval))
             return float4(0.f, 0.f, 0.f, 1.f);
-        return farSeaMarch(origin, w, interval, distanceSum);
+        return farSeaMarch(origin, w, interval, distanceSum, banded);
     }
 
     /// Writes a texel: reprojected, or from its composed segments (radiance, transmittance and distance sum).
-    void farSeaFinish(uint2 texel, float4 far, float distanceSum)
+    void farSeaFinish(uint2 texel, float4 far, float distanceSum, bool banded)
     {
         float2 uv;
         const uint decision = farSeaDecision(texel, uv);
         if (decision == 0u)
             return;
+        if ((params.seaFarProbe & 64u) != 0)
+        {
+            uint unused;
+            const float previous = hstrFarDistancePrev[texel];
+            InterlockedAdd(hstrFarCounts[24], decision == 2u && previous < 0.f && params.seaFarBand != 0 ? 1u : 0u, unused);
+            InterlockedAdd(hstrFarCounts[25], decision == 1u ? 1u : 0u, unused);
+        }
         if ((params.seaFarProbe & 32u) != 0)
         {
             hstrFarFieldOutput[texel] = float4(0.f, 0.f, 0.f, 1.f);
@@ -3775,8 +3864,22 @@ struct HSTRCloudRenderer
         }
         if (decision == 1u)
         {
-            hstrFarFieldOutput[texel] = hstrFarFieldPrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
-            hstrFarDistanceOutput[texel] = hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+            // PROBE (seaFarProbe bit 9): the source texel itself, so a chain of reprojections does not blur it bilinearly each run.
+            if ((params.seaFarProbe & 512u) != 0)
+            {
+                const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+                hstrFarFieldOutput[texel] = hstrFarFieldPrev[min(uint2(max(uv, 0.f) * float2(dims)), dims - 1u)];
+            }
+            else
+                hstrFarFieldOutput[texel] = hstrFarFieldPrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
+            // With the band flag (a negative distance) the source texel's own value: a bilinear blend would mix signs.
+            if (params.seaFarBand != 0)
+            {
+                const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+                hstrFarDistanceOutput[texel] = hstrFarDistancePrev[min(uint2(max(uv, 0.f) * float2(dims)), dims - 1u)];
+            }
+            else
+                hstrFarDistanceOutput[texel] = hstrFarDistancePrev.SampleLevel(hstrLinearClampSampler, uv, 0.f);
             return;
         }
         const float3 w = farTexelDirection(texel);
@@ -3795,7 +3898,7 @@ struct HSTRCloudRenderer
         // Stored as what it adds behind the near march - its radiance less the sky it hides - so the composite is one fetch.
         const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
         hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
-        hstrFarDistanceOutput[texel] = farDistance;
+        hstrFarDistanceOutput[texel] = banded && params.seaFarBand != 0 && farDistance > 0.f ? -farDistance : farDistance;
     }
 
     /// What the far sea adds behind the near march along camera ray w: its radiance, less the sky it hides. Read by direction, so
@@ -7577,6 +7680,9 @@ struct HSTRCloudRenderer
         float densest = -1.f;
         float exit = 1e30f;
         bool resolved = false;
+#if HSTR_SUN_PACKED
+        hit.sun = -1.f;
+#endif
 #if HSTR_LAYER_PROBE
         uint denseLayers = 0;
         bool layer0Dense = false;
@@ -7830,7 +7936,20 @@ struct HSTRCloudRenderer
             ++denseLayers;
 #endif
             exit = -1.f; // Density here: no skip.
+#if HSTR_SUN_PACKED
+            float layerSun;
+            float d;
+            {
+                const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
+                d = cloudPackedDensity(sample.entry, sample.level, sample.x, instance.sunClass, layerSun) * scale;
+                if (brick.fade < 1.f)
+                    d = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, sample.x, int3(floor(sample.x + 0.5f))) * scale : proxy,
+                             d, brick.fade);
+                d *= 1.f - sample.skirtCut;
+            }
+#else
             const float d = cloudSampleDensity(sample, proxy, scale);
+#endif
 #if HSTR_LAYER_PROBE
             if ((layerMask & (1u << layer)) == 0u)
             {
@@ -7852,6 +7971,9 @@ struct HSTRCloudRenderer
                 hit.x = x;
                 hit.scale = instance.sourceVoxelWorld;
                 hit.near = instance.scale;
+#if HSTR_SUN_PACKED
+                hit.sun = layerSun;
+#endif
             }
         }
         if (!resolved)
@@ -7882,6 +8004,9 @@ struct HSTRCloudRenderer
         hit.x = 0.f;
         hit.scale = 0.f;
         hit.near = 0.f;
+#if HSTR_SUN_PACKED
+        hit.sun = -1.f;
+#endif
         skipTo = -1.f;
         fineVoxels = 1.f;
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
@@ -7921,7 +8046,11 @@ struct HSTRCloudRenderer
         hit.near = instance.scale;
         const HSTRCloudBrick brick = hstrCloudBricks[sample.entry];
         const int3 i = int3(floor(x + 0.5f));
+#if HSTR_SUN_PACKED
+        float density = cloudPackedDensity(sample.entry, sample.level, x, instance.sunClass, hit.sun) * scale;
+#else
         float density = cloudBrickDensity(sample.entry, x, i) * scale;
+#endif
         if (brick.fade < 1.f)
             density = lerp(brick.parent != kCloudRefNone ? cloudBrickDensity(brick.parent, x, i) * scale : proxy, density, brick.fade);
         return fade * density * (1.f - sample.skirtCut);
@@ -7939,6 +8068,16 @@ struct HSTRCloudRenderer
         {
             const float sourceVoxelWorld = hit.scale;
             const float near = params.sunNearVoxels * hit.near;
+#if HSTR_SUN_PACKED
+            if (hit.sun >= 0.f)
+            {
+                // The bake came with the density (cloudPackedDensity): no resolved lookup, no bake fetch - the far field alone.
+                const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
+                const float farDepth = fineSunAt(far);
+                const float baked = params.cloudSunPackedAtlas == 1u ? cloudSunDecode(hit.sun) * hit.near : hit.sun * sourceVoxelWorld;
+                return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
+            }
+#endif
             const uint2 resolved = hstrCloudSunResolved[hit.entry * kCloudSunClasses + (hit.levels >> 16)];
             if (resolved.x != kCloudRefNone)
             {
@@ -8084,6 +8223,10 @@ struct HSTRCloudRenderer
         // A run breaks wherever the step changes, and the step follows the transmittance, so no run holds more than one lit sample.
         // The brick crossing (the same brick and instance, any step) is what a span-level sun would cover: counted separately.
         uint crossEntry = kCloudRefNone, crossInstance = 0, crossSamples = 0, crossLit = 0;
+        // And the runs of brick samples an RT query would have to find (spanRestarts).
+        float restartPrevT = -1.f, restartPrevDt = 0.f;
+        bool restartProxy = false;
+        uint restartStrict = 0, restartLoose = 0;
 #endif
         // MEASURED and REMOVED (leandefer1, 4K, errors identical): deferred lighting. The loop issues 81.4M lane steps for 61.5M
         // steps (76%, leancount3 walk), but only 28% of steps are lit, so the light body ran with ~7 of 32 lanes (Nsight: 14.3
@@ -8205,6 +8348,18 @@ struct HSTRCloudRenderer
                     }
                     ++crossSamples;
                     crossLit += alpha > 1e-6f ? 1u : 0u;
+                    if (entry == kCloudRefNone)
+                        restartProxy = true;
+                    else
+                    {
+                        const float reach = max(dt, restartPrevDt);
+                        const float gap = tSample - restartPrevT;
+                        restartStrict += restartPrevT < 0.f || restartProxy || gap > 1.5f * reach ? 1u : 0u;
+                        restartLoose += restartPrevT < 0.f || gap > 16.f * reach ? 1u : 0u;
+                        restartPrevT = tSample;
+                        restartPrevDt = dt;
+                        restartProxy = false;
+                    }
                     const bool continues =openSamples != 0u && entry == openEntry && hit.instance == openInstance && dt == openDt &&
                                            abs(tSample - (openFirst + float(openSamples) * openDt)) <= 1e-4f * dt;
                     if (continues)
@@ -8280,6 +8435,7 @@ struct HSTRCloudRenderer
         if (spanKept)
         {
             spanCrossing(crossEntry, crossSamples, crossLit);
+            spanRestarts(restartStrict, restartLoose);
             if (openSamples != 0u)
             {
                 if (spanCount < kSpanPerRay)
@@ -8378,6 +8534,37 @@ struct HSTRCloudRenderer
         InterlockedAdd(hstrSpanCounts[kSpanCrossSaveLinear], max(lit, 2u) - 2u, unused);
     }
 
+    /// spanLoop 256: whether span k of a ray reads hstrSpanPacked - a brick span whose instance's sun bake is resolved at the
+    /// brick's own level (what packSpanBricks packs), not a constant brick.
+    bool spanPackable(uint ray, uint k)
+    {
+        const uint4 a = hstrSpanRecords[2u * (ray * kSpanPerRay + k)];
+        if (a.w == kCloudRefNone)
+            return false;
+        const HSTRCloudInstance instance = hstrCloudInstances[hstrSpanRecords[2u * (ray * kSpanPerRay + k) + 1u].x];
+        const HSTRCloudBrick brick = hstrCloudBricks[a.w];
+        const uint2 resolved = hstrCloudSunResolved[a.w * kCloudSunClasses + instance.sunClass];
+        return (brick.info & kCloudBrickConstant) == 0u && resolved.x != kCloudRefNone && (resolved.y >> 24) == (brick.info & 15u);
+    }
+
+    /// Span probe recording: one dirty ray's RT restarts (runs of brick samples, strict and loose; see kSpanRestartRays).
+    /// MEASURED (restart1, 1920x1080 walk, one settle): 132,999 of 215,229 recorded rays have brick samples; strict runs 190,985
+    /// (1.44 a ray with bricks; 1 / 2 / 3 / 4 / 5-8 runs: 92.8k / 27.5k / 9.0k / 2.8k / 1.0k), loose 138,967 (1.04; 127k / 5.9k /
+    /// 21). Counting a final miss query, ~1.9 / ~1.65 queries a recorded ray - under the ~2-2.5 a ray at which RT entry finding
+    /// (rtprobe1: ~0.13 ms a nearest-box query over the walk's 4K dirty rays) stops paying. Not counted: the walk inside a run,
+    /// the proxy (strict treats it as a gap), and the BLAS upkeep rtprobe1 priced at 22.6 ms a rebuild.
+    void spanRestarts(uint strict, uint loose)
+    {
+        if (strict == 0u)
+            return;
+        uint unused;
+        InterlockedAdd(hstrSpanCounts[kSpanRestartRays], 1u, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanRestartStrict], strict, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanRestartLoose], loose, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanRestartStrictHistogram + (strict <= 4u ? strict : (strict <= 8u ? 5u : 6u))], 1u, unused);
+        InterlockedAdd(hstrSpanCounts[kSpanRestartLooseHistogram + (loose <= 4u ? loose : (loose <= 8u ? 5u : 6u))], 1u, unused);
+    }
+
     /// A brick span's source position at its first sample and its source displacement per unit of t: cloudInstanceAt's transform,
     /// linear in t inside one sea tile.
     void spanSource(SpanRay r, float first, HSTRCloudInstance instance, out float3 x0, out float3 dx)
@@ -8471,6 +8658,14 @@ struct HSTRCloudRenderer
         const float3 sunStart = (x0 + 0.5f) * sunInverse - 0.5f - float3(((i0 >> int(sunLevel)) >> 3) * 8);
         const float3 sunStep = dx * (dt * sunInverse);
         const float3 sunBase = float3(uint3(resolved.x & mask, (resolved.x >> shift) & mask, resolved.x >> (2u * shift)) * kCloudBrickEdge) + 1.5f;
+        // spanLoop 256: density and bake from one fetch of hstrSpanPacked, at the bake's clamp (-0.5-7.5), the density's apron
+        // repeating its edge so that the density still reads as at its own clamp (0-7). Same level: sunStart is densityStart.
+        // MEASURED (packed1, 1080p walk, read at the density's clamp instead): spans 0.623 -> 0.490 ms (no bake fetch 0.400); light
+        // off the march by > 0.02 in 4,753 -> 22,957 rays - the sun read inside its own clamp.
+        // MEASURED (packed3, 1080p walk, one run): spans 0.586 / 0.587 -> 0.492 / 0.492 at the sun's clamp (exact: light bad 4,792,
+        // T bad 5,715), 0.473 at the density's (light bad 22,960), no bake fetch 0.383. One fetch saves ~0.094 ms (16%, ~45% of
+        // the bake's ceiling); the wider read costs ~0.02. Arms of the packed path vary ~0.04 ms between runs (packed2: 0.533).
+        const bool packedSpan = (HSTR_SPAN_LOOP & 256) != 0 && bakeable && sunLevel == level && !constantBrick;
         // spanLoop 4 / 8 (oracles, quality only): the sun depth of the span's lit samples between its first and last lit one
         // interpolated linearly between those two (4) or the first one's held (8). A first pass over the span finds them (and pays
         // for every lit sample's exact depth, so these arms' time means nothing); spanBaked / spanFallback then count only the exact
@@ -8487,7 +8682,18 @@ struct HSTRCloudRenderer
             const float footprint = (entryDistance + t * worldLength) * params.cloudPixelAngle;
             const float fade = fadeScale > 0.f ? saturate((1.f - footprint * fadeScale) * params.seaFadeInverse) : 1.f;
             float density;
-            if (!resolvedLoop)
+            float packedSun = 0.f;
+            if (packedSpan)
+            {
+                // At the sun's clamp: the packed apron repeats the edge density (packSpanBricks). 512: at the density's clamp
+                // instead (packed1's read: the sun then wrong in the half voxel inside each face) - whether the wider read costs.
+                const float3 local = (HSTR_SPAN_LOOP & 512) != 0 ? clamp(sunStart + float(j) * sunStep, 0.f, 7.f)
+                                                                 : clamp(sunStart + float(j) * sunStep, -0.5f, 7.5f);
+                const float2 stored = hstrSpanPacked.SampleLevel(hstrLinearClampSampler, (sunBase + local) * params.cloudSunAtlasInvSize, 0.f);
+                density = (brick.minValue + brick.range * stored.x * stored.x) * scale;
+                packedSun = stored.y;
+            }
+            else if (!resolvedLoop)
                 density = cloudBrickDensity(entry, x, int3(floor(x + 0.5f))) * scale;
             else if (constantBrick)
                 density = brick.minValue * scale;
@@ -8518,8 +8724,16 @@ struct HSTRCloudRenderer
                     depth = lerp(depthFirst, depthLast, float(j - litFirst) / float(litLast - litFirst));
                 else if (bakeable && level >= desired)
                 {
+                    // spanLoop 64 / 128 (cost split only: the light is then wrong): no far-field fetch, or no bake fetch - the
+                    // ceiling of a bake packed beside the density (one fetch for both) is what 128 saves.
+                    // MEASURED (restart1, 1080p walk): spans 0.584 -> 0.360 (no bake fetch) / 0.584 (no far field) / 0.347
+                    // (neither): the bake fetch is the sun's whole cost.
                     float bakedDepth;
-                    if (resolvedLoop)
+                    if ((HSTR_SPAN_LOOP & 128) != 0)
+                        bakedDepth = 0.f;
+                    else if (packedSpan)
+                        bakedDepth = params.cloudSunAtlas8 != 0 ? cloudSunDecode(packedSun) * instance.scale : packedSun * instance.sourceVoxelWorld;
+                    else if (resolvedLoop)
                     {
                         const float3 local = clamp(sunStart + float(j) * sunStep, -0.5f, 7.5f);
                         const float stored = hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, (sunBase + local) * params.cloudSunAtlasInvSize, 0.f);
@@ -8528,7 +8742,7 @@ struct HSTRCloudRenderer
                     else
                         bakedDepth = cloudBrickSunAt(sunLevel, resolved.x, x, instance.sourceVoxelWorld, instance.scale);
                     const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
-                    const float farDepth = fineSunAt(far);
+                    const float farDepth = (HSTR_SPAN_LOOP & 64) != 0 ? 0.f : fineSunAt(far);
                     depth = bakedDepth > kCloudSunDepthOpaque ? bakedDepth : bakedDepth + farDepth;
                     baked += pass;
                 }
@@ -8542,6 +8756,9 @@ struct HSTRCloudRenderer
                     hit.x = x;
                     hit.scale = instance.sourceVoxelWorld;
                     hit.near = instance.scale;
+#if HSTR_SUN_PACKED
+                    hit.sun = -1.f;
+#endif
                     depth = leanSunDepth(v, footprint, hit);
                     fallback += pass;
                 }
@@ -8873,6 +9090,8 @@ struct HSTRCloudRenderer
                 InterlockedAdd(hstrSpanCounts[kSpanLitHistogram + (lit <= 4u ? lit : (lit <= 8u ? 5u : 6u))], 1u, unused);
                 InterlockedAdd(hstrSpanCounts[kSpanLitSaveHold], max(lit, 1u) - 1u, unused);
                 InterlockedAdd(hstrSpanCounts[kSpanLitSaveLinear], max(lit, 2u) - 2u, unused);
+                if (spanPackable(ray, k))
+                    InterlockedAdd(hstrSpanCounts[kSpanPackedSamples], hstrSpanRecords[2u * (ray * kSpanPerRay + k)].z, unused);
             }
         }
         if (!counting)
@@ -9098,6 +9317,9 @@ struct HSTRCloudRenderer
                             hit.x = x0 + (t - first) * dx;
                             hit.scale = instance.sourceVoxelWorld;
                             hit.near = instance.scale;
+#if HSTR_SUN_PACKED
+                            hit.sun = -1.f;
+#endif
                             depths[q] = leanSunDepth((position + t * direction) * cellWidth, footprint, hit);
                             ++fallback;
                         }
@@ -13723,7 +13945,8 @@ struct HSTRCloudRenderer
         CutRay ray;
         if (!makeCutRay(gScene.camera.data.posW, direction, volume, ray))
         {
-            color[pixel] = float4((params.hstComponents & kComponentBackground) != 0 ? sky : 0.f, 1.f);
+            // Past the near window's box: the far sea behind it at full transmittance (as execute's miss path).
+            color[pixel] = float4(((params.hstComponents & kComponentBackground) != 0 ? sky : 0.f) + farSeaExtra(direction), 1.f);
             return;
         }
         ray.sunOctaves.yzw = 0.f;
@@ -13773,7 +13996,10 @@ struct HSTRCloudRenderer
         CutRay ray;
         if (!makeCutRay(origin, direction, volume, ray))
         {
-            color[pixel] = float4((params.hstComponents & kComponentBackground) != 0 ? sky : 0.f, 1.f);
+            // A ray past the near window's box still sees the far sea behind it, at full transmittance. Without it the exact
+            // reference had no far sea above the window's top edge while the beam resolve did (image1 / image2: a constant horizon
+            // band, every arm of sea_motion's walk 8.1% over 0.02 at p99.9 0.819 against leantstep1's 0.137% before the far sea).
+            color[pixel] = float4(((params.hstComponents & kComponentBackground) != 0 ? sky : 0.f) + farSeaExtra(direction), 1.f);
             transportError[pixel] = 0.f;
             cutStats[pixel] = 0.f;
             return;
@@ -13903,8 +14129,9 @@ void renderCloudCamera(uint3 dispatchThreadId: SV_DispatchThreadID)
 void renderFarSea(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     float distanceSum;
-    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum);
-    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum);
+    bool banded;
+    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum, banded);
+    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum, banded);
 }
 
 
@@ -14846,6 +15073,33 @@ void checkSpanShares(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThr
 void countSpanShares(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.countSpanShareSlot(dispatchThreadId.x);
+}
+
+/// spanLoop 256: every (brick, sun class) whose resolved bake is at the brick's own level gets the brick's density texels beside
+/// the bake's in hstrSpanPacked, at the bake's slot. One thread a (brick, class, z slice); untimed, every frame of the arm.
+[numthreads(64, 1, 1)]
+void packSpanBricks(uint3 id: SV_DispatchThreadID)
+{
+    uint count, stride;
+    gHSTRCloud.hstrCloudBricks.GetDimensions(count, stride);
+    if (id.x >= count || id.y >= kCloudSunClasses || id.z >= kCloudBrickEdge)
+        return;
+    const HSTRCloudBrick brick = gHSTRCloud.hstrCloudBricks[id.x];
+    const uint2 resolved = gHSTRCloud.hstrCloudSunResolved[id.x * kCloudSunClasses + id.y];
+    if ((brick.info & kCloudBrickConstant) != 0u || resolved.x == kCloudRefNone || (resolved.y >> 24) != (brick.info & 15u))
+        return;
+    const uint shift = gHSTRCloud.params.cloudAtlasShift;
+    const uint3 density = cloudSlotOrigin(brick.slot, shift);
+    const uint3 sun = cloudSlotOrigin(resolved.x, shift);
+    for (uint y = 0; y < kCloudBrickEdge; ++y)
+        for (uint x = 0; x < kCloudBrickEdge; ++x)
+        {
+            // The density's apron texels take the nearest core texel's value: read at the sun's clamp (-0.5-7.5, texels 1.0-9.0),
+            // the trilinear density then equals the density atlas' at its own clamp (0-7), per axis and so in all three.
+            const uint3 texel = uint3(x, y, id.z);
+            gHSTRCloud.hstrSpanPackedOutput[sun + texel] = float2(gHSTRCloud.hstrCloudAtlas.Load(int4(density + clamp(texel, 1u, 8u), 0)),
+                                                                  gHSTRCloud.hstrCloudSunAtlas.Load(int4(sun + texel, 0)));
+        }
 }
 
 /// Cell views: the build dispatch's arguments, one group per queued cell.
@@ -15928,6 +16182,14 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
 #endif
     gHSTRCloud.hstrCloudSunAtlasOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
         params.cloudSunAtlas8 != 0 ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth;
+    if (params.cloudSunPackedAtlas != 0u)
+    {
+        // The packed atlas: the bake beside its brick's density, the apron taking the nearest core texel (cloudPackedDensity).
+        const uint3 density = cloudSlotOrigin(gHSTRCloud.hstrCloudBricks[job.brick].slot, params.cloudAtlasShift) + clamp(texel, 1u, 8u);
+        gHSTRCloud.hstrCloudSunPackedOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
+            float2(params.cloudSunPackedAtlas == 1u ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth,
+                   gHSTRCloud.hstrCloudAtlas.Load(int4(density, 0)));
+    }
 }
 
 /// Byte k of the packed coefficients starting at payload word p.

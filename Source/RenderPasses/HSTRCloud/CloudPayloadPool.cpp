@@ -12,9 +12,28 @@
 #endif
 #include <Windows.h>
 #include <dstorage.h>
+#include <dxgi1_4.h>
+#pragma comment(lib, "dxgi.lib")
 
 namespace hstrcloud
 {
+float2 queryVideoMemoryMB(const ref<Device>& pDevice)
+{
+    if (pDevice->getType() != Device::Type::D3D12)
+        return float2(0.f);
+    LUID luid = pDevice->getNativeHandle(0).as<ID3D12Device*>()->GetAdapterLuid();
+    IDXGIFactory4* factory = nullptr;
+    IDXGIAdapter3* adapter = nullptr;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))))
+        adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+    if (adapter)
+        adapter->Release();
+    if (factory)
+        factory->Release();
+    return float2(float(info.CurrentUsage / (1024.0 * 1024.0)), float(info.Budget / (1024.0 * 1024.0)));
+}
+
 namespace
 {
 constexpr uint32_t kTickets = 1024; ///< Outstanding DirectStorage loads (the residency queues at most 256 pages).

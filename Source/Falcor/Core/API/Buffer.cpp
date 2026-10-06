@@ -36,6 +36,8 @@
 #include "Core/Program/Program.h"
 #include "Core/Program/ShaderVar.h"
 #include "Utils/Logger.h"
+#include "Core/Platform/OS.h"
+#include <cstdlib>
 #include "Utils/Scripting/ScriptBindings.h"
 #include "Utils/Scripting/ndarray.h"
 
@@ -145,6 +147,10 @@ Buffer::Buffer(
     }
 
     mGfxBufferResource = createBufferResource(mpDevice, mState.global, mSize, mStructSize, mFormat, mBindFlags, mMemoryType);
+
+    // FALCOR_ALLOC_LOG=<MB>: logs every buffer at least that large with its creator, to find what fills video memory.
+    if (const char* threshold = std::getenv("FALCOR_ALLOC_LOG"); threshold && mSize >= size_t(std::atof(threshold) * 1048576.0))
+        logInfo("Allocated a {:.1f} MB buffer:\n{}", double(mSize) / 1048576.0, getStackTrace(1, 6));
 
     if (pInitData)
         setBlob(pInitData, 0, size);

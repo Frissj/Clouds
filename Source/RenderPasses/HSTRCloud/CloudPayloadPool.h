@@ -19,6 +19,10 @@ struct IDStorageStatusArray;
 
 namespace hstrcloud
 {
+/// The process's local video memory: (current usage, OS budget) in MB, from DXGI (D3D12 only; zero otherwise). Over budget, the
+/// driver pages resources to system memory and a long dispatch can time out (sunpacked1: TDR, nvlddmkm 153, in the 4K reference).
+float2 queryVideoMemoryMB(const ref<Device>& pDevice);
+
 /** GPU memory of the packed coefficients of resident pages, and their loading.
  *
  * With DirectStorage (D3D12), a page payload's GDeflate blob goes from the package file straight into its range of the pool

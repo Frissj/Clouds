@@ -560,6 +560,8 @@ private:
     LazyComputePass mpSpanShareInsertPass;
     LazyComputePass mpSpanShareCheckPass;
     LazyComputePass mpSpanShareCountPass;
+    ref<Texture> mpSpanPacked; ///< spanLoop 256: the sun atlas' layout, each bake's brick density beside it.
+    LazyComputePass mpSpanPackPass;
     void runSpanProbe(RenderContext* pRenderContext);
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
@@ -771,6 +773,9 @@ private:
     uint64_t mSunPageQueuedTotal = 0;    ///< ... and tiles the sun-move queue released.
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
     uint32_t mCloudSunPoolScale = 1;       ///< Sun atlas slots per density slot (CloudResidencyDesc::sunPoolScale).
+    uint32_t mCloudSunPacked = 0;          ///< cloudSunPacked: CloudResidencyDesc::sunPacked (0 none, 1 RG8, 2 RG16F).
+    bool mCloudSunPackedRead = false;      ///< cloudSunPackedRead: the beam marches read density + bake from it (HSTR_SUN_PACKED).
+    bool mBeamListsFull = false;           ///< beamListsFull (DIAGNOSTIC): the beam lists at four levels' 85 per tile, the old size.
     LazyComputePass mpBakeCloudSunPass;
     // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).
     bool mCloudGpuSun = true;

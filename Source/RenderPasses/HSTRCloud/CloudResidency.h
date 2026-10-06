@@ -57,7 +57,10 @@ struct CloudResidencyDesc
     uint32_t sunPoolScale = 1;
     /// 1 byte a texel instead of 2: the depth log-encoded (cloudSunEncode), so pool 3 costs less than pool 2 at 16 bits.
     bool sunAtlas8 = false;
-    bool gpuSun = false;             ///< Sun bakes are scheduled on the GPU (the scheduler passes of HSTRCloud.cs.slang).
+    /// A second sun atlas, every bake's texels with its brick's density beside them (r sun, g density; the density's apron repeats
+    /// its edge), so a lit sample reads both from one filtered fetch (cloudSunPackedRead). 0 none, 1 RG8 (8-bit sun code), 2 RG16F.
+    uint32_t sunPacked = 0;
+    bool gpuSun = false;            ///< Sun bakes are scheduled on the GPU (the scheduler passes of HSTRCloud.cs.slang).
 };
 
 /// What the residency cut is computed for.
@@ -177,6 +180,7 @@ public:
         var["hstrCloudAtlas"] = mpAtlas;
         var["hstrCloudOccupancy"] = mpOccupancy;
         var["hstrCloudSunAtlas"] = mpSunAtlas;
+        var["hstrCloudSunPacked"] = mpSunPacked;
         var["hstrCloudSunBakes"] = mpSunBakes;
         var["hstrCloudSunSlots"] = mpSunSlotTable;
         var["hstrCloudSunResolved"] = mpSunResolved;
@@ -188,6 +192,7 @@ public:
     ref<Texture> getAtlas() const { return mpAtlas; }
     ref<Buffer> getOccupancy() const { return mpOccupancy; }
     ref<Texture> getSunAtlas() const { return mpSunAtlas; }
+    ref<Texture> getSunPacked() const { return mpSunPacked; } ///< CloudResidencyDesc::sunPacked (null when off).
     /// Sun bakes staged this frame (bakeCloudSun runs over them after the commits).
     uint32_t getSunBakeCount() const { return uint32_t(mSunBakes.size()); }
     /// Bricks staged this frame (decodeCloudResiduals runs over them before the commit groups).
@@ -514,6 +519,7 @@ private:
     ref<Texture> mpAtlas;
     ref<Buffer> mpOccupancy; ///< kCloudCellWords words per GPU brick: 4-bit cell density bounds (occupancyCloudBricks).
     ref<Texture> mpSunAtlas; ///< Baked sun optical depth: its own pool of slots laid out like density atlas slots.
+    ref<Texture> mpSunPacked; ///< The sun atlas' slots with each bake's brick density beside it (CloudResidencyDesc::sunPacked).
     ref<Buffer> mpSunBakes;
     ref<Buffer> mpSunSlotTable;
     std::vector<HSTRCloudSunBake> mSunBakes;

@@ -41,6 +41,8 @@
 #include "Utils/Scripting/ScriptBindings.h"
 #include "Utils/Scripting/ndarray.h"
 #include "Core/Pass/FullScreenPass.h"
+#include "Core/Platform/OS.h"
+#include <cstdlib>
 
 #include <mutex>
 
@@ -199,6 +201,12 @@ Texture::Texture(
 
         FALCOR_GFX_CALL(mpDevice->getGfxDevice()->createTextureResource(desc, nullptr, mGfxTextureResource.writeRef()));
         FALCOR_ASSERT(mGfxTextureResource);
+
+        // FALCOR_ALLOC_LOG=<MB>: logs every texture at least that large (top mip) with its creator, to find what fills video memory.
+        const double bytes =
+            double(mWidth) * mHeight * mDepth * mArraySize * mSampleCount * getFormatBytesPerBlock(mFormat) / getFormatPixelsPerBlock(mFormat);
+        if (const char* threshold = std::getenv("FALCOR_ALLOC_LOG"); threshold && bytes >= std::atof(threshold) * 1048576.0)
+            logInfo("Allocated a {:.1f} MB texture ({}x{}x{} {}):\n{}", bytes / 1048576.0, mWidth, mHeight, mDepth, to_string(mFormat), getStackTrace(1, 6));
 
         if (pInitData)
         {

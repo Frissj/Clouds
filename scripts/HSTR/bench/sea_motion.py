@@ -11,6 +11,9 @@ OUT = "C:/Users/Friss/Documents/HSTR_results"
 TAG = os.environ.get("HSTR_TAG", "sea_motion")
 os.environ["HSTR_CLOUD_LIBRARY"] = os.environ.get("HSTR_CLOUD_LIBRARY", "C:/Users/Friss/Downloads/clouds_hr/codec/v6_default")
 BASE = json.loads(os.environ["HSTR_BASE"])
+# HSTR_LAUNCH_PROPS (JSON): properties every arm shares that must hold from the first frame - residency options such as
+# cloudSunPacked rebuild the residency when they change, so they cannot be an arm's.
+BASE.update(json.loads(os.environ.get("HSTR_LAUNCH_PROPS", "{}")))
 TESTS = json.loads(os.environ["HSTR_TESTS"])
 MOTIONS = json.loads(os.environ.get("HSTR_MOTIONS", '[["fly 2", 2.0, 0.0], ["fly 20", 20.0, 0.0], ["yaw", 0.0, 0.004]]'))
 # READ THIS BEFORE COMPARING A WORLD-PERSISTENT CACHE ACROSS ARMS. WARM is how many frames an arm runs before its timed window,
@@ -47,6 +50,21 @@ def log(line):
 
 def stats():
     return hstr.properties.get("cloudStats", {})
+
+
+def video(label):
+    # The process's video memory against the OS budget (DXGI). sunpacked2: 5,111 MB at the settle, 12,896 of 11,227 after the first
+    # arm's flight - over budget the driver pages to system memory, the timings measure that, and the 4K reference timed out.
+    s = stats()
+    log(f"video memory {label}: {s.get('videoUsedMB', 0):.0f} of {s.get('videoBudgetMB', 0):.0f} MB")
+
+
+def capture(label):
+    # HSTR_MOTION_OUT: each scored step's arm frame and the reference frame it is compared against (as in sunset_motion.py).
+    if os.environ.get("HSTR_MOTION_OUT"):
+        m.frameCapture.outputDir = os.environ["HSTR_MOTION_OUT"]
+        m.frameCapture.baseFilename = f"{TAG}_{label}".replace(" ", "_").replace(":", "")
+        m.frameCapture.capture()
 
 
 def settle():
@@ -183,7 +201,8 @@ settled = stats()
 log(f"sea: settled in {frames} frames (mapped {settled.get('mapped', 0)}, sun baked {settled.get('sunBaked', 0)}, waiting "
     f"{settled.get('sunWaiting', 0)}, slots free {settled.get('sunSlotsFree', 0)}, world cache samples "
     f"{hstr.properties.get('worldCacheSampleCount', 0)}, fades {settled.get('activeFades', 0)}, map backlog "
-    f"{settled.get('mapBacklog', 0)}, fading out {settled.get('undesiredFadingOut', 0)})")
+    f"{settled.get('mapBacklog', 0)}, fading out {settled.get('undesiredFadingOut', 0)}, video memory "
+    f"{settled.get('videoUsedMB', 0):.0f} of {settled.get('videoBudgetMB', 0):.0f} MB)")
 # Near cloud: the start pose looks at cloud from clear air (beamPushProbe, 2026-09-23: no visible cell within 8 voxels), which never
 # exercises cells covering much of the screen. Motions labelled "near ..." fly through the pose, among a few around the start with
 # the same view direction, whose cells nearer than 8 voxels overlap the most tiles (the probe's pushNearOverlaps).
@@ -232,8 +251,13 @@ for motion, forward, yaw, *rest in MOTIONS:
         for i in range(WARM):
             pose(i - WARM - TIMED, forward, yaw, sun)
             m.renderFrame()
+            if i == 0:
+                video(f"{motion} {test} after its first frame")
+        video(f"{motion} {test} after warming")
         t = timed(TIMED, -TIMED, forward, yaw, sun, report=f"{motion}_{test}".replace(" ", "_"))
         tilesBeforeSteps = int(stats().get("seaTilesChanged", 0)) - tilesAtStart
+        # Logged before the steps: the reference frame is the longest dispatch, and over budget it timed out (sunpacked1).
+        video(f"{motion} {test} after the flight")
         tilesPerStep = []
         errors = []
         for step in range(STEPS):
@@ -252,10 +276,15 @@ for motion, forward, yaw, *rest in MOTIONS:
             # compares the frame it has just stored with itself.
             hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
+            capture(f"{motion}_{test}_step{step}_arm")
             s = dict(stats())
             marched = float(hstr.properties["beamMarchedFraction"])
             hstr.set_properties(dict(BASE, compareReference=False, compareExact=False))
             m.renderFrame()  # As before, the reference view renders once before the frame that is compared.
+            capture(f"{motion}_{test}_step{step}_reference")
+            far = {k: stats().get(k, -1) for k in ("farSeaActive", "farLayerValid", "farSeaField", "farSeaRuns")}
+            log(f"{motion:7s} {test:16s} far sea: arm frame {json.dumps({k: s.get(k, -1) for k in far})}, reference frame "
+                f"{json.dumps(far)}")
             hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
             m.renderFrame()
             p = hstr.properties

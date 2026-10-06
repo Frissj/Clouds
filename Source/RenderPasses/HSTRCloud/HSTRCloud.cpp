@@ -279,6 +279,27 @@ void HSTRCloud::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
+        if (key == "cloudSunPacked")
+        {
+            mCloudSunPacked = std::min(uint32_t(value), 2u);
+            continue;
+        }
+        if (key == "cloudSunPackedRead")
+        {
+            mCloudSunPackedRead = bool(value);
+            continue;
+        }
+        if (key == "beamListsFull")
+        {
+            mBeamListsFull = bool(value);
+            continue;
+        }
+        if (key == "seaFarBand" || key == "seaFarSourceDistance")
+        {
+            (key == "seaFarBand" ? mParams.seaFarBand : mParams.seaFarSourceDistance) = bool(value) ? 1u : 0u;
+            mFarSeaDirty = true;
+            continue;
+        }
         if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
@@ -1393,8 +1414,9 @@ void HSTRCloud::setProperties(const Properties& props)
     {
         return fmt::format(
             // The sun bake rate and pool are the residency's too: without them here a runtime change never rebuilt it (an arm set
-            // them and kept the old residency).
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            // them and kept the old residency). The sun atlas formats likewise (sunpacked2: cloudSunPacked set after load never made
+            // its atlas, and both packed arms read the anchors' numbers to the last digit).
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             mCloudLibraryPath,
             mCloudProxyResolution,
             mCloudBrickPoolMB,
@@ -1407,7 +1429,9 @@ void HSTRCloud::setProperties(const Properties& props)
             mCloudSunPoolScale,
             mCloudLodPixels,
             mCloudFadeFrames,
-            mCloudVirtual
+            mCloudVirtual,
+            mCloudSunPacked,
+            mParams.cloudSunAtlas8
         );
     };
     const std::string previousCloud = cloudSettings();
@@ -1489,6 +1513,8 @@ Properties HSTRCloud::getProperties() const
     props["seaFarField"] = mSeaFarField;
     props["seaFarDistance"] = mParams.seaFarDistance;
     props["seaFarProbe"] = mParams.seaFarProbe;
+    props["seaFarBand"] = mParams.seaFarBand != 0;
+    props["seaFarSourceDistance"] = mParams.seaFarSourceDistance != 0;
     props["seaFarScale"] = mParams.seaFarScale;
     props["seaFarRefresh"] = mParams.seaFarRefresh;
     props["seaFarOverlap"] = mSeaFarOverlap;
@@ -1687,6 +1713,9 @@ Properties HSTRCloud::getProperties() const
     props["cloudSeaLayers"] = mCloudSeaLayers;
     props["cloudSunPoolScale"] = mCloudSunPoolScale;
     props["cloudSunAtlas8"] = mParams.cloudSunAtlas8 != 0;
+    props["cloudSunPacked"] = mCloudSunPacked;
+    props["cloudSunPackedRead"] = mCloudSunPackedRead;
+    props["beamListsFull"] = mBeamListsFull;
     props[kCloudLodPixels] = mCloudLodPixels;
     props[kCloudLodBias] = mParams.cloudLodBias;
     props[kCloudFadeFrames] = mCloudFadeFrames;
@@ -1771,6 +1800,14 @@ Properties HSTRCloud::getProperties() const
         cloud["pageUnique"] = stats.pageUnique;
         cloud["residentMB"] = stats.residentMB;
         cloud["payloadMB"] = stats.payloadMB;
+        // The far sea's state for the frame just rendered (image1: the exact reference frame showed no far sea behind the window).
+        cloud["farSeaActive"] = mFarSeaActive;
+        cloud["farLayerValid"] = mFarLayerValid;
+        cloud["farSeaField"] = mParams.seaFarField;
+        cloud["farSeaRuns"] = mFarSeaRuns;
+        const float2 video = hstrcloud::queryVideoMemoryMB(mpDevice);
+        cloud["videoUsedMB"] = video.x;
+        cloud["videoBudgetMB"] = video.y;
         cloud["cutMs"] = stats.cutMilliseconds;
         cloud["sunBaked"] = stats.sunBaked;
         cloud["sunWaiting"] = stats.sunWaiting;
@@ -1880,6 +1917,15 @@ Properties HSTRCloud::getProperties() const
             cloud["spanProxyBehind"] = span[kSpanProxyBehind];
             for (uint32_t b = 0; b < kSpanProxyDistanceBins; ++b)
                 cloud["spanProxyDistance" + std::to_string(b)] = span[kSpanProxyDistance + b];
+            cloud["spanPackedSamples"] = span[kSpanPackedSamples];
+            cloud["spanRestartRays"] = span[kSpanRestartRays];
+            cloud["spanRestartStrict"] = span[kSpanRestartStrict];
+            cloud["spanRestartLoose"] = span[kSpanRestartLoose];
+            for (uint32_t b = 0; b < kSpanRestartBins; ++b)
+            {
+                cloud["spanRestartStrictBin" + std::to_string(b)] = span[kSpanRestartStrictHistogram + b];
+                cloud["spanRestartLooseBin" + std::to_string(b)] = span[kSpanRestartLooseHistogram + b];
+            }
         }
         // beamPushProbe: the last probed frame's counters (a readback, so only when asked for), and the list's footprint.
         if (mPushProbe && mpPushCounts)
@@ -2424,6 +2470,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpSpanShareInsertPass = createPass("insertSpanShares");
     mpSpanShareCheckPass = createPass("checkSpanShares");
     mpSpanShareCountPass = createPass("countSpanShares");
+    mpSpanPackPass = createPass("packSpanBricks");
     mpCellArgsPass = createPass("writeCellViewArgs");
     mpCellBuildPass = createPass("buildCellViews");
     mpCellInvalidatePass = createPass("invalidateCellViews");
@@ -3014,7 +3061,8 @@ void HSTRCloud::buildCloudDomain()
         mCloudInstancesUploaded = false;
     }
     const std::string residencyKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        mCloudSunPacked,
         mCloudBrickPoolMB,
         mCloudBrickLoadsPerFrame,
         mCloudLodPixels,
@@ -3041,6 +3089,7 @@ void HSTRCloud::buildCloudDomain()
         residencyDesc.sunBakesPerFrame = mCloudSunBakesPerFrame;
         residencyDesc.sunPoolScale = mCloudSunPoolScale;
         residencyDesc.sunAtlas8 = mParams.cloudSunAtlas8 != 0;
+        residencyDesc.sunPacked = mCloudSunPacked;
         residencyDesc.gpuSun = mCloudGpuSun;
         mpCloudResidency = std::make_unique<hstrcloud::CloudResidency>(mpDevice, *mpCloudSea, residencyDesc);
         mResidencyPassesBound.clear();
@@ -3070,6 +3119,7 @@ void HSTRCloud::buildCloudDomain()
         mParams.cloudAtlasInvSize = 1.f / float3(float(atlas->getWidth()), float(atlas->getHeight()), float(atlas->getDepth()));
         const auto& sunAtlas = mpCloudResidency->getSunAtlas();
         mParams.cloudSunAtlasInvSize = 1.f / float3(float(sunAtlas->getWidth()), float(sunAtlas->getHeight()), float(sunAtlas->getDepth()));
+        mParams.cloudSunPackedAtlas = mpCloudResidency->getSunPacked() ? mCloudSunPacked : 0u;
     }
     mVoxelSize = float3(voxel);
     constexpr uint32_t kCellWidth = 16;
@@ -3730,6 +3780,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mParams.cloudCommitCount = bakes;
         bindRenderer(pRenderContext, mpBakeCloudSunPass);
         bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", mpCloudResidency->getSunAtlas(), "hstrCloudSunAtlas");
+        bindOutput(mpBakeCloudSunPass, "hstrCloudSunPackedOutput", mpCloudResidency->getSunPacked(), "hstrCloudSunPacked");
         mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * bakes));
         mParams.cloudCommitCount = 0;
         mBeamReusable = false;
@@ -3896,7 +3947,10 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
             );
         }
         if (bindResidencyPass(pRenderContext, mpBakeCloudSunPass, true))
+        {
             bindOutput(mpBakeCloudSunPass, "hstrCloudSunAtlasOutput", residency.getSunAtlas(), "hstrCloudSunAtlas");
+            bindOutput(mpBakeCloudSunPass, "hstrCloudSunPackedOutput", residency.getSunPacked(), "hstrCloudSunPacked");
+        }
         if (mSunBakeProbe)
         {
             if (!mpSunBakeProbe)
@@ -4797,6 +4851,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrSpanShareKeys"] = mpSpanShareKeys;
     var["hstrSpanShareCounts"] = mpSpanShareCounts;
     var["hstrSpanShareValues"] = mpSpanShareValues;
+    var["hstrSpanPacked"] = mpSpanPacked;
     var["hstrPushShareRays"] = mpPushShareRays;
     var["hstrPushShareEntries"] = mpPushShareEntries;
     var["hstrPushShareAges"] = mpPushShareAges;
@@ -4886,7 +4941,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         if (!mpFarCounts)
-            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 23);
+            mpFarCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 26);
         pRenderContext->clearUAV(mpFarCounts->getUAV().get(), uint4(0));
         var["hstrFarCounts"] = mpFarCounts;
     }
@@ -4894,8 +4949,8 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     if (counting)
     {
         // DIAGNOSTIC: stalls for the readback.
-        uint32_t c[23];
-        for (uint32_t i = 0; i < 23; ++i)
+        uint32_t c[26];
+        for (uint32_t i = 0; i < 26; ++i)
             c[i] = mpFarCounts->getElement<uint32_t>(i);
         const double n = double(std::max(c[0], 1u));
         const double paidAll = double(std::max(c[7], 1u));
@@ -4916,6 +4971,11 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
             mFarSeaRuns, mParams.seaVoxelSize.x / std::max(mParams.cloudPixelAngle * float(mParams.seaFarScale), 1e-12f),
             mParams.seaFarDistance, c[19] / nAll, double(c[20]) / std::max(double(c[1]) - c[5] - c[6], 1.0), c[22] / nAll,
             double(c[21]) / std::max(c[22], 1u)
+        );
+        logInfo(
+            "HSTRCloud: far sea run {} band: {} marched texels lit inside the near / far fade, {} marched again for it (seaFarBand), "
+            "{} reprojected.",
+            mFarSeaRuns, c[23], c[24], c[25]
         );
     }
     mFarRunDeferred = false;
@@ -5326,6 +5386,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+    pPass->getProgram()->addDefine("HSTR_SUN_PACKED", mCloudSunPackedRead && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -5573,6 +5634,19 @@ void HSTRCloud::runSpanProbe(RenderContext* pRenderContext)
         pPass->getProgram()->addDefine("HSTR_SPAN_LOOP", std::to_string(mParams.spanLoop));
         bindRenderer(pRenderContext, pPass);
     };
+    // spanLoop 256: the packed density + bake texture, rebuilt untimed every frame from the atlases (bakes change under churn).
+    if ((mParams.spanLoop & 256u) != 0 && mpCloudResidency)
+    {
+        const ref<Texture>& sunAtlas = mpCloudResidency->getSunAtlas();
+        if (!mpSpanPacked)
+            mpSpanPacked = mpDevice->createTexture3D(
+                sunAtlas->getWidth(), sunAtlas->getHeight(), sunAtlas->getDepth(),
+                mParams.cloudSunAtlas8 != 0 ? ResourceFormat::RG8Unorm : ResourceFormat::RG16Float, 1, nullptr, spanFlags
+            );
+        bindRenderer(pRenderContext, mpSpanPackPass);
+        bindOutput(mpSpanPackPass, "hstrSpanPackedOutput", mpSpanPacked, "hstrSpanPacked");
+        mpSpanPackPass->execute(pRenderContext, uint3(mpCloudResidency->getBricks()->getElementCount(), kCloudSunClasses, kCloudBrickEdge));
+    }
     bindRenderer(pRenderContext, mpSpanArgsPass);
     mpSpanArgsPass->execute(pRenderContext, uint3(1));
     if (mParams.spanEval != 0)
@@ -6502,14 +6576,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         }
         else
             mpBeamGuide = nullptr;
-        // List l (1-4) holds up to 4^(l-1) entries per coarsest tile; the list after the finest level is the march list.
+        // List l (1-4) holds up to 4^(l-1) entries per coarsest tile; the list after the finest level is the march list. Sized
+        // for the levels in use, (4^L - 1) / 3 per tile (beamListOffset), not always the 85 of four levels: at beamLevels 1 the
+        // two lists and the sparse candidates took 3 x 1,618 MB at the 4K octahedral image, and the shipping arms ran at
+        // 13,926 of an 11,227 MB budget (sunpacked4, FALCOR_ALLOC_LOG) - paged, resolveEarly/warp 6.1 ms, the reference timed out.
+        const uint32_t listsPerTile = mBeamListsFull ? 85u : ((1u << (2u * mParams.beamLevels)) - 1u) / 3u;
         bool layoutChanged = false;
         for (uint32_t i = 0; i < 2; ++i)
         {
-            if (!mpBeamLists[i] || mpBeamLists[i]->getElementCount() != tileCount * 85)
+            if (!mpBeamLists[i] || mpBeamLists[i]->getElementCount() != tileCount * listsPerTile)
             {
-                mpBeamLists[i] =
-                    mpDevice->createStructuredBuffer(sizeof(uint32_t), tileCount * 85, flags, MemoryType::DeviceLocal, nullptr, false);
+                mpBeamLists[i] = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), tileCount * listsPerTile, flags, MemoryType::DeviceLocal, nullptr, false
+                );
                 layoutChanged = true;
             }
             if (!mpBeamCounts[i])
@@ -6523,7 +6602,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         }
         // Sparse query compiler. The coordinate map provides stable virtual IDs;
         // results and final tiles are authoritative for verification and resolve.
-        const uint32_t sparseTileCapacity = tileCount * 85u;
+        const uint32_t sparseTileCapacity = tileCount * listsPerTile; // beamSparseListOffset: levels 0 .. L-1.
         const uint32_t sparseQueryCapacity = latticeDims.x * latticeDims.y;
         const uint32_t sparseFinalCapacity = tileCount * (1u << (2u * (mParams.beamLevels - 1u)));
         if (!mpBeamSparseCandidates || mpBeamSparseCandidates->getElementCount() != sparseTileCapacity)

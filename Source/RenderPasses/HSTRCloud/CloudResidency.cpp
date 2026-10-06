@@ -216,8 +216,18 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
+    if (mDesc.sunPacked != 0)
+        mpSunPacked = mpDevice->createTexture3D(
+            mpSunAtlas->getWidth(),
+            mpSunAtlas->getHeight(),
+            mpSunAtlas->getDepth(),
+            mDesc.sunPacked == 1 ? ResourceFormat::RG8Unorm : ResourceFormat::RG16Float,
+            1,
+            nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
     const auto readWrite = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
-    mpSunBakes = mpDevice->createStructuredBuffer(
+    mpSunBakes =mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudSunBake), std::max(1u, mDesc.sunBakesPerFrame), readWrite, MemoryType::DeviceLocal, nullptr, false
     );
     // sunPoolScale sun slots per density slot; a brick short of a slot keeps the live march for that orientation.
