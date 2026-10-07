@@ -475,17 +475,28 @@ int main(int argc, char** argv)
                             b[a] = int64_t(std::floor(p[a]));
                             f[a] = p[a] - float(b[a]);
                         }
+                        // As reconstructBrick reads a parent: within the coarse brick holding this voxel only (its apron is its
+                        // own edge texels), so no density bleeds across a brick face into an empty neighbour.
+                        int64_t brickLo[3], brickHi[3];
+                        for (int a = 0; a < 3; ++a)
+                        {
+                            const int64_t first = int64_t(((g[a] >> 1) >> 3) << 3);
+                            brickLo[a] = std::max<int64_t>(first - int64_t(cLo[a]), 0);
+                            brickHi[a] = std::min<int64_t>(first + 7 - int64_t(cLo[a]), int64_t(cDim[a]) - 1);
+                        }
                         float v = 0.f;
                         for (uint32_t corner = 0; corner < 8; ++corner)
                         {
                             int64_t q[3] = {b[0] + (corner & 1), b[1] + ((corner >> 1) & 1), b[2] + (corner >> 2)};
                             for (int a = 0; a < 3; ++a)
-                                q[a] = std::clamp<int64_t>(q[a], 0, int64_t(cDim[a]) - 1);
+                                q[a] = std::clamp<int64_t>(q[a], brickLo[a], brickHi[a]);
                             const float w = ((corner & 1) ? f[0] : 1.f - f[0]) * ((corner & 2) ? f[1] : 1.f - f[1]) *
                                             ((corner & 4) ? f[2] : 1.f - f[2]);
                             v += w * coarse[q[0] + cDim[0] * (q[1] + cDim[1] * q[2])];
                         }
-                        // The parent's child mask: an octant without density is empty.
+                        // The parent's child mask: an octant without density is empty. Where the parent is not stored either, the
+                        // codec dropped it (its own parent predicts it) and the runtime reads the nearest stored ancestor: the
+                        // upsampled value stands, already zero where an ancestor's mask emptied it.
                         const uint32_t pc = uint32_t(g[0] >> 4) | (uint32_t(g[1] >> 4) << 10) | (uint32_t(g[2] >> 4) << 20);
                         const auto parent = stored.find(key(uint32_t(level) + 1u, pc));
                         if (parent != stored.end())
@@ -494,8 +505,6 @@ int main(int argc, char** argv)
                             if (!(parent->second.childMask & (1u << oct)))
                                 v = 0.f;
                         }
-                        else
-                            v = 0.f; // No parent brick: nothing there.
                         fine[x + fDim[0] * (y + fDim[1] * z)] = v;
                     }
         // Paste stored bricks of this level.
