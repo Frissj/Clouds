@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 361;
+static const uint kBeamCountSlots = 464;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -150,6 +150,29 @@ static const uint kBeamCoverPoints = 357;
 static const uint kBeamCoverNearer = 358;
 static const uint kBeamCoverChanged = 359;
 static const uint kBeamGuardNeighbourListed = 360; ///< beamGuardNeighbour: certified blocks it listed.
+/// beamLayerProbe: the dirty query's waves (32 lanes) by their longest ray's steps, in half-octave bins (bin = 2 log2(steps + 1)),
+/// then the summed longest-ray steps of the waves in each quarter of the listed order - what the query's drain is made of, and
+/// where in the list its cost sits.
+static const uint kBeamQueryWaveBins = 20;
+static const uint kBeamQueryWaveHist = 361;
+static const uint kBeamQueryWaveQuarter = 381;
+/// beamRepairProbe: by the old value's opacity-weighted distance (bin 0 none, 1 under 64 world units, k in [64 2^(k-2),
+/// 64 2^(k-1)), the last 32768 and over), units then query rays: samples scored, their march steps, and the steps of those whose
+/// old value kept in place or reprojected was within 0.02.
+/// MEASURED (repairdist1, sunset launcher 4K, 8 counted frames; bins sum to the probe's totals exactly): no content under 128
+/// units. Walk units' steps by bin 256 / 512 / 1k / 2k: 19 / 36 / 33 / 4%, held within 0.02 58 / 51 / 50 / 58%; query rays 39 /
+/// 35 / 14 / 1%, held 74 / 75 / 60 / 44%. Sprint units 7 / 27 / 42 / 8%, held 45 / 47 / 39 / 36%; rays held 36 / 36 / 37 / 24%.
+/// What the guard re-marches changes at the same rate at every distance (it already holds what is provably stable), so
+/// refreshing far content less often has no concentrated stable work to skip beyond the reuse oracle's ~60% (edcad809), and the
+/// work lies at 512-2048 units, where a 4K pixel (~0.37 units at 1000, 46-degree vertical field) is still under a source voxel
+/// (~0.86 units: 5.16-unit sea voxels of ~6 source voxels) - no coarser level of detail to take there either.
+static const uint kBeamProbeDistanceBins = 12;
+static const uint kBeamProbeDistance = 385;
+/// formR 2 (HSTR_FORM_R 2, counting probe: no jump): over the lean marches, hull queries, march steps taken while outside every
+/// hull (what formR 1 jumps over), brick density samples outside every hull (must be 0: else the hulls drop cloud), proxy density
+/// samples outside every hull (non-resident bricks answered by the proxy), back faces met outside every hull (count drift, must
+/// be 0), all march steps, rays.
+static const uint kFormRProbe = 457;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1881,6 +1904,36 @@ struct HSTRCloudParams
     /// 12.52%. The sprint's old speckle is most of its error; ~+0.05 ms. Refresh 4 not taken: +0.06 ms more, no sprint gain.
     uint seaFarBand = 1;
     uint seaFarSourceDistance = 1;
+    /// DIAGNOSTIC: 1 dispatches the dirty query's 64-thread groups in reverse listed order, each group keeping its own rays. The
+    /// query fills its SMs for its first half and then drains with no waves left to launch (unitsreg1, 4K walk: 9.5 warps / SM over
+    /// 1.04 ms, then 3.6 over 1.10 ms); which end of the list holds the waves that drain it decides whether ordering them longest
+    /// first can shorten the tail.
+    /// MEASURED (waveorder1, sunset launcher 4K walk, 60 profiled frames an arm): query listed 1.80 / reversed 1.80 / listed 1.74 /
+    /// reversed 1.80 ms - no end of the list holds the long waves. wavehist1 (kBeamQueryWaveHist, 8 counted frames): ~2,030 waves a
+    /// frame, longest ray 22-90 steps in 86% of them (half-octave bins 9-12: 401 / 528 / 455 / 357), 108 at 90-127, 4 at 127-180;
+    /// cost by list quarter 23.2k / 23.6k / 24.1k / 24.2k steps - uniform. Mean wave 47 steps, so perfectly packed waves take ~2.9x
+    /// a mean wave while the longest take ~3-4x: longest-first order is bounded by those waves at ~0.2-0.5 ms of the 2.1 ms
+    /// before paying its sort and the locality a cost order breaks (random order: +10%, leanorder1). Under the 0.5 ms stop rule;
+    /// not built.
+    uint beamQueryWaveOrder = 0;
+    /// ORACLE, timing only (wrong images; HSTR_LAYER_ORACLE in the dirty passes): a lookup the layer masks leave to the instance /
+    /// brick chain is answered by the world proxy the sample has already read, as a merged world-space structure would answer
+    /// it in one read. 1: layer 1's lookups only (the ceiling of merging the second layer into the first's chain); 2: both
+    /// layers' (the floor of any one-read world structure, a dense clipmap included). 0: off.
+    /// MEASURED (layeroracle1 / 2, sunset launcher 4K walk, 60 profiled frames an arm; paid steps from beamLayerProbe twins, 4
+    /// counted frames): units + query shipped 4.16 / 4.74 ms (16.32M warp-paid steps), layer 1 one read 2.91 (11.03M), both one
+    /// read 0.86 (5.09M); one layer (cloudLayersRead 1) 3.03 in layeroracle1. The oracles are fast because they take fewer steps:
+    /// a lookup answered without its brick leaves fineVoxels at one sea voxel, so the step lengthens. Per paid step: shipped 0.273
+    /// ns, layer 1 one read 0.264 (-3%), both 0.169 (-38%). At shipped's steps, merging the second layer into the first's chain
+    /// saves ~0.15 ms: under the 0.8 ms stop rule, closed. Any one-read world structure (merged pages, a dense clipmap) floors at
+    /// ~2.8 ms of units + query (-1.7 ms), before real lighting (the oracle lights as proxy samples). The step count, set by the
+    /// resolved brick's voxel size, not the lookup, is what the layers cost; 04675421's layer cuts (instance / box 1.02 ms, chain
+    /// 1.46) changed the steps the same way.
+    uint cloudLayerOracle = 0;
+    /// formR: the y range of every hull instance in the hull TLAS (sea voxels). A lean march counts hull faces from where its ray
+    /// leaves this band backwards, so the count starts outside every hull.
+    float formRHullYMin = 0.f;
+    float formRHullYMax = 0.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

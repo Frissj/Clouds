@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <numeric>
 #include <thread>
 #include <unordered_map>
@@ -294,6 +295,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamListsFull = bool(value);
             continue;
         }
+        if (key == "beamQueryWaveOrder")
+        {
+            mParams.beamQueryWaveOrder = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudLayerOracle")
+        {
+            mParams.cloudLayerOracle = std::min(uint32_t(value), 2u);
+            continue;
+        }
         if (key == "seaFarBand" || key == "seaFarSourceDistance")
         {
             (key == "seaFarBand" ? mParams.seaFarBand : mParams.seaFarSourceDistance) = bool(value) ? 1u : 0u;
@@ -551,6 +562,26 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "rtSpanProbe")
         {
             mRtSpanProbe = bool(value);
+            continue;
+        }
+        if (key == "formR")
+        {
+            mFormR = std::min(uint32_t(value), 2u);
+            continue;
+        }
+        if (key == "formRLevelBias")
+        {
+            mFormRLevelBias = int(value);
+            continue;
+        }
+        if (key == "formRDilate")
+        {
+            mFormRDilate = bool(value);
+            continue;
+        }
+        if (key == "formRHulls")
+        {
+            mFormRHulls = value.operator std::string();
             continue;
         }
         if (key == "rtSpanProbeSpans")
@@ -1515,6 +1546,12 @@ Properties HSTRCloud::getProperties() const
     props["seaFarProbe"] = mParams.seaFarProbe;
     props["seaFarBand"] = mParams.seaFarBand != 0;
     props["seaFarSourceDistance"] = mParams.seaFarSourceDistance != 0;
+    props["beamQueryWaveOrder"] = mParams.beamQueryWaveOrder;
+    props["formR"] = mFormR;
+    props["formRDilate"] = mFormRDilate;
+    props["formRLevelBias"] = mFormRLevelBias;
+    props["formRHulls"] = mFormRHulls;
+    props["cloudLayerOracle"] = mParams.cloudLayerOracle;
     props["seaFarScale"] = mParams.seaFarScale;
     props["seaFarRefresh"] = mParams.seaFarRefresh;
     props["seaFarOverlap"] = mSeaFarOverlap;
@@ -1854,6 +1891,15 @@ Properties HSTRCloud::getProperties() const
             cloud[std::string("beamProbeUnitSteps") + probeNames[k]] = mBeamLevelCounts[kBeamProbeSteps + k];
             cloud[std::string("beamProbeRaySteps") + probeNames[k]] = mBeamLevelCounts[kBeamProbeSteps + 4 + k];
         }
+        for (uint32_t kind = 0; kind < 2; ++kind)
+            for (uint32_t bin = 0; bin < kBeamProbeDistanceBins; ++bin)
+            {
+                const uint32_t slot = kBeamProbeDistance + 3 * (bin + kind * kBeamProbeDistanceBins);
+                const std::string name = std::string(kind == 0 ? "beamProbeDistUnit" : "beamProbeDistRay") + std::to_string(bin);
+                cloud[name + "Scored"] = mBeamLevelCounts[slot];
+                cloud[name + "Steps"] = mBeamLevelCounts[slot + 1];
+                cloud[name + "Stable"] = mBeamLevelCounts[slot + 2];
+            }
         const char* divergenceNames[] = {"UnitStepsTaken", "UnitStepsPaid", "RayStepsTaken", "RayStepsPaid"};
         for (uint32_t k = 0; k < 4; ++k)
             cloud[std::string("beamProbe") + divergenceNames[k]] = mBeamLevelCounts[kBeamProbeDivergence + k];
@@ -2181,6 +2227,10 @@ Properties HSTRCloud::getProperties() const
             cloud["beamUnitStartTransmittanceOff"] = mBeamLevelCounts[kBeamUnitStartProbe + 5];
             cloud["beamUnitStartOffNoMiss"] = mBeamLevelCounts[kBeamUnitStartProbe + 6];
             cloud["beamUnitStartStepsSaved"] = mBeamLevelCounts[kBeamUnitStartProbe + 7];
+            for (uint32_t k = 0; k < kBeamQueryWaveBins; ++k)
+                cloud["beamQueryWaveHist" + std::to_string(k)] = mBeamLevelCounts[kBeamQueryWaveHist + k];
+            for (uint32_t k = 0; k < 4; ++k)
+                cloud["beamQueryWaveQuarter" + std::to_string(k)] = mBeamLevelCounts[kBeamQueryWaveQuarter + k];
             cloud["beamTailQueryEmpty"] = mBeamLevelCounts[kBeamTailSteps];
             cloud["beamTailQueryIdealPaid"] = mBeamLevelCounts[kBeamTailSteps + 1];
             cloud["beamTailUnitEmpty"] = mBeamLevelCounts[kBeamTailSteps + 2];
@@ -2200,6 +2250,14 @@ Properties HSTRCloud::getProperties() const
             cloud["beamUnitSpanStepsSaved"] = mBeamLevelCounts[kBeamUnitSpanProbe + 4];
         }
         cloud["beamDirtyOwnMarched"] = mBeamLevelCounts[kBeamDirtyOwnMarched];
+        const char* formRNames[] = {"Queries", "OutsideSteps", "Missed", "MissedProxy", "Drift", "Steps", "Rays"};
+        for (uint32_t k = 0; k < 7; ++k)
+            cloud[std::string("formR") + formRNames[k]] = mBeamLevelCounts[kFormRProbe + k];
+        cloud["formRInstances"] = mHullInstances;
+        cloud["formRTriangles"] = mHullTriangles;
+        for (uint32_t l = 0; l < kFormRLevels; ++l)
+            if (mHullLevelCounts[l] != 0)
+                cloud["formRLevel" + std::to_string(l)] = mHullLevelCounts[l];
         cloud["beamWarpEdgeUnits"] = mBeamLevelCounts[kBeamWarpEdgeUnits];
         cloud["beamHistoryHeld"] = mBeamLevelCounts[kBeamHistoryHeld];
         cloud["beamHistoryLanded"] = mBeamLevelCounts[kBeamHistoryLanded];
@@ -4659,6 +4717,12 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     }
     else
         mpScene->bindShaderData(pPass->getRootVar()["gScene"]);
+    if (mHullTlas)
+    {
+        ShaderVar root = pPass->getRootVar();
+        if (root.hasMember("gHullTlas"))
+            root["gHullTlas"].setAccelerationStructure(mHullTlas);
+    }
     // The fields resolved once per pass (and vars), not by name on every bind. MEASURED (4K Intel half sea, streaming after a turn,
     // profiler off): ~120 fields by name, 21 binds a frame, cost 1.60 ms of CPU a frame after same-value binds became no-ops.
     // (ShaderVar's assignment binds a value, so entries are constructed in place, never assigned.)
@@ -5388,6 +5452,8 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
     pPass->getProgram()->addDefine("HSTR_SUN_PACKED", mCloudSunPackedRead && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_LAYER_ORACLE", std::to_string(mParams.cloudLayerOracle));
+    pPass->getProgram()->addDefine("HSTR_FORM_R", mHullTlas && mHullTlasFrame == mExecuteFrames ? std::to_string(mFormR) : "0");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -5850,6 +5916,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mOptionsChanged = false;
         mParams.frameIndex = 0;
     }
+    if (mFormR != 0 && mpCloudResidency && mpCloudSea && mpScene)
+        updateHullTlas(pRenderContext);
 
     const auto& color = renderData.getTexture(kColor);
     // beamPolicy only ever reaches the guard-driven build that decided it (see decideBeamPolicy); every other march, the exact
@@ -8361,6 +8429,222 @@ void HSTRCloud::runRtSpanProbe(RenderContext* pRenderContext)
         mpRtReducePass->execute(pRenderContext, groups);
     }
     mRtStats = mpRtStats->getElements<uint32_t>(0, 16);
+}
+
+void HSTRCloud::updateHullTlas(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "formR");
+    const hstrcloud::CloudResidency& residency = *mpCloudResidency;
+    const uint32_t assetCount = residency.getAssetCount();
+    // The hulls (form_r_hulls.py), one bottom-level structure each, built once per hull set.
+    const std::string suffix = mFormRDilate ? "" : "_u";
+    const std::string key = mFormRHulls + "|" + suffix;
+    if (mFormRLoaded != key)
+    {
+        mFormRLoaded = key;
+        mHullBlas.assign(size_t(assetCount) * kFormRLevels, nullptr);
+        mHullMeshBuffers.clear();
+        mHullBlasBuffers.clear();
+        mHullTriangles = 0;
+        ref<Buffer> pScratch;
+        for (uint32_t a = 0; a < assetCount; ++a)
+            for (uint32_t level = 0; level < kFormRLevels; ++level)
+            {
+                const std::filesystem::path file =
+                    std::filesystem::path(mFormRHulls) / fmt::format("hull_a{}_L{}{}.bin", a, level, suffix);
+                std::ifstream in(file, std::ios::binary);
+                uint32_t counts[2] = {};
+                if (!in || !in.read(reinterpret_cast<char*>(counts), sizeof(counts)) || counts[1] == 0)
+                    continue;
+                std::vector<float3> vertices(counts[0]);
+                std::vector<uint32_t> indices(size_t(counts[1]) * 3);
+                in.read(reinterpret_cast<char*>(vertices.data()), vertices.size() * sizeof(float3));
+                in.read(reinterpret_cast<char*>(indices.data()), indices.size() * sizeof(uint32_t));
+                if (!in)
+                {
+                    logWarning("HSTRCloud: formR hull '{}' is truncated.", file);
+                    continue;
+                }
+                ref<Buffer> pVertices = mpDevice->createBuffer(
+                    vertices.size() * sizeof(float3), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, vertices.data()
+                );
+                ref<Buffer> pIndices = mpDevice->createBuffer(
+                    indices.size() * sizeof(uint32_t), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, indices.data()
+                );
+                RtGeometryDesc geometry = {};
+                geometry.type = RtGeometryType::Triangles;
+                geometry.flags = RtGeometryFlags::Opaque;
+                geometry.content.triangles.transform3x4 = 0;
+                geometry.content.triangles.indexFormat = ResourceFormat::R32Uint;
+                geometry.content.triangles.vertexFormat = ResourceFormat::RGB32Float;
+                geometry.content.triangles.indexCount = uint32_t(indices.size());
+                geometry.content.triangles.vertexCount = counts[0];
+                geometry.content.triangles.indexData = pIndices->getGpuAddress();
+                geometry.content.triangles.vertexData = pVertices->getGpuAddress();
+                geometry.content.triangles.vertexStride = sizeof(float3);
+                RtAccelerationStructureBuildInputs inputs = {};
+                inputs.kind = RtAccelerationStructureKind::BottomLevel;
+                inputs.flags = RtAccelerationStructureBuildFlags::PreferFastTrace;
+                inputs.descCount = 1;
+                inputs.geometryDescs = &geometry;
+                const RtAccelerationStructurePrebuildInfo info = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+                if (!pScratch || pScratch->getSize() < info.scratchDataSize)
+                    pScratch = mpDevice->createBuffer(info.scratchDataSize, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+                ref<Buffer> pResult =
+                    mpDevice->createBuffer(info.resultDataMaxSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+                RtAccelerationStructure::Desc desc;
+                desc.setKind(RtAccelerationStructureKind::BottomLevel);
+                desc.setBuffer(pResult, 0, info.resultDataMaxSize);
+                ref<RtAccelerationStructure> pBlas = RtAccelerationStructure::create(mpDevice, desc);
+                RtAccelerationStructure::BuildDesc build = {};
+                build.inputs = inputs;
+                build.dest = pBlas.get();
+                build.scratchData = pScratch->getGpuAddress();
+                pRenderContext->buildAccelerationStructure(build, 0, nullptr);
+                pRenderContext->uavBarrier(pScratch.get());
+                pRenderContext->uavBarrier(pResult.get());
+                mHullBlas[size_t(a) * kFormRLevels + level] = pBlas;
+                mHullMeshBuffers.push_back(pVertices);
+                mHullMeshBuffers.push_back(pIndices);
+                mHullBlasBuffers.push_back(pResult);
+                mHullTriangles += counts[1];
+            }
+        pRenderContext->submit(true); // The scratch buffer goes out of scope.
+        logInfo("HSTRCloud: formR loaded {} hulls ({} triangles) from '{}'{}.", mHullBlasBuffers.size(), mHullTriangles, mFormRHulls,
+                mFormRDilate ? "" : " (undilated)");
+    }
+    // No hulls: no structure, so the passes compile without formR (an empty structure would skip every ray).
+    if (mHullBlasBuffers.empty())
+    {
+        mHullTlas = nullptr;
+        mHullTlasCapacity = 0;
+        return;
+    }
+    // Instances: as runRtSpanProbe's, each occupied sea tile slot at its tile copy nearest the camera (asset source voxels to sea
+    // voxels), within the view distance, over its asset's hull of the coarsest level its farthest point reads: cloudInstanceAt's
+    // footprint level there, or the nearest coarser level with a hull (the finest hull where none is coarser). A coarser level's
+    // occupancy holds a finer one's, so the hull bounds every level the instance's samples read.
+    const CameraData& camera = mpScene->getCamera()->getData();
+    const float3 cameraVoxel = (camera.posW - mParams.seaOrigin) / mParams.seaVoxelSize - 0.5f;
+    std::vector<RtInstanceDesc> instances;
+    float yMin = 1e30f, yMax = -1e30f;
+    std::fill(std::begin(mHullLevelCounts), std::end(mHullLevelCounts), 0u);
+    {
+        const auto& desc = mpCloudSea->getDesc();
+        const auto& records = residency.getInstanceRecords();
+        const int tiles = int(desc.tiles);
+        const float tileVoxels = float(desc.tileVoxels);
+        for (uint32_t index = 0; index < records.size(); ++index)
+        {
+            const HSTRCloudInstance& r = records[index];
+            if (!(r.scale > 0.f))
+                continue;
+            const uint32_t layer = index / uint32_t(tiles * tiles);
+            const int sx = int(index % uint32_t(tiles)), sz = int((index / uint32_t(tiles)) % uint32_t(tiles));
+            const float shift = 0.5f * tileVoxels * float(layer);
+            const float cx = std::floor((cameraVoxel.x + 0.5f - shift) / tileVoxels);
+            const float cz = std::floor((cameraVoxel.z + 0.5f - shift) / tileVoxels);
+            const float wx = float(sx) + float(tiles) * std::round((cx - float(sx)) / float(tiles));
+            const float wz = float(sz) + float(tiles) * std::round((cz - float(sz)) / float(tiles));
+            float3x3 rotation;
+            rotation.setRow(0, r.row0.xyz());
+            rotation.setRow(1, r.row1.xyz());
+            rotation.setRow(2, r.row2.xyz());
+            const float3x3 inverse = math::inverse(rotation);
+            const float3 offset(wx * tileVoxels + shift, 0.f, wz * tileVoxels + shift);
+            const float3 translation = offset - math::mul(inverse, float3(r.row0.w, r.row1.w, r.row2.w));
+            const float3 dims = float3(residency.getAssetDims(r.asset));
+            // The box of the coarsest hull (its dilation reaches a cell of 4 << level source voxels past the asset), in world units.
+            auto bounds = [&](float margin, float3& lo, float3& hi)
+            {
+                lo = float3(1e30f);
+                hi = float3(-1e30f);
+                for (uint32_t c = 0; c < 8; ++c)
+                {
+                    const float3 corner((c & 1) ? dims.x - 0.5f + margin : -0.5f - margin, (c & 2) ? dims.y - 0.5f + margin : -0.5f - margin,
+                                        (c & 4) ? dims.z - 0.5f + margin : -0.5f - margin);
+                    const float3 voxel = math::mul(inverse, corner) + translation;
+                    lo = min(lo, voxel);
+                    hi = max(hi, voxel);
+                }
+            };
+            float3 lo, hi;
+            bounds(float(4u << (kFormRLevels - 1)), lo, hi);
+            const float3 worldLo = (lo + 0.5f) * mParams.seaVoxelSize + mParams.seaOrigin;
+            const float3 worldHi = (hi + 0.5f) * mParams.seaVoxelSize + mParams.seaOrigin;
+            if (length(clamp(camera.posW, worldLo, worldHi) - camera.posW) > mParams.seaViewDistance)
+                continue;
+            float far = 0.f;
+            for (uint32_t c = 0; c < 8; ++c)
+            {
+                const float3 corner((c & 1) ? worldHi.x : worldLo.x, (c & 2) ? worldHi.y : worldLo.y, (c & 4) ? worldHi.z : worldLo.z);
+                far = std::max(far, length(corner - camera.posW));
+            }
+            far = std::min(far, mParams.seaViewDistance);
+            // formRLevelBias: coarser hulls than the footprint asks for, for samples that read a coarser resident ancestor.
+            const int need = std::max(
+                0, int(std::floor(std::log2(std::max(far * mParams.cloudPixelAngle / r.sourceVoxelWorld, 1.f)) + mParams.cloudLodBias)) +
+                       mFormRLevelBias
+            );
+            int level = -1;
+            for (int l = need; l < int(kFormRLevels) && level < 0; ++l)
+                if (mHullBlas[size_t(r.asset) * kFormRLevels + l])
+                    level = l;
+            for (int l = std::min(need, int(kFormRLevels)) - 1; l >= 0 && level < 0; --l)
+                if (mHullBlas[size_t(r.asset) * kFormRLevels + l])
+                    level = l;
+            if (level < 0)
+                continue;
+            ++mHullLevelCounts[level];
+            bounds(float(4u << level), lo, hi);
+            yMin = std::min(yMin, lo.y);
+            yMax = std::max(yMax, hi.y);
+            RtInstanceDesc instance = {};
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int column = 0; column < 3; ++column)
+                    instance.transform[row][column] = inverse[row][column];
+                instance.transform[row][3] = translation[row];
+            }
+            instance.instanceID = index;
+            instance.instanceMask = 0xFF;
+            instance.accelerationStructure = mHullBlas[size_t(r.asset) * kFormRLevels + level]->getGpuAddress();
+            instances.push_back(instance);
+        }
+    }
+    mHullInstances = uint32_t(instances.size());
+    // One sea voxel past the hulls' band: the march counts faces from outside it.
+    mParams.formRHullYMin = yMin - 1.f;
+    mParams.formRHullYMax = yMax + 1.f;
+    RtAccelerationStructureBuildInputs inputs = {};
+    inputs.kind = RtAccelerationStructureKind::TopLevel;
+    inputs.flags = RtAccelerationStructureBuildFlags::PreferFastTrace;
+    inputs.descCount = std::max(mHullInstances, 1u);
+    if (!mHullTlas || mHullTlasCapacity < inputs.descCount)
+    {
+        const RtAccelerationStructurePrebuildInfo info = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+        mpHullTlasBuffer = mpDevice->createBuffer(info.resultDataMaxSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+        mpHullTlasScratch = mpDevice->createBuffer(info.scratchDataSize, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+        RtAccelerationStructure::Desc desc;
+        desc.setKind(RtAccelerationStructureKind::TopLevel);
+        desc.setBuffer(mpHullTlasBuffer, 0, info.resultDataMaxSize);
+        mHullTlas = RtAccelerationStructure::create(mpDevice, desc);
+        mHullTlasCapacity = inputs.descCount;
+    }
+    if (instances.empty())
+        instances.push_back({}); // An instance with no structure (null address) hits nothing.
+    GpuMemoryHeap::Allocation allocation =
+        mpDevice->getUploadHeap()->allocate(instances.size() * sizeof(RtInstanceDesc), sizeof(RtInstanceDesc));
+    std::memcpy(allocation.pData, instances.data(), instances.size() * sizeof(RtInstanceDesc));
+    RtAccelerationStructure::BuildDesc build = {};
+    build.inputs = inputs;
+    build.inputs.instanceDescs = allocation.getGpuAddress();
+    build.dest = mHullTlas.get();
+    build.scratchData = mpHullTlasScratch->getGpuAddress();
+    pRenderContext->buildAccelerationStructure(build, 0, nullptr);
+    mpDevice->getUploadHeap()->release(allocation);
+    pRenderContext->uavBarrier(mpHullTlasBuffer.get());
+    mHullTlasFrame = mExecuteFrames;
 }
 
 /// Writes the reference (per component and half: rgb mean, a sample count) as one EXR per slice, so an expensive path-traced

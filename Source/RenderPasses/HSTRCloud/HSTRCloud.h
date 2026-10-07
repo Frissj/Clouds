@@ -535,6 +535,38 @@ private:
     uint32_t mRtTlasCapacity = 0;
     std::vector<uint32_t> mRtStats;       ///< Last probe frame's gProbeStats (HSTRCloudRtProbe.cs.slang slots).
     uint32_t mRtInstances = 0;            ///< Instances in the last top-level structure.
+    /// formR (LIT_VOLUME.md section 6c, gate R1): the lean marches cross empty space between shared occupancy hulls by inline ray
+    /// query (1), or only count what that would do (2: HSTR_FORM_R 2, kFormRProbe). Hulls are triangle meshes per (asset, level)
+    /// from form_r_hulls.py (formRHulls: their directory; formRDilate false loads the undilated sanity hulls), one bottom-level
+    /// structure each, built once; the top-level structure over the sea instances, each at its tile copy nearest the camera with the
+    /// hull of the coarsest level its farthest point reads, is rebuilt every frame formR is on.
+    /// MEASURED and REJECTED (formr1-4, sunset launcher 4K walk, live residency): R1's stop rule (units + query down 15%) fails.
+    /// formR 2 counts: 6.3M lean steps a build, 51% outside every hull, 1.08M queries (6 a ray), but 38k brick density samples
+    /// outside the dilated hulls (undilated 124k; formRLevelBias 1 / 2: 17.7k / 3.2k, outside steps 42% / 26%) - samples read
+    /// coarse resident ancestors whose reach passes a finer hull. formR 1 cuts warp-paid steps 42% (beamLayerProbe: query 16.4M ->
+    /// 9.3M, units 13.4M -> 7.7M) yet units + query 3.86 / 3.70 -> 3.90 / 3.50 ms (formr1) and +2.2% over 0.02 moving. GPU Trace
+    /// (formr4, ngfx/formr4{off,on}_export): units 2.76 -> 2.91 ms, instructions only -8%, warps active and register-allocation
+    /// stalls unchanged (not occupancy), SM throughput 35 -> 31%, L1 hit 78 -> 74%, DRAM up; query 2.05 -> 1.82 ms. The jumped
+    /// steps were already cheap (majorant-zero and layer-mask skips); the cost is the brick chain at samples inside the hulls,
+    /// which the hulls cannot remove, and the queries' traversal and BVH traffic outweigh what they skip. Off by default.
+    void updateHullTlas(RenderContext* pRenderContext);
+    uint32_t mFormR = 0;
+    bool mFormRDilate = true;
+    int mFormRLevelBias = 0;              ///< formRLevelBias: hull level = the footprint's + this (coarser, more conservative).
+    std::string mFormRHulls;
+    std::string mFormRLoaded;             ///< The hull set the bottom-level structures hold (directory + dilation), empty if none.
+    std::vector<ref<Buffer>> mHullMeshBuffers;
+    std::vector<ref<Buffer>> mHullBlasBuffers;
+    std::vector<ref<RtAccelerationStructure>> mHullBlas; ///< Per asset * kFormRLevels + level (null where no file).
+    ref<Buffer> mpHullTlasBuffer;
+    ref<Buffer> mpHullTlasScratch;
+    ref<RtAccelerationStructure> mHullTlas;
+    uint32_t mHullTlasCapacity = 0;
+    uint64_t mHullTlasFrame = ~0ull;      ///< mExecuteFrames of the last build.
+    static constexpr uint32_t kFormRLevels = 8;
+    uint32_t mHullInstances = 0;          ///< Instances in the last hull top-level structure.
+    uint32_t mHullLevelCounts[kFormRLevels] = {}; ///< Of those, by hull level.
+    uint64_t mHullTriangles = 0;          ///< Triangles over the loaded hulls.
     /// spanProbe: the dirty march records its rays as spans (HSTR_SHIP bit 262144) and evaluateSpans integrates them alone.
     bool mSpanProbe = false;
     ref<Buffer> mpSpanRays;

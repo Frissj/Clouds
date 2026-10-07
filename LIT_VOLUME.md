@@ -263,6 +263,21 @@ pip install slangpy
 python form_r_trace.py form_r_walk.npz                              # prints facing, CPU check, counts, four timed arms, verdict
 ```
 
+R0 on the 4080 Laptop (L1 hulls for all five assets, 1.13M triangles, 75.5 MB of BLAS): facing default leaves 0 of 288,185 first
+hits on a back face; 1,693 of 1,727 check rays enter within the CPU interval, 34 early, 4 GPU only; 7.3 queries a ray, 2.50M a
+frame. Full 0.508 ms (0.204 ms per 1M queries), shuffled 1.059, first entry 0.070, anchor 0.506: STOP by 1.6% on the 0.5 ms rule,
+taken as a pass.
+
+R1 (renderer, `formR`, `form_r_hulls.py`; HSTRCloud.h updateHullTlas) - FAILED its stop rule, Form R REJECTED:
+- The hulls are not exact: dilated by one cell they still miss 38k brick density samples a build (formR 2's count; undilated
+  124k), falling to 3.2k only two levels coarser, where the outside share of steps falls from 51% to 26%. Samples read coarse
+  resident ancestors whose reach passes a finer hull.
+- The jump removes 42% of warp-paid steps but only 8% of the units' instructions: the steps outside the hulls were already the
+  cheap ones (majorant-zero and layer-mask skips). Units + query 3.86 / 3.70 -> 3.90 / 3.50 ms; GPU Trace units 2.76 -> 2.91 ms
+  (occupancy unchanged, SM throughput 35 -> 31%, L1 hit 78 -> 74%: traversal waits and BVH traffic), query 2.05 -> 1.82 ms.
+- What remains is the brick chain and lighting at samples inside the clouds, which no empty-space structure removes - the same
+  conclusion as `layeroracle1`. 2 ms needs the per-sample cost cut (R2), not the empty space.
+
 ## 7. In this commit
 
 - `LIT_VOLUME.md` (this file).

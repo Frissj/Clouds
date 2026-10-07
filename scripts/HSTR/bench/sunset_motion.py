@@ -58,6 +58,10 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... and a perfect ray start's oracle (kBeamLeadSteps): leading empty steps, warp-paid steps with that run as one step,
          # rays with no density and their steps, for the dirty query and the units.
          tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")) +
+         # ... and the dirty query's waves by their longest ray (half-octave bins) and their cost by quarter of the listed order.
+         tuple(f"beamQueryWaveHist{k}" for k in range(20)) + tuple(f"beamQueryWaveQuarter{k}" for k in range(4)) +
+         # ... and beamRepairProbe's re-marched samples by distance: scored, steps, steps whose old value held within 0.02.
+         tuple(f"beamProbeDist{kind}{b}{n}" for kind in ("Unit", "Ray") for b in range(12) for n in ("Scored", "Steps", "Stable")) +
          # ... and beamUnitStart's misses (kBeamUnitStartProbe).
          ("beamUnitStartHinted", "beamUnitStartMissed", "beamUnitStartLost", "beamUnitStartMissedVoxels16",
           "beamUnitStartRadianceOff", "beamUnitStartTransmittanceOff", "beamUnitStartOffNoMiss", "beamUnitStartStepsSaved") +
@@ -70,7 +74,11 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... and beamUnitSpan's (kBeamUnitSpanProbe): units with a mask, jumps, against the unmasked march from the same start
          # units off by > 0.02 in log radiance / in transmittance, steps saved.
          ("beamUnitSpanUnits", "beamUnitSpanJumps", "beamUnitSpanRadianceOff", "beamUnitSpanTransmittanceOff",
-          "beamUnitSpanStepsSaved"))
+          "beamUnitSpanStepsSaved") +
+         # ... and formR 2's (kFormRProbe): hull queries, steps outside every hull, density samples there (bricks / proxy), back
+         # faces met outside (drift), steps, rays; the hull structure's instances and triangles.
+         tuple(f"formR{n}" for n in ("Queries", "OutsideSteps", "Missed", "MissedProxy", "Drift", "Steps", "Rays", "Instances",
+                                     "Triangles")))
 
 
 def score():

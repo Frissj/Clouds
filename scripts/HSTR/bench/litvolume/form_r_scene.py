@@ -34,13 +34,13 @@ from lit_volume_budget import (CAMERA, LAYER_HEIGHT, ORIGIN, PIXEL_ANGLE, TILE_W
 CELL = 4  # voxels per hull cell at its level (an octant of an 8^3 brick)
 
 
-def hull_cells(volume):
-    """Occupied octant cells of a (z, y, x) volume, dilated by one cell (3 x 3 x 3)."""
+def hull_cells(volume, dilate=True):
+    """Occupied octant cells of a (z, y, x) volume, dilated by one cell (3 x 3 x 3) unless dilate is False (R1's sanity hull)."""
     pad = [(0, -(-d // CELL) * CELL - d) for d in volume.shape]
     v = np.pad(np.asarray(volume) > 0, pad)
     occ = v.reshape(v.shape[0] // CELL, CELL, v.shape[1] // CELL, CELL, v.shape[2] // CELL, CELL).any(axis=(1, 3, 5))
     occ = np.pad(occ, 1)  # room for the dilation (np.roll wraps only these zero planes); cell indices shift by one
-    for a in range(3):
+    for a in range(3 if dilate else 0):
         lo = np.roll(occ, 1, axis=a)
         hi = np.roll(occ, -1, axis=a)
         occ = occ | lo | hi

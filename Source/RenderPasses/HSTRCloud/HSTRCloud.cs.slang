@@ -56,6 +56,16 @@ import Atmosphere;
 #ifndef HSTR_SUN_PACKED
 #define HSTR_SUN_PACKED 0 // cloudSunPackedRead: the beam marches read density and sun bake from hstrCloudSunPacked in one fetch.
 #endif
+#ifndef HSTR_LAYER_ORACLE
+#define HSTR_LAYER_ORACLE 0 // cloudLayerOracle: layers answered by the world proxy instead of their chains (timing oracle).
+#endif
+#ifndef HSTR_FORM_R
+#define HSTR_FORM_R 0 // formR: the lean marches cross empty space between the occupancy hulls by ray query (1), or count it (2).
+                      // MEASURED and REJECTED (formr1-4): see HSTRCloud.h updateHullTlas.
+#endif
+// formR: one instance per occupied sea tile slot over its asset's hull (HSTRCloud.cpp). Declared in every variant so the passes'
+// variables keep one layout whatever HSTR_FORM_R a pass was last compiled with.
+RaytracingAccelerationStructure gHullTlas;
 #ifndef HSTR_SPAN_LOOP
 #define HSTR_SPAN_LOOP 0 // spanLoop: the span probe's evaluator variants (evaluateSpan), compiled in only on the span passes.
 #endif
@@ -7852,6 +7862,37 @@ struct HSTRCloudRenderer
                 exit = min(exit, tSample + max(leave, 0.f));
                 continue;
             }
+#if HSTR_LAYER_ORACLE != 0
+            // ORACLE (cloudLayerOracle), timing only: the layer answered by the world proxy this sample already read, as one read of
+            // a merged world-space structure would answer it - no instance, box or brick chain.
+            if (HSTR_LAYER_ORACLE == 2 || layer == 1u)
+            {
+                if (proxy > 0.f)
+                {
+                    if (HSTR_LAYER_ORACLE == 2)
+                    {
+                        skipTo = -1.f;
+                        hit.entry = kCloudRefNone;
+                        fineVoxels = 1.f;
+                        return proxy;
+                    }
+                    density += 0.5f * proxy; // Lit through layer 0's hit when it has one, else as a proxy sample.
+                    resolved = true;
+                    exit = -1.f;
+                    continue;
+                }
+                const float3 s = seaVoxel(v);
+                const float3 lo = floor(s + 0.5f) - 0.5f;
+                const float3 dv = ray.direction * float(params.hstrCellWidth);
+                float leave = 1e30f;
+                [unroll]
+                for (uint a = 0; a < 3; ++a)
+                    if (abs(dv[a]) > 1e-12f)
+                        leave = min(leave, ((dv[a] > 0.f ? lo[a] + 1.f : lo[a]) - s[a]) / dv[a]);
+                exit = min(exit, tSample + max(leave, 0.f));
+                continue;
+            }
+#endif
             uint instanceIndex;
             float3 x;
             float footprintLevel;
@@ -8179,6 +8220,24 @@ struct HSTRCloudRenderer
     /// from the page, before the empty-cell test, and the brick record only decoded it - one dependent round trip off every
     /// density sample. Walk 1.88 / 1.85 -> 1.98 ms, sprint 2.06 / 2.06 -> 2.16. The texel held live across the cell test and the
     /// wasted fetches of empty samples cost more than the latency saved: the chain is occupancy-bound, not latency-bound.
+#if HSTR_FORM_R != 0
+    /// formR: the nearest hull face of any instance on hullRay past from (ray parameter), 1e30 if none; front: entering a hull.
+    float hullNextFace(RayDesc hullRay, float from, out bool front)
+    {
+        hullRay.TMin = from;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE> query;
+        query.TraceRayInline(gHullTlas, RAY_FLAG_NONE, 0xFF, hullRay);
+        while (query.Proceed())
+        {
+        }
+        front = false;
+        if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+            return 1e30f;
+        front = query.CommittedTriangleFrontFace();
+        return query.CommittedRayT();
+    }
+#endif
+
     void marchBeamLean(
         CutRay ray,
         float2 segment,
@@ -8249,9 +8308,62 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
+#if HSTR_FORM_R != 0
+        // formR (LIT_VOLUME.md section 6c, gate R1): the hulls of both layers' instances overlap, so the union's inside is a count of
+        // faces crossed (+1 front, -1 back), started where the ray leaves the hulls' y band backwards (outside every hull) and kept
+        // by one ray query per face. Outside every hull the march jumps to the next face instead of stepping (formR 1).
+        // hullRay is in sea voxels with the march's parameter shifted: march t = hull t + hullShift.
+        RayDesc hullRay;
+        float hullShift = 0.f;
+        int hullInside = 0;
+        bool hullFront = false;
+        float hullFace = 1e30f;
+        const float hullEps = 1e-3f * unitsPerVoxel;
+        {
+            const float3 o = ray.position * cellWidth + float3(params.hstrGridMin);
+            const float3 d = ray.direction * cellWidth;
+            const bool inBand = o.y > params.formRHullYMin && o.y < params.formRHullYMax;
+            if (inBand && abs(d.y) > 1e-9f)
+                hullShift = ((d.y > 0.f ? params.formRHullYMin : params.formRHullYMax) - o.y) / d.y;
+            hullRay.Origin = o + hullShift * d;
+            hullRay.Direction = d;
+            hullRay.TMin = 0.f;
+            hullRay.TMax = segment.y - hullShift;
+            if (inBand && !(abs(d.y) > 1e-9f))
+                hullInside = 1 << 20; // Level inside the band: no outside point to count from, so never jump.
+            else
+                hullFace = hullNextFace(hullRay, 0.f, hullFront) + hullShift;
+        }
+#if HSTR_FORM_R == 2
+        uint hullQueries = hullInside == 0 ? 1u : 0u;
+        uint hullOutside = 0, hullMissed = 0, hullMissedProxy = 0, hullDrift = 0;
+#endif
+#endif
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
+#if HSTR_FORM_R != 0
+            [loop]
+            while (hullFace <= t)
+            {
+#if HSTR_FORM_R == 2
+                hullDrift += hullInside == 0 && !hullFront ? 1u : 0u;
+                ++hullQueries;
+#endif
+                hullInside = max(hullInside + (hullFront ? 1 : -1), 0);
+                hullFace = hullNextFace(hullRay, hullFace - hullShift + hullEps, hullFront) + hullShift;
+            }
+#if HSTR_FORM_R == 1
+            if (hullInside == 0)
+            {
+                // Outside every hull: no density before the next face.
+                if (hullFace >= segment.y)
+                    break;
+                t = hullFace;
+                continue;
+            }
+#endif
+#endif
 #if HSTR_UNIT_SPAN
             // beamUnitSpan: a unit in a bin none of its tile's corners saw density in moves on to the next bin one did, and ends
             // where none did after it. Before the corners' first density (the start's margin) and in bin 63 it marches as usual.
@@ -8334,6 +8446,10 @@ struct HSTRCloudRenderer
 #if HSTR_UNIT_SPAN
                 if (alpha > 0.f)
                     spanMark(ray.entryDistance + t * ray.worldLength, ray.entryDistance + (t + dt) * ray.worldLength);
+#endif
+#if HSTR_FORM_R == 2
+                hullMissed += hullInside == 0 && sigma > 0.f && hit.entry != kCloudRefNone ? 1u : 0u;
+                hullMissedProxy += hullInside == 0 && sigma > 0.f && hit.entry == kCloudRefNone ? 1u : 0u;
 #endif
 #if (HSTR_SHIP & 4096) != 0
                 countEmpty += skipTo >= 0.f ? 1u : 0u;
@@ -8433,6 +8549,9 @@ struct HSTRCloudRenderer
 #endif
             t = next;
             ++steps;
+#if HSTR_FORM_R == 2
+            hullOutside += hullInside == 0 ? 1u : 0u;
+#endif
 #if HSTR_LAYER_PROBE
             gLeadSteps += gLeadDone ? 0u : 1u;
             gLeadDone = gLeadDone || transmittance < 1.f;
@@ -8440,6 +8559,21 @@ struct HSTRCloudRenderer
             gTailTransmittance = transmittance;
 #endif
         }
+#if HSTR_FORM_R == 2
+        {
+            const uint counts[7] = {hullQueries, hullOutside, hullMissed, hullMissedProxy, hullDrift, steps, 1u};
+            [unroll]
+            for (uint k = 0; k < 7; ++k)
+            {
+                const uint sum = WaveActiveSum(counts[k]);
+                if (WaveIsFirstLane())
+                {
+                    uint unused;
+                    InterlockedAdd(hstrBeamCounts[kFormRProbe + k], sum, unused);
+                }
+            }
+        }
+#endif
 #if HSTR_UNIT_SPAN
         // Stopped short (opacity or the step cap): this ray says nothing about what lies past where it stopped.
         if (!gSpanSkip && t < segment.y)
@@ -11631,8 +11765,21 @@ struct HSTRCloudRenderer
     /// reprojected by the old distance. Four counters from base: marched, in place within 0.02, reprojected within 0.02, either.
     /// The same four again from kBeamProbeSteps (units, then rays), weighted by the march steps the sample cost: what a prediction
     /// would save is the steps it avoids, not the samples.
-    void beamProbeCount(uint base, bool scored, bool inPlace, bool reprojected, float steps)
+    void beamProbeCount(uint base, bool scored, bool inPlace, bool reprojected, float steps, float distance)
     {
+        // kBeamProbeDistance: by the old value's opacity-weighted distance (log2 bins from 64 world units; bin 0 none), the samples
+        // scored, their steps, and the steps of those kept or reprojected within 0.02 - where the re-marched work lies and how much
+        // of it changed.
+        if (scored)
+        {
+            const uint bin = distance > 0.f ? uint(clamp(2.f + floor(log2(distance / 64.f)), 1.f, float(kBeamProbeDistanceBins - 1u))) : 0u;
+            const uint slot = kBeamProbeDistance + 3u * (bin + (base == kBeamProbeUnits ? 0u : kBeamProbeDistanceBins));
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[slot], 1u, unused);
+            InterlockedAdd(hstrBeamCounts[slot + 1u], uint(steps), unused);
+            if (inPlace || reprojected)
+                InterlockedAdd(hstrBeamCounts[slot + 2u], uint(steps), unused);
+        }
         const uint n = WaveActiveCountBits(scored);
         const uint a = WaveActiveCountBits(scored && inPlace);
         const uint b = WaveActiveCountBits(scored && reprojected);
@@ -11669,7 +11816,7 @@ struct HSTRCloudRenderer
             const float4 moved = hstrBeamPixelsSnapshot.SampleLevel(hstrLinearClampSampler, position / float2(params.beamFrameDim), 0.f);
             reprojected = beamProbeError(moved.rgb, exact) <= 0.02f;
         }
-        beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected, steps);
+        beamProbeCount(kBeamProbeUnits, scored, inPlace, reprojected, steps, old.a);
         // The residual of the blocks a witness policy would have carried: of their units' steps, how many were within 0.02 in place,
         // and how many kept or reprojected. Units of blocks the query did not list read no acceptance (cleared each build).
         {
@@ -11904,7 +12051,7 @@ struct HSTRCloudRenderer
         float2 moved;
         if (scored && beamProbeReproject(w, single.a, moved))
             reprojected = beamProbeError(beamProbeLatticeRadiance(moved, w, albedo), exact) <= 0.02f;
-        beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected, fresh.steps);
+        beamProbeCount(kBeamProbeRays, scored, inPlace, reprojected, fresh.steps, single.a);
         beamProbeDivergence(kBeamProbeDivergence + 2, fresh.steps);
         // Block-coherent: would carrying the WHOLE block have been right, and would a geometry signature of this view have said so?
         // The signature is taken from this exact march, so it prices the classifier, not a validator march.
@@ -14453,7 +14600,21 @@ groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance t
 [numthreads(64, 1, 1)]
 void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
-    const uint thread = foldedDirtyThread(groupId, groupThreadId.x);
+    uint thread = foldedDirtyThread(groupId, groupThreadId.x);
+#if HSTR_LAYER_PROBE
+    const uint listedGroup = thread / 64u;
+#endif
+    if (gHSTRCloud.params.beamQueryWaveOrder == 1u)
+    {
+        // DIAGNOSTIC: the groups in reverse listed order (writeBeamDirtyArgs' thread count), each keeping its own rays.
+        const uint rb = max(gHSTRCloud.params.beamDirtyPointStride, 1u);
+        const uint passes = gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u;
+        const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
+        const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], gHSTRCloud.params.beamDirtyCapacity);
+        const uint groups = (blocks * rb * rb * passes * segments + 63u) / 64u;
+        const uint group = thread / 64u;
+        thread = group < groups ? (groups - 1u - group) * 64u + groupThreadId.x : thread;
+    }
 #if HSTR_BEAM_DIRTY_SLICES == 0
     uint2 point;
     bool centre;
@@ -14552,6 +14713,23 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
     gHSTRCloud.beamQueryMarched(position, ray);
+#if HSTR_LAYER_PROBE
+    {
+        // kBeamQueryWaveHist / kBeamQueryWaveQuarter: the wave's longest ray, and where its group sits in the listed order.
+        const uint waveSteps = WaveActiveMax(uint(ray.steps));
+        if (WaveIsFirstLane())
+        {
+            const uint rb = max(gHSTRCloud.params.beamDirtyPointStride, 1u);
+            const uint passes = gHSTRCloud.params.beamCentreless != 0 ? 1u : 2u;
+            const uint blocks = min(gHSTRCloud.hstrBeamDirtyCount[0], gHSTRCloud.params.beamDirtyCapacity);
+            const uint groups = max((blocks * rb * rb * passes + 63u) / 64u, 1u);
+            const uint bin = min(uint(2.f * log2(float(waveSteps) + 1.f)), kBeamQueryWaveBins - 1u);
+            uint unused;
+            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryWaveHist + bin], 1u, unused);
+            InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamQueryWaveQuarter + min(listedGroup * 4u / groups, 3u)], waveSteps, unused);
+        }
+    }
+#endif
 #endif
 #else
     const uint segments = clamp(gHSTRCloud.params.beamDirtySegments, 1u, 64u);
