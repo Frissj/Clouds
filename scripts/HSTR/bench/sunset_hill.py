@@ -139,8 +139,12 @@ if SUN_ARMS or PT_ARMS:
         for k in props:
             touched.setdefault(k, hstr.properties.get(k))
         hstr.set_properties({k: v for k, v in touched.items() if v is not None})
-        if SUN_ARMS and (arm[0] != hstr.properties["cloudSunPoolScale"] or arm[1] != hstr.properties["cloudSunAtlas8"]):
-            hstr.set_properties(dict(REFERENCE, cloudSunPoolScale=arm[0], cloudSunAtlas8=arm[1], cloudResidencyFrozen=False))
+        # An optional third value: cloudSunPacked (1 = the sun atlas is RG8, the 8-bit bake beside its brick's density).
+        packed = arm[2] if SUN_ARMS and len(arm) > 2 else 0
+        if SUN_ARMS and (arm[0] != hstr.properties["cloudSunPoolScale"] or arm[1] != hstr.properties["cloudSunAtlas8"] or
+                         packed != hstr.properties["cloudSunPacked"]):
+            hstr.set_properties(dict(REFERENCE, cloudSunPoolScale=arm[0], cloudSunAtlas8=arm[1], cloudSunPacked=packed,
+                                     cloudResidencyFrozen=False))
             for _ in range(settle):
                 m.renderFrame()
             hstr.set_properties({"cloudResidencyFrozen": True})

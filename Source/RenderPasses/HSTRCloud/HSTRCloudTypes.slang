@@ -1855,7 +1855,15 @@ struct HSTRCloudParams
     /// The packed sun atlas the residency keeps (cloudSunPacked; set by the host): 0 none; 1 RG8, which IS the sun atlas (the
     /// 8-bit bake in r, its brick's density in g - cloudSun8 - at R16F's memory); 2 a second RG16F atlas beside it. bakeCloudSun
     /// writes it, and with HSTR_SUN_PACKED (cloudSunPackedRead) the beam marches read density and bake from it. Off by default:
-    /// ~-0.02 ms of units (sunpacked12), not yet measured on the sunset launcher.
+    /// ~-0.02 ms of units (sunpacked12).
+    /// MEASURED (hillpack2, sunset 960x540 hill against the 326 spp trace, launcher beam view, read off): RG8 shared error 0.1262 /
+    /// log 0.0477 / p99.9 0.689, R16F 0.1277 / 0.0482 / 0.689 - the 8-bit atlas costs nothing. The read itself is invisible there:
+    /// only the dirty passes compile it (setBeamDirtyMarchDefines) and a reset build uses the full-build passes (on / off / on
+    /// identical, sanity beamUnitStart -8 0.037 against 0.020).
+    /// MEASURED (motpack1, sunset launcher 4K live, RG8 shared, HSTR_MOTION_SCORE 2, units ms / over 0.02 mean): walk on 1.93 / 2.39%,
+    /// off 1.97 / 2.36%, on 1.81 / 2.57%, sanity 2.53%; sprint on 2.88 / 6.16%, off 2.60 / 4.64%, on 2.71 / 8.83% (one chunk 25%),
+    /// sanity 12.17%. Walk -0.09 ms, sprint +0.19 ms; residency at half its desired bricks the whole flight (mapped 102-136k of
+    /// 243k). Not a measurable win at 4K: kept off.
     uint cloudSunPackedAtlas = 0;
     /// The far layer's reprojection (seaFarBand, seaFarSourceDistance). A texel whose march lit the near / far fade (stored with
     /// its distance negative) marches again every run: the fade moves with the camera, so no reprojection carries that content. A
