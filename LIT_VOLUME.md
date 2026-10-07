@@ -208,6 +208,61 @@ shared baseline under this counting, so S1's absolute threshold cannot separate 
 (aligned instances, shared lit bricks) is untouched by both: no resampling (S0 is exactly its SANITY aligned arm: 0), and its
 memory and turnover are the shared line. It needs the owner's decision on the scene layout before the renderer gates (S2 / S3).
 
+## 6c. Form R: cross empty space by hardware ray queries over shared asset hulls (proposed 2026-10-07)
+
+An outside review proposed "Form C": keep values native in asset space behind the instance transform, and skip empty space with a
+per-asset Chebyshev distance field. The first half stands and replaces Form B's reason to change the sea: the transform is cheap
+(`fcbef650`, chainsplit1), so shared lit bricks need no aligned layout, only the transform. The navigation half is already
+measured:
+- Its oracle exists: `4f900bbe` nav_probe1, perfect empty-run skips cut warp-paid steps 14.77M -> 5.76M (2.57x).
+- No static isotropic structure reaches it (`ec2c1879`): 54% of empty samples lie in a 4-voxel majorant block with density and
+  42% one block away; the octant-mask oracle cut warp-paid steps 2.8%. The runs (~45 sea voxels) thread gaps between wisps, and a
+  Chebyshev cube is bounded by the clearance across the ray, not the run along it. Asset coordinates do not change the cube.
+- Ray-specific but 8 px apart is too coarse (`af162241`: lattice depth masks, <= 17% of steps for 12% of units wrong); a finer
+  loop in the lookup costs more than it saves (`c92ee8c9`: 4.3 -> 6.1 ms).
+- Entries free, density + single sun alone project ~1.3 ms at 4K (`db20cf3b`); a brick crossing is 1.28 samples (`b686db3e`).
+
+The gaps are per ray, so the navigation must be too. Form R asks the RT cores:
+- **Hulls**: one BLAS per (asset, level), the closed boundary of the octant cells (4 voxels at the level) holding any decoded
+  density, dilated one cell. Shared by every instance, as the density atlas is. Measured on the decoded Intel assets (per asset):
+  L4 ~3.4k triangles, L3 ~12k, L2 ~43-48k, L1 ~207k (a0); L0 undecoded (dense L0 is ~3.2 GB an asset). Built from the decoded
+  bricks, so it also removes the dropped density of `fcbef650`'s layer bits (0.085%, built from source maxima).
+- **TLAS**: one instance per (sea tile, layer) in range, its transform makeTile's scaled signed permutation; rebuilt only when
+  tiles change (`seaTilesChanged` 0 on profiled flights). One query sees both layers.
+- **Overlap**: both layers fill the same slab (y -80..80, the second shifted half a tile in x / z), so hulls overlap, and a jump
+  is exact only from outside every hull. The union's inside is a count (+1 front face, -1 back face), and every face crossing
+  costs a query: not one query per empty run. The CPU estimate on the walk frame's lattice: 5.9 faces a ray (p50 5, p90 12,
+  max 28) with L1 / L2 hulls, ~6.9 queries a ray with the final miss, ~2.4M for the 342k lattice rays.
+- **March**: outside every hull, take the query's front-face hit and jump there; inside, today's lean chain steps, and the
+  pending query's face says when the count changes. No image change if the dilation covers the reconstruction's reach
+  (trilinear, fade parent, skirts): the renderer must take the margin from the codec, not R0's one cell.
+- **Ceiling**: at most nav_probe1's 2.57x warp-paid, less query cost and lane divergence. It does not lower `db20cf3b`'s floor
+  for samples in cloud, so 2 ms also needs the lit-sample arm (packed density + sun from shared bricks, one coarse world light
+  fetch for far field / cache / octaves), measured alone against the path trace.
+
+Gates, stop rules set before any run:
+- **R0 query cost** (`form_r_scene.py` + `form_r_trace.py`, slangpy on D3D12, minutes, no renderer change): every lattice ray of
+  the 4K walk frame, every face crossing. Stop if it costs more than 0.5 ms. Sanity: shuffled ray order must be slower with
+  identical counts; anchor within ~5%; the facing convention must leave no first hit on a back face; first entries must fall in
+  the CPU reference interval.
+- **R1 renderer arm** (walk only, one launch, off / on / off / on): queries replace empty stepping; sanity arm with undilated
+  hulls must change the image. Stop if units + query fall less than 15%.
+- **R2 lit-sample arm**: its own run against the saved path trace.
+
+R0 so far (this container, no GPU): the scene half ran. Hulls are closed and outward (signed volume equals cell volume exactly,
+directed edges balanced), 345 instances lie within the near view distance, the far rule needs levels 0-2 (27 instances want
+level 0 and get the L1 hull, or L2 where L1 is undecoded), 342,002 lattice rays reach the slab, and 1,811 of 2,048 check rays
+enter a hull. The GPU half has not run; its Slang source type-checks (the CPU target rejects only the ray-query capability). On
+the 4080 Laptop, decode L1 for every asset first, or R0 times L2 hulls for four of the five and understates the cost:
+
+```
+for i in 0 1 2 3 4: hstrlib_dense IntelSea/half/intelCloudLib_dense.$i.L.hstrlib 1 a${i}_L1.npy
+                    hstrlib_dense IntelSea/half/intelCloudLib_dense.$i.L.hstrlib 2 a${i}_L2.npy
+python form_r_scene.py --volumes . --out form_r_walk.npz            # ~20 s; --level-rule near for finer, heavier hulls
+pip install slangpy
+python form_r_trace.py form_r_walk.npz                              # prints facing, CPU check, counts, four timed arms, verdict
+```
+
 ## 7. In this commit
 
 - `LIT_VOLUME.md` (this file).
@@ -217,6 +272,7 @@ memory and turnover are the shared line. It needs the owner's decision on the sc
 - `scripts/HSTR/bench/litvolume/lit_volume_fit.py` (S0) and `lit_volume_budget.py` (S1). Both are smoke-tested on a synthetic
   volume only (`--synthetic`). S0's sanity arm scores exactly 0, its coarse arm is clearly worse, and its anchor repeats to the
   digit. The real-data runs have not happened yet.
+- `scripts/HSTR/bench/litvolume/form_r_scene.py`, `form_r_trace.py`, `form_r_trace.slang`: Form R gate R0 (section 6c).
 
 To run them on the half-resolution Intel sea (`IntelSea/half`, five assets):
 
