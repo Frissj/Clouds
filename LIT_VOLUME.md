@@ -166,6 +166,48 @@ skip / ship again. Sanity arm: LWV with sun depth forced to 0 (must change the i
 within +1% of the anchor (0.020228) with images looked at, motion `HSTR_MOTION_SCORE=2` walk within the anchors' spread, and walk
 / sprint frame time with bake cost counted.
 
+## 6b. Results (2026-10-07, real Intel half-resolution clouds, clouds-v1 package)
+
+**S0 - Form A fails its stop rule.** Asset 0 at level 1, sea fit scale 0.784 (level-1 instance voxel 0.392 world units at scale
+1), 48 crops (12 each rim / interior / wispy / any) x 2 instance transforms, 768 rays and 4,800 columns a crop (`s0_run1`, 410 s).
+Harness checks hold: SANITY aligned 0 exactly in every metric, SANITY c = 2 clearly worse, anchor identical to the digit.
+
+| arm | memory vs instanced | column p99 | columns > 0.0365 | rays \|dL\|/L90 > 0.02 | rim rays > 0.02 | interior rays > 0.02 |
+|---|---|---|---|---|---|---|
+| point c = 1.0 | 0.58x | 0.0549 | 2.32% | 8.29% | 14.25% | 0.31% |
+| point c = 0.8 | 1.14x | 0.0444 | 1.55% | 4.85% | 7.68% | 0.14% |
+| point c = 0.65 | 2.13x | 0.0372 | 1.04% | 2.74% | 3.82% | 0.05% |
+| point c = 0.5 | 4.67x | 0.0292 | 0.58% | 1.21% | 1.43% | 0.01% |
+| prefilter c = 1.0 | 0.58x | 0.0408 | 1.27% | 4.90% | 8.09% | 0.22% |
+| prefilter c = 0.8 | 1.14x | 0.0314 | 0.71% | 2.11% | 2.92% | 0.12% |
+| SANITY c = 2 | 0.07x | 0.1102 | 6.91% | 25.21% | 43.88% | 2.75% |
+
+The rule needed column p99 <= 0.0365 **and** <= 1% of rays over 0.02 at some c >= 0.65. No arm meets both. Even c = 0.5 at 4.7x
+memory puts 1.21% of rays over. The error is the second interpolation at rims: at c = 0.65, rim rays 3.82% and rim column p99
+0.0527, against interior 0.05% / 0.0016. The wispy class's ray share (17-23%) is inflated by its tiny L90 and is not what
+fails the rule: rim and "any" fail it alone. Not tested: prefilter at c = 0.65.
+
+**S1 - reduced run (walk only, 3 frames, rays every 8 px, `s1_run2`).** The full run (4 px, 6 walk + 4 sprint frames) needs over
+an hour on the 4-core container and was stopped. Frame 2 (bricks kept 4 frames, so the history is not yet full):
+
+| set | bricks | MB at 2 KB | new this frame |
+|---|---|---|---|
+| world c = 1.0 | 1.80M | 3,428 | 162k |
+| world c = 0.65 | 2.69M | 5,136 | 384k |
+| per-instance | 1.85M | 3,527 | 174k |
+| shared asset bricks (today's) | 1.40M | 2,666 | 70k |
+
+Absolute sizes are not the renderer's. The same counting puts today's shared set at 1.4M bricks and 70k new a frame, but the
+renderer caps at 243k and streams <= 1,024 a frame (and is starved in flight, `57499ed5`: 102-136k held of 243k wanted). The sim
+counts every brick a sample in cloud touches, through a coarse level-4 transmittance with no empty-box or majorant skipping. The
+ratios under identical counting are the result: world c = 1.0 costs 1.3x the shared set's memory and 2.3x its turnover; c = 0.65,
+the setting S0 would need, costs 1.9x and 5.5x. By the stated rule (> 2.6 GB or > 4k new a frame) Form A also fails S1. So does the
+shared baseline under this counting, so S1's absolute threshold cannot separate the forms; the ratios can.
+
+**Reading.** Form A (de-instanced, resampled world bricks) fails S0 outright and costs 2-5x the turnover of shared bricks. Form B
+(aligned instances, shared lit bricks) is untouched by both: no resampling (S0 is exactly its SANITY aligned arm: 0), and its
+memory and turnover are the shared line. It needs the owner's decision on the scene layout before the renderer gates (S2 / S3).
+
 ## 7. In this commit
 
 - `LIT_VOLUME.md` (this file).
