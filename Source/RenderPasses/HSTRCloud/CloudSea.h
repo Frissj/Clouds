@@ -27,6 +27,11 @@ struct CloudSeaDesc
     /// layer-1 cloud straddles four layer-0 tiles and neighbouring clouds overlap and merge instead of standing in rows. A domain
     /// voxel is covered by one tile of each layer; its density is their sum (the proxy here, the bricks in cameraExtinction).
     uint32_t layers = 1;
+    /// Form B (LIT_VOLUME.md section 4b): 0 off. L > 0: every instance at one scale (1) and its asset's voxel grid snapped to the world
+    /// grid of level-L bricks (8 << L source voxels from the origin), with the fit scale lowered so that half a tile (the layers'
+    /// stagger) is a whole number of those bricks. Asset bricks of levels <= L then land exactly on world bricks under any quarter
+    /// turn or mirror (padded asset dims are multiples of 128), so a world page can name a shared asset brick.
+    uint32_t alignLevel = 0;
 };
 
 /// Where the sea's workers write a tile's GPU upload: host-visible staging buffers of one tile's packed volume each (HSTRCloud).
@@ -93,6 +98,8 @@ public:
     float getVoxelWorld() const { return mVoxelWorld; }
     /// World size of a VDB unit at instance scale 1 (an asset's source voxel is asset.voxelWorld times this, times the scale).
     float getFitScale() const { return mFitScale; }
+    /// alignLevel > 0: the world size of one source voxel, the same for every instance (0 otherwise).
+    float getAlignVoxelWorld() const { return mDesc.alignLevel > 0 ? mAlignWorld / float(8u << mDesc.alignLevel) : 0.f; }
     /// Mean density of a domain voxel (inside the domain).
     float meanAt(uint3 voxel) const
     {
@@ -153,6 +160,7 @@ private:
     uint3 mDims = uint3(0);
     float mVoxelWorld = 1.f;
     float mFitScale = 1.f;                ///< World size of a VDB unit so the largest cloud fits a tile.
+    float mAlignWorld = 0.f;              ///< alignLevel > 0: world size of an aligned brick.
     std::vector<uint3> mContentMin;       ///< Per asset: bounds of non-zero source voxels.
     std::vector<uint3> mContentMax;
     std::vector<TileVolume> mVolumes;     ///< Per slot (a finished tile's volume is swapped in).

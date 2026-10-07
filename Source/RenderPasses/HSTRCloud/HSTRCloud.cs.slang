@@ -63,6 +63,14 @@ import Atmosphere;
 #define HSTR_FORM_R 0 // formR: the lean marches cross empty space between the occupancy hulls by ray query (1), or count it (2).
                       // MEASURED and REJECTED (formr1-4): see HSTRCloud.h updateHullTlas.
 #endif
+#ifndef HSTR_FORM_B
+#define HSTR_FORM_B 0 // formB: the lean marches read the world brick table over an aligned sea (1), and count what it answered (2).
+#endif
+static const uint kFormBEmpty = 1u << 30;
+static const uint kFormBFallback = 1u << 31;
+#if HSTR_FORM_B == 2
+static uint gFormBCount[4]; // kFormBProbe: table texel reads, table empties, fallbacks, outside the table or level 3+.
+#endif
 // formR: one instance per occupied sea tile slot over its asset's hull (HSTRCloud.cpp). Declared in every variant so the passes'
 // variables keep one layout whatever HSTR_FORM_R a pass was last compiled with.
 RaytracingAccelerationStructure gHullTlas;
@@ -496,6 +504,17 @@ struct HSTRCloudRenderer
     /// brick whose bake it is with its level in bits 24-27.
     StructuredBuffer<uint2> hstrCloudSunResolved;
     RWStructuredBuffer<uint2> hstrCloudSunResolvedOutput;
+    /// formB's world brick table (buildFormBTable): per level-2 world brick 0 (empty), kFormBFallback, or 1 + a record. A record:
+    /// x the level-2 cell word, y its (minValue, range) as half2, z / w the first of its 8 level-1 / 64 level-0 children (~0: none).
+    /// A child: (cell word, half2 minValue / range). Cell word: packed atlas slot in bits 0-20, per asset axis r the world axis it
+    /// reads in bits 21 + 2r and its mirror in bit 27 + r, kFormBEmpty, kFormBFallback.
+    StructuredBuffer<uint> hstrFormBTable;
+    StructuredBuffer<uint4> hstrFormBRecords;
+    StructuredBuffer<uint2> hstrFormBChildren;
+    RWStructuredBuffer<uint> hstrFormBTableOutput;
+    RWStructuredBuffer<uint4> hstrFormBRecordsOutput;
+    RWStructuredBuffer<uint2> hstrFormBChildrenOutput;
+    RWStructuredBuffer<uint> hstrFormBCountsOutput; ///< Records, children allocated; fallback cells, empty cells, two-layer bricks.
     // GPU sun bake scheduling (CloudResidencyDesc::gpuSun): the scheduler owns the slot table, the bake frames and the free slots.
     RWStructuredBuffer<uint> hstrCloudSunSlotsOutput;
     RWStructuredBuffer<HSTRCloudSunBake> hstrCloudSunBakesOutput;
@@ -7674,6 +7693,283 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// formB: the world source voxel (voxel centres at integers) at domain voxel v.
+    float3 formBVoxel(float3 v)
+    {
+        const float3 world = params.seaOrigin + (v + 0.5f) * params.seaVoxelSize;
+        return (world - float3(params.formBOriginX, params.formBOriginY, params.formBOriginZ)) / params.formBVoxelWorld - 0.5f;
+    }
+
+    /// formB's table build: the cell word and half2 (minValue, range) of instance's level-`level` brick holding source voxel x.
+    /// absent: the level is mapped through a coarser brick (the parent's word serves, as the old chain reads that ancestor).
+    uint2 formBCellWord(HSTRCloudInstance instance, float3 x, uint level, out bool absent)
+    {
+        absent = false;
+        const int3 i = int3(floor(x + 0.5f));
+        const uint3 pages = uint3(instance.pageDims & 1023u, (instance.pageDims >> 10) & 1023u, instance.pageDims >> 20);
+        if (any(i < 0) || any(i >= int3(pages * 8u)))
+            return uint2(kFormBEmpty, 0u);
+        if (level > instance.topLevel)
+            return uint2(kFormBFallback, 0u);
+        uint base = instance.levelPageBase;
+        for (uint l = 0; l < level; ++l)
+        {
+            const uint3 d = (pages + (1u << l) - 1u) >> l;
+            base += d.x * d.y * d.z;
+        }
+        const uint3 levelDims = (pages + (1u << level) - 1u) >> level;
+        const uint3 c = (uint3(i) >> 3u) >> level;
+        const uint word = hstrCloudLevelPages[base + c.x + levelDims.x * (c.y + levelDims.y * c.z)];
+        if (word == kCloudRefNone)
+            return uint2(kFormBFallback, 0u); // Not mapped: the old chain answers with the proxy.
+        if ((word & kCloudLevelEmpty) != 0u)
+        {
+            // An empty octant: empty, unless a neighbour's skirt reaches into one of its level-0 pages (the old chain ramps those).
+            const HSTRCloudAsset asset = hstrCloudAssets[instance.asset];
+            const uint3 assetPages = asset.dims >> 3u;
+            const uint span = 1u << level;
+            uint holds = 0u;
+            for (uint z = 0; z < span; ++z)
+                for (uint y = 0; y < span; ++y)
+                    for (uint x0 = 0; x0 < span; ++x0)
+                    {
+                        const uint3 p = c * span + uint3(x0, y, z);
+                        if (all(p < assetPages))
+                            holds |= hstrCloudSkirtMasks[asset.pageOffset + p.x + assetPages.x * (p.y + assetPages.y * p.z)];
+                    }
+            return uint2(holds != 0u ? kFormBFallback : kFormBEmpty, 0u);
+        }
+        if (((word >> 24) & 15u) != level)
+        {
+            absent = true;
+            return uint2(kFormBFallback, 0u);
+        }
+        const uint entry = word & 0xFFFFFFu;
+        const HSTRCloudBrick brick = hstrCloudBricks[entry];
+        const uint2 resolved = hstrCloudSunResolved[entry * kCloudSunClasses + instance.sunClass];
+        if (brick.fade < 1.f || (brick.info & kCloudBrickConstant) != 0u || resolved.x == kCloudRefNone || (resolved.y >> 24) != level ||
+            resolved.x >= (1u << 21))
+            return uint2(kFormBFallback, 0u);
+        uint code = resolved.x;
+        const float3 rows[3] = {instance.row0.xyz, instance.row1.xyz, instance.row2.xyz};
+        [unroll]
+        for (uint r = 0; r < 3; ++r)
+        {
+            const float3 a = abs(rows[r]);
+            const uint column = a.x >= a.y && a.x >= a.z ? 0u : (a.y >= a.z ? 1u : 2u);
+            code |= column << (21u + 2u * r);
+            if (rows[r][column] < 0.f)
+                code |= 1u << (27u + r);
+        }
+        return uint2(code, f32tof16(brick.minValue) | (f32tof16(brick.range) << 16));
+    }
+
+    /// buildFormBTable: one level-2 world brick of the table. The instance of each layer at the brick's centre; none: empty; two:
+    /// the old chain; one: a record with its level-2 word and, near the camera, its level-1 and level-0 children.
+    void buildFormBCell(uint index)
+    {
+        const uint3 dims = uint3(params.formBTableDimX, params.formBTableDimY, params.formBTableDimZ);
+        if (index >= dims.x * dims.y * dims.z)
+            return;
+        const int3 b = int3(index % dims.x, (index / dims.x) % dims.y, index / (dims.x * dims.y)) +
+                       int3(params.formBTableMinX, params.formBTableMinY, params.formBTableMinZ);
+        const float s = params.formBVoxelWorld;
+        const float3 origin = float3(params.formBOriginX, params.formBOriginY, params.formBOriginZ);
+        const float3 centre = float3(b * 32) + 15.5f;
+        const float3 world = origin + (centre + 0.5f) * s;
+        const float3 v = (world - params.seaOrigin) / params.seaVoxelSize - 0.5f;
+        // Each layer's level-2 word here: a layer counts where its brick holds content (or cannot be answered); an empty octant of
+        // one layer's asset box does not stop the other layer's brick from being served.
+        uint layers = 0u;
+        bool fallback = false;
+        HSTRCloudInstance found = {};
+        float3 xFound = 0.f;
+        uint2 word2 = uint2(kFormBEmpty, 0u);
+        for (uint layer = 0; layer < params.cloudLayers; ++layer)
+        {
+            uint instanceIndex;
+            float3 x;
+            float footprintLevel;
+            HSTRCloudInstance instance;
+            if (!cloudInstanceAt(v, 0.f, instanceIndex, x, footprintLevel, instance, layer))
+                continue;
+            bool absent;
+            const uint2 word = formBCellWord(instance, x, 2u, absent);
+            if ((word.x & kFormBFallback) != 0u)
+                fallback = true;
+            else if ((word.x & kFormBEmpty) == 0u)
+            {
+                ++layers;
+                found = instance;
+                xFound = x;
+                word2 = word;
+            }
+        }
+        uint unused;
+        if (layers > 1u || (layers == 1u && fallback))
+        {
+            InterlockedAdd(hstrFormBCountsOutput[4], 1u, unused);
+            hstrFormBTableOutput[index] = kFormBFallback;
+            return;
+        }
+        if (fallback || layers == 0u)
+        {
+            InterlockedAdd(hstrFormBCountsOutput[fallback ? 2u : 3u], 1u, unused);
+            hstrFormBTableOutput[index] = fallback ? kFormBFallback : 0u;
+            return;
+        }
+        uint record;
+        InterlockedAdd(hstrFormBCountsOutput[0], 1u, record);
+        if (record >= params.formBRecordCapacity)
+        {
+            hstrFormBTableOutput[index] = kFormBFallback;
+            return;
+        }
+        // Asset source voxels follow world source voxels by the instance's signed permutation, at one scale (the aligned sea).
+        float3x3 axes;
+        axes[0] = round(normalize(found.row0.xyz));
+        axes[1] = round(normalize(found.row1.xyz));
+        axes[2] = round(normalize(found.row2.xyz));
+        const float distance = length(world - gScene.camera.data.posW) - 32.f * s;
+        uint4 r = uint4(word2.x, word2.y, ~0u, ~0u);
+        [unroll]
+        for (uint level = 0; level < 2u; ++level)
+        {
+            if (distance >= (level == 0u ? params.formBChildDistance0 : params.formBChildDistance1))
+                continue;
+            const uint per = level == 0u ? 4u : 2u;
+            const uint count = per * per * per;
+            uint childBase;
+            InterlockedAdd(hstrFormBCountsOutput[1], count, childBase);
+            if (childBase + count > params.formBChildCapacity)
+                continue;
+            for (uint k = 0; k < count; ++k)
+            {
+                const uint3 kk = uint3(k % per, (k / per) % per, k / (per * per));
+                const float3 childCentre = float3(b * 32) + float3(kk * (8u << level)) + (float(4u << level) - 0.5f);
+                const float3 x = xFound + mul(axes, childCentre - centre);
+                bool childAbsent;
+                const uint2 word = formBCellWord(found, x, level, childAbsent);
+                hstrFormBChildrenOutput[childBase + k] = childAbsent ? uint2(kFormBEmpty | kFormBFallback, 0u) : word;
+            }
+            if (level == 0u)
+                r.w = childBase;
+            else
+                r.z = childBase;
+        }
+        hstrFormBRecordsOutput[record] = r;
+        hstrFormBTableOutput[index] = record + 1u;
+    }
+
+#if HSTR_FORM_B != 0
+    /// formB's lean sample (LIT_VOLUME.md section 4b): where the world table answers v, its density from one packed (density, sun)
+    /// texel - table entry, record, child, texel - with the sun bake in hit for leanSunDepth, or an empty cell's exit in skipTo.
+    /// False: the old chain answers (two layers, a skirt, a fading or unbaked brick, outside the table, level 3+).
+    bool formBExtinction(CutRay ray, float3 v, float footprint, float tSample, inout float fineVoxels, inout LeanHit hit,
+                         inout float skipTo, out float density)
+    {
+        density = 0.f;
+        const float s = params.formBVoxelWorld;
+        const uint level = uint(max(log2(max(footprint / s, 1.f)) + params.cloudLodBias, 0.f));
+        const float3 u = formBVoxel(v);
+        const int3 b = int3(floor((u + 0.5f) / 32.f));
+        const int3 cell = b - int3(params.formBTableMinX, params.formBTableMinY, params.formBTableMinZ);
+        const uint3 dims = uint3(params.formBTableDimX, params.formBTableDimY, params.formBTableDimZ);
+        if (level > 2u || any(cell < 0) || any(cell >= int3(dims)))
+        {
+#if HSTR_FORM_B == 2
+            ++gFormBCount[3];
+#endif
+            return false;
+        }
+        const uint entry = hstrFormBTable[cell.x + dims.x * (cell.y + dims.y * cell.z)];
+        uint word = kFormBEmpty;
+        uint minRange = 0u;
+        uint wordLevel = 2u;
+        if (entry == kFormBFallback)
+        {
+#if HSTR_FORM_B == 2
+            ++gFormBCount[2];
+#endif
+            return false;
+        }
+        if (entry != 0u)
+        {
+            const uint4 r = hstrFormBRecords[entry - 1u];
+            word = r.x;
+            minRange = r.y;
+            const uint childBase = level == 1u ? r.z : (level == 0u ? r.w : ~0u);
+            if (childBase != ~0u)
+            {
+                const uint per = level == 1u ? 2u : 4u;
+                const int3 k = int3(floor((u + 0.5f) / float(8u << level))) - b * int(per);
+                const uint2 child = hstrFormBChildren[childBase + uint(k.x) + per * (uint(k.y) + per * uint(k.z))];
+                if (child.x != (kFormBEmpty | kFormBFallback))
+                {
+                    word = child.x;
+                    minRange = child.y;
+                    wordLevel = level;
+                }
+            }
+        }
+        if ((word & kFormBFallback) != 0u)
+        {
+#if HSTR_FORM_B == 2
+            ++gFormBCount[2];
+#endif
+            return false;
+        }
+        const float size = float(8u << wordLevel);
+        const float3 lo = floor((u + 0.5f) / size) * size - 0.5f;
+        if ((word & kFormBEmpty) != 0u)
+        {
+            const float3 du = ray.direction * float(params.hstrCellWidth) * params.seaVoxelSize / s;
+            float leave = 1e30f;
+            [unroll]
+            for (uint a = 0; a < 3; ++a)
+                if (abs(du[a]) > 1e-12f)
+                    leave = min(leave, ((du[a] > 0.f ? lo[a] + size : lo[a]) - u[a]) / du[a]);
+            skipTo = tSample + max(leave, 0.f);
+            fineVoxels = 1.f;
+            hit.entry = kCloudRefNone;
+#if HSTR_FORM_B == 2
+            ++gFormBCount[1];
+#endif
+            return true;
+        }
+        const float3 local = (u - lo) / float(1u << wordLevel) - 0.5f;
+        float3 a;
+        [unroll]
+        for (uint r = 0; r < 3; ++r)
+        {
+            const float l = local[(word >> (21u + 2u * r)) & 3u];
+            a[r] = ((word >> (27u + r)) & 1u) != 0u ? 7.f - l : l;
+        }
+        a = clamp(a, -0.5f, 7.5f);
+        const uint shift = params.cloudAtlasShift;
+        const uint mask = (1u << shift) - 1u;
+        const uint slotBits = word & 0x1FFFFFu;
+        const uint3 slot = uint3(slotBits & mask, (slotBits >> shift) & mask, slotBits >> (2u * shift));
+        const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + a;
+        const float2 stored = hstrCloudSunPacked.SampleLevel(hstrLinearClampSampler, texel * params.cloudSunAtlasInvSize, 0.f);
+        const float scale = gScene.getGridVolume(0).data.densityScale * params.densityScale;
+        density = (f16tof32(minRange) + f16tof32(minRange >> 16) * stored.y * stored.y) * scale;
+        // The aligned sea has one instance scale (1): the bake's near reach and the source voxel size are the sea's.
+        hit.entry = 0u;
+        hit.instance = 0u;
+        hit.levels = wordLevel | (wordLevel << 8) | kLeanHitPackedSun;
+        hit.x = float3(stored.x, 0.f, 0.f);
+        hit.scale = s;
+        hit.near = 1.f;
+        fineVoxels = float(1u << wordLevel) * s / params.seaVoxelSize.x;
+        skipTo = -1.f;
+#if HSTR_FORM_B == 2
+        ++gFormBCount[0];
+#endif
+        return true;
+    }
+#endif
+
     /// cameraExtinctionAtVoxel for the lean march: the same value, but whatever the rest of the step needs from the lookup is taken
     /// out here - the empty box's exit (skipTo, negative where the sample is not an empty box) and the brick for the sun (hit) -
     /// so the CloudSample dies inside this function instead of staying live across the lighting.
@@ -8059,6 +8355,13 @@ struct HSTRCloudRenderer
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
                                ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) * params.seaFadeInverse)
                                : 1.f;
+#if HSTR_FORM_B != 0
+        {
+            float density;
+            if (formBExtinction(ray, v, footprint, tSample, fineVoxels, hit, skipTo, density))
+                return fade * density;
+        }
+#endif
         const float proxy = extinctionAtVoxel(v);
         if (params.cloudLayers > 1)
             return fade * leanExtinctionLayered(ray, v, footprint, tSample, proxy, fineVoxels, hit, skipTo);
@@ -8308,6 +8611,10 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
+#if HSTR_FORM_B == 2
+        for (uint k = 0; k < 4; ++k)
+            gFormBCount[k] = 0u;
+#endif
 #if HSTR_FORM_R != 0
         // formR (LIT_VOLUME.md section 6c, gate R1): the hulls of both layers' instances overlap, so the union's inside is a count of
         // faces crossed (+1 front, -1 back), started where the ray leaves the hulls' y band backwards (outside every hull) and kept
@@ -8559,6 +8866,18 @@ struct HSTRCloudRenderer
             gTailTransmittance = transmittance;
 #endif
         }
+#if HSTR_FORM_B == 2
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint sum = WaveActiveSum(gFormBCount[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kFormBProbe + k], sum, unused);
+            }
+        }
+#endif
 #if HSTR_FORM_R == 2
         {
             const uint counts[7] = {hullQueries, hullOutside, hullMissed, hullMissedProxy, hullDrift, steps, 1u};
@@ -16119,6 +16438,13 @@ void resolveDirtyCloudPages(uint3 id: SV_DispatchThreadID)
         gHSTRCloud.hstrCloudLevelPagesOutput[base + c.x + levelDims.x * (c.y + levelDims.y * c.z)] = word;
         base += levelDims.x * levelDims.y * levelDims.z;
     }
+}
+
+/// formB's world brick table (HSTRCloud::updateFormBTable): one thread per level-2 world brick, 4096 a row.
+[numthreads(64, 1, 1)]
+void buildFormBTable(uint3 id: SV_DispatchThreadID)
+{
+    gHSTRCloud.buildFormBCell(id.x + 4096u * id.y);
 }
 
 /// The sun bake every brick's samples read, per orientation class, resolved once a frame (after the frame's bakes and slot changes)

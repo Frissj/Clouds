@@ -78,7 +78,11 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # ... and formR 2's (kFormRProbe): hull queries, steps outside every hull, density samples there (bricks / proxy), back
          # faces met outside (drift), steps, rays; the hull structure's instances and triangles.
          tuple(f"formR{n}" for n in ("Queries", "OutsideSteps", "Missed", "MissedProxy", "Drift", "Steps", "Rays", "Instances",
-                                     "Triangles")))
+                                     "Triangles")) +
+         # ... and formB 2's (kFormBProbe): lean samples answered by a table texel / a table empty, sent to the old chain by a
+         # fallback word / by being outside the table or level 3+; the last table build's counts.
+         tuple(f"formB{n}" for n in ("Texels", "Empties", "Fallbacks", "Outside", "BuildRecords", "BuildChildren",
+                                     "BuildFallbackCells", "BuildEmptyCells", "BuildTwoLayerCells", "Builds")))
 
 
 def score():

@@ -57,6 +57,20 @@ CloudSea::CloudSea(std::vector<CloudAsset> assets, const CloudSeaDesc& desc) : m
         const float3 extent = float3(mContentMax.back() - mContentMin.back() + 1u) * asset.voxelWorld;
         mFitScale = std::min(mFitScale, 0.98f * std::min(mDesc.tileWorld / std::max(extent.x, extent.z), mDesc.layerHeight / extent.y));
     }
+    if (mDesc.alignLevel > 0)
+    {
+        // Half a tile a whole number of aligned bricks (makeTile snaps each asset onto that grid). Every asset shares one voxel size.
+        const float voxelWorld = mAssets[0].voxelWorld;
+        for (const CloudAsset& asset : mAssets)
+            FALCOR_CHECK(std::abs(asset.voxelWorld - voxelWorld) <= 1e-5f * voxelWorld,
+                         "HSTRCloud: an aligned cloud sea needs one source voxel size ({} and {}).", voxelWorld, asset.voxelWorld);
+        const float brickVoxels = float(8u << mDesc.alignLevel);
+        const float bricks = std::ceil(0.5f * mDesc.tileWorld / (brickVoxels * voxelWorld * mFitScale));
+        mFitScale = 0.5f * mDesc.tileWorld / (bricks * brickVoxels * voxelWorld);
+        mAlignWorld = brickVoxels * voxelWorld * mFitScale;
+        logInfo("HSTRCloud: aligned cloud sea, level-{} bricks of {:.4f} world units, {} to half a tile.", mDesc.alignLevel, mAlignWorld,
+                bricks);
+    }
     mDesc.layers = std::clamp(mDesc.layers, 1u, kCloudSeaLayers);
     mTiles.resize(mDesc.tiles * mDesc.tiles);
     mInstanceTiles.resize(mDesc.layers * mTiles.size());
@@ -128,12 +142,13 @@ CloudSea::Tile CloudSea::makeTile(int2 world, uint32_t layer) const
     const CloudAsset& asset = mAssets[assetID];
     const uint32_t turns = std::min(uint32_t(rng.next() * 4.f), 3u);
     const bool mirror = rng.next() < 0.5f;
-    const float scale = kCloudSeaMinScale + (1.f - kCloudSeaMinScale) * rng.next();
+    const float drawnScale = kCloudSeaMinScale + (1.f - kCloudSeaMinScale) * rng.next();
+    const float scale = mDesc.alignLevel > 0 ? 1.f : drawnScale; // Aligned: one scale (the draw is kept so later draws match).
     const float sourceVoxelWorld = asset.voxelWorld * mFitScale * scale;
     const float3 contentVoxels = float3(mContentMax[assetID] - mContentMin[assetID] + 1u);
     const float3 extent = contentVoxels * sourceVoxelWorld;
     const float3 footprint = (turns & 1u) ? float3(extent.z, extent.y, extent.x) : extent;
-    const float3 offset(
+    float3 offset(
         rng.next() * std::max(0.f, mDesc.tileWorld - footprint.x),
         // Layered, the bases spread over the whole layer height: with one layer they sat within 30% of it, a flat line of bases.
         (mDesc.layers > 1 ? 1.f : 0.3f) * rng.next() * std::max(0.f, mDesc.layerHeight - footprint.y),
@@ -148,7 +163,22 @@ CloudSea::Tile CloudSea::makeTile(int2 world, uint32_t layer) const
         linear = mul(float3x3{0.f, 0.f, 1.f, 0.f, 1.f, 0.f, -1.f, 0.f, 0.f}, linear);
     const float3x3 forward = linear * sourceVoxelWorld;
     const float3 centre = offset + 0.5f * footprint;
-    const float3 translation = centre - mul(forward, 0.5f * (contentVoxels - 1.f));
+    float3 translation = centre - mul(forward, 0.5f * (contentVoxels - 1.f));
+    if (mDesc.alignLevel > 0)
+    {
+        // The asset's voxel grid corner (source voxel -0.5) onto the brick grid. The tile corner is on it (half a tile is whole
+        // bricks), so snap tile-local: down, or up where down would leave the tile's room for the cloud.
+        const float3 room(mDesc.tileWorld - footprint.x, mDesc.layerHeight - footprint.y, mDesc.tileWorld - footprint.z);
+        const float3 gridCorner = mul(forward, float3(-0.5f) - float3(mContentMin[assetID])) + translation;
+        float3 delta;
+        for (int a = 0; a < 3; ++a)
+        {
+            const float down = std::floor(gridCorner[a] / mAlignWorld) * mAlignWorld - gridCorner[a];
+            delta[a] = offset[a] + down >= 0.f || offset[a] + down + mAlignWorld > room[a] ? down : down + mAlignWorld;
+        }
+        translation += delta;
+        offset += delta;
+    }
     // The inverse of a scaled signed permutation is its transpose over the squared scale.
     const float3x3 inverse = transpose(linear) * (1.f / sourceVoxelWorld);
     // Domain tile-local voxel p (voxel centres at integers) to asset source voxel x: q = (p + 0.5) size.

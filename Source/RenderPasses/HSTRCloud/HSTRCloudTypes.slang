@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 464;
+static const uint kBeamCountSlots = 472;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -173,6 +173,10 @@ static const uint kBeamProbeDistance = 385;
 /// samples outside every hull (non-resident bricks answered by the proxy), back faces met outside every hull (count drift, must
 /// be 0), all march steps, rays.
 static const uint kFormRProbe = 457;
+/// formB 2 (HSTR_FORM_B 2): over the lean marches' samples, answered by the world table (texel read), answered empty, sent to the
+/// old chain (fallback word, outside the table, level 3+); and over the table build: records, children, fallback cells.
+static const uint kFormBProbe = 464;
+static const uint kFormBProbeSlots = 8;
 static const uint kBeamDirtyBlocks = 28;     ///< Blocks the translation guard could not certify, and so the work this build generated.
 static const uint kBeamDirtyUnverified = 29; ///< Of those, the ones it knows nothing about rather than the ones whose bound failed.
 static const uint kBeamDirtyOwnMarched = 30;   ///< Units of listed blocks the dirty march marched.
@@ -1934,6 +1938,23 @@ struct HSTRCloudParams
     /// leaves this band backwards, so the count starts outside every hull.
     float formRHullYMin = 0.f;
     float formRHullYMax = 0.f;
+    /// formB (LIT_VOLUME.md section 4b, gate S2): the world brick table over an aligned sea (cloudSeaAlign 2). World source voxel u
+    /// (voxel centres at integers) = (world - formBOrigin) / formBVoxelWorld - 0.5; the table holds level-2 bricks (32 source voxels)
+    /// formBTableMin + [0, formBTableDim) per axis.
+    float formBOriginX = 0.f;
+    float formBOriginY = 0.f;
+    float formBOriginZ = 0.f;
+    float formBVoxelWorld = 0.f;
+    int formBTableMinX = 0;
+    int formBTableMinY = 0;
+    int formBTableMinZ = 0;
+    uint formBTableDimX = 0;
+    uint formBTableDimY = 0;
+    uint formBTableDimZ = 0;
+    uint formBRecordCapacity = 0;
+    uint formBChildCapacity = 0;
+    float formBChildDistance1 = 0.f; ///< Level-1 children are built for bricks nearer the table's camera than this (world units).
+    float formBChildDistance0 = 0.f; ///< Level-0 children likewise.
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

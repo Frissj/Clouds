@@ -311,7 +311,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             mFarSeaDirty = true;
             continue;
         }
-        if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
+        if (key == "skyModel" || key == "cloudSeaLayers" || key == "cloudSeaAlign" || key == "cloudSunPoolScale" || key == "cloudSunAtlas8" || key.rfind("atmosphere", 0) == 0 ||
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
@@ -368,6 +368,8 @@ void HSTRCloud::parseProperties(const Properties& props)
                 mParams.cloudSunAtlas8 = bool(value) ? 1u : 0u;
             else if (key == "cloudSeaLayers")
                 mCloudSeaLayers = std::clamp(uint32_t(value), 1u, kCloudSeaLayers);
+            else if (key == "cloudSeaAlign")
+                mCloudSeaAlign = std::min(uint32_t(value), 4u);
             else if (key == "atmosphereSunColor")
                 mAtmosphereSunColor = value;
             else if (key == "atmosphereSunIntensity")
@@ -567,6 +569,17 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "formR")
         {
             mFormR = std::min(uint32_t(value), 2u);
+            continue;
+        }
+        if (key == "formB")
+        {
+            mFormB = std::min(uint32_t(value), 2u);
+            continue;
+        }
+        if (key == "formBChild1" || key == "formBChild0" || key == "formBRebuildDistance")
+        {
+            (key == "formBChild1" ? mFormBChildDistance1 : key == "formBChild0" ? mFormBChildDistance0 : mFormBRebuildDistance) = float(value);
+            mFormBValid = false; // Rebuilt with the new distances.
             continue;
         }
         if (key == "formRLevelBias")
@@ -1447,7 +1460,7 @@ void HSTRCloud::setProperties(const Properties& props)
             // The sun bake rate and pool are the residency's too: without them here a runtime change never rebuilt it (an arm set
             // them and kept the old residency). The sun atlas formats likewise (sunpacked2: cloudSunPacked set after load never made
             // its atlas, and both packed arms read the anchors' numbers to the last digit).
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             mCloudLibraryPath,
             mCloudProxyResolution,
             mCloudBrickPoolMB,
@@ -1456,6 +1469,7 @@ void HSTRCloud::setProperties(const Properties& props)
             mCloudSeaSeed,
             mCloudSeaCoverage,
             mCloudSeaLayers,
+            mCloudSeaAlign,
             mCloudSunBakesPerFrame,
             mCloudSunPoolScale,
             mCloudLodPixels,
@@ -1550,6 +1564,10 @@ Properties HSTRCloud::getProperties() const
     props["formR"] = mFormR;
     props["formRDilate"] = mFormRDilate;
     props["formRLevelBias"] = mFormRLevelBias;
+    props["formB"] = mFormB;
+    props["formBChild1"] = mFormBChildDistance1;
+    props["formBChild0"] = mFormBChildDistance0;
+    props["formBRebuildDistance"] = mFormBRebuildDistance;
     props["formRHulls"] = mFormRHulls;
     props["cloudLayerOracle"] = mParams.cloudLayerOracle;
     props["seaFarScale"] = mParams.seaFarScale;
@@ -1748,6 +1766,7 @@ Properties HSTRCloud::getProperties() const
     props[kCloudSeaSeed] = mCloudSeaSeed;
     props[kCloudSeaCoverage] = mCloudSeaCoverage;
     props["cloudSeaLayers"] = mCloudSeaLayers;
+    props["cloudSeaAlign"] = mCloudSeaAlign;
     props["cloudSunPoolScale"] = mCloudSunPoolScale;
     props["cloudSunAtlas8"] = mParams.cloudSunAtlas8 != 0;
     props["cloudSunPacked"] = mCloudSunPacked;
@@ -2253,6 +2272,13 @@ Properties HSTRCloud::getProperties() const
         const char* formRNames[] = {"Queries", "OutsideSteps", "Missed", "MissedProxy", "Drift", "Steps", "Rays"};
         for (uint32_t k = 0; k < 7; ++k)
             cloud[std::string("formR") + formRNames[k]] = mBeamLevelCounts[kFormRProbe + k];
+        const char* formBNames[] = {"Texels", "Empties", "Fallbacks", "Outside"};
+        for (uint32_t k = 0; k < 4; ++k)
+            cloud[std::string("formB") + formBNames[k]] = mBeamLevelCounts[kFormBProbe + k];
+        const char* formBBuildNames[] = {"Records", "Children", "FallbackCells", "EmptyCells", "TwoLayerCells"};
+        for (uint32_t k = 0; k < 5; ++k)
+            cloud[std::string("formBBuild") + formBBuildNames[k]] = mFormBStats[k];
+        cloud["formBBuilds"] = mFormBBuilds;
         cloud["formRInstances"] = mHullInstances;
         cloud["formRTriangles"] = mHullTriangles;
         for (uint32_t l = 0; l < kFormRLevels; ++l)
@@ -2571,6 +2597,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpResolveSkirtMasksPass = createPass("resolveCloudSkirtMasks");
     mpCheckSkirtMasksPass = createPass("checkCloudSkirtMasks");
     mpResolveCloudSunSlotsPass = createPass("resolveCloudSunSlots");
+    mpFormBBuildPass = createPass("buildFormBTable");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
     mpScanSunPass = createPass("scanSunBakes");
@@ -3083,12 +3110,13 @@ void HSTRCloud::buildCloudDomain()
     const AABB bounds = volume->getBounds();
     const float3 cameraPosition = mpScene->getCamera()->getPosition();
     const std::string seaKey = fmt::format(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         mCloudLibraryPath,
         mCloudSeaTiles,
         mCloudSeaSeed,
         mCloudSeaCoverage,
         mCloudSeaLayers,
+        mCloudSeaAlign,
         mCloudProxyResolution,
         bounds.minPoint,
         bounds.extent()
@@ -3109,6 +3137,7 @@ void HSTRCloud::buildCloudDomain()
         seaDesc.seed = mCloudSeaSeed;
         seaDesc.coverage = mCloudSeaCoverage;
         seaDesc.layers = mCloudSeaLayers;
+        seaDesc.alignLevel = mCloudSeaAlign;
         mpCloudSea = std::make_unique<hstrcloud::CloudSea>(std::move(library.assets), seaDesc);
         // Staging for three rows of tiles: a flight takes on at most a row and a column at a time. The load's full window
         // overflows it into host memory, which uploads from the main thread.
@@ -4779,6 +4808,9 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     {
         var["hstrDomainLayers"] = mpDomainLayers; // cloudLayerTightSkip.
         var["hstrDomainLayerDistance"] = mpDomainLayerDistance; // cloudLayerRunDistance.
+        var["hstrFormBTable"] = mpFormBTable; // formB.
+        var["hstrFormBRecords"] = mpFormBRecords;
+        var["hstrFormBChildren"] = mpFormBChildren;
         var["hstrDomainBlocks"] = mpDomainBlocks; // Its probe's check that the layer bits agree with the block maxima.
         var["hstrDomainVolume"] = mpDomainVolume; // Its probe's voxel-scale oracle (domainVoxelLayers).
     }
@@ -5451,7 +5483,10 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
-    pPass->getProgram()->addDefine("HSTR_SUN_PACKED", mCloudSunPackedRead && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
+    // formB reads the packed (density, sun) texel and hands its bake to leanSunDepth's packed branch.
+    const bool formB = mFormB != 0 && mFormBValid;
+    pPass->getProgram()->addDefine("HSTR_SUN_PACKED", (mCloudSunPackedRead || formB) && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_FORM_B", formB ? std::to_string(mFormB) : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_ORACLE", std::to_string(mParams.cloudLayerOracle));
     pPass->getProgram()->addDefine("HSTR_FORM_R", mHullTlas && mHullTlasFrame == mExecuteFrames ? std::to_string(mFormR) : "0");
 }
@@ -5918,6 +5953,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
     if (mFormR != 0 && mpCloudResidency && mpCloudSea && mpScene)
         updateHullTlas(pRenderContext);
+    if (mFormB != 0 && mpCloudResidency && mpCloudSea && mpScene)
+        updateFormBTable(pRenderContext);
 
     const auto& color = renderData.getTexture(kColor);
     // beamPolicy only ever reaches the guard-driven build that decided it (see decideBeamPolicy); every other march, the exact
@@ -8645,6 +8682,78 @@ void HSTRCloud::updateHullTlas(RenderContext* pRenderContext)
     mpDevice->getUploadHeap()->release(allocation);
     pRenderContext->uavBarrier(mpHullTlasBuffer.get());
     mHullTlasFrame = mExecuteFrames;
+}
+
+void HSTRCloud::updateFormBTable(RenderContext* pRenderContext)
+{
+    // Exact only where levels 0-2 align (cloudSeaAlign >= 2) and the packed atlas holds the bakes (cloudSunPacked 1).
+    const float s = mpCloudSea->getAlignVoxelWorld();
+    if (mCloudSeaAlign < 2 || !(s > 0.f) || mParams.cloudSunPackedAtlas != 1u)
+    {
+        if (mFormBValid || mFormBBuilds == 0)
+            logWarning("HSTRCloud: formB needs cloudSeaAlign 2 and cloudSunPacked 1; it stays off.");
+        mFormBValid = false;
+        mFormBBuilds = std::max(mFormBBuilds, 1u);
+        return;
+    }
+    const float3 camera = mpScene->getCamera()->getPosition();
+    if (mFormBValid && length(camera - mFormBCentre) < mFormBRebuildDistance)
+        return;
+    FALCOR_PROFILE(pRenderContext, "formB");
+    // Level-2 bricks (32 source voxels) within the view distance and the rebuild distance of the camera, the layer's height.
+    const float brick = 32.f * s;
+    const auto& desc = mpCloudSea->getDesc();
+    const int half = int(std::ceil((mParams.seaViewDistance + mFormBRebuildDistance) / brick)) + 1;
+    const float3 u = (camera - desc.origin) / s - 0.5f;
+    const int3 centre = int3(math::floor((u + 0.5f) / 32.f));
+    mParams.formBOriginX = desc.origin.x;
+    mParams.formBOriginY = desc.origin.y;
+    mParams.formBOriginZ = desc.origin.z;
+    mParams.formBVoxelWorld = s;
+    mParams.formBTableMinX = centre.x - half;
+    mParams.formBTableMinY = -1;
+    mParams.formBTableMinZ = centre.z - half;
+    mParams.formBTableDimX = uint32_t(2 * half + 1);
+    mParams.formBTableDimY = uint32_t(std::ceil(desc.layerHeight / brick)) + 2u;
+    mParams.formBTableDimZ = uint32_t(2 * half + 1);
+    mParams.formBRecordCapacity = 4u << 20;
+    mParams.formBChildCapacity = 48u << 20;
+    mParams.formBChildDistance1 = mFormBChildDistance1;
+    mParams.formBChildDistance0 = mFormBChildDistance0;
+    const uint32_t cells = mParams.formBTableDimX * mParams.formBTableDimY * mParams.formBTableDimZ;
+    const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    if (!mpFormBTable || mpFormBTable->getElementCount() < cells)
+        mpFormBTable = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells, flags);
+    if (!mpFormBRecords)
+    {
+        mpFormBRecords = mpDevice->createStructuredBuffer(4 * sizeof(uint32_t), mParams.formBRecordCapacity, flags);
+        mpFormBChildren = mpDevice->createStructuredBuffer(2 * sizeof(uint32_t), mParams.formBChildCapacity, flags);
+        mpFormBCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 8u, flags);
+    }
+    pRenderContext->clearUAV(mpFormBCounts->getUAV().get(), uint4(0));
+    bindRenderer(pRenderContext, mpFormBBuildPass);
+    ShaderVar var = mpFormBBuildPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["hstrFormBTableOutput"] = mpFormBTable;
+    var["hstrFormBRecordsOutput"] = mpFormBRecords;
+    var["hstrFormBChildrenOutput"] = mpFormBChildren;
+    var["hstrFormBCountsOutput"] = mpFormBCounts;
+    const uint32_t width = 4096u;
+    mpFormBBuildPass->execute(pRenderContext, uint3(width, (cells + width - 1u) / width, 1u));
+    pRenderContext->uavBarrier(mpFormBTable.get());
+    pRenderContext->uavBarrier(mpFormBRecords.get());
+    pRenderContext->uavBarrier(mpFormBChildren.get());
+    // The march binds the tables (bindRenderer); the build's outputs are unbound so no pass holds them as UAVs.
+    var["hstrFormBTableOutput"] = ref<Buffer>();
+    var["hstrFormBRecordsOutput"] = ref<Buffer>();
+    var["hstrFormBChildrenOutput"] = ref<Buffer>();
+    const std::vector<uint32_t> stats = mpFormBCounts->getElements<uint32_t>(0, 5);
+    std::copy(stats.begin(), stats.end(), mFormBStats);
+    mFormBCentre = camera;
+    mFormBValid = true;
+    ++mFormBBuilds;
+    logInfo("HSTRCloud: formB table {} x {} x {} level-2 bricks of {:.3f}: {} records, {} children, {} fallback / {} empty / {} two-layer "
+            "cells.", mParams.formBTableDimX, mParams.formBTableDimY, mParams.formBTableDimZ, brick, stats[0], stats[1], stats[2],
+            stats[3], stats[4]);
 }
 
 /// Writes the reference (per component and half: rgb mean, a sample count) as one EXR per slice, so an expensive path-traced

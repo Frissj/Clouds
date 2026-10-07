@@ -564,6 +564,24 @@ private:
     uint32_t mHullTlasCapacity = 0;
     uint64_t mHullTlasFrame = ~0ull;      ///< mExecuteFrames of the last build.
     static constexpr uint32_t kFormRLevels = 8;
+    /// formB (LIT_VOLUME.md section 4b, gate S2): over an aligned sea (cloudSeaAlign 2) the lean marches read a world table of
+    /// level-2 bricks (buildFormBTable) naming each brick's shared packed (density, sun) texel, instead of the instance chain (1),
+    /// and count what it answered (2). Built when first wanted and when the camera has moved formBRebuildDistance from where the
+    /// table was centred; it reads the residency as it stood then, so S2 runs with residency frozen.
+    void updateFormBTable(RenderContext* pRenderContext);
+    uint32_t mFormB = 0;
+    float mFormBChildDistance1 = 1200.f; ///< formBChild1: level-1 children for bricks nearer than this (world units).
+    float mFormBChildDistance0 = 600.f;  ///< formBChild0: level-0 children likewise.
+    float mFormBRebuildDistance = 300.f;
+    bool mFormBValid = false;
+    float3 mFormBCentre = float3(0.f);
+    uint32_t mFormBBuilds = 0;
+    uint32_t mFormBStats[5] = {};       ///< The last build's hstrFormBCountsOutput.
+    ref<Buffer> mpFormBTable;
+    ref<Buffer> mpFormBRecords;
+    ref<Buffer> mpFormBChildren;
+    ref<Buffer> mpFormBCounts;
+    LazyComputePass mpFormBBuildPass;
     uint32_t mHullInstances = 0;          ///< Instances in the last hull top-level structure.
     uint32_t mHullLevelCounts[kFormRLevels] = {}; ///< Of those, by hull level.
     uint64_t mHullTriangles = 0;          ///< Triangles over the loaded hulls.
@@ -774,6 +792,7 @@ private:
     uint32_t mCloudSeaSeed = 1;
     float mCloudSeaCoverage = 0.85f;
     uint32_t mCloudSeaLayers = 1; ///< Staggered cloud layers (CloudSeaDesc::layers).
+    uint32_t mCloudSeaAlign = 0;  ///< cloudSeaAlign: Form B's aligned sea (CloudSeaDesc::alignLevel), 0 off.
     float mCloudLodPixels = 1.f;
     uint32_t mCloudFadeFrames = 8;
     bool mCloudVirtual = true;
