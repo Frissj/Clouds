@@ -19,6 +19,7 @@ target_sources(HSTRCloud PRIVATE
     HSTRCloud.cpp
     HSTRCloud.cs.slang
     HSTRCloud.h
+    HSTRCloudRaster.slang
     HSTRCloudRtProbe.cs.slang
     HSTRCloudTypes.slang
 )

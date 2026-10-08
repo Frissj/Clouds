@@ -28,7 +28,12 @@ import Atmosphere;
 #endif
 /// beamWarp: the resolve reads a held guard block where its capture camera saw the content (beamWarpPosition).
 /// PROBE (mBeamStripProbe): the dirty query and unit passes' timing copies. 1 returns after the ray setup, 2 marches one step,
-/// 3 the full march; each computes and never writes (beamStripSink). 0: the real passes.
+/// 3 the full march; each computes and never writes (beamStripSink). 0: the real passes. 4 marches density only, 5 density + sun,
+/// 6 density + cache lighting.
+/// MEASURED unitstrip1 (4K walk, frozen residency, far-sea overlap off, ms a frame, units strip / query strip): setup 0.008 / 0.020,
+/// one step 0.034 / 0.033, density 0.917 / 0.903, density + sun 1.126 / 1.094, density + cache 1.469 / 1.167, full 1.723-1.767 /
+/// 1.335-1.366 (anchor repeated). Ray setup and the first step are ~2% of a unit: the time is per step. Density walk 52% of units,
+/// sun +0.21 (12%), cache lighting +0.55 (31%); in the query density 67%, sun +0.19, cache +0.26.
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
@@ -91,6 +96,9 @@ RaytracingAccelerationStructure gHullTlas;
 #ifndef HSTR_LAYER_PROBE
 #define HSTR_LAYER_PROBE 0 // beamLayerProbe: count leanExtinctionLayered's lookups by outcome (kBeamLayerProbe), dirty passes only.
 #endif
+#ifndef HSTR_WORKSET_PROBE
+#define HSTR_WORKSET_PROBE 0 // worksetProbe: the distinct density bricks and sun bakes the dirty marches read (hstrWorkset).
+#endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
 static uint gLayerTightZero; ///< This thread's layered samples in an undilated zero block (kBeamLayerSteps + 3).
@@ -115,6 +123,7 @@ static uint gRayLayerWalks[2]; ///< beamLayerProbe: the ray's brick walks per la
 static uint gRayLayerDense[2]; ///< ... and its density samples per layer.
 static uint gRunSkip[4];       ///< beamLayerProbe: the layer-free run skip (kBeamRunSkip).
 #endif
+static float gUnitOracleFirst = -2.f; ///< beamUnitOracle 2: this unit's recorded first-density distance (-1: none, -2: no oracle).
 #if HSTR_UNIT_START
 static float gFirstDistance; ///< HSTR_UNIT_START: world distance to the start of marchBeam's first step with density (-1: none).
 #endif
@@ -698,6 +707,12 @@ struct HSTRCloudRenderer
     /// every frame by packSpanBricks, so a span reads both from one filtered fetch.
     Texture3D<float2> hstrSpanPacked;
     RWTexture3D<float2> hstrSpanPackedOutput;
+    /// spanLoop 4096 / 8192 (oracle): apron-free copies of the density / sun atlases, a slot's 8^3 core texels at slot x 8
+    /// (packSpanCompact, packSpanCompactSun), untimed every frame - the reads of a brick layout half the size, aligned to 8.
+    Texture3D<float> hstrSpanCompact;
+    RWTexture3D<unorm float> hstrSpanCompactOutput;
+    Texture3D<float> hstrSpanCompactSun;
+    RWTexture3D<float> hstrSpanCompactSunOutput;
     /// pushShare: the lattice points the dirty query marched this frame (packed beam position), and per list entry (cell x tile)
     /// the dirty rays that crossed it and the march steps they spent inside it. See countPushShare.
     RWStructuredBuffer<uint> hstrPushShareRays;
@@ -748,6 +763,14 @@ struct HSTRCloudRenderer
     RWTexture2D<float4> hstrBeamPixelOutput;    ///< beamRefresh: this build's marched pixels.
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
+    /// worksetProbe (HSTR_WORKSET_PROBE): per frame, density brick reads and distinct bricks, sun bake reads and distinct bake slots
+    /// (words 0-3), then a bit per brick index and a bit per sun atlas slot (kWorksetSetWords each).
+    /// MEASURED (workset2, sunset_motion 3840x2160, walk speed 2): live ~1.12M brick reads over 86,841 distinct bricks (12.8 reads
+    /// a brick a frame) and 921k bake reads over 25,200 bake slots (37 a slot); the worst frame 140,205 bricks / 63,148 bakes.
+    /// Parked ~0 (the beam serves it). ~87k bricks x 1000 B is ~87 MB of density alone against the 4080 Laptop's 48 MB L2, and each is
+    /// touched ~13 times: the dirty march streams its bricks, it does not reuse them.
+    RWStructuredBuffer<uint> hstrWorkset;
+    RWStructuredBuffer<float> hstrUnitStartOracle; ///< beamUnitOracle: per listed unit, its own first-density distance (-1: none).
     RWStructuredBuffer<uint> hstrBeamArgs;
     RWStructuredBuffer<uint> hstrBeamSparseCandidates; ///< Candidate tiles, partitioned by level.
     RWStructuredBuffer<uint> hstrBeamSparseArgs;       ///< emit and verify indirect arguments.
@@ -907,8 +930,21 @@ struct HSTRCloudRenderer
         const uint shift = params.cloudAtlasShift;
         const uint mask = (1u << shift) - 1u;
         const uint3 slot = uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift));
-        const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + local;
-        const float t = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudAtlasInvSize, 0.f);
+        float t;
+        if (params.cloudCompactDensity == 2u)
+            // compactDensity 2 (oracle, wrong image): no atlas read, a varying value in its place - the read's share of the march.
+            t = frac(dot(local, float3(0.13f, 0.17f, 0.19f)) + 0.5f);
+        else if (params.cloudCompactDensity != 0u)
+        {
+            uint w, h, d;
+            hstrSpanCompact.GetDimensions(w, h, d);
+            t = hstrSpanCompact.SampleLevel(hstrLinearClampSampler, (float3(slot * 8u) + 0.5f + local) / float3(w, h, d), 0.f);
+        }
+        else
+        {
+            const float3 texel = float3(slot * kCloudDensityEdge) + 0.5f + local;
+            t = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudAtlasInvSize, 0.f);
+        }
         return brick.minValue + brick.range * t * t;
     }
 
@@ -3051,7 +3087,8 @@ struct HSTRCloudRenderer
     /// 25 the same and far enough inside the block that a tight test could reject them, 26 brick samples that change the pixel,
     /// 27 the distinct brick entries holding at least one of those (26 over 27 is the contributing run length).
     /// The trilinear page a brick-level transport node would carry, evaluated at asset source position x: the brick's own eight
-    /// shared corner densities (the apron texels, so neighbouring bricks agree on them) interpolated over the brick. This is the
+    /// corner densities (the apron texels until the density atlas lost its apron; now its own corner texels, so neighbours no longer
+    /// share them exactly) interpolated over the brick. This is the
     /// same representation HSTRCutNode.transmittanceCorners holds for an HST leaf, one level of the resident pyramid at a time.
     float cloudBrickPage(uint entry, float3 x)
     {
@@ -3072,7 +3109,8 @@ struct HSTRCloudRenderer
         for (uint corner = 0; corner < 8; ++corner)
         {
             const float3 c = float3(corner & 1u, (corner >> 1u) & 1u, corner >> 2u);
-            const float3 texel = float3(slot * kCloudBrickEdge) + 1.5f + (c * 8.f - 0.5f);
+            // The density atlas has no apron now (kCloudDensityEdge): the corner reads the brick's own corner texel.
+            const float3 texel = float3(slot * kCloudDensityEdge) + 0.5f + c * 7.f;
             const float t = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, texel * params.cloudAtlasInvSize, 0.f);
             const float3 weights = lerp(1.f - f, f, c);
             page += (brick.minValue + brick.range * t * t) * weights.x * weights.y * weights.z;
@@ -8436,6 +8474,9 @@ struct HSTRCloudRenderer
 #else
             const float d = cloudSampleDensity(sample, proxy, scale);
 #endif
+#if HSTR_WORKSET_PROBE
+            worksetMark(0u, sample.entry);
+#endif
 #if HSTR_LAYER_PROBE
             if ((layerMask & (1u << layer)) == 0u)
             {
@@ -8624,6 +8665,22 @@ struct HSTRCloudRenderer
     }
 
     /// sunDepthAt for a lean sample, from the few words of it the lean march kept.
+#if HSTR_WORKSET_PROBE
+    /// worksetProbe: one read of density brick index (set 0) or sun atlas slot (set 1) - the read counted, and the index too the
+    /// first time this frame. The frame's distinct reads times a brick's bytes is the working set a cache-resident form must hold.
+    void worksetMark(uint set, uint index)
+    {
+        uint unused, before;
+        InterlockedAdd(hstrWorkset[2u * set], 1u, unused);
+        if ((index >> 5) >= kWorksetSetWords)
+            return;
+        const uint bit = 1u << (index & 31u);
+        InterlockedOr(hstrWorkset[kWorksetHeader + set * kWorksetSetWords + (index >> 5)], bit, before);
+        if ((before & bit) == 0u)
+            InterlockedAdd(hstrWorkset[2u * set + 1u], 1u, unused);
+    }
+#endif
+
     float leanSunDepth(float3 v, float footprint, LeanHit hit)
     {
 #if (HSTR_SHIP & 2048) != 0
@@ -8656,6 +8713,9 @@ struct HSTRCloudRenderer
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
                 const float farDepth = fineSunAt(far);
                 const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x, sourceVoxelWorld, hit.near);
+#if HSTR_WORKSET_PROBE
+                worksetMark(1u, resolved.x);
+#endif
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
         }
@@ -9339,12 +9399,40 @@ struct HSTRCloudRenderer
         const float densityInverse = 1.f / float(1u << level);
         const float3 densityStart = (x0 + 0.5f) * densityInverse - 0.5f - float3(((i0 >> int(level)) >> 3) * 8);
         const float3 densityStep = dx * (dt * densityInverse);
-        const float3 densityBase = float3(uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift)) * kCloudBrickEdge) + 1.5f;
+        // spanLoop 1024 / 2048 (ORACLE, with 1; the image is then wrong): every brick's density and sun slot folded into a 16^3 / 4^3
+        // block of atlas slots, so the same instructions read a working set of 4096 bricks (~4 MB an atlas, inside the L2) or 64
+        // (~64 KB, about one L1). Whether the brick samples are slow because of what they read or because of how they read it.
+        // MEASURED (workset1, 1920x1080 walk, one settle, 215k recorded rays, 617k brick samples; march/spans ms, brick samples =
+        // arm - floor): resolved loop 0.606 / again 0.606 (0.352), 16^3 0.343 (0.089, 4.0x), 4^3 0.265 (0.011, ~32x), no bake fetch
+        // 0.382 (0.128), bricks skipped 0.254 (the floor). Light misses 4,753 -> ~100k in both oracle arms (they reach the code). The
+        // brick samples are slow because of their working set (~1.3 GB of atlases against the 48 MB L2), not their instructions:
+        // a cache-resident representation is the lever (stop rule: <= a third of the anchor's - passes).
+        const uint workingSet = (HSTR_SPAN_LOOP & 2048) != 0 ? 3u : ((HSTR_SPAN_LOOP & 1024) != 0 ? 15u : 0xFFFFFFFFu);
+        // spanLoop 4096 / 8192 (ORACLE, with 1): density / sun from the apron-free 8^3 copies (hstrSpanCompact*). Exact for the
+        // density, whose reads stay inside a slot's core (0-7); the sun then reads at the density's clamp too (its own is -0.5-7.5).
+        const bool compactDensity = (HSTR_SPAN_LOOP & 4096) != 0;
+        const bool compactSun = (HSTR_SPAN_LOOP & 8192) != 0;
+        float3 compactInvSize = 1.f, compactSunInvSize = 1.f;
+        if (compactDensity)
+        {
+            uint w, h, d;
+            hstrSpanCompact.GetDimensions(w, h, d);
+            compactInvSize = 1.f / float3(w, h, d);
+        }
+        if (compactSun)
+        {
+            uint w, h, d;
+            hstrSpanCompactSun.GetDimensions(w, h, d);
+            compactSunInvSize = 1.f / float3(w, h, d);
+        }
+        const float3 densitySlot = float3(uint3(brick.slot & mask, (brick.slot >> shift) & mask, brick.slot >> (2u * shift)) & workingSet);
+        const float3 densityBase = densitySlot * kCloudDensityEdge + 0.5f; // The atlas and the compact copy share the core layout.
         const uint sunLevel = resolved.y >> 24;
         const float sunInverse = 1.f / float(1u << sunLevel);
         const float3 sunStart = (x0 + 0.5f) * sunInverse - 0.5f - float3(((i0 >> int(sunLevel)) >> 3) * 8);
         const float3 sunStep = dx * (dt * sunInverse);
-        const float3 sunBase = float3(uint3(resolved.x & mask, (resolved.x >> shift) & mask, resolved.x >> (2u * shift)) * kCloudBrickEdge) + 1.5f;
+        const float3 sunSlot = float3(uint3(resolved.x & mask, (resolved.x >> shift) & mask, resolved.x >> (2u * shift)) & workingSet);
+        const float3 sunBase = compactSun ? sunSlot * 8.f + 0.5f : sunSlot * kCloudBrickEdge + 1.5f;
         // spanLoop 256: density and bake from one fetch of hstrSpanPacked, at the bake's clamp (-0.5-7.5), the density's apron
         // repeating its edge so that the density still reads as at its own clamp (0-7). Same level: sunStart is densityStart.
         // MEASURED (packed1, 1080p walk, read at the density's clamp instead): spans 0.623 -> 0.490 ms (no bake fetch 0.400); light
@@ -9387,7 +9475,8 @@ struct HSTRCloudRenderer
             else
             {
                 const float3 local = clamp(densityStart + float(j) * densityStep, 0.f, 7.f);
-                const float stored = hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, (densityBase + local) * params.cloudAtlasInvSize, 0.f);
+                const float stored = compactDensity ? hstrSpanCompact.SampleLevel(hstrLinearClampSampler, (densityBase + local) * compactInvSize, 0.f)
+                                                    : hstrCloudAtlas.SampleLevel(hstrLinearClampSampler, (densityBase + local) * params.cloudAtlasInvSize, 0.f);
                 density = (brick.minValue + brick.range * stored * stored) * scale;
             }
             if (brick.fade < 1.f)
@@ -9422,8 +9511,9 @@ struct HSTRCloudRenderer
                         bakedDepth = cloudSun8() ? cloudSunDecode(packedSun) * instance.scale : packedSun * instance.sourceVoxelWorld;
                     else if (resolvedLoop)
                     {
-                        const float3 local = clamp(sunStart + float(j) * sunStep, -0.5f, 7.5f);
-                        const float stored = hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, (sunBase + local) * params.cloudSunAtlasInvSize, 0.f);
+                        const float3 local = compactSun ? clamp(sunStart + float(j) * sunStep, 0.f, 7.f) : clamp(sunStart + float(j) * sunStep, -0.5f, 7.5f);
+                        const float stored = compactSun ? hstrSpanCompactSun.SampleLevel(hstrLinearClampSampler, (sunBase + local) * compactSunInvSize, 0.f)
+                                                        : hstrCloudSunAtlas.SampleLevel(hstrLinearClampSampler, (sunBase + local) * params.cloudSunAtlasInvSize, 0.f);
                         bakedDepth = cloudSun8() ? cloudSunDecode(stored) * instance.scale : stored * instance.sourceVoxelWorld;
                     }
                     else
@@ -11452,8 +11542,10 @@ struct HSTRCloudRenderer
         // Two words: an 8-texel tile has 64 units. One word lost units 32-63 (1u << k past 31), so a moving 8-texel build never
         // re-marched the lower half of a failed tile (tile8_frames: stale stripes, 7.6% of pixels over 0.02 against 2.8% at 4).
         uint2 mask = 0;
+        // beamSubTiles: only the 2-pixel lattice (even, even) and the sub-tile centres (odd, odd); refineBeamSubTiles lists the rest.
+        const bool sub = params.beamSubTiles != 0 && ts == 4u;
         for (uint k = 0; failed && k < min(ts * ts, 64u); ++k)
-            if (beamFailedUnitNeedsMarch(tile * ts + uint2(k % ts, k / ts), own, true, certified))
+            if ((!sub || ((k ^ (k >> 2)) & 1u) == 0u) && beamFailedUnitNeedsMarch(tile * ts + uint2(k % ts, k / ts), own, true, certified))
                 mask[k >> 5] |= 1u << (k & 31u);
         const uint count = countbits(mask.x) + countbits(mask.y);
         const uint total = WaveActiveSum(count);
@@ -11627,6 +11719,9 @@ struct HSTRCloudRenderer
     /// tile's unit is instead taken from its own basis: the estimate that tile was accepted with, at no march. (Acceptance tests
     /// the centre surplus and the edge contrast, so this is the basis the resolve would use there anyway, not a bound on every
     /// unit of the tile.)
+    // MEASURED and REMOVED (subtile1, 4K walk): interpolating a held sub-tile's units here, as the mean of their two corner units,
+    // took resolve/residual 0.28 -> 1.93-2.49 ms - the extra reconstructions' registers in every residual pixel. refineBeamSubTile
+    // now writes those units as stored values instead.
     float3 beamUnitRadiance(uint2 unit)
     {
         const uint finest = beamTileEdge(params.beamLevels - 1);
@@ -12874,7 +12969,10 @@ struct HSTRCloudRenderer
     {
         const float3 w = beamRayDirection(float2(unit) + 0.5f);
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        const float start = beamUnitStartDistance(unit);
+        float start = beamUnitStartDistance(unit);
+        // ORACLE (beamUnitOracle 2): the unit's own first density, as the untimed record pass found it from the shipped start.
+        if (gUnitOracleFirst >= 0.f)
+            start = max(start, max(gUnitOracleFirst - params.beamUnitStart * params.seaVoxelSize.x, 0.f));
 #if HSTR_UNIT_SPAN && !HSTR_DIRTY_FUSED
         gSpanSkip = beamUnitSpanSetup(unit);
 #if HSTR_LAYER_PROBE
@@ -13719,16 +13817,93 @@ struct HSTRCloudRenderer
     /// a full march for one or two lanes - 20.8 ms of a 28 ms frame.
     void marchBeamDirtyListedUnit(uint thread)
     {
-        if (thread >= hstrBeamDirtyCount[1])
+        // beamSubTiles' second march: the units refineBeamSubTiles listed after the tile pass's (count [3], from [1]).
+        uint index = thread;
+        if (params.beamSubPhase != 0u)
+        {
+            if (thread >= hstrBeamDirtyCount[3])
+                return;
+            index = hstrBeamDirtyCount[1] + thread;
+        }
+        else if (thread >= hstrBeamDirtyCount[1])
             return;
 #if HSTR_DIRTY_FUSED
-        const uint packed = gFusedUnits[thread]; // Listed by another wave, possibly on another SM, a moment ago.
+        const uint packed = gFusedUnits[index]; // Listed by another wave, possibly on another SM, a moment ago.
 #else
-        const uint packed = hstrBeamDirtyUnits[thread];
+        const uint packed = hstrBeamDirtyUnits[index];
 #endif
         // beamWarpGap: bit 31 marks a disocclusion repair unit (repairBeamWarpGapAt), marched into the transient overlay.
         gUnitRepair = (packed >> 31) != 0u;
-        marchBeamUnitExact(uint2(packed & 0xFFFFu, (packed >> 16) & 0x7FFFu));
+        const uint2 unit = uint2(packed & 0xFFFFu, (packed >> 16) & 0x7FFFu);
+#if HSTR_UNIT_START
+        if (params.beamUnitOracle == 1u)
+        {
+            marchBeam(beamRayDirection(float2(unit) + 0.5f), float2(0.f, 1.f), beamUnitStartDistance(unit));
+            hstrUnitStartOracle[index] = gFirstDistance;
+            return;
+        }
+        gUnitOracleFirst = params.beamUnitOracle == 2u ? hstrUnitStartOracle[index] : -2.f;
+#endif
+        marchBeamUnitExact(unit);
+    }
+
+    /// beamSubTiles: a corner's stored unit (radiance before the far sea, transmittance), if it is a unit of a failed tile that holds
+    /// a marched value - an accepted neighbour's corner is not, and its sub-tile then marches.
+    bool beamSubCorner(uint2 unit, out float4 value, out float transmittance)
+    {
+        value = hstrBeamPixelOutput[unit];
+        transmittance = hstrBeamUnitTransmittanceOutput[unit];
+        return hstrBeamLevel[unit / beamTileEdge(params.beamLevels - 1)] == params.beamLevels && value.a >= 0.f;
+    }
+
+    /// beamSubTiles, after the first unit march: a listed sub-tile centre (odd, odd) against the mean of its four corners (2-pixel
+    /// lattice units of failed tiles, marched in the same march), stored values only. Within beamSubTolerance the sub-tile's other
+    /// two units, (x, y - 1) and (x - 1, y), are written as the mean of the two corners each lies between - radiance, transmittance
+    /// and distance, as a march would store them, so the resolve reads them like any unit; otherwise, or where a corner is not a
+    /// marched unit, they are listed for the second march (hstrBeamDirtyUnits past the first list, counted in hstrBeamDirtyCount[3]).
+    void refineBeamSubTile(uint thread)
+    {
+        if (thread >= hstrBeamDirtyCount[1])
+            return;
+        const uint packed = hstrBeamDirtyUnits[thread];
+        if ((packed >> 31) != 0u)
+            return; // A warp-gap repair unit (beamWarpGap), not a tile's.
+        const uint2 unit = uint2(packed & 0xFFFFu, (packed >> 16) & 0x7FFFu);
+        if ((unit.x & unit.y & 1u) == 0u)
+            return; // Only centres decide.
+        const uint2 hi = min(unit + 1u, params.beamFrameDim - 1u);
+        float4 c00, c10, c01, c11;
+        float t00, t10, t01, t11;
+        bool holds = beamSubCorner(unit - 1u, c00, t00);
+        holds = beamSubCorner(uint2(hi.x, unit.y - 1u), c10, t10) && holds;
+        holds = beamSubCorner(uint2(unit.x - 1u, hi.y), c01, t01) && holds;
+        holds = beamSubCorner(hi, c11, t11) && holds;
+        const float3 predicted = 0.25f * (c00.rgb + c10.rgb + c01.rgb + c11.rgb);
+        const float3 exact = hstrBeamPixelOutput[unit].rgb;
+        holds = holds && dot(abs(log(1.f + max(predicted, 0.f)) - log(1.f + max(exact, 0.f))), 1.f / 3.f) <= params.beamSubTolerance;
+        uint capacity, stride;
+        hstrBeamDirtyUnits.GetDimensions(capacity, stride);
+        [unroll]
+        for (uint k = 0; k < 2; ++k)
+        {
+            const uint2 fine = unit - (k == 0 ? uint2(0, 1) : uint2(1, 0));
+            if (any(fine >= params.beamFrameDim) || !beamUnitOnScreen(fine))
+                continue;
+            if (holds)
+            {
+                // (x, y - 1) lies between c00 and c10, (x - 1, y) between c00 and c01. A distance of 0 is "nothing hit".
+                const float4 b = k == 0 ? c10 : c01;
+                const float d = c00.a > 0.f && b.a > 0.f ? 0.5f * (c00.a + b.a) : max(c00.a, b.a);
+                hstrBeamPixelOutput[fine] = float4(0.5f * (c00.rgb + b.rgb), d);
+                hstrBeamUnitTransmittanceOutput[fine] = 0.5f * (t00 + (k == 0 ? t10 : t01));
+                continue;
+            }
+            uint slot;
+            InterlockedAdd(hstrBeamDirtyCount[3], 1u, slot);
+            const uint at = hstrBeamDirtyCount[1] + slot;
+            if (at < capacity)
+                hstrBeamDirtyUnits[at] = fine.x | (fine.y << 16);
+        }
     }
 
     /// marchBeamUnitExact's writes for a marched unit.
@@ -15364,6 +15539,20 @@ void writeBeamDirtyUnitArgs()
     writeFoldedDirtyArgs(15, gHSTRCloud.hstrBeamDirtyCount[1] - beamDirtyUnitStart());
 }
 
+/// beamSubTiles: one thread per unit of the first list (the unit march's own arguments); the centres decide their sub-tiles.
+[numthreads(64, 1, 1)]
+void refineBeamSubTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    gHSTRCloud.refineBeamSubTile(foldedDirtyThread(groupId, groupThreadId.x));
+}
+
+/// beamSubTiles: the second unit march's arguments, from the units refineBeamSubTiles listed.
+[numthreads(1, 1, 1)]
+void writeBeamSubUnitArgs()
+{
+    writeFoldedDirtyArgs(18, gHSTRCloud.hstrBeamDirtyCount[3]);
+}
+
 [numthreads(64, 1, 1)]
 void marchBeamDirtyUnits(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
@@ -15844,7 +16033,7 @@ void packSpanBricks(uint3 id: SV_DispatchThreadID)
     if ((brick.info & kCloudBrickConstant) != 0u || resolved.x == kCloudRefNone || (resolved.y >> 24) != (brick.info & 15u))
         return;
     const uint shift = gHSTRCloud.params.cloudAtlasShift;
-    const uint3 density = cloudSlotOrigin(brick.slot, shift);
+    const uint3 density = cloudDensityOrigin(brick.slot, shift);
     const uint3 sun = cloudSlotOrigin(resolved.x, shift);
     for (uint y = 0; y < kCloudBrickEdge; ++y)
         for (uint x = 0; x < kCloudBrickEdge; ++x)
@@ -15852,9 +16041,31 @@ void packSpanBricks(uint3 id: SV_DispatchThreadID)
             // The density's apron texels take the nearest core texel's value: read at the sun's clamp (-0.5-7.5, texels 1.0-9.0),
             // the trilinear density then equals the density atlas' at its own clamp (0-7), per axis and so in all three.
             const uint3 texel = uint3(x, y, id.z);
-            gHSTRCloud.hstrSpanPackedOutput[sun + texel] = float2(gHSTRCloud.hstrCloudAtlas.Load(int4(density + clamp(texel, 1u, 8u), 0)),
+            gHSTRCloud.hstrSpanPackedOutput[sun + texel] = float2(gHSTRCloud.hstrCloudAtlas.Load(int4(density + clamp(texel, 1u, 8u) - 1u, 0)),
                                                                   gHSTRCloud.hstrCloudSunAtlas.Load(int4(sun + texel, 0)));
         }
+}
+
+/// spanLoop 4096: the density atlas' core texels (1-8 of each 10^3 slot) into hstrSpanCompact at slot x 8. Untimed, every frame.
+[numthreads(4, 4, 4)]
+void packSpanCompact(uint3 id: SV_DispatchThreadID)
+{
+    uint w, h, d;
+    gHSTRCloud.hstrSpanCompactOutput.GetDimensions(w, h, d);
+    if (any(id >= uint3(w, h, d)))
+        return;
+    gHSTRCloud.hstrSpanCompactOutput[id] = gHSTRCloud.hstrCloudAtlas.Load(int4(id, 0)); // The atlas is core-only already.
+}
+
+/// spanLoop 8192: the same for the sun atlas into hstrSpanCompactSun.
+[numthreads(4, 4, 4)]
+void packSpanCompactSun(uint3 id: SV_DispatchThreadID)
+{
+    uint w, h, d;
+    gHSTRCloud.hstrSpanCompactSunOutput.GetDimensions(w, h, d);
+    if (any(id >= uint3(w, h, d)))
+        return;
+    gHSTRCloud.hstrSpanCompactSunOutput[id] = gHSTRCloud.hstrCloudSunAtlas.Load(int4((id >> 3u) * kCloudBrickEdge + 1u + (id & 7u), 0));
 }
 
 /// Cell views: the build dispatch's arguments, one group per queued cell.
@@ -16450,51 +16661,58 @@ uint3 cloudSlotOrigin(uint slot, uint shift)
     return uint3(slot & mask, (slot >> shift) & mask, slot >> (2u * shift)) * kCloudBrickEdge;
 }
 
+/// Density atlas texel origin of a brick slot (core-only slots, kCloudDensityEdge).
+uint3 cloudDensityOrigin(uint slot, uint shift)
+{
+    const uint mask = (1u << shift) - 1u;
+    return uint3(slot & mask, (slot >> shift) & mask, slot >> (2u * shift)) * kCloudDensityEdge;
+}
+
 /// Reconstructs the staged bricks of one level into their atlas slots (reconstructBrick in CloudFormat.h is the same rule):
-/// value = max(0, trilinear parent prediction + residual on the core), requantised as sqrt-spaced unorm. Thread (x, y, z) is
-/// value (x, y, z % 10) of staged brick cloudCommitOffset + z / 10; the parents were written by earlier dispatches.
+/// value = max(0, trilinear parent prediction + residual on the core), requantised as sqrt-spaced unorm. Thread (x, y, z) is core
+/// value (x, y, z % 8) of staged brick cloudCommitOffset + z / 8 (the density atlas keeps no apron, kCloudDensityEdge); the parents
+/// were written by earlier dispatches.
 [numthreads(4, 4, 4)]
 void commitCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     const HSTRCloudParams params = gHSTRCloud.params;
-    const uint local = dispatchThreadId.z / kCloudBrickEdge;
-    if (local >= params.cloudCommitCount || any(dispatchThreadId.xy >= kCloudBrickEdge))
+    const uint local = dispatchThreadId.z / kCloudDensityEdge;
+    if (local >= params.cloudCommitCount || any(dispatchThreadId.xy >= kCloudDensityEdge))
         return;
     const uint staged = params.cloudCommitOffset + local;
     const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[staged];
-    const uint3 texel = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudBrickEdge);
+    const uint3 core = uint3(dispatchThreadId.xy, dispatchThreadId.z % kCloudDensityEdge);
 
     float prediction = 0.f;
     if (info.parentSlot != kCloudRefNone)
     {
         const float3 parity = float3((info.parity & 1u) != 0 ? 1.f : 0.f, (info.parity & 2u) != 0 ? 1.f : 0.f, (info.parity & 4u) != 0 ? 1.f : 0.f);
-        const float3 position = 4.f * parity + (float3(texel) - 1.f + 0.5f) * 0.5f - 0.5f + 1.f;
+        // In the parent's core texels (the apron layout's position less one).
+        const float3 position = 4.f * parity + (float3(core) + 0.5f) * 0.5f - 0.5f;
         const int3 base = int3(floor(position));
         const float3 f = position - float3(base);
-        const uint3 parentOrigin = cloudSlotOrigin(info.parentSlot, params.cloudAtlasShift);
+        const uint3 parentOrigin = cloudDensityOrigin(info.parentSlot, params.cloudAtlasShift);
         for (uint corner = 0; corner < 8; ++corner)
         {
-            const uint3 offset = uint3(corner & 1u, (corner >> 1) & 1u, corner >> 2);
-            const float3 w = select(offset != 0u, f, 1.f - f);
-            // The parent's apron texels read as its adjacent core texels (reconstructBrick in CloudFormat.h).
-            const float t = gHSTRCloud.hstrCloudAtlasOutput[parentOrigin + clamp(uint3(base) + offset, 1u, 8u)];
+            const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, corner >> 2);
+            const float3 w = select(offset != 0, f, 1.f - f);
+            // Past the parent's core the nearest core texel (the apron's old value; reconstructBrick in CloudFormat.h).
+            const float t = gHSTRCloud.hstrCloudAtlasOutput[parentOrigin + uint3(clamp(base + offset, 0, 7))];
             prediction += w.x * w.y * w.z * (info.parentMin + info.parentRange * t * t);
         }
     }
     float residual = 0.f;
-    if (info.coded != 0 && all(texel >= 1u) && all(texel <= 8u))
-    {
-        const uint3 core = texel - 1u;
+    if (info.coded != 0)
         residual = gHSTRCloud.hstrCloudResiduals[staged * 512u + core.x + 8u * (core.y + 8u * core.z)];
-    }
     const float density = max(0.f, prediction + residual);
     const float t = info.valueRange > 0.f ? sqrt(saturate((density - info.valueMin) / info.valueRange)) : 0.f;
-    gHSTRCloud.hstrCloudAtlasOutput[cloudSlotOrigin(info.slot, params.cloudAtlasShift) + texel] = t;
+    gHSTRCloud.hstrCloudAtlasOutput[cloudDensityOrigin(info.slot, params.cloudAtlasShift) + core] = t;
 }
 
 /// Occupancy of the staged bricks after their commit dispatches: cell (x, y, z) of a brick's 4^3 covers level voxels 2c and 2c + 1
-/// per axis, whose trilinear samples read atlas texels 2c to 2c + 3 (the apron shifts them by one); its bit is set if any of those
-/// decodes to non-zero density (valueMin + valueRange t^2, so t > 0 or valueMin > 0). One thread per brick.
+/// per axis, whose trilinear samples read core texels 2c - 1 to 2c + 2, clamped to the core as cloudBrickDensity clamps (the apron
+/// these once read is gone; the clamped set is exactly what the march reads, so the bound is as safe and tighter); its bit is set if
+/// any of those decodes to non-zero density (valueMin + valueRange t^2, so t > 0 or valueMin > 0). One thread per brick.
 [numthreads(16, 1, 1)]
 void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
@@ -16502,7 +16720,7 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
     if (dispatchThreadId.x >= params.cloudStagedCount)
         return;
     const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[dispatchThreadId.x];
-    const uint3 origin = cloudSlotOrigin(info.slot, params.cloudAtlasShift);
+    const uint3 origin = cloudDensityOrigin(info.slot, params.cloudAtlasShift);
     uint words[kCloudCellWords] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
     for (uint cz = 0; cz < 4; ++cz)
         for (uint cy = 0; cy < 4; ++cy)
@@ -16512,7 +16730,7 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
                 for (uint z = 2 * cz; z < 2 * cz + 4; ++z)
                     for (uint y = 2 * cy; y < 2 * cy + 4; ++y)
                         for (uint x = 2 * cx; x < 2 * cx + 4; ++x)
-                            t = max(t, gHSTRCloud.hstrCloudAtlas.Load(int4(origin + uint3(x, y, z), 0)));
+                            t = max(t, gHSTRCloud.hstrCloudAtlas.Load(int4(origin + uint3(clamp(int3(x, y, z) - 1, 0, 7)), 0)));
                 const uint cell = cx + 4u * cy + 16u * cz;
                 const uint code = cloudCellCode(t > 0.f ? info.valueMin + info.valueRange * t * t : info.valueMin);
                 words[cell >> 3u] |= code << ((cell & 7u) * 4u);
@@ -16949,7 +17167,7 @@ void bakeCloudSun(uint3 dispatchThreadId: SV_DispatchThreadID)
     if (params.cloudSunPackedAtlas != 0u)
     {
         // The packed atlas: the bake beside its brick's density, the apron taking the nearest core texel (cloudPackedDensity).
-        const uint3 density = cloudSlotOrigin(gHSTRCloud.hstrCloudBricks[job.brick].slot, params.cloudAtlasShift) + clamp(texel, 1u, 8u);
+        const uint3 density = cloudDensityOrigin(gHSTRCloud.hstrCloudBricks[job.brick].slot, params.cloudAtlasShift) + clamp(texel, 1u, 8u) - 1u;
         gHSTRCloud.hstrCloudSunPackedOutput[cloudSlotOrigin(job.slot, params.cloudAtlasShift) + texel] =
             float2(params.cloudSunPackedAtlas == 1u ? HSTRCloudRenderer::cloudSunEncode(depth * asset.sourceVoxelWorld) : depth,
                    gHSTRCloud.hstrCloudAtlas.Load(int4(density, 0)));

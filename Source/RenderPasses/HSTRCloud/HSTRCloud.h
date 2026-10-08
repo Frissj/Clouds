@@ -3,6 +3,7 @@
  **************************************************************************/
 #pragma once
 #include "Falcor.h"
+#include "Core/Pass/RasterPass.h"
 #include "Rendering/Volumes/HSTRHierarchy.h"
 #include "RenderGraph/RenderPass.h"
 #include "HSTRCloudTypes.slang"
@@ -375,6 +376,10 @@ private:
     float mBeamGuardWarpParallax = 0.f; ///< beamGuardWarpParallax: texels of near-to-far parallax a held block may carry (0: off).
     uint32_t mBeamGuardMotion = 0;  ///< beamGuardMotion: the motion-aware certificate (HSTRCloudTypes.slang).
     bool mBeamLayerProbe = false;   ///< beamLayerProbe: count the layered lookups by outcome (HSTR_LAYER_PROBE).
+    /// worksetProbe: the distinct density bricks and sun bakes the dirty marches read a frame (HSTR_WORKSET_PROBE, hstrWorkset).
+    bool mWorksetProbe = false;
+    ref<Buffer> mpWorkset;
+    std::vector<uint32_t> mWorksetStats; ///< Last frame's brick reads, bricks, bake reads, bake slots.
     bool mBeamUnitRefill = false;   ///< beamUnitRefill: PROBE, the units pass with lane refill (marchBeamDirtyUnitsRefill).
     /// HSTR_SUN_BAKE_PROBE=1 in the environment (fixed from the first bake, so the pass compiles once): count bakeCloudSun's steps
     /// and exits (HSTR_BAKE_PROBE), logged every 240 frames.
@@ -478,6 +483,11 @@ private:
     LazyComputePass mpBeamDirtyMarchRefillPass; ///< beamUnitRefill's units pass (marchBeamDirtyUnitsRefill).
     ref<Buffer> mpBeamRefill;                   ///< Its claim counter.
     LazyComputePass mpBeamDirtyUnitArgsPass;
+    bool mBeamSubTiles = false;          ///< beamSubTiles (HSTRCloudParams::beamSubTiles), where the dirty build can run it.
+    bool mBeamUnitStartOracle = false;   ///< ORACLE (beamUnitStartOracle): HSTRCloudParams::beamUnitOracle's record pass and start.
+    ref<Buffer> mpUnitStartOracle;       ///< Per listed unit, its own first-density distance (hstrUnitStartOracle).
+    LazyComputePass mpBeamSubRefinePass; ///< beamSubTiles: refineBeamSubTiles.
+    LazyComputePass mpBeamSubArgsPass;   ///< beamSubTiles: writeBeamSubUnitArgs.
     // Cell views (cellViews): cached per-cell views of the transfer. No reader since composeBeam's removal.
     bool mCellViews = false;
     bool mCellViewsClear = true;           ///< The map and the views must be emptied before the next use.
@@ -536,6 +546,40 @@ private:
     uint32_t mRtTlasCapacity = 0;
     std::vector<uint32_t> mRtStats;       ///< Last probe frame's gProbeStats (HSTRCloudRtProbe.cs.slang slots).
     uint32_t mRtInstances = 0;            ///< Instances in the last top-level structure.
+    /// rasterProbe (DIAGNOSTIC): each frame, the cloud sea drawn by the rasterizer instead of marched (HSTRCloudRaster.slang): the
+    /// boxes of the bricks the march would read, cut into view-aligned slices at its step, depth-sorted and drawn front to back.
+    void runRasterProbe(RenderContext* pRenderContext);
+    /// The apron-free 8^3 copies of the density atlas (and the sun's) behind spanLoop 4096 / 8192 and rasterProbeFetchMask 4.
+    void packCompactAtlases(RenderContext* pRenderContext, bool sun);
+    uint32_t mCompactDensity = 0; ///< compactDensity: 1 the march's density reads from the apron-free copy, 2 no read (oracle).
+    bool mRasterProbe = false;
+    float mRasterProbeScale = 0.5f; ///< rasterProbeScale: the probe's target over the frame (0.5: about a beam texel a pixel).
+    bool mRasterProbeCount = true;  ///< rasterProbeCount: a second, untimed draw counts the fragments.
+    bool mRasterProbeFetch = true;  ///< rasterProbeFetch: false drops the fragments' atlas and bake reads (cost split only).
+    uint32_t mRasterProbeFetchMask = 3u; ///< rasterProbeFetchMask: 1 the density read, 2 the sun bake read (cost split only).
+    bool mRasterProbePrebuilt = false; ///< rasterProbePrebuilt: polygons built once a slice in rasterScatter, one indexed list.
+    ref<Buffer> mpRasterPolygons;      ///< Six world vertices a slice (rasterProbePrebuilt).
+    ref<Vao> mpRasterListVao;          ///< Index buffer 6 s + fan over every slice s (rasterProbePrebuilt).
+    ref<ComputePass> mpRasterArgsPass;
+    ref<ComputePass> mpRasterLevelPass;
+    ref<ComputePass> mpRasterScanPass;
+    ref<ComputePass> mpRasterScatterPass;
+    ref<RasterPass> mpRasterDrawPass;
+    ref<RasterPass> mpRasterCountPass;
+    ref<Buffer> mpRasterInstances;
+    ref<Buffer> mpRasterQueue[2];
+    ref<Buffer> mpRasterCounters;
+    ref<Buffer> mpRasterArgs;
+    ref<Buffer> mpRasterBoxes;
+    ref<Buffer> mpRasterBins;
+    ref<Buffer> mpRasterItems;
+    ref<Texture> mpRasterTarget;
+    ref<Fbo> mpRasterFbo;
+    ref<Vao> mpRasterVao;
+    std::vector<uint32_t> mRasterStats; ///< Last probe frame's gCounters (HSTRCloudRaster.slang slots).
+    uint32_t mRasterInstanceCount = 0;  ///< Sea instances in range in the last probe frame.
+    uint32_t mRasterSeeds = 0;          ///< Regions it started from, at mRasterSeedLevel.
+    uint32_t mRasterSeedLevel = 0;
     /// formR (LIT_VOLUME.md section 6c, gate R1): the lean marches cross empty space between shared occupancy hulls by inline ray
     /// query (1), or only count what that would do (2: HSTR_FORM_R 2, kFormRProbe). Hulls are triangle meshes per (asset, level)
     /// from form_r_hulls.py (formRHulls: their directory; formRDilate false loads the undilated sanity hulls), one bottom-level
@@ -613,6 +657,10 @@ private:
     LazyComputePass mpSpanShareCountPass;
     ref<Texture> mpSpanPacked; ///< spanLoop 256: the sun atlas' layout, each bake's brick density beside it.
     LazyComputePass mpSpanPackPass;
+    ref<Texture> mpSpanCompact;    ///< spanLoop 4096: the density atlas' core texels, 8^3 a slot at slot x 8.
+    ref<Texture> mpSpanCompactSun; ///< spanLoop 8192: the sun atlas' likewise.
+    LazyComputePass mpSpanCompactPass;
+    LazyComputePass mpSpanCompactSunPass;
     void runSpanProbe(RenderContext* pRenderContext);
     ref<Buffer> mpPushShareRays;    ///< The dirty query's marched points this frame.
     ref<Buffer> mpPushShareEntries; ///< Per list entry: dirty rays crossing it, their steps inside it.
@@ -698,6 +746,9 @@ private:
                                                         ///< per-pixel march list. Eight queries per entry, so these are what the
                                                         ///< query pass costs.
     std::string mSaveReferencePath;    ///< When set, the reference sums are written to <path>_s<slice>.exr at the end of the frame.
+    /// DIAGNOSTIC (saveColorRaw): when set, this frame's color output is written to the path raw - uint32 width, height, bytes a
+    /// texel, then the texels - for offline oracles (Mogwai's Python has no numpy, the EXRs are PIZ). Cleared once written.
+    std::string mSaveColorRawPath;
     std::string mBeamPathDump;   ///< beamPathDump: when set, this frame's per-pixel resolve path is written to <path> (raw R32Uint).
     ref<Texture> mpBeamPathCode; ///< beamPathDump: the per-pixel code (resolveBeamPixel).
     ref<Texture> mpBeamGuardWhy; ///< beamPathDump: per guard block, why it was held or listed (classifyBeamGuardCell).

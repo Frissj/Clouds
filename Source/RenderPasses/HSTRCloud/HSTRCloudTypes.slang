@@ -54,6 +54,9 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
 static const uint kBeamCountSlots = 480;
+/// worksetProbe (hstrWorkset): four counters, then one bit set of kWorksetSetWords words for brick indices and one for sun slots.
+static const uint kWorksetHeader = 8;
+static const uint kWorksetSetWords = 32768;
 /// Cell views (cellViews), per build: rays composed, content cells answered from a view, empty cells answered from a view, cells
 /// marched exactly (no usable view), cells visited, views requested, views built, march steps of the exact chords.
 static const uint kCellViewRays = 240;
@@ -239,7 +242,19 @@ struct HSTRCutNode
 // Virtual cloud density. Every VDB of the cloud library is a sparse mip pyramid of 8^3 bricks (level L voxels cover 2^L source
 // voxels) stored with a one-voxel apron, so a resident brick filters trilinearly in the atlas without its neighbours.
 static const uint kCloudBrickCore = 8;
-static const uint kCloudBrickEdge = 10;        ///< Stored edge: core plus apron.
+static const uint kCloudBrickEdge = 10;        ///< Stored edge of a sun atlas slot: core plus apron.
+/// Stored edge of a density atlas slot: the core alone. Every density read clamps to the core (cloudBrickDensity: the apron made a
+/// seam on every face), so the apron was never read but by the commit's parent prediction, occupancy and diagnostics, which now clamp
+/// to the core as well. MEASURED: a moving 4K frame reads ~87k distinct bricks (workset2), ~87 MB with aprons against the 4080
+/// Laptop's 48 MB L2; the core alone is 512 of 1000 bytes. Raster probe density read 1.58 -> 0.70 ms (raster5); the march's units
+/// + query -0.18 ms through a repacked copy (compactship1), now with no copy and half the atlas memory.
+/// MEASURED (corespan1, span evaluator 1080p, the compact1 sweep on this layout): resolved loop 0.541 / again 0.542 ms (compact1 on
+/// the apron layout: 0.613 / 0.612), floor 0.251 (0.240): brick samples 0.373 -> 0.290 ms. Same values: the compact copy arm now
+/// matches the anchor (T mismatches 10,321 / 10,318, bad rays 5,785 T / 4,645 light in both), where on the apron layout the copy
+/// moved only the sub-texel rounding (bad T 5,730 -> 5,729). 4K walk units + query 3.226 / 3.084 ms (coreship1) against 3.156 /
+/// 3.288 before (compactship2): inside the cross-run spread. The saved-reference gate (hillcore1 / 2) could not judge it: its
+/// first sanity arm never reached the image, and its anchor did not repeat after the second's residency rebuild.
+static const uint kCloudDensityEdge = 8;
 static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 bricks (128 source voxels).
 static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
 /// Changed-content spheres markBeamChanges and compactBeamChanges may list for one build of the beam image; past it every guard
@@ -1184,7 +1199,18 @@ struct HSTRCloudParams
     /// content band made interval.x the positive distance to the band, and every ray then marched a view distance BEYOND it. The
     /// same bug would have bitten a camera flying above the grid with no clamp at all, which is the intended use of this renderer.
     uint cloudSlabClamp = 1;
-    uint padHSTRCloud10 = 0;
+    /// compactDensity: cloudBrickDensity reads the apron-free 8^3 copy of the atlas (hstrSpanCompact, packed every frame) - the same
+    /// values (its reads never leave a slot's core), about half the bytes: a moving 4K frame touches ~87k distinct bricks, ~87 MB
+    /// with aprons against the 48 MB L2 (workset2), and the raster probe's density read cost 1.58 -> 0.70 ms on the copy (raster5).
+    /// MEASURED (compactship1, sunset_motion 4K walk 2, frozen, matched leaves, arms alternated): units + query atlas 1.838 + 1.399
+    /// / again 1.743 + 1.465, compact 1.660 + 1.334 / again 1.681 + 1.395 ms: -0.18 ms (-5.5%), under the 0.3 ms stop rule; far sea
+    /// 0.70 unchanged; the full repack (compactPack) 1.29 ms. In the march the read is a smaller share than in the raster draw.
+    /// 2: oracle, no atlas read (wrong image) - the read's whole share of the march.
+    /// MEASURED (compactship2, same conditions): units / query atlas 1.734 / 1.422, again 1.802 / 1.486; compact 1.666 / 1.369; no
+    /// read 1.672 / 1.166 ms. The density read is ~0.1 ms of units and ~0.3 of query - ~0.4 of ~3.2 ms (12%); the compact copy
+    /// takes back ~0.15 of it. Whether the oracle also changed the samples taken is unknown: the counted arms' workset counters do
+    /// not reach the arm summary (sunset_motion prints LEVELS only on the settle and live lines).
+    uint cloudCompactDensity = 0;
 
     /// Measurement only, needs a stored exact frame: >0 replaces every beam tile test with the truth - a tile refines when at least
     /// this many of its pixels, reconstructed from its basis, are off the stored frame by more than beamOracleBar in the compare
@@ -1553,6 +1579,10 @@ struct HSTRCloudParams
     /// points, one per resident-brick voxel it spans (see marchBeamLean). 1: the midpoint alone.
     uint beamRimTaps = 1;
     /// The sun atlas holds cloudSunEncode's 8-bit code of the depth instead of the depth in source voxels (CloudResidencyDesc::sunAtlas8).
+    /// MEASURED (sun8walk1, sunset_motion 4K walk 2, frozen, pool 2, set before the settle so a separate launch): units / query 1.789 /
+    /// 1.379, again 1.714 / 1.327 ms against costsplit1's 16-bit ship arms 1.840 / 1.406, 1.767 / 1.368 - about -0.09 ms, inside the
+    /// cross-run spread; units listed 2.28M / 2.35M over 20 frames (2.27M / 2.44M). Half the sun bytes a sample does not move the
+    /// L1-bound march (nor did the core-only density atlas, coreship1). Kept off.
     uint cloudSunAtlas8 = 0;
     /// DIAGNOSTIC (cacheOracleRadiance): the exact view replaces its cache lookups with paths traced from the sample, bits 0-7 paths
     /// per lookup, bit 8 through the resident fine bricks instead of the transport proxy. 0: the cache.
@@ -1968,6 +1998,33 @@ struct HSTRCloudParams
     /// ORACLE (beamRimCentroid, n > 0): every lean-march step with density is read at n taps for an exact tau and lit at its
     /// opacity-weighted centroid (leanCentroidTaps). Slow; read for quality.
     uint beamRimCentroid = 0;
+    /// beamSubTiles: a failed 4-pixel tile is refined at 2 pixels before it marches every unit. The dirty tile pass lists only its
+    /// 2-pixel lattice units (even, even) and its four 2 x 2 sub-tiles' centres (odd, odd); refineBeamSubTiles then tests each centre
+    /// against the bilinear of its four corners and lists the sub-tile's other two units only where that misses by more than
+    /// beamSubTolerance (log(1 + radiance), mean over rgb); a sub-tile that holds gets them written as the mean of their two corner
+    /// units, as stored values the resolve reads like any unit. Needs beamTileSize 4, beamLevels 1, the plain dirty passes.
+    /// Ceiling (tile_oracle.py, exact 4K sunset frame, emulated): 13-18% fewer units than one level at equal error.
+    /// MEASURED (subtile1, 4K walk, first form: the resolve interpolated marked units): units listed 2.31M -> 1.53M (0.01) / 1.49M
+    /// (0.02) over 20 frames, but units 1.63 / 1.84 -> 2.11 / 2.01 ms (the refine pass reconstructed basis and far sea at every
+    /// corner) and resolve/residual 0.28 -> 1.93 / 2.17 ms; sanity (tolerance 10) 0.99M units, residual 2.49 ms.
+    /// MEASURED (stored-value form; subtile2 with motion scores, subtile3 / subtile4 with seaFarOverlap off so units is the march
+    /// alone): residual back to 0.20-0.21 ms; units listed -15-18% (2.31M -> 1.95M over 20 frames), but units 1.64 / 1.71 -> 2.49-2.64
+    /// ms: first march 1.21 / 1.29 (~1.16M units, ~21 ns each against ~15 for today's units - half as dense on screen), refine 0.02,
+    /// second march 1.22 / 1.38 (~0.79M units, ~32 ns each - the sub-tiles that miss hold the frame's longest, least coherent rays,
+    /// and as their own dispatch they pay their own tail). Over 0.02 against a fresh rebuild 1.68% (0.01) / 1.82% (0.02) vs 1.56%.
+    /// REJECTED on this GPU: a failed tile's units cost about the same marched in one pass or in two; kept off, for review.
+    uint beamSubTiles = 0;
+    float beamSubTolerance = 0.01f;
+    /// Set per dispatch: the dirty unit march runs the sub-tiles' second list (units past hstrBeamDirtyCount[1], count [3]).
+    uint beamSubPhase = 0;
+    /// ORACLE (beamUnitStartOracle; set per dispatch): 1 - the dirty unit march only marches each listed unit and records its own
+    /// first-density distance (hstrUnitStartOracle, untimed); 2 - the timed march starts each unit at that distance less the
+    /// beamUnitStart margin where it is past the tile's start. The time a perfect per-unit start would save.
+    /// MEASURED (ustartoracle1, 4K walk, seaFarOverlap off, clocks low in this launch): units off 2.754 / 2.734 ms, oracle 2.813 /
+    /// 3.095 (the record pass apart, unitOracle 1.8-2.0). ustartoracle2 (beamLayerProbe, 8 counted frames; the oracle arm's counts
+    /// hold its record pass too): units lane steps 7.78M -> ~3.96M timed, warp-paid 10.25M -> ~5.65M (-45%), for no time at all.
+    /// The leading empty run is free: its steps are mask-skips. Step counts are not the march's cost - price oracles in time.
+    uint beamUnitOracle = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

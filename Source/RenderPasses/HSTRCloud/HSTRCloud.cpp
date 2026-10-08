@@ -574,6 +574,61 @@ void HSTRCloud::parseProperties(const Properties& props)
             mRtSpanProbe = bool(value);
             continue;
         }
+        if (key == "rasterProbe")
+        {
+            mRasterProbe = bool(value);
+            continue;
+        }
+        if (key == "rasterProbeScale")
+        {
+            mRasterProbeScale = std::clamp(float(value), 0.0625f, 1.f);
+            continue;
+        }
+        if (key == "rasterProbeCount")
+        {
+            mRasterProbeCount = bool(value);
+            continue;
+        }
+        if (key == "rasterProbeFetch")
+        {
+            mRasterProbeFetch = bool(value);
+            continue;
+        }
+        if (key == "beamUnitStartOracle")
+        {
+            mBeamUnitStartOracle = bool(value);
+            continue;
+        }
+        if (key == "beamSubTiles")
+        {
+            mBeamSubTiles = bool(value);
+            continue;
+        }
+        if (key == "beamSubTolerance")
+        {
+            mParams.beamSubTolerance = float(value);
+            continue;
+        }
+        if (key == "saveColorRaw")
+        {
+            mSaveColorRawPath = value.operator std::string();
+            continue;
+        }
+        if (key == "compactDensity")
+        {
+            mCompactDensity = uint32_t(value);
+            continue;
+        }
+        if (key == "rasterProbeFetchMask")
+        {
+            mRasterProbeFetchMask = uint32_t(value);
+            continue;
+        }
+        if (key == "rasterProbePrebuilt")
+        {
+            mRasterProbePrebuilt = bool(value);
+            continue;
+        }
         if (key == "formR")
         {
             mFormR = std::min(uint32_t(value), 2u);
@@ -916,6 +971,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamLayerProbe")
         {
             mBeamLayerProbe = bool(value);
+            continue;
+        }
+        if (key == "worksetProbe")
+        {
+            mWorksetProbe = bool(value);
             continue;
         }
         if (key == "beamWarp")
@@ -1953,6 +2013,28 @@ Properties HSTRCloud::getProperties() const
                 cloud["rtProbeBin" + std::to_string(k)] = mRtStats[8 + k];
             cloud["rtProbeInstances"] = mRtInstances;
         }
+        // worksetProbe: the last frame's density brick reads and distinct bricks, sun bake reads and distinct bake slots.
+        if (mWorksetProbe && mWorksetStats.size() == 4)
+        {
+            cloud["worksetBrickReads"] = mWorksetStats[0];
+            cloud["worksetBricks"] = mWorksetStats[1];
+            cloud["worksetBakeReads"] = mWorksetStats[2];
+            cloud["worksetBakes"] = mWorksetStats[3];
+        }
+        // rasterProbe: the last probe frame's counts (HSTRCloudRaster.slang gCounters).
+        if (mRasterProbe && !mRasterStats.empty())
+        {
+            const char* names[] = {"Boxes", "Items", "QueueOverflow", "BoxOverflow", "ItemOverflow", "Culled", "Empty", "Unbaked",
+                                   "Fragments", "Subdivided", "NoSlice"};
+            for (uint32_t k = 0; k < 11; ++k)
+                cloud[std::string("raster") + names[k]] = mRasterStats[k];
+            for (uint32_t k = 0; k < 16; ++k)
+                if (mRasterStats[16 + k] != 0)
+                    cloud["rasterLevelBoxes" + std::to_string(k)] = mRasterStats[16 + k];
+            cloud["rasterInstances"] = mRasterInstanceCount;
+            cloud["rasterSeeds"] = mRasterSeeds;
+            cloud["rasterSeedLevel"] = mRasterSeedLevel;
+        }
         // spanProbe: the last frame's span counters (a readback, only while the probe is on).
         if (mSpanProbe && mpSpanCounts)
         {
@@ -2576,6 +2658,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpSpanShareCheckPass = createPass("checkSpanShares");
     mpSpanShareCountPass = createPass("countSpanShares");
     mpSpanPackPass = createPass("packSpanBricks");
+    mpSpanCompactPass = createPass("packSpanCompact");
+    mpSpanCompactSunPass = createPass("packSpanCompactSun");
     mpCellArgsPass = createPass("writeCellViewArgs");
     mpCellBuildPass = createPass("buildCellViews");
     mpCellInvalidatePass = createPass("invalidateCellViews");
@@ -2593,6 +2677,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpPushScatterPass = createPass("scatterPushPieces");
     mpPushSortPass = createPass("sortPushTiles");
     mpBeamDirtyUnitArgsPass = createPass("writeBeamDirtyUnitArgs");
+    mpBeamSubRefinePass = createPass("refineBeamSubTiles");
+    mpBeamSubArgsPass = createPass("writeBeamSubUnitArgs");
     mpBeamDirtyFusedSetupPass = createPass("setupBeamDirtyFused");
     mpBeamDirtyFusedPass = createPass("runBeamDirtyFused");
     mpBeamDirtyTilePass = createPass("testBeamDirtyTiles");
@@ -3799,7 +3885,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             mParams.cloudCommitCount = group.count;
             if (bindResidencyPass(pRenderContext, mpCommitCloudPass, false))
                 bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
-            mpCommitCloudPass->execute(pRenderContext, uint3(10, 10, 10 * group.count));
+            mpCommitCloudPass->execute(pRenderContext, uint3(kCloudDensityEdge, kCloudDensityEdge, kCloudDensityEdge * group.count));
         }
         mParams.cloudCommitCount = 0;
         // Then their occupancy, from the reconstructed atlas texels, for the camera marches' empty-cell skipping.
@@ -4969,6 +5055,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrSpanShareCounts"] = mpSpanShareCounts;
     var["hstrSpanShareValues"] = mpSpanShareValues;
     var["hstrSpanPacked"] = mpSpanPacked;
+    var["hstrSpanCompact"] = mpSpanCompact;
+    var["hstrSpanCompactSun"] = mpSpanCompactSun;
     var["hstrPushShareRays"] = mpPushShareRays;
     var["hstrPushShareEntries"] = mpPushShareEntries;
     var["hstrPushShareAges"] = mpPushShareAges;
@@ -5006,6 +5094,12 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamQueueCounts"] = mpBeamQueueCounts;
     var["hstrBeamLists"] = mpBeamLists[mBeamParity];
     var["hstrBeamCounts"] = mpBeamCounts[mBeamParity];
+    if (!mpWorkset)
+    {
+        mpWorkset = mpDevice->createStructuredBuffer(sizeof(uint32_t), kWorksetHeader + 2u * kWorksetSetWords);
+        pRenderContext->clearUAV(mpWorkset->getUAV().get(), uint4(0));
+    }
+    var["hstrWorkset"] = mpWorkset;
     var["hstrBeamSparseCandidates"] = mpBeamSparseCandidates;
     var["hstrBeamResults"] = mpBeamResults;
     var["hstrBeamFinalTiles"] = mpBeamFinalTiles;
@@ -5049,7 +5143,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
         setBeamDirtyMarchDefines(pPass);
     else if (mFarSeaMarchDefines)
     {
-        for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_LAYER_WRAP_SELECT",
+        for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_WORKSET_PROBE", "HSTR_LAYER_WRAP_SELECT",
                                  "HSTR_LAYER_RUN_DISTANCE", "HSTR_UNIT_START", "HSTR_SUN_PACKED", "HSTR_FORM_B", "HSTR_LAYER_ORACLE",
                                  "HSTR_FORM_R"})
             pPass->getProgram()->removeDefine(name);
@@ -5518,6 +5612,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
     pPass->getProgram()->addDefine("HSTR_STRIP", "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
+    pPass->getProgram()->addDefine("HSTR_WORKSET_PROBE", mWorksetProbe ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
@@ -5787,6 +5882,9 @@ void HSTRCloud::runSpanProbe(RenderContext* pRenderContext)
         bindOutput(mpSpanPackPass, "hstrSpanPackedOutput", mpSpanPacked, "hstrSpanPacked");
         mpSpanPackPass->execute(pRenderContext, uint3(mpCloudResidency->getBricks()->getElementCount(), kCloudSunClasses, kCloudBrickEdge));
     }
+    // spanLoop 4096 / 8192: apron-free copies of the density and sun atlases (8^3 a slot), rebuilt untimed every frame.
+    if ((mParams.spanLoop & (4096u | 8192u)) != 0 && mpCloudResidency)
+        packCompactAtlases(pRenderContext, true);
     bindRenderer(pRenderContext, mpSpanArgsPass);
     mpSpanArgsPass->execute(pRenderContext, uint3(1));
     if (mParams.spanEval != 0)
@@ -6031,6 +6129,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     if (mpCloudSea)
         updateCloudDomain(pRenderContext);
     updateAtmosphere(pRenderContext);
+    // compactDensity: this frame's bricks into the apron-free copy before anything marches (a full repack for the A/B; a shipping
+    // version would copy only the slots committed this frame).
+    mParams.cloudCompactDensity = mpCloudResidency ? std::min(mCompactDensity, 2u) : 0u;
+    if (mParams.cloudCompactDensity == 1u)
+    {
+        FALCOR_PROFILE(pRenderContext, "compactPack");
+        packCompactAtlases(pRenderContext, false);
+    }
 
     // Unbiased reference on the same medium and lights; accumulated over frames by the graph.
     if (!mpReferenceSum || mpReferenceSum->getWidth() != frameDim.x || mpReferenceSum->getHeight() != frameDim.y)
@@ -6646,8 +6752,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-                // Blocks listed, units to march, blocks held.
-                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3);
+                // Blocks listed, units to march, blocks held, beamSubTiles' second units.
+                mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 4);
                 if (!mpBeamWarpArgs)
                 {
                     // Warp on, step scale 1, the set tolerance, until a translating build decides (decideBeamPolicy).
@@ -6667,7 +6773,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamFusedBlocks = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2 * cells);
                 pRenderContext->clearUAV(mpBeamFusedBlocks->getUAV().get(), uint4(0));
                 mpBeamDirtyArgs = mpDevice->createStructuredBuffer(
-                    sizeof(uint32_t), 18, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                    sizeof(uint32_t), 21, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                               ResourceBindFlags::IndirectArg
                 );
                 const uint2 coarseDims = (guardDims + 3u) / 4u;
@@ -7402,6 +7508,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                                   mParams.beamRefFrame != 0 && !mBeamRepairProbe && mBeamStripProbe == 0 &&
                                                   mParams.beamDirtySegments <= 1 && mParams.beamOrderProbe == 0 &&
                                                   !(mPushProbe && mPushShare) && !mSpanProbe && mParams.beamQueue == 0;
+                                // beamSubTiles: only where the unit march below runs its two phases (the plain dirty passes).
+                                mParams.beamSubTiles = mBeamSubTiles && !mBeamFusedBuild && mParams.beamTileSize == 4u &&
+                                                               mParams.beamLevels == 1u && mBeamUnitRefill == false
+                                                           ? 1u
+                                                           : 0u;
                                 if (!mBeamFusedBuild)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "query");
@@ -8059,6 +8170,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     // The units to march were listed by the dirty tile pass (listBeamFailedTileUnits).
                     bindDirty(mpBeamDirtyUnitArgsPass);
                     mpBeamDirtyUnitArgsPass->execute(pRenderContext, uint3(1));
+                    // ORACLE (beamUnitStartOracle): every listed unit marched once, untimed, for its own first-density distance; the
+                    // timed march below then starts there (beamUnitOracle 2).
+                    if (mBeamUnitStartOracle && !fusedChain && mParams.beamUnitStart > 0.f)
+                    {
+                        FALCOR_PROFILE(pRenderContext, "unitOracle");
+                        if (!mpUnitStartOracle || mpUnitStartOracle->getElementCount() != mpBeamDirtyUnits->getElementCount())
+                            mpUnitStartOracle = mpDevice->createStructuredBuffer(sizeof(float), mpBeamDirtyUnits->getElementCount());
+                        mParams.beamUnitOracle = 1u;
+                        bindDirty(mpBeamDirtyMarchPass);
+                        mpBeamDirtyMarchPass->getRootVar()["CB"]["gHSTRCloud"]["hstrUnitStartOracle"] = mpUnitStartOracle;
+                        mpBeamDirtyMarchPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
+                        pRenderContext->uavBarrier(mpUnitStartOracle.get());
+                        mParams.beamUnitOracle = 2u;
+                    }
                     if (mBeamStripProbe != 0)
                     {
                         // PROBE: the same units, stripped, writing nothing (see mBeamStripProbe).
@@ -8100,23 +8225,55 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         bindDirty(pUnits);
                         if (mBeamUnitRefill)
                             pUnits->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamRefill"] = mpBeamRefill;
+                        if (mParams.beamUnitOracle == 2u)
+                            pUnits->getRootVar()["CB"]["gHSTRCloud"]["hstrUnitStartOracle"] = mpUnitStartOracle;
                         if (farBeside)
                         {
                             // The march never reads its own arguments; bound, they would transition back to a UAV.
                             pUnits->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamDirtyArgs"] = ref<Buffer>();
                             pRenderContext->setAutoUavBarriers(false);
                         }
-                        pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
+                        if (mParams.beamSubTiles != 0u)
+                        {
+                            // beamSubTiles: the first march its own scope, so the three parts read apart (units is their sum).
+                            FALCOR_PROFILE(pRenderContext, "first");
+                            pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
+                        }
+                        else
+                            pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
+                        // beamSubTiles: the centres just marched decide their sub-tiles; the sub-tiles that missed march their
+                        // other two units. Inside this scope, so units times the whole residual either way.
+                        if (mParams.beamSubTiles != 0u)
+                        {
+                            {
+                                FALCOR_PROFILE(pRenderContext, "refine");
+                                pRenderContext->uavBarrier(mpBeamPixels[0].get());
+                                pRenderContext->uavBarrier(mpBeamUnitTransmittance.get());
+                                bindDirty(mpBeamSubRefinePass);
+                                mpBeamSubRefinePass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60);
+                                pRenderContext->uavBarrier(mpBeamDirtyCount.get());
+                                pRenderContext->uavBarrier(mpBeamDirtyUnits.get());
+                                bindDirty(mpBeamSubArgsPass);
+                                mpBeamSubArgsPass->execute(pRenderContext, uint3(1));
+                            }
+                            FALCOR_PROFILE(pRenderContext, "second");
+                            mParams.beamSubPhase = 1u;
+                            bindDirty(pUnits);
+                            pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 72); // Eighteen uints in.
+                            mParams.beamSubPhase = 0u;
+                        }
                     }
                     // DIAGNOSTIC (beamDirtyStats): what this frame listed, so arms can be compared by work as well as time.
                     if (mBeamDirtyStats && mpBeamDirtyCount)
                     {
                         mDirtyStatBlocks += mpBeamDirtyCount->getElement<uint32_t>(0);
-                        mDirtyStatUnits += mpBeamDirtyCount->getElement<uint32_t>(1);
+                        mDirtyStatUnits += mpBeamDirtyCount->getElement<uint32_t>(1) +
+                                           (mParams.beamSubTiles != 0u ? mpBeamDirtyCount->getElement<uint32_t>(3) : 0u);
                         ++mDirtyStatFrames;
                     }
                     mParams.beamDirtyFused = 0;
+                    mParams.beamUnitOracle = 0u;
                     if (mPushProbe && mPushShare && mpPushShareRays)
                         runPushShare(pRenderContext);
                     if (mSpanProbe && mpSpanRays)
@@ -8294,8 +8451,27 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         saveReference(pRenderContext, mSaveReferencePath);
         mSaveReferencePath.clear();
     }
+    if (!mSaveColorRawPath.empty())
+    {
+        const std::vector<uint8_t> data = pRenderContext->readTextureSubresource(color.get(), 0);
+        const uint32_t header[3] = {color->getWidth(), color->getHeight(), getFormatBytesPerBlock(color->getFormat())};
+        std::ofstream out(mSaveColorRawPath, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(header), sizeof(header));
+        out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+        logInfo("HSTRCloud: color {}x{} ({}, {} B a texel) written raw to '{}'.", header[0], header[1], to_string(color->getFormat()),
+                header[2], mSaveColorRawPath);
+        mSaveColorRawPath.clear();
+    }
     if (mRtSpanProbe && mpCloudResidency && mpCloudSea && mpScene)
         runRtSpanProbe(pRenderContext);
+    if (mRasterProbe && mpCloudResidency && mpCloudSea && mpScene)
+        runRasterProbe(pRenderContext);
+    // worksetProbe: this frame's reads (the dirty marches ran above), then a clean set for the next frame.
+    if (mWorksetProbe && mpWorkset)
+    {
+        mWorksetStats = mpWorkset->getElements<uint32_t>(0, 4);
+        pRenderContext->clearUAV(mpWorkset->getUAV().get(), uint4(0));
+    }
     ++mParams.frameIndex;
 }
 
@@ -8518,6 +8694,371 @@ void HSTRCloud::runRtSpanProbe(RenderContext* pRenderContext)
         mpRtReducePass->execute(pRenderContext, groups);
     }
     mRtStats = mpRtStats->getElements<uint32_t>(0, 16);
+}
+
+namespace
+{
+/// HSTRCloudRaster.slang RasterInstance.
+struct RasterInstance
+{
+    float4 toWorld[3];
+    float4 toAsset[3];
+    uint32_t levelPageBase;
+    uint32_t pageDims;
+    uint32_t sunClass;
+    float sourceVoxelWorld;
+    float scale;
+    uint32_t topLevel;
+    uint32_t pad[2];
+};
+static_assert(sizeof(RasterInstance) == 128);
+} // namespace
+
+void HSTRCloud::packCompactAtlases(RenderContext* pRenderContext, bool sun)
+{
+    const ref<Texture>& atlas = mpCloudResidency->getAtlas();
+    const ref<Texture>& sunAtlas = mpCloudResidency->getSunAtlas();
+    if (!mpSpanCompact)
+    {
+        const auto compactOf = [&](const ref<Texture>& pAtlas, uint32_t edge)
+        {
+            return mpDevice->createTexture3D(
+                pAtlas->getWidth() / edge * 8u, pAtlas->getHeight() / edge * 8u, pAtlas->getDepth() / edge * 8u,
+                pAtlas->getFormat(), 1, nullptr, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+        };
+        mpSpanCompact = compactOf(atlas, kCloudDensityEdge);
+        mpSpanCompactSun = compactOf(sunAtlas, kCloudBrickEdge);
+        logInfo("HSTRCloud: spanLoop compact atlases {}x{}x{} and {}x{}x{} ({} / {}).", mpSpanCompact->getWidth(), mpSpanCompact->getHeight(),
+                mpSpanCompact->getDepth(), mpSpanCompactSun->getWidth(), mpSpanCompactSun->getHeight(), mpSpanCompactSun->getDepth(),
+                to_string(atlas->getFormat()), to_string(sunAtlas->getFormat()));
+    }
+    bindRenderer(pRenderContext, mpSpanCompactPass);
+    bindOutput(mpSpanCompactPass, "hstrSpanCompactOutput", mpSpanCompact, "hstrSpanCompact");
+    mpSpanCompactPass->execute(pRenderContext, uint3(mpSpanCompact->getWidth(), mpSpanCompact->getHeight(), mpSpanCompact->getDepth()));
+    if (!sun)
+        return;
+    bindRenderer(pRenderContext, mpSpanCompactSunPass);
+    bindOutput(mpSpanCompactSunPass, "hstrSpanCompactSunOutput", mpSpanCompactSun, "hstrSpanCompactSun");
+    mpSpanCompactSunPass->execute(pRenderContext, uint3(mpSpanCompactSun->getWidth(), mpSpanCompactSun->getHeight(), mpSpanCompactSun->getDepth()));
+}
+
+void HSTRCloud::runRasterProbe(RenderContext* pRenderContext)
+{
+    // rasterProbeFetchMask 4: density from the apron-free 8^3 copy (spanLoop 4096's), packed untimed before the probe's scope; the
+    // probe's own boxes, slices and polygons (hundreds of MB) pass through L2 before the draw reads it.
+    if ((mRasterProbeFetchMask & 4u) != 0 && mpCloudResidency)
+        packCompactAtlases(pRenderContext, false);
+    FALCOR_PROFILE(pRenderContext, "rasterProbe");
+    const hstrcloud::CloudResidency& residency = *mpCloudResidency;
+    const char* file = "RenderPasses/HSTRCloud/HSTRCloudRaster.slang";
+    // HSTRCloudRaster.slang's sizes: regions queued a level, boxes kept, slices drawn, depth bins, counters, draw arguments' offset.
+    constexpr uint32_t kQueueCapacity = 4u << 20, kBoxCapacity = 4u << 20, kItemCapacity = 8u << 20;
+    constexpr uint32_t kBins = 65536, kCounters = 48, kQueueSlot = 32, kBoxSlot = 0, kDrawArgs = 4;
+    if (!mpRasterLevelPass)
+    {
+        auto create = [&](const char* entry)
+        {
+            ProgramDesc desc;
+            desc.addShaderLibrary(file).csEntry(entry);
+            desc.setShaderModel(ShaderModel::SM6_5);
+            return ComputePass::create(mpDevice, desc);
+        };
+        mpRasterArgsPass = create("rasterArgs");
+        mpRasterLevelPass = create("rasterLevel");
+        mpRasterScanPass = create("rasterScan");
+        mpRasterScatterPass = create("rasterScatter");
+        auto raster = [&](bool count)
+        {
+            ProgramDesc desc;
+            desc.addShaderLibrary(file).vsEntry("rasterVS").psEntry("rasterPS");
+            desc.setShaderModel(ShaderModel::SM6_5);
+            DefineList defines;
+            defines.add("RASTER_COUNT", count ? "1" : "0");
+            ref<RasterPass> pass = RasterPass::create(mpDevice, desc, defines);
+            DepthStencilState::Desc depth;
+            depth.setDepthEnabled(false);
+            depth.setDepthWriteMask(false);
+            pass->getState()->setDepthStencilState(DepthStencilState::create(depth));
+            RasterizerState::Desc rasterizer;
+            rasterizer.setCullMode(RasterizerState::CullMode::None);
+            pass->getState()->setRasterizerState(RasterizerState::create(rasterizer));
+            // Front to back: colour and opacity both added under what is already there, src x (1 - dst alpha) + dst.
+            BlendState::Desc blend;
+            blend.setRtBlend(0, true).setRtParams(
+                0, BlendState::BlendOp::Add, BlendState::BlendOp::Add, BlendState::BlendFunc::OneMinusDstAlpha, BlendState::BlendFunc::One,
+                BlendState::BlendFunc::OneMinusDstAlpha, BlendState::BlendFunc::One
+            );
+            pass->getState()->setBlendState(BlendState::create(blend));
+            return pass;
+        };
+        mpRasterDrawPass = raster(false);
+        mpRasterCountPass = raster(true);
+        const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+        mpRasterQueue[0] = mpDevice->createStructuredBuffer(16u, kQueueCapacity, flags);
+        mpRasterQueue[1] = mpDevice->createStructuredBuffer(16u, kQueueCapacity, flags);
+        mpRasterCounters = mpDevice->createStructuredBuffer(sizeof(uint32_t), kCounters, flags);
+        mpRasterArgs = mpDevice->createStructuredBuffer(sizeof(uint32_t), 12u, flags | ResourceBindFlags::IndirectArg);
+        mpRasterBoxes = mpDevice->createStructuredBuffer(16u, 2u * kBoxCapacity, flags);
+        mpRasterBins = mpDevice->createStructuredBuffer(sizeof(uint32_t), kBins, flags);
+        mpRasterItems = mpDevice->createStructuredBuffer(8u, kItemCapacity, flags);
+        const uint32_t indices[12] = {0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5};
+        ref<Buffer> pIndices = mpDevice->createBuffer(sizeof(indices), ResourceBindFlags::Index, MemoryType::DeviceLocal, indices);
+        mpRasterVao = Vao::create(Vao::Topology::TriangleList, nullptr, Vao::BufferVec(), pIndices, ResourceFormat::R32Uint);
+        logInfo("HSTRCloud: rasterProbe {:.0f} MB of queues, boxes and slices.",
+                double(2ull * kQueueCapacity * 16 + 2ull * kBoxCapacity * 16 + uint64_t(kItemCapacity) * 8) / (1 << 20));
+    }
+    if (mRasterProbePrebuilt && !mpRasterPolygons)
+    {
+        mpRasterPolygons = mpDevice->createStructuredBuffer(16u, 6u * kItemCapacity, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        const uint32_t fan[12] = {0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5};
+        std::vector<uint32_t> indices(size_t(12) * kItemCapacity);
+        for (size_t i = 0; i < indices.size(); ++i)
+            indices[i] = uint32_t(6 * (i / 12) + fan[i % 12]);
+        ref<Buffer> pIndices = mpDevice->createBuffer(
+            indices.size() * sizeof(uint32_t), ResourceBindFlags::Index, MemoryType::DeviceLocal, indices.data()
+        );
+        mpRasterListVao = Vao::create(Vao::Topology::TriangleList, nullptr, Vao::BufferVec(), pIndices, ResourceFormat::R32Uint);
+        logInfo("HSTRCloud: rasterProbePrebuilt {:.0f} MB of polygons and indices.", double(uint64_t(kItemCapacity) * (96 + 48)) / (1 << 20));
+    }
+    const char* prebuilt = mRasterProbePrebuilt ? "1" : "0";
+    mpRasterScanPass->addDefine("RASTER_PREBUILT", prebuilt);
+    mpRasterScatterPass->addDefine("RASTER_PREBUILT", prebuilt);
+    const uint2 targetDim = max(uint2(float2(mParams.frameDim) * mRasterProbeScale + 0.5f), uint2(1u));
+    if (!mpRasterTarget || mpRasterTarget->getWidth() != targetDim.x || mpRasterTarget->getHeight() != targetDim.y)
+    {
+        mpRasterTarget = mpDevice->createTexture2D(
+            targetDim.x, targetDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget
+        );
+        mpRasterFbo = Fbo::create(mpDevice, {mpRasterTarget});
+    }
+
+    // Instances in range: as runRtSpanProbe places them (each occupied tile slot at its tile copy nearest the camera; the march's
+    // instance test maps sea voxel v to x = R (v - offset) + t), as world <-> asset source voxel affine maps.
+    const CameraData& camera = mpScene->getCamera()->getData();
+    const float3 cameraVoxel = (camera.posW - mParams.seaOrigin) / mParams.seaVoxelSize - 0.5f;
+    std::vector<RasterInstance> instances;
+    {
+        const auto& desc = mpCloudSea->getDesc();
+        const auto& records = residency.getInstanceRecords();
+        const int tiles = int(desc.tiles);
+        const float tileVoxels = float(desc.tileVoxels);
+        const float3 size = mParams.seaVoxelSize;
+        for (uint32_t index = 0; index < records.size(); ++index)
+        {
+            const HSTRCloudInstance& r = records[index];
+            if (!(r.scale > 0.f))
+                continue;
+            const uint32_t layer = index / uint32_t(tiles * tiles);
+            const int sx = int(index % uint32_t(tiles)), sz = int((index / uint32_t(tiles)) % uint32_t(tiles));
+            const float shift = 0.5f * tileVoxels * float(layer);
+            const float cx = std::floor((cameraVoxel.x + 0.5f - shift) / tileVoxels);
+            const float cz = std::floor((cameraVoxel.z + 0.5f - shift) / tileVoxels);
+            const float wx = float(sx) + float(tiles) * std::round((cx - float(sx)) / float(tiles));
+            const float wz = float(sz) + float(tiles) * std::round((cz - float(sz)) / float(tiles));
+            float3x3 rotation;
+            rotation.setRow(0, r.row0.xyz());
+            rotation.setRow(1, r.row1.xyz());
+            rotation.setRow(2, r.row2.xyz());
+            const float3x3 inverse = math::inverse(rotation);
+            const float3 offset(wx * tileVoxels + shift, 0.f, wz * tileVoxels + shift);
+            const float3 t(r.row0.w, r.row1.w, r.row2.w);
+            const float3 translation = offset - math::mul(inverse, t);
+            RasterInstance instance = {};
+            // world = size (inverse x + translation + 0.5) + seaOrigin;  x = R ((world - seaOrigin) / size - 0.5 - offset) + t.
+            const float3 assetOrigin = mParams.seaOrigin / size + 0.5f + offset;
+            for (int row = 0; row < 3; ++row)
+            {
+                instance.toWorld[row] = float4(
+                    size[row] * inverse[row][0], size[row] * inverse[row][1], size[row] * inverse[row][2],
+                    size[row] * (translation[row] + 0.5f) + mParams.seaOrigin[row]
+                );
+                const float3 coefficients = rotation.getRow(row);
+                instance.toAsset[row] = float4(coefficients / size, t[row] - dot(coefficients, assetOrigin));
+            }
+            // Range: the asset's box against the view distance.
+            const float3 dims = float3(residency.getAssetDims(r.asset));
+            float3 lo(1e30f), hi(-1e30f);
+            for (uint32_t c = 0; c < 8; ++c)
+            {
+                const float3 corner((c & 1) ? dims.x - 0.5f : -0.5f, (c & 2) ? dims.y - 0.5f : -0.5f, (c & 4) ? dims.z - 0.5f : -0.5f);
+                const float3 world(
+                    dot(instance.toWorld[0].xyz(), corner) + instance.toWorld[0].w, dot(instance.toWorld[1].xyz(), corner) + instance.toWorld[1].w,
+                    dot(instance.toWorld[2].xyz(), corner) + instance.toWorld[2].w
+                );
+                lo = min(lo, world);
+                hi = max(hi, world);
+            }
+            if (length(clamp(camera.posW, lo, hi) - camera.posW) > mParams.seaViewDistance)
+                continue;
+            instance.levelPageBase = r.levelPageBase;
+            instance.pageDims = r.pageDims;
+            instance.sunClass = r.sunClass;
+            instance.sourceVoxelWorld = r.sourceVoxelWorld;
+            instance.scale = r.scale;
+            instance.topLevel = r.topLevel;
+            instances.push_back(instance);
+        }
+    }
+    mRasterInstanceCount = uint32_t(instances.size());
+    if (instances.empty())
+        return;
+    // Seeds: every region of every instance at the coarsest level all of them have resolved pages for.
+    uint32_t seedLevel = 15;
+    for (const RasterInstance& instance : instances)
+        seedLevel = std::min(seedLevel, instance.topLevel);
+    std::vector<uint4> seeds;
+    for (uint32_t index = 0; index < instances.size(); ++index)
+    {
+        const uint32_t w = instances[index].pageDims;
+        const uint3 pages(w & 1023u, (w >> 10) & 1023u, w >> 20);
+        const uint3 dims = (pages + (1u << seedLevel) - 1u) >> seedLevel;
+        for (uint32_t z = 0; z < dims.z; ++z)
+            for (uint32_t y = 0; y < dims.y; ++y)
+                for (uint32_t x = 0; x < dims.x; ++x)
+                    seeds.push_back(uint4(index, x | (y << 10) | (z << 20), 0u, 0u));
+    }
+    seeds.resize(std::min<size_t>(seeds.size(), kQueueCapacity));
+    mRasterSeeds = uint32_t(seeds.size());
+    mRasterSeedLevel = seedLevel;
+    if (!mpRasterInstances || mpRasterInstances->getElementCount() < instances.size())
+        mpRasterInstances = mpDevice->createStructuredBuffer(sizeof(RasterInstance), uint32_t(instances.size() * 2), ResourceBindFlags::ShaderResource);
+    mpRasterInstances->setBlob(instances.data(), 0, instances.size() * sizeof(RasterInstance));
+    mpRasterQueue[seedLevel & 1]->setBlob(seeds.data(), 0, seeds.size() * sizeof(uint4));
+    pRenderContext->clearUAV(mpRasterCounters->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(mpRasterBins->getUAV().get(), uint4(0));
+    mpRasterCounters->setElement(kQueueSlot + seedLevel, mRasterSeeds);
+
+    // The constants every program reads.
+    const float3 forward = normalize(camera.cameraW);
+    const float4x4& m = camera.viewProjMatNoJitter;
+    const float4 rows[4] = {m.getRow(0), m.getRow(1), m.getRow(2), m.getRow(3)};
+    const float4 frustum[4] = {rows[3] + rows[0], rows[3] - rows[0], rows[3] + rows[1], rows[3] - rows[1]};
+    const auto& grids = mpScene->getGridVolumes();
+    const float densityScale = (grids.empty() ? 1.f : grids[0]->getDensityScale()) * mParams.densityScale;
+    auto bind = [&](const ShaderVar& var)
+    {
+        auto cb = var["RasterCB"];
+        cb["gViewProj"] = m;
+        for (uint32_t k = 0; k < 4; ++k)
+            cb["gFrustum"][k] = frustum[k];
+        cb["gCameraPos"] = camera.posW;
+        cb["gViewDistance"] = mParams.seaViewDistance;
+        cb["gForward"] = forward;
+        cb["gPixelAngle"] = mParams.cloudPixelAngle;
+        cb["gCameraU"] = camera.cameraU;
+        cb["gLodBias"] = mParams.cloudLodBias;
+        cb["gCameraV"] = camera.cameraV;
+        cb["gNear"] = camera.nearZ;
+        cb["gCameraW"] = camera.cameraW;
+        cb["gMinStepVoxels"] = mParams.minStepVoxels;
+        cb["gSunColour"] = mParams.residualStrength * mParams.sunRadiance;
+        cb["gMaxStepVoxels"] = mParams.maxStepVoxels;
+        cb["gAtlasInvSize"] = mParams.cloudAtlasInvSize;
+        cb["gSeaVoxel"] = mParams.seaVoxelSize.x;
+        cb["gSunAtlasInvSize"] = mParams.cloudSunAtlasInvSize;
+        cb["gFineMinVoxels"] = mParams.cloudFineMinVoxels;
+        cb["gDensityScale"] = densityScale;
+        cb["gBinScale"] = float(kBins) / mParams.seaViewDistance;
+        cb["gAtlasShift"] = mParams.cloudAtlasShift;
+        cb["gSun8"] = (mParams.cloudSunAtlas8 != 0 || mParams.cloudSunPackedAtlas == 1u) ? 1u : 0u;
+        cb["gTargetDim"] = targetDim;
+        cb["gQueueCapacity"] = kQueueCapacity;
+        cb["gBoxCapacity"] = kBoxCapacity;
+        cb["gItemCapacity"] = kItemCapacity;
+        var["gInstances"] = mpRasterInstances;
+        var["gLevelPages"] = residency.getLevelPages();
+        var["gBricks"] = residency.getBricks();
+        var["gSunResolved"] = residency.getSunResolved();
+        var["gCounters"] = mpRasterCounters;
+        var["gArgs"] = mpRasterArgs;
+        var["gBins"] = mpRasterBins;
+    };
+    auto args = [&](uint32_t source, uint32_t cap)
+    {
+        auto var = mpRasterArgsPass->getRootVar();
+        bind(var);
+        var["RasterCB"]["gArgsSource"] = source;
+        var["RasterCB"]["gArgsCap"] = cap;
+        var["RasterCB"]["gArgsOffset"] = 0u;
+        mpRasterArgsPass->execute(pRenderContext, 1u, 1u, 1u);
+        pRenderContext->uavBarrier(mpRasterArgs.get());
+    };
+    {
+        FALCOR_PROFILE(pRenderContext, "rasterBoxes");
+        for (int level = int(seedLevel); level >= 0; --level)
+        {
+            args(kQueueSlot + uint32_t(level), kQueueCapacity);
+            auto var = mpRasterLevelPass->getRootVar();
+            bind(var);
+            var["RasterCB"]["gLevel"] = uint32_t(level);
+            var["gQueueIn"] = mpRasterQueue[level & 1];
+            var["gQueueOut"] = mpRasterQueue[(level + 1) & 1];
+            var["gBoxes"] = mpRasterBoxes;
+            mpRasterLevelPass->executeIndirect(pRenderContext, mpRasterArgs.get(), 0);
+            pRenderContext->uavBarrier(mpRasterCounters.get());
+            pRenderContext->uavBarrier(mpRasterQueue[(level + 1) & 1].get());
+        }
+    }
+    {
+        FALCOR_PROFILE(pRenderContext, "rasterSort");
+        pRenderContext->uavBarrier(mpRasterBins.get());
+        {
+            auto var = mpRasterScanPass->getRootVar();
+            bind(var);
+            mpRasterScanPass->execute(pRenderContext, 1024u, 1u, 1u);
+        }
+        pRenderContext->uavBarrier(mpRasterBins.get());
+        pRenderContext->uavBarrier(mpRasterArgs.get());
+        args(kBoxSlot, kBoxCapacity);
+        // rasterArgs rewrote only the dispatch arguments (0-2); the scan's draw arguments (4-8) stand.
+        {
+            auto var = mpRasterScatterPass->getRootVar();
+            bind(var);
+            var["gBoxes"] = mpRasterBoxes;
+            var["gItems"] = mpRasterItems;
+            if (mRasterProbePrebuilt)
+                var["gPolygons"] = mpRasterPolygons;
+            mpRasterScatterPass->executeIndirect(pRenderContext, mpRasterArgs.get(), 0);
+        }
+        pRenderContext->uavBarrier(mpRasterItems.get());
+        if (mRasterProbePrebuilt)
+            pRenderContext->uavBarrier(mpRasterPolygons.get());
+    }
+    auto draw = [&](const ref<RasterPass>& pass)
+    {
+        pass->addDefine("RASTER_FETCH", std::to_string(mRasterProbeFetch ? mRasterProbeFetchMask & 7u : 0u));
+        pass->addDefine("RASTER_PREBUILT", prebuilt);
+        auto var = pass->getRootVar();
+        bind(var);
+        var["gBoxesRead"] = mpRasterBoxes;
+        var["gItemsRead"] = mpRasterItems;
+        if (mRasterProbePrebuilt)
+            var["gPolygonsRead"] = mpRasterPolygons;
+        var["gAtlas"] = residency.getAtlas();
+        var["gSunAtlas"] = residency.getSunAtlas();
+        if ((mRasterProbeFetchMask & 4u) != 0 && mpSpanCompact)
+        {
+            var["gAtlasCompact"] = mpSpanCompact;
+            var["RasterCB"]["gCompactInvSize"] =
+                float3(1.f / mpSpanCompact->getWidth(), 1.f / mpSpanCompact->getHeight(), 1.f / mpSpanCompact->getDepth());
+        }
+        var["gLinearClamp"] = mpLinearClampSampler;
+        pRenderContext->clearRtv(mpRasterTarget->getRTV().get(), float4(0.f));
+        pass->getState()->setFbo(mpRasterFbo);
+        pass->getState()->setVao(mRasterProbePrebuilt ? mpRasterListVao : mpRasterVao);
+        pRenderContext->drawIndexedIndirect(pass->getState().get(), pass->getVars().get(), 1, mpRasterArgs.get(), kDrawArgs * sizeof(uint32_t), nullptr, 0);
+    };
+    {
+        FALCOR_PROFILE(pRenderContext, "rasterDraw");
+        draw(mpRasterDrawPass);
+    }
+    if (mRasterProbeCount)
+    {
+        FALCOR_PROFILE(pRenderContext, "rasterCount");
+        draw(mpRasterCountPass);
+    }
+    mRasterStats = mpRasterCounters->getElements<uint32_t>(0, kCounters);
 }
 
 void HSTRCloud::updateHullTlas(RenderContext* pRenderContext)

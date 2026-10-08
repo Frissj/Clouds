@@ -33,7 +33,11 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
           "beamMarchTiles", "bindCpuMs") + tuple(  # rtSpanProbe's last frame (present only while it is on).
           f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
-          f"rtProbeBin{b}" for b in range(8))
+          f"rtProbeBin{b}" for b in range(8)) + tuple(  # rasterProbe's last frame (present only while it is on).
+          f"raster{n}" for n in ("Boxes", "Items", "Fragments", "Culled", "Empty", "Unbaked", "Subdivided", "NoSlice", "QueueOverflow",
+                                 "BoxOverflow", "ItemOverflow", "Instances", "Seeds", "SeedLevel")) + tuple(
+          f"rasterLevelBoxes{k}" for k in range(16)) + (  # worksetProbe's last frame.
+          "worksetBrickReads", "worksetBricks", "worksetBakeReads", "worksetBakes")
 CHUNK = int(os.environ.get("HSTR_MOTION_CHUNK", "20"))
 DROP = CHUNK // 4  # Frames at the start of each chunk carrying the previous arm's state.
 

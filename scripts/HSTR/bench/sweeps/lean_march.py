@@ -229,6 +229,43 @@ PACKED = [
     ("span packed again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=256, spanShare=False)),
     ("span per ray again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=0, spanShare=False)),
 ]
+# The working set of a brick sample: the resolved loop (1, the same integral as per ray, spanorder1) with every density and sun
+# slot folded into 16^3 slots (1024: ~4 MB an atlas, fits the 48 MB L2) or 4^3 (2048: ~64 KB, about one SM's L1). Same
+# instructions, wrong image (their light / T mismatches against the anchor's are the sanity check). The bake fetch alone (128) and
+# the brick-skipped floor (32, the headers and proxy) in the same run. Brick-sample time = arm - floor.
+# Stop rule (set before running): if the 16^3 arm's brick-sample time is more than half the anchor's, the working set is not what
+# makes a real brick sample slow, and a compact (cache-resident) representation is closed. At a third or less, it is the lever.
+WORKSET = [
+    ("span resolved loop", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1, spanShare=False)),
+    ("span working set 16^3", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 1024, spanShare=False)),
+    ("span working set 4^3", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 2048, spanShare=False)),
+    ("span no bake fetch", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 128, spanShare=False)),
+    ("span floor (bricks skipped)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 32, spanShare=False)),
+    ("span resolved loop again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1, spanShare=False)),
+]
+# The cheapest smaller working set: the same bricks without their aprons, 8^3 a slot, aligned to 8 (an untimed copy every frame).
+# 4096 reads the density there (exact: its reads never leave a slot's core, so T misses must equal the anchor's), 8192 the sun too
+# (at the density's clamp, so the light moves a little at brick faces). The 16^3 fold is the ceiling, the floor as before.
+# Stop rule (set before running): brick-sample time (arm - floor) down >= 1.5x with both compact -> the layout alone is worth
+# building into the march; under 1.15x -> the working set needs real compression (codebook / block compression), not a layout.
+COMPACT = [
+    ("span resolved loop", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1, spanShare=False)),
+    ("span compact density", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 4096, spanShare=False)),
+    ("span compact density + sun", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 4096 | 8192, spanShare=False)),
+    ("span working set 16^3", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 1024, spanShare=False)),
+    ("span floor (bricks skipped)", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1 | 32, spanShare=False)),
+    ("span resolved loop again", dict(DSUN, spanProbe=True, spanGather=0, spanEval=0, spanLoop=1, spanShare=False)),
+]
+# MEASURED (compact1, HSTR_RES=1920x1080, --steps 1): spans 0.613 / again 0.612, compact density 0.561, compact density + sun
+# 0.494, 16^3 0.333, floor 0.240 ms. Brick samples (arm - floor) 0.373 -> 0.321 (1.16x, density alone) -> 0.254 (1.47x, both)
+# -> 0.093 (16^3). Density compact is nearly exact (T bad 5,730 -> 5,729, T mismatches 10,358 -> 12,282 from the other texture
+# size's sub-texel rounding); the sun at the density's clamp is not (light bad 4,753 -> 23,385). Between the stop rule's lines:
+# just under 1.5x with both, and only by an inexact sun. Halving the bytes (1000 -> 512 a slot) bought a third of the 16^3
+# ceiling. Caveat: the untimed pack runs inside the march scope right before the spans (march 2.74 -> 5.92 ms), so the copy's
+# last writes may sit in L2 and flatter the compact arms.
+# MEASURED (workset1, HSTR_RES=1920x1080, --steps 1): spans 0.606 / 16^3 0.343 / 4^3 0.265 / no bake fetch 0.382 / floor 0.254 /
+# again 0.606 ms; brick samples (arm - floor) 0.352 -> 0.089 (4.0x) -> 0.011 (~32x); light misses 4,753 -> ~100k in the oracle
+# arms. PASSES: the working set, not the instructions, makes a real brick sample slow. See evaluateSpan.
 # MEASURED (packed2, edge density replicated into the apron, read at the sun's clamp): spans 0.601 / again 0.604, packed 0.533
 # (-0.07), no bake fetch 0.380; light off by > 0.02 4,753 -> 4,791, T 5,730 -> 5,716: exact now, but half packed1's saving.
 # MEASURED (packed3, both clamps in one run): spans 0.586 / again 0.587, packed (sun's clamp, exact) 0.492 / again 0.492 (-0.094),

@@ -191,10 +191,11 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mFadeEnds.resize(std::max(1u, mDesc.fadeFrames) + 1);
     mFadeProcessed = mFrame;
     mpFadeFrame = mpDevice->createStructuredBuffer(sizeof(HSTRCloudFadeFrame), 1, shaderResource, MemoryType::DeviceLocal, nullptr, false);
+    // Core-only density slots (kCloudDensityEdge); the sun atlas below keeps its apron (kCloudBrickEdge).
     mpAtlas = mpDevice->createTexture3D(
-        kAtlasBricksXY * 10u,
-        kAtlasBricksXY * 10u,
-        atlasDepth * 10u,
+        kAtlasBricksXY * kCloudDensityEdge,
+        kAtlasBricksXY * kCloudDensityEdge,
+        atlasDepth * kCloudDensityEdge,
         ResourceFormat::R8Unorm,
         1,
         nullptr,
@@ -214,9 +215,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     // (three arms of that run disturbed - the sanity arm read 1.59 where it reads 1.31 - so only the undisturbed pairs count);
     // over 0.02 arm for arm as at RG16F (walk 3.87 / 3.74 / 3.89 / 3.97%) though every arm now reads the 8-bit sun.
     mpSunAtlas = mpDevice->createTexture3D(
-        mpAtlas->getWidth(),
-        mpAtlas->getHeight(),
-        mpAtlas->getDepth() * sunScale,
+        kAtlasBricksXY * kCloudBrickEdge,
+        kAtlasBricksXY * kCloudBrickEdge,
+        atlasDepth * kCloudBrickEdge * sunScale,
         mDesc.sunPacked == 1 ? ResourceFormat::RG8Unorm : (mDesc.sunAtlas8 ? ResourceFormat::R8Unorm : ResourceFormat::R16Float),
         1,
         nullptr,
