@@ -16,6 +16,10 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # sea's proxy draws mid-distance clouds as blobs). Score a changed distance on its second arm: the first after a change is
     # deterministically worse (0.0274 vs 0.0211 at 1600, cause not found).
     "seaViewDistance": 2000.0,
+    # A quality trade the owner took (2026-10-08): camera step 4 -> 5 sea voxels. Measured (IntelCloudSeaHalf.py's notes, qualfront /
+    # qualtime4): +0.5% excess squared log error against the 326-spp path trace, units + query -0.43 ms on the 4K walk, motion
+    # slightly less stable. Step 6 (+2.3% in hillcent1, -0.9 ms) was offered and not taken.
+    "minStepVoxels": 5.0,
     # Two layers ask for about twice the sun bakes of one; until a brick's bake lands its samples take the live sun march. 1024 a frame
     # (bakeCloudSun ~0.2-2 ms while baking). NOT MEASURED against 256: the A/B that seemed to show it (1871ae53) changed the rate at
     # runtime, which did not rebuild the residency then, so its second arm was the first one settled longer.

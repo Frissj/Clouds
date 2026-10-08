@@ -315,7 +315,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
-            key == "seaFarOverlap" || key == "seaFarBricks" || key == "seaFarFadeWidth" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
+            key == "seaFarOverlap" || key == "seaFarBricks" || key == "seaFarFadeWidth" || key == "beamResolveProbe" || key == "beamRimCentroid" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
             key == "beamDirtyStats" || key == "beamCacheTolerance" || key == "beamSunTolerance" || key == "compareSquared")
         {
             if (key == "compareSquared")
@@ -342,6 +342,10 @@ void HSTRCloud::parseProperties(const Properties& props)
                 mParams.seaFarProbe = value;
             else if (key == "seaFarBricks")
                 mParams.seaFarBricks = bool(value) ? 1u : 0u;
+            else if (key == "beamResolveProbe")
+                mParams.beamResolveProbe = value;
+            else if (key == "beamRimCentroid")
+                mParams.beamRimCentroid = std::min(uint32_t(value), 32u);
             else if (key == "seaFarFadeWidth")
                 mSeaFarFadeWidth = std::clamp(float(value), 1e-3f, 0.3f);
             else if (key == "seaFarField")
@@ -5051,6 +5055,11 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
             pPass->getProgram()->removeDefine(name);
     }
     mFarSeaMarchDefines = mParams.seaFarBricks != 0;
+    // The counters stay compiled in (read only under bit 6); seaFarProbe bit 7 compiles them out.
+    // MEASURED (farreg1, 4K walk at 2000, overlap off, alternating arms): out 0.797 / 0.811 ms, in 0.759 / 0.746 - the far march
+    // is register-bound (31% of its time waiting on register allocation, viewv2000 trace), but dropping these counters changed
+    // its allocation for the worse.
+    pPass->getProgram()->addDefine("HSTR_FAR_PROBE", (mParams.seaFarProbe & 128u) != 0 ? "0" : "1");
     bindRenderer(pRenderContext, pPass);
     ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
     var["hstrFarFieldOutput"] = mpFarField[mFarCurrent ^ 1u];

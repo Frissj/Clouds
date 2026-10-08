@@ -1961,6 +1961,13 @@ struct HSTRCloudParams
     /// seaFarBricks: the far sea (farSeaMarch) reads the resident bricks' density and their baked sun (leanExtinctionLayered,
     /// leanSunDepth) where the near march would, instead of the transport proxy and fineSunAt; the proxy answers elsewhere.
     uint seaFarBricks = 0;
+    /// DIAGNOSTIC (beamResolveProbe, wrong images, read for time): the pixel resolve stops after the beam mapping (bit 0), skips the
+    /// warp (bit 1), skips the sky behind the clouds (bit 2), stops after the level read (bit 3); bit 4 (A/B, right images): the sky
+    /// and far sea behind are read even under 1e-4 transmittance, as before that skip.
+    uint beamResolveProbe = 0;
+    /// ORACLE (beamRimCentroid, n > 0): every lean-march step with density is read at n taps for an exact tau and lit at its
+    /// opacity-weighted centroid (leanCentroidTaps). Slow; read for quality.
+    uint beamRimCentroid = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

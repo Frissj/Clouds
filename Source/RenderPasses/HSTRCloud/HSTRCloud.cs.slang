@@ -63,6 +63,10 @@ import Atmosphere;
 #define HSTR_FORM_R 0 // formR: the lean marches cross empty space between the occupancy hulls by ray query (1), or count it (2).
                       // MEASURED and REJECTED (formr1-4): see HSTRCloud.h updateHullTlas.
 #endif
+#ifndef HSTR_FAR_PROBE
+// seaFarProbe bit 6's counters (farSeaMarch): compiled in by default, out with seaFarProbe bit 7 (slower, see dispatchFarSea).
+#define HSTR_FAR_PROBE 1
+#endif
 #ifndef HSTR_FORM_B
 #define HSTR_FORM_B 0 // formB: the lean marches read the world brick table over an aligned sea (1), and count what it answered (2).
 #endif
@@ -3561,12 +3565,16 @@ struct HSTRCloudRenderer
     /// withFar false: without the far sea behind (a stored unit adds it when read, beamUnitRadiance).
     float3 hazedBeamRadiance(float3 cache, float3 single, float depth, float distance, float3 w, float3 albedo, bool withFar = true)
     {
-        const float3 radiance = beamRadiance(cache, single, depth, w, albedo) + (withFar ? exp(-depth) * farSeaExtra(w) : 0.f);
+        // The far sea behind only where it shows (as the sky in beamRadiance: under 1e-4 transmittance).
+        const float transmittance = exp(-depth);
+        const float3 radiance =
+            beamRadiance(cache, single, depth, w, albedo) +
+            (withFar && (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u) ? transmittance * farSeaExtra(w) : 0.f);
         if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f))
             return radiance;
         const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
         const float4 aerial = atmosphereAerial(hstrAtmosphere, hstrAtmosphereAerial, hstrLinearClampSampler, w, distance);
-        return radiance - cloud * (1.f - aerial.a) + aerial.rgb * (1.f - exp(-depth));
+        return radiance - cloud * (1.f - aerial.a) + aerial.rgb * (1.f - transmittance);
     }
 
     /// The far sea: the path tracer's periodic sea reaches the horizon, the near march stops at seaViewDistance (the camera-centred
@@ -3770,7 +3778,7 @@ struct HSTRCloudRenderer
             }
             s += ds;
         }
-        if ((params.seaFarProbe & 64u) != 0)
+        if (HSTR_FAR_PROBE != 0 && (params.seaFarProbe & 64u) != 0)
         {
             uint unused;
             InterlockedAdd(hstrFarCounts[23], banded ? 1u : 0u, unused);
@@ -8478,6 +8486,30 @@ struct HSTRCloudRenderer
         return density;
     }
 
+    /// ORACLE (beamRimCentroid): a step [t, t + dt] read at `taps` evenly spaced points - its mean extinction (an exact tau to the
+    /// taps' resolution) and the opacity-weighted centroid of its extinction (tCentroid), where its one source is then evaluated
+    /// instead of the midpoint (5276cb29 / bbe94288: halves the error at a fixed step on the old march). Read for quality only.
+    float leanCentroidTaps(CutRay ray, float t, float dt, float footprint, uint taps, out float tCentroid)
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float sub = dt / float(max(taps, 1u));
+        float sum = 0.f, m0 = 0.f, m1 = 0.f, through = 1.f;
+        for (uint o = 0; o < max(taps, 1u); ++o)
+        {
+            const float to = t + (float(o) + 0.5f) * sub;
+            LeanHit tapHit;
+            float tapSkip, tapVoxels;
+            const float s = leanExtinction(ray, (ray.position + to * ray.direction) * cellWidth, footprint, to, tapVoxels, tapHit, tapSkip);
+            sum += s;
+            const float a = 1.f - exp(-s * sub * ray.worldLength);
+            m0 += through * a;
+            m1 += through * a * to;
+            through *= 1.f - a;
+        }
+        tCentroid = m0 > 0.f ? m1 / m0 : t + 0.5f * dt;
+        return sum / float(max(taps, 1u));
+    }
+
     float leanExtinction(CutRay ray, float3 v, float footprint, float tSample, inout float fineVoxels, out LeanHit hit, out float skipTo)
     {
         hit.entry = kCloudRefNone;
@@ -8902,11 +8934,20 @@ struct HSTRCloudRenderer
             if (majorant > 0.f)
             {
                 const float tSample = t + 0.5f * dt;
-                const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
                 const float footprint = rayFootprint(ray, tSample);
                 LeanHit hit;
                 float skipTo;
                 float sigma = leanExtinction(ray, midpoint, footprint, tSample, fineVoxels, hit, skipTo);
+                if (params.beamRimCentroid != 0u && sigma > 0.f)
+                {
+                    // ORACLE: exact tau and the centroid's source; the centroid's own lookup supplies the sun's hit.
+                    float tc;
+                    sigma = leanCentroidTaps(ray, t, dt, footprint, params.beamRimCentroid, tc);
+                    midpoint = (ray.position + tc * ray.direction) * cellWidth;
+                    float cSkip, cVoxels = fineVoxels;
+                    leanExtinction(ray, midpoint, footprint, tc, cVoxels, hit, cSkip);
+                }
                 // Rim quadrature: a step through a resident brick spans up to 2 sea voxels x the transmittance boost - several of the
                 // brick's own voxels - and one midpoint read of a steep backlit rim lands inside or outside it per pixel, drawn as
                 // hair along every sunset silhouette. Such a step reads its density at one evenly spaced point per brick voxel it
@@ -10876,7 +10917,13 @@ struct HSTRCloudRenderer
     float3 beamRadiance(float3 cache, float3 single, float depth, float3 w, float3 albedo)
     {
         const float phase = phaseHG(dot(normalize(params.sunDirection), w));
-        const float3 background = (params.hstComponents & kComponentBackground) != 0 ? exp(-depth) * skyRadianceAt(w) : 0.f;
+        // The sky behind only where it shows: under 1e-4 transmittance it adds under 1e-4 of the sky's radiance (pixprobe1: the sky
+        // lookup is 0.11 of the 4K pixel resolve's 0.64 ms).
+        const float transmittance = exp(-depth);
+        const float3 background = (params.hstComponents & kComponentBackground) != 0 && (params.beamResolveProbe & 4u) == 0u &&
+                                          (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u)
+                                      ? transmittance * skyRadianceAt(w)
+                                      : 0.f;
         return albedo * (phase * single + cache) + background;
     }
 
@@ -11985,6 +12032,11 @@ struct HSTRCloudRenderer
         float2 beamPosition;
         if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
             return false;
+        if ((params.beamResolveProbe & 1u) != 0u)
+        {
+            color[pixel] = float4(beamPosition.xyx * 1e-6f, 1.f);
+            return false;
+        }
 #if HSTR_BEAM_PATH
         const float2 destination = beamPosition;
 #endif
@@ -11996,7 +12048,7 @@ struct HSTRCloudRenderer
         // beamWarpHistory: a listed block's pixel reads its live, freshly marched values unwarped; a held one is warped through
         // the field built from the snapshots and reads them.
         gHistory = beamHistoryHeld(beamPosition);
-        if (!beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
+        if ((params.beamResolveProbe & 2u) == 0u && !beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
         {
             beamPosition = beamWarpedPosition(beamPosition);
             w = beamRayDirection(beamPosition);
@@ -12024,6 +12076,11 @@ struct HSTRCloudRenderer
 #endif
         const uint finest = beamTileEdge(params.beamLevels - 1);
         const uint level = beamLevelRead(uint2(beamPosition) / finest);
+        if ((params.beamResolveProbe & 8u) != 0u)
+        {
+            color[pixel] = float4(beamPosition.xyx * 1e-6f + float(level) * 1e-6f, 1.f);
+            return false;
+        }
 #if HSTR_BEAM_PATH
         {
             // beamPathDump: bits 0-7 the destination block's beamGuardWhy, 8-15 the warp source block's, 16-19 the level read
@@ -13798,11 +13855,20 @@ struct HSTRCloudRenderer
                 if (majorant > 0.f)
                 {
                     const float tSample = t + 0.5f * dt;
-                    const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                    float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
                     const float footprint = rayFootprint(ray, tSample);
                     LeanHit hit;
                     float skipTo;
                     float sigma = leanExtinction(ray, midpoint, footprint, tSample, fineVoxels, hit, skipTo);
+                    if (params.beamRimCentroid != 0u && sigma > 0.f)
+                    {
+                        // ORACLE (beamRimCentroid), as in marchBeamLean.
+                        float tc;
+                        sigma = leanCentroidTaps(ray, t, dt, footprint, params.beamRimCentroid, tc);
+                        midpoint = (ray.position + tc * ray.direction) * cellWidth;
+                        float cSkip, cVoxels = fineVoxels;
+                        leanExtinction(ray, midpoint, footprint, tc, cVoxels, hit, cSkip);
+                    }
                     if (params.beamRimTaps > 1u && hit.entry != kCloudRefNone)
                     {
                         const uint taps = min(params.beamRimTaps, uint(ceil(dt * voxelsPerUnit / max(fineVoxels, 1e-3f))));
