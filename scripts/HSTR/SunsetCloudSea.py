@@ -9,6 +9,13 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # Two staggered layers of the Intel clouds (CloudSeaDesc::layers): each layer-1 cloud sits across four layer-0 tiles, so the
     # clouds overlap and merge, and their bases spread over the whole layer height.
     "cloudSeaLayers": 2,
+    # The near march stops at 2000 world units (the 16-tile window allows 7 x 330 = 2310); the far sea draws the rest. The horizon
+    # rays it cuts are the march's longest: 4K walk (viewtime2, frozen) units + query 5.49 -> 3.20 ms, live (viewlive1) 5.80-5.95 ->
+    # 3.60-3.65 ms, far sea 0.35 -> 0.69 ms and resolve pixels 0.12 -> 0.41 ms back. Against the 326-spp path trace
+    # (sunset_hill_0_0_3840x2160_960x540, hillview5) excess squared log error 0.02048 -> 0.02057 (+0.4%); 1600 is +3.1% (the far
+    # sea's proxy draws mid-distance clouds as blobs). Score a changed distance on its second arm: the first after a change is
+    # deterministically worse (0.0274 vs 0.0211 at 1600, cause not found).
+    "seaViewDistance": 2000.0,
     # Two layers ask for about twice the sun bakes of one; until a brick's bake lands its samples take the live sun march. 1024 a frame
     # (bakeCloudSun ~0.2-2 ms while baking). NOT MEASURED against 256: the A/B that seemed to show it (1871ae53) changed the rate at
     # runtime, which did not rebuild the residency then, so its second arm was the first one settled longer.

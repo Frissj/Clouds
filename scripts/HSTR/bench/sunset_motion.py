@@ -81,8 +81,12 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
                                      "Triangles")) +
          # ... and formB 2's (kFormBProbe): lean samples answered by a table texel / a table empty, sent to the old chain by a
          # fallback word / by being outside the table or level 3+; the last table build's counts.
-         tuple(f"formB{n}" for n in ("Texels", "Empties", "Fallbacks", "Outside", "BuildRecords", "BuildChildren",
-                                     "BuildFallbackCells", "BuildEmptyCells", "BuildTwoLayerCells", "Builds")))
+         tuple(f"formB{n}" for n in ("Texels", "Empties", "Fallbacks", "Outside", "EmptyMissed", "TexelOff", "TexelExtra",
+                                     "TexelCompared", "EmptyAlong", "TexelOffOtherLevel", "TexelOffSameLevel", "TexelOtherLevel",
+                                     "FallbackL0", "FallbackL1", "FallbackL2", "FallbackCell",
+                                     "BuildRecords", "BuildChildren", "BuildFallbackCells", "BuildEmptyCells",
+                                     "BuildTwoLayerCells", "BuildWhyUnmapped", "BuildWhySkirt", "BuildWhyCoarser", "BuildWhyFade",
+                                     "BuildWhyConstant", "BuildWhyNoBake", "BuildWhyBakeLevel", "BuildWhyTop", "Builds")))
 
 
 def score():

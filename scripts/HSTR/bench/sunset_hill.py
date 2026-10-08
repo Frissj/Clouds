@@ -174,7 +174,8 @@ if SUN_ARMS or PT_ARMS:
             p = hstr.properties
             mse, noise = float(p["referenceNoiseError"]), float(p["referenceNoiseLogError"])
             print(f"HILL {label} squared: mse {mse:.6f} noise {noise:.6f} excess {mse - noise:.6f} "
-                  f"(rms {math.sqrt(max(mse - noise, 0.0)):.4f}) units {units}", flush=True)
+                  f"(rms {math.sqrt(max(mse - noise, 0.0)):.4f}) units {units} "
+                  f"farSeaRuns {p.get('cloudStats', {}).get('farSeaRuns')}", flush=True)
             hstr.set_properties({"compareSquared": False})
         hstr.set_properties({"compareReference": False, "compareExact": False})
 elif POOLS:

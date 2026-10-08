@@ -68,8 +68,12 @@ import Atmosphere;
 #endif
 static const uint kFormBEmpty = 1u << 30;
 static const uint kFormBFallback = 1u << 31;
-#if HSTR_FORM_B == 2
-static uint gFormBCount[4]; // kFormBProbe: table texel reads, table empties, fallbacks, outside the table or level 3+.
+#if HSTR_FORM_B >= 2
+// kFormBProbe: table texel reads, table empties, fallbacks, outside the table or level 3+; formB 3 (validation): table empties
+// where the old chain has density, texels off the old chain by > 5%, texels with density where the old chain has none, texels
+// compared; old-chain density at 4 points across each table empty's skip; off texels at another level than the old chain's / at
+// the same level; texels at another level; fallbacks by the footprint's level (0, 1, 2); fallbacks from a fallback table cell.
+static uint gFormBCount[16];
 #endif
 // formR: one instance per occupied sea tile slot over its asset's hull (HSTRCloud.cpp). Declared in every variant so the passes'
 // variables keep one layout whatever HSTR_FORM_R a pass was last compiled with.
@@ -734,6 +738,9 @@ struct HSTRCloudRenderer
     Texture2D<uint> hstrBeamLevelPrev;          ///< beamRefresh: the previous build's level map.
     Texture2D<float4> hstrBeamPixelPrev;        ///< beamRefresh: the previous build's marched pixels (rgb radiance, a distance).
     Texture2D<float4> hstrBeamPixels;           ///< beamRefFrame: this build's marched beam units, which the resolve samples.
+    /// beamRefFrame: each marched unit's transmittance, by which the resolve adds the far sea behind it (hstrBeamPixels hold none).
+    Texture2D<float> hstrBeamUnitTransmittance;
+    RWTexture2D<float> hstrBeamUnitTransmittanceOutput;
     RWTexture2D<float4> hstrBeamPixelOutput;    ///< beamRefresh: this build's marched pixels.
     RWStructuredBuffer<uint> hstrBeamLists;
     RWStructuredBuffer<uint> hstrBeamCounts;
@@ -3551,9 +3558,10 @@ struct HSTRCloudRenderer
     /// in over its opacity, at the beam's opacity-weighted distance to it (BeamSample::distance). The background part (exp(-depth)
     /// sky) already is the sky, atmosphere included. A display effect only: the path-traced reference has no air, so quality gates
     /// run with skyModel 0, or with skyModel 2 and atmosphereAerialDistance 0 (no haze; the atmosphere's sun and sky still light).
-    float3 hazedBeamRadiance(float3 cache, float3 single, float depth, float distance, float3 w, float3 albedo)
+    /// withFar false: without the far sea behind (a stored unit adds it when read, beamUnitRadiance).
+    float3 hazedBeamRadiance(float3 cache, float3 single, float depth, float distance, float3 w, float3 albedo, bool withFar = true)
     {
-        const float3 radiance = beamRadiance(cache, single, depth, w, albedo) + exp(-depth) * farSeaExtra(w);
+        const float3 radiance = beamRadiance(cache, single, depth, w, albedo) + (withFar ? exp(-depth) * farSeaExtra(w) : 0.f);
         if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f))
             return radiance;
         const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
@@ -3722,13 +3730,32 @@ struct HSTRCloudRenderer
             const float ds = min(clamp(0.25f / majorant, shortest, exit), interval.y - s);
             const float middle = s + 0.5f * ds;
             const float3 vm = start + middle * d;
-            const float sigma = (1.f - saturate((1.f - middle * inverseView) * params.seaFadeInverse)) * extinctionAtVoxel(vm);
+            const float farFade = 1.f - saturate((1.f - middle * inverseView) * params.seaFadeInverse);
+            float sigma;
+            LeanHit hit = {};
+            hit.entry = kCloudRefNone;
+            if (params.seaFarBricks != 0 && params.cloudLayers > 1)
+            {
+                // seaFarBricks: the near march's unfaded density (resident bricks, the proxy where none answers) on a ray in world
+                // units from the camera, at the pixel's footprint, so the same levels answer as in the near march.
+                CutRay ray = {};
+                ray.position = start / float(params.hstrCellWidth);
+                ray.direction = d / float(params.hstrCellWidth);
+                ray.worldLength = 1.f;
+                ray.entryDistance = 0.f;
+                float fineVoxels = 1.f;
+                float skipTo;
+                sigma = farFade * leanExtinctionLayered(ray, vm, middle * params.cloudPixelAngle, middle, extinctionAtVoxel(vm),
+                                                        fineVoxels, hit, skipTo);
+            }
+            else
+                sigma = farFade * extinctionAtVoxel(vm);
             // Light only what can show: a sample adding under 1e-4 of the pixel is dropped.
             if (sigma > 0.f && transmittance * sigma * ds > 1e-4f)
             {
                 const float alpha = 1.f - exp(-sigma * ds);
-                // One sun-depth read for the single scattering and the cache's modulation.
-                const float depth = fineSunAt(vm);
+                // One sun-depth read for the single scattering and the cache's modulation (seaFarBricks: the brick's bake).
+                const float depth = hit.entry != kCloudRefNone ? leanSunDepth(vm, middle * params.cloudPixelAngle, hit) : fineSunAt(vm);
                 float3 source = 0.f;
                 if (withSingle)
                     source += phase * params.sunRadiance * exp(-depth);
@@ -7702,15 +7729,21 @@ struct HSTRCloudRenderer
 
     /// formB's table build: the cell word and half2 (minValue, range) of instance's level-`level` brick holding source voxel x.
     /// absent: the level is mapped through a coarser brick (the parent's word serves, as the old chain reads that ancestor).
-    uint2 formBCellWord(HSTRCloudInstance instance, float3 x, uint level, out bool absent)
+    /// count: the build's level-2 words also count their fallback's reason (hstrFormBCountsOutput 5-12).
+    uint2 formBCellWord(HSTRCloudInstance instance, float3 x, uint level, out bool absent, bool count = false)
     {
         absent = false;
         const int3 i = int3(floor(x + 0.5f));
         const uint3 pages = uint3(instance.pageDims & 1023u, (instance.pageDims >> 10) & 1023u, instance.pageDims >> 20);
         if (any(i < 0) || any(i >= int3(pages * 8u)))
             return uint2(kFormBEmpty, 0u);
+        uint unused;
         if (level > instance.topLevel)
+        {
+            if (count)
+                InterlockedAdd(hstrFormBCountsOutput[12], 1u, unused);
             return uint2(kFormBFallback, 0u);
+        }
         uint base = instance.levelPageBase;
         for (uint l = 0; l < level; ++l)
         {
@@ -7721,7 +7754,11 @@ struct HSTRCloudRenderer
         const uint3 c = (uint3(i) >> 3u) >> level;
         const uint word = hstrCloudLevelPages[base + c.x + levelDims.x * (c.y + levelDims.y * c.z)];
         if (word == kCloudRefNone)
+        {
+            if (count)
+                InterlockedAdd(hstrFormBCountsOutput[5], 1u, unused);
             return uint2(kFormBFallback, 0u); // Not mapped: the old chain answers with the proxy.
+        }
         if ((word & kCloudLevelEmpty) != 0u)
         {
             // An empty octant: empty, unless a neighbour's skirt reaches into one of its level-0 pages (the old chain ramps those).
@@ -7737,19 +7774,31 @@ struct HSTRCloudRenderer
                         if (all(p < assetPages))
                             holds |= hstrCloudSkirtMasks[asset.pageOffset + p.x + assetPages.x * (p.y + assetPages.y * p.z)];
                     }
+            if (count && holds != 0u)
+                InterlockedAdd(hstrFormBCountsOutput[6], 1u, unused);
             return uint2(holds != 0u ? kFormBFallback : kFormBEmpty, 0u);
         }
         if (((word >> 24) & 15u) != level)
         {
+            if (count)
+                InterlockedAdd(hstrFormBCountsOutput[7], 1u, unused);
             absent = true;
             return uint2(kFormBFallback, 0u);
         }
         const uint entry = word & 0xFFFFFFu;
         const HSTRCloudBrick brick = hstrCloudBricks[entry];
         const uint2 resolved = hstrCloudSunResolved[entry * kCloudSunClasses + instance.sunClass];
-        if (brick.fade < 1.f || (brick.info & kCloudBrickConstant) != 0u || resolved.x == kCloudRefNone || (resolved.y >> 24) != level ||
-            resolved.x >= (1u << 21))
+        const uint reason = brick.fade < 1.f ? 8u
+                            : (brick.info & kCloudBrickConstant) != 0u ? 9u
+                            : resolved.x == kCloudRefNone || resolved.x >= (1u << 21) ? 10u
+                            : (resolved.y >> 24) != level ? 11u
+                            : 0u;
+        if (reason != 0u)
+        {
+            if (count)
+                InterlockedAdd(hstrFormBCountsOutput[reason], 1u, unused);
             return uint2(kFormBFallback, 0u);
+        }
         uint code = resolved.x;
         const float3 rows[3] = {instance.row0.xyz, instance.row1.xyz, instance.row2.xyz};
         [unroll]
@@ -7781,7 +7830,7 @@ struct HSTRCloudRenderer
         // Each layer's level-2 word here: a layer counts where its brick holds content (or cannot be answered); an empty octant of
         // one layer's asset box does not stop the other layer's brick from being served.
         uint layers = 0u;
-        bool fallback = false;
+        uint fallbacks = 0u;
         HSTRCloudInstance found = {};
         float3 xFound = 0.f;
         uint2 word2 = uint2(kFormBEmpty, 0u);
@@ -7794,28 +7843,76 @@ struct HSTRCloudRenderer
             if (!cloudInstanceAt(v, 0.f, instanceIndex, x, footprintLevel, instance, layer))
                 continue;
             bool absent;
-            const uint2 word = formBCellWord(instance, x, 2u, absent);
-            if ((word.x & kFormBFallback) != 0u)
-                fallback = true;
-            else if ((word.x & kFormBEmpty) == 0u)
+            const uint2 word = formBCellWord(instance, x, 2u, absent, true);
+            if ((word.x & kFormBEmpty) == 0u || (word.x & kFormBFallback) != 0u)
             {
-                ++layers;
+                if ((word.x & kFormBFallback) != 0u)
+                    ++fallbacks;
+                else
+                    ++layers;
                 found = instance;
                 xFound = x;
                 word2 = word;
             }
         }
+        const float distance = length(world - gScene.camera.data.posW) - 32.f * s;
         uint unused;
-        if (layers > 1u || (layers == 1u && fallback))
+        if (layers + fallbacks > 1u)
         {
             InterlockedAdd(hstrFormBCountsOutput[4], 1u, unused);
             hstrFormBTableOutput[index] = kFormBFallback;
             return;
         }
-        if (fallback || layers == 0u)
+        // One layer whose level-2 word falls back (level 2 mapped through a coarser brick, or its sun baked at another level): near
+        // the camera the march wants level 1 or 0 there, so the record still carries the children; its level-2 word stays the
+        // fallback.
+        if (layers == 0u && (fallbacks == 0u || distance >= params.formBChildDistance1))
         {
-            InterlockedAdd(hstrFormBCountsOutput[fallback ? 2u : 3u], 1u, unused);
-            hstrFormBTableOutput[index] = fallback ? kFormBFallback : 0u;
+            InterlockedAdd(hstrFormBCountsOutput[fallbacks != 0u ? 2u : 3u], 1u, unused);
+            hstrFormBTableOutput[index] = fallbacks != 0u ? kFormBFallback : 0u;
+            return;
+        }
+        // Asset source voxels follow world source voxels by the instance's signed permutation, at one scale (the aligned sea).
+        float3x3 axes;
+        axes[0] = round(normalize(found.row0.xyz));
+        axes[1] = round(normalize(found.row1.xyz));
+        axes[2] = round(normalize(found.row2.xyz));
+        // A level's children are stored only where one of them is resident at that level: an all-absent level answers from the
+        // record's coarser word as the old chain does, and a fallback cell without resident children needs no record.
+        // formbval6: records for every near fallback cell took 4.04M (and their children would pass the 24M capacity).
+        // Level 0 is stored per level-1 octant (mask0: the octants with a resident level-0 child): 8 header entries naming each
+        // octant's 8 children, or ~0 where none is resident.
+        // formbval7: all 64 level-0 children per record within the level-0 distance asked for 42.5M children (24M capacity).
+        bool resident1 = false;
+        uint mask0 = 0u;
+        if (distance < params.formBChildDistance1)
+        {
+            for (uint k = 0; k < 8u && !resident1; ++k)
+            {
+                const uint3 kk = uint3(k & 1u, (k >> 1) & 1u, k >> 2);
+                bool childAbsent;
+                formBCellWord(found, xFound + mul(axes, float3(b * 32) + float3(kk * 16u) + 7.5f - centre), 1u, childAbsent);
+                resident1 = !childAbsent;
+            }
+        }
+        if (distance < params.formBChildDistance0)
+        {
+            for (uint k = 0; k < 64u; ++k)
+            {
+                const uint3 kk = uint3(k & 3u, (k >> 2) & 3u, k >> 4);
+                const uint3 o = kk >> 1u;
+                const uint bit = 1u << (o.x + 2u * (o.y + 2u * o.z));
+                if ((mask0 & bit) != 0u)
+                    continue;
+                bool childAbsent;
+                formBCellWord(found, xFound + mul(axes, float3(b * 32) + float3(kk * 8u) + 3.5f - centre), 0u, childAbsent);
+                mask0 |= childAbsent ? 0u : bit;
+            }
+        }
+        if (layers == 0u && mask0 == 0u && !resident1)
+        {
+            InterlockedAdd(hstrFormBCountsOutput[2], 1u, unused);
+            hstrFormBTableOutput[index] = kFormBFallback;
             return;
         }
         uint record;
@@ -7825,37 +7922,51 @@ struct HSTRCloudRenderer
             hstrFormBTableOutput[index] = kFormBFallback;
             return;
         }
-        // Asset source voxels follow world source voxels by the instance's signed permutation, at one scale (the aligned sea).
-        float3x3 axes;
-        axes[0] = round(normalize(found.row0.xyz));
-        axes[1] = round(normalize(found.row1.xyz));
-        axes[2] = round(normalize(found.row2.xyz));
-        const float distance = length(world - gScene.camera.data.posW) - 32.f * s;
         uint4 r = uint4(word2.x, word2.y, ~0u, ~0u);
-        [unroll]
-        for (uint level = 0; level < 2u; ++level)
+        if (resident1)
         {
-            if (distance >= (level == 0u ? params.formBChildDistance0 : params.formBChildDistance1))
-                continue;
-            const uint per = level == 0u ? 4u : 2u;
-            const uint count = per * per * per;
+            uint childBase;
+            InterlockedAdd(hstrFormBCountsOutput[1], 8u, childBase);
+            if (childBase + 8u <= params.formBChildCapacity)
+            {
+                for (uint k = 0; k < 8u; ++k)
+                {
+                    const uint3 kk = uint3(k & 1u, (k >> 1) & 1u, k >> 2);
+                    bool childAbsent;
+                    const uint2 word = formBCellWord(found, xFound + mul(axes, float3(b * 32) + float3(kk * 16u) + 7.5f - centre), 1u, childAbsent);
+                    hstrFormBChildrenOutput[childBase + k] = childAbsent ? uint2(kFormBEmpty | kFormBFallback, 0u) : word;
+                }
+                r.z = childBase;
+            }
+        }
+        if (mask0 != 0u)
+        {
+            const uint count = 8u + 8u * countbits(mask0);
             uint childBase;
             InterlockedAdd(hstrFormBCountsOutput[1], count, childBase);
-            if (childBase + count > params.formBChildCapacity)
-                continue;
-            for (uint k = 0; k < count; ++k)
+            if (childBase + count <= params.formBChildCapacity)
             {
-                const uint3 kk = uint3(k % per, (k / per) % per, k / (per * per));
-                const float3 childCentre = float3(b * 32) + float3(kk * (8u << level)) + (float(4u << level) - 0.5f);
-                const float3 x = xFound + mul(axes, childCentre - centre);
-                bool childAbsent;
-                const uint2 word = formBCellWord(found, x, level, childAbsent);
-                hstrFormBChildrenOutput[childBase + k] = childAbsent ? uint2(kFormBEmpty | kFormBFallback, 0u) : word;
-            }
-            if (level == 0u)
+                uint next = childBase + 8u;
+                for (uint o = 0; o < 8u; ++o)
+                {
+                    if ((mask0 & (1u << o)) == 0u)
+                    {
+                        hstrFormBChildrenOutput[childBase + o] = uint2(~0u, 0u);
+                        continue;
+                    }
+                    hstrFormBChildrenOutput[childBase + o] = uint2(next, 0u);
+                    const uint3 oo = uint3(o & 1u, (o >> 1) & 1u, o >> 2);
+                    for (uint j = 0; j < 8u; ++j)
+                    {
+                        const uint3 kk = oo * 2u + uint3(j & 1u, (j >> 1) & 1u, j >> 2);
+                        bool childAbsent;
+                        const uint2 word = formBCellWord(found, xFound + mul(axes, float3(b * 32) + float3(kk * 8u) + 3.5f - centre), 0u, childAbsent);
+                        hstrFormBChildrenOutput[next + j] = childAbsent ? uint2(kFormBEmpty | kFormBFallback, 0u) : word;
+                    }
+                    next += 8u;
+                }
                 r.w = childBase;
-            else
-                r.z = childBase;
+            }
         }
         hstrFormBRecordsOutput[record] = r;
         hstrFormBTableOutput[index] = record + 1u;
@@ -7877,7 +7988,7 @@ struct HSTRCloudRenderer
         const uint3 dims = uint3(params.formBTableDimX, params.formBTableDimY, params.formBTableDimZ);
         if (level > 2u || any(cell < 0) || any(cell >= int3(dims)))
         {
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
             ++gFormBCount[3];
 #endif
             return false;
@@ -7888,8 +7999,10 @@ struct HSTRCloudRenderer
         uint wordLevel = 2u;
         if (entry == kFormBFallback)
         {
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
             ++gFormBCount[2];
+            ++gFormBCount[12 + level];
+            ++gFormBCount[15];
 #endif
             return false;
         }
@@ -7898,29 +8011,49 @@ struct HSTRCloudRenderer
             const uint4 r = hstrFormBRecords[entry - 1u];
             word = r.x;
             minRange = r.y;
-            const uint childBase = level == 1u ? r.z : (level == 0u ? r.w : ~0u);
-            if (childBase != ~0u)
+            // The finest resident level at or above the footprint's, as the old chain reads (its level page names the mapped
+            // ancestor): level 0's child, else level 1's, else the record's level 2.
+            // MEASURED (formbval4): taking level 2 whenever the wanted child was absent read another level than the old chain in
+            // 95% of texels (1.38M of 1.46M), 711k of them off by > 5%; at the same level 2.8k were off.
+            [unroll]
+            for (uint l = 0; l < 2u; ++l)
             {
-                const uint per = level == 1u ? 2u : 4u;
-                const int3 k = int3(floor((u + 0.5f) / float(8u << level))) - b * int(per);
-                const uint2 child = hstrFormBChildren[childBase + uint(k.x) + per * (uint(k.y) + per * uint(k.z))];
+                const uint childBase = l == 0u ? r.w : r.z;
+                if (level > l || childBase == ~0u || wordLevel != 2u)
+                    continue;
+                const uint per = l == 1u ? 2u : 4u;
+                const uint3 k = uint3(int3(floor((u + 0.5f) / float(8u << l))) - b * int(per));
+                uint at = childBase;
+                if (l == 0u)
+                {
+                    // Level 0: the level-1 octant's header names its 8 children (~0: none resident there).
+                    const uint3 o = k >> 1u;
+                    at = hstrFormBChildren[childBase + o.x + 2u * (o.y + 2u * o.z)].x;
+                    if (at == ~0u)
+                        continue;
+                }
+                const uint3 j = l == 0u ? k & 1u : k;
+                const uint2 child = hstrFormBChildren[at + j.x + 2u * (j.y + 2u * j.z)];
                 if (child.x != (kFormBEmpty | kFormBFallback))
                 {
                     word = child.x;
                     minRange = child.y;
-                    wordLevel = level;
+                    wordLevel = l;
                 }
             }
         }
         if ((word & kFormBFallback) != 0u)
         {
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
             ++gFormBCount[2];
+            ++gFormBCount[12 + level];
 #endif
             return false;
         }
         const float size = float(8u << wordLevel);
         const float3 lo = floor((u + 0.5f) / size) * size - 0.5f;
+        if ((params.formBUse & ((word & kFormBEmpty) != 0u ? 2u : 1u)) == 0u)
+            return false; // formBUse: this kind goes to the old chain.
         if ((word & kFormBEmpty) != 0u)
         {
             const float3 du = ray.direction * float(params.hstrCellWidth) * params.seaVoxelSize / s;
@@ -7930,9 +8063,12 @@ struct HSTRCloudRenderer
                 if (abs(du[a]) > 1e-12f)
                     leave = min(leave, ((du[a] > 0.f ? lo[a] + size : lo[a]) - u[a]) / du[a]);
             skipTo = tSample + max(leave, 0.f);
-            fineVoxels = 1.f;
+            // The empty brick's voxel size, as the old chain's empty sample leaves it: the next steps keep the brick's spacing.
+            // MEASURED (formbval3): one sea voxel here lengthened the steps after every table empty - empties alone 8.41% of moving
+            // pixels over 0.02 against 0.66-1.93% for ship, though no table empty skipped density (formbval4: 3 of 12M probes).
+            fineVoxels = float(1u << wordLevel) * s / params.seaVoxelSize.x;
             hit.entry = kCloudRefNone;
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
             ++gFormBCount[1];
 #endif
             return true;
@@ -7963,7 +8099,7 @@ struct HSTRCloudRenderer
         hit.near = 1.f;
         fineVoxels = float(1u << wordLevel) * s / params.seaVoxelSize.x;
         skipTo = -1.f;
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
         ++gFormBCount[0];
 #endif
         return true;
@@ -8355,7 +8491,50 @@ struct HSTRCloudRenderer
         const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
                                ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) * params.seaFadeInverse)
                                : 1.f;
-#if HSTR_FORM_B != 0
+#if HSTR_FORM_B == 3
+        // VALIDATION (formB 3): the table's answer beside the old chain's at every sample; the march goes on with the old chain's.
+        if (params.cloudLayers > 1)
+        {
+            LeanHit tableHit = hit;
+            float tableSkip = -1.f;
+            float tableVoxels = 1.f;
+            float table;
+            const bool answered = formBExtinction(ray, v, footprint, tSample, tableVoxels, tableHit, tableSkip, table);
+            const float proxy = extinctionAtVoxel(v);
+            const float old = fade * leanExtinctionLayered(ray, v, footprint, tSample, proxy, fineVoxels, hit, skipTo);
+            if (answered)
+            {
+                table *= fade;
+                if (tableSkip >= 0.f)
+                {
+                    gFormBCount[4] += old > 0.f ? 1u : 0u; // A table empty where the old chain has density.
+                    // ... and along the span its skip would jump: the old chain at 4 points of [tSample, tableSkip].
+                    [unroll]
+                    for (uint k = 1; k <= 4; ++k)
+                    {
+                        const float tk = lerp(tSample, tableSkip, float(k) / 5.f);
+                        LeanHit kHit;
+                        float kSkip, kVoxels = 1.f;
+                        const float3 vk = (ray.position + tk * ray.direction) * float(params.hstrCellWidth);
+                        gFormBCount[8] += leanExtinctionLayered(ray, vk, footprint, tk, extinctionAtVoxel(vk), kVoxels, kHit, kSkip) > 0.f ? 1u : 0u;
+                    }
+                }
+                else
+                {
+                    gFormBCount[7] += 1u;
+                    gFormBCount[6] += old <= 0.f && table > 0.f ? 1u : 0u; // Density the old chain does not have.
+                    const bool off = old > 0.f && abs(table - old) > 0.05f * old; // Off by more than 5%.
+                    gFormBCount[5] += off ? 1u : 0u;
+                    // The off texels split by whether the old chain read the same level (its densest layer's brick).
+                    const bool sameLevel = (hit.levels & 255u) == (tableHit.levels & 255u);
+                    gFormBCount[9] += off && !sameLevel ? 1u : 0u;
+                    gFormBCount[10] += off && sameLevel ? 1u : 0u;
+                    gFormBCount[11] += !sameLevel ? 1u : 0u;
+                }
+            }
+            return old;
+        }
+#elif HSTR_FORM_B != 0
         {
             float density;
             if (formBExtinction(ray, v, footprint, tSample, fineVoxels, hit, skipTo, density))
@@ -8611,8 +8790,8 @@ struct HSTRCloudRenderer
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
         const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
-#if HSTR_FORM_B == 2
-        for (uint k = 0; k < 4; ++k)
+#if HSTR_FORM_B >= 2
+        for (uint k = 0; k < kFormBProbeSlots; ++k)
             gFormBCount[k] = 0u;
 #endif
 #if HSTR_FORM_R != 0
@@ -8866,9 +9045,9 @@ struct HSTRCloudRenderer
             gTailTransmittance = transmittance;
 #endif
         }
-#if HSTR_FORM_B == 2
+#if HSTR_FORM_B >= 2
         [unroll]
-        for (uint k = 0; k < 4; ++k)
+        for (uint k = 0; k < kFormBProbeSlots; ++k)
         {
             const uint sum = WaveActiveSum(gFormBCount[k]);
             if (WaveIsFirstLane())
@@ -11412,8 +11591,11 @@ struct HSTRCloudRenderer
         if (level >= params.beamLevels)
         {
             const float4 held = beamPixelRead(unit);
+            // The far sea behind it is added here, from the current layer: stored with it, a unit kept the layer of the frame it
+            // was marched in until re-marched - a parked camera kept a stale far sea after any far-sea change (hillfar1: the same
+            // settings 0.0206 -> 0.0248 excess squared log error against the path trace, the arm after a quarter-resolution one).
             if (held.a >= 0.f)
-                return held.rgb;
+                return held.rgb + hstrBeamUnitTransmittance[unit] * farSeaExtra(w);
             // A failed tile's unit the residual has not reached - outside the on-screen box it marches. Its finest basis
             // failed the surplus test, but it is still an estimate of this direction; the texel is not.
             return beamReconstruct(params.beamLevels - 1u, p, w, false);
@@ -12701,7 +12883,8 @@ struct HSTRCloudRenderer
             hstrBeamRepair[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
             return;
         }
-        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
+        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false), exact.distance);
+        hstrBeamUnitTransmittanceOutput[unit] = exp(-exact.depth);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
 #endif
@@ -13495,7 +13678,8 @@ struct HSTRCloudRenderer
     void beamUnitWrite(uint2 unit, float3 w, BeamSample exact)
     {
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
+        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false), exact.distance);
+        hstrBeamUnitTransmittanceOutput[unit] = exp(-exact.depth);
         if (params.beamGuard != 0 && params.beamRefFrame != 0)
         {
             const uint2 cell = unit / max(params.beamDirtyBlockEdge, 1u);

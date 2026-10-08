@@ -294,6 +294,7 @@ private:
     ref<Texture> mpBeamLatticePrev;
     ref<Texture> mpBeamLevelPrev;
     std::array<ref<Texture>, 2> mpBeamPixels;
+    ref<Texture> mpBeamUnitTransmittance; ///< Beside mpBeamPixels[0]: each marched unit's transmittance (the far sea is added at resolve).
     uint3 mBeamAllocatedDim = uint3(0); ///< The beam image size and tile size the beam resources were last sized for.
     uint32_t mBeamRefresh = 0; ///< Requested beamRefresh; the shader's copy is 0 where the build cannot refresh.
     bool mBeamQueue = false;   ///< Requested beamQueue; the shader's copy is 0 where the build cannot queue.
@@ -570,13 +571,13 @@ private:
     /// table was centred; it reads the residency as it stood then, so S2 runs with residency frozen.
     void updateFormBTable(RenderContext* pRenderContext);
     uint32_t mFormB = 0;
-    float mFormBChildDistance1 = 1200.f; ///< formBChild1: level-1 children for bricks nearer than this (world units).
-    float mFormBChildDistance0 = 600.f;  ///< formBChild0: level-0 children likewise.
+    float mFormBChildDistance1 = -1.f; ///< formBChild1: level-1 children for bricks nearer than this (world units); < 0 from the LOD rule.
+    float mFormBChildDistance0 = -1.f; ///< formBChild0: level-0 children likewise.
     float mFormBRebuildDistance = 300.f;
     bool mFormBValid = false;
     float3 mFormBCentre = float3(0.f);
     uint32_t mFormBBuilds = 0;
-    uint32_t mFormBStats[5] = {};       ///< The last build's hstrFormBCountsOutput.
+    uint32_t mFormBStats[13] = {};      ///< The last build's hstrFormBCountsOutput (counts, then fallback reasons 5-12).
     ref<Buffer> mpFormBTable;
     ref<Buffer> mpFormBRecords;
     ref<Buffer> mpFormBChildren;
@@ -889,7 +890,9 @@ private:
     ref<Texture> mpFarDistance[2];           ///< And its opacity-weighted distance, for the reprojection.
     uint32_t mFarCurrent = 0;
     bool mFarLayerValid = false;             ///< mpFarField[mFarCurrent] holds a finished layer.
-    bool mSeaFarOverlap = true;              ///< seaFarOverlap: the run is dispatched beside the dirty unit march (see dispatchFarSea).
+    float mSeaFarFadeWidth = 0.05f;          ///< seaFarFadeWidth: the near / far cross-fade, a fraction of seaViewDistance below it.
+    bool mFarSeaMarchDefines = false;      ///< The far-sea pass holds the march program's defines (seaFarBricks).
+    bool mSeaFarOverlap = true;             ///< seaFarOverlap: the run is dispatched beside the dirty unit march (see dispatchFarSea).
     bool mFarRunDeferred = false;            ///< This frame's run waits for the unit march (or the end of the frame).
     uint2 mFarRunDims = uint2(0);            ///< Its far-layer size.
     ref<Buffer> mpFarCounts;                 ///< DIAGNOSTIC: seaFarProbe bit 6 counters.

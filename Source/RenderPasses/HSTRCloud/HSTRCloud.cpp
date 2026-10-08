@@ -315,7 +315,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
-            key == "seaFarOverlap" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
+            key == "seaFarOverlap" || key == "seaFarBricks" || key == "seaFarFadeWidth" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
             key == "beamDirtyStats" || key == "beamCacheTolerance" || key == "beamSunTolerance" || key == "compareSquared")
         {
             if (key == "compareSquared")
@@ -340,6 +340,10 @@ void HSTRCloud::parseProperties(const Properties& props)
                 mParams.seaFarRefresh = std::clamp(uint32_t(value), 1u, 16u);
             else if (key == "seaFarProbe")
                 mParams.seaFarProbe = value;
+            else if (key == "seaFarBricks")
+                mParams.seaFarBricks = bool(value) ? 1u : 0u;
+            else if (key == "seaFarFadeWidth")
+                mSeaFarFadeWidth = std::clamp(float(value), 1e-3f, 0.3f);
             else if (key == "seaFarField")
                 mSeaFarField = bool(value);
             else if (key == "seaFarDistance")
@@ -573,7 +577,12 @@ void HSTRCloud::parseProperties(const Properties& props)
         }
         if (key == "formB")
         {
-            mFormB = std::min(uint32_t(value), 2u);
+            mFormB = std::min(uint32_t(value), 3u);
+            continue;
+        }
+        if (key == "formBUse")
+        {
+            mParams.formBUse = uint32_t(value) & 3u;
             continue;
         }
         if (key == "formBChild1" || key == "formBChild0" || key == "formBRebuildDistance")
@@ -1558,6 +1567,8 @@ Properties HSTRCloud::getProperties() const
     props["seaFarField"] = mSeaFarField;
     props["seaFarDistance"] = mParams.seaFarDistance;
     props["seaFarProbe"] = mParams.seaFarProbe;
+    props["seaFarBricks"] = mParams.seaFarBricks != 0;
+    props["seaFarFadeWidth"] = mSeaFarFadeWidth;
     props["seaFarBand"] = mParams.seaFarBand != 0;
     props["seaFarSourceDistance"] = mParams.seaFarSourceDistance != 0;
     props["beamQueryWaveOrder"] = mParams.beamQueryWaveOrder;
@@ -1565,6 +1576,7 @@ Properties HSTRCloud::getProperties() const
     props["formRDilate"] = mFormRDilate;
     props["formRLevelBias"] = mFormRLevelBias;
     props["formB"] = mFormB;
+    props["formBUse"] = mParams.formBUse;
     props["formBChild1"] = mFormBChildDistance1;
     props["formBChild0"] = mFormBChildDistance0;
     props["formBRebuildDistance"] = mFormBRebuildDistance;
@@ -2272,11 +2284,15 @@ Properties HSTRCloud::getProperties() const
         const char* formRNames[] = {"Queries", "OutsideSteps", "Missed", "MissedProxy", "Drift", "Steps", "Rays"};
         for (uint32_t k = 0; k < 7; ++k)
             cloud[std::string("formR") + formRNames[k]] = mBeamLevelCounts[kFormRProbe + k];
-        const char* formBNames[] = {"Texels", "Empties", "Fallbacks", "Outside"};
-        for (uint32_t k = 0; k < 4; ++k)
+        const char* formBNames[] = {"Texels",        "Empties",    "Fallbacks",     "Outside",
+                                    "EmptyMissed",   "TexelOff",   "TexelExtra",    "TexelCompared",
+                                    "EmptyAlong",    "TexelOffOtherLevel", "TexelOffSameLevel", "TexelOtherLevel",
+                                    "FallbackL0",    "FallbackL1", "FallbackL2",    "FallbackCell"};
+        for (uint32_t k = 0; k < kFormBProbeSlots; ++k)
             cloud[std::string("formB") + formBNames[k]] = mBeamLevelCounts[kFormBProbe + k];
-        const char* formBBuildNames[] = {"Records", "Children", "FallbackCells", "EmptyCells", "TwoLayerCells"};
-        for (uint32_t k = 0; k < 5; ++k)
+        const char* formBBuildNames[] = {"Records", "Children", "FallbackCells", "EmptyCells", "TwoLayerCells", "WhyUnmapped",
+                                         "WhySkirt", "WhyCoarser", "WhyFade", "WhyConstant", "WhyNoBake", "WhyBakeLevel", "WhyTop"};
+        for (uint32_t k = 0; k < 13; ++k)
             cloud[std::string("formBBuild") + formBBuildNames[k]] = mFormBStats[k];
         cloud["formBBuilds"] = mFormBBuilds;
         cloud["formRInstances"] = mHullInstances;
@@ -4981,6 +4997,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamLevelPrev"] = mpBeamLevelPrev;
     var["hstrBeamPixelPrev"] = mpBeamPixels[mBeamRefFrame ? 0u : (mBeamParity ^ 1u)];
     var["hstrBeamPixels"] = mpBeamPixels[mBeamRefFrame ? 0u : mBeamParity];
+    var["hstrBeamUnitTransmittance"] = mpBeamUnitTransmittance;
     var["hstrBeamQueue"] = mpBeamQueue;
     var["hstrBeamQueueCounts"] = mpBeamQueueCounts;
     var["hstrBeamLists"] = mpBeamLists[mBeamParity];
@@ -5023,6 +5040,17 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
 {
     FALCOR_PROFILE(pRenderContext, "farSea");
     const ref<ComputePass>& pPass = mpFarSeaPass;
+    // seaFarBricks: the lean march's brick density and resolved / packed sun need the march program's switches.
+    if (mParams.seaFarBricks != 0)
+        setBeamDirtyMarchDefines(pPass);
+    else if (mFarSeaMarchDefines)
+    {
+        for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_LAYER_WRAP_SELECT",
+                                 "HSTR_LAYER_RUN_DISTANCE", "HSTR_UNIT_START", "HSTR_SUN_PACKED", "HSTR_FORM_B", "HSTR_LAYER_ORACLE",
+                                 "HSTR_FORM_R"})
+            pPass->getProgram()->removeDefine(name);
+    }
+    mFarSeaMarchDefines = mParams.seaFarBricks != 0;
     bindRenderer(pRenderContext, pPass);
     ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
     var["hstrFarFieldOutput"] = mpFarField[mFarCurrent ^ 1u];
@@ -5031,6 +5059,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     var["hstrFarDistancePrev"] = mpFarDistance[mFarCurrent];
     // Nothing the unit march beside it holds in another state (any transition between them would wait for this run).
     var["hstrBeamPixels"] = ref<Texture>();
+    var["hstrBeamUnitTransmittance"] = ref<Texture>();
     var["hstrBeamPixelPrev"] = ref<Texture>();
     var["hstrBeamDirtyArgs"] = ref<Buffer>();
     var["hstrBeamWarpArgs"] = ref<Buffer>();
@@ -5972,7 +6001,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     // near march keeps its bricks at full density to 0.95 of it.
     mFarSeaActive = mSeaFarField && mParams.seaMode != 0 && mParams.cloudDomain != 0 &&
                     (mParams.debugView == kBeamView || mParams.debugView == kWorldCacheView);
-    mParams.seaFadeInverse = mFarSeaActive ? 20.f : 1.f / 0.3f;
+    mParams.seaFadeInverse = mFarSeaActive ? 1.f / std::max(mSeaFarFadeWidth, 1e-3f) : 1.f / 0.3f;
     // beamUnitStart's odometer: the camera's cumulative path length. A stored first-density distance along a fixed world direction
     // can have come closer by at most the distance travelled since it was marched.
     if (mpScene)
@@ -6551,6 +6580,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mpBeamCoarse = nullptr;
                 mpBeamCoarseState = nullptr;
                 mpBeamPixels = {};
+                mpBeamUnitTransmittance = nullptr;
                 mpBeamPixelsSnapshot = nullptr;
                 mpBeamLists = {};
                 mpBeamHistory = {};
@@ -6780,9 +6810,15 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     pPixels = mpDevice->createTexture2D(beamDim.x, beamDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr, flags);
                     mBeamRefreshValid = false;
                 }
+            if (!mpBeamUnitTransmittance || mpBeamUnitTransmittance->getWidth() != beamDim.x ||
+                mpBeamUnitTransmittance->getHeight() != beamDim.y)
+                mpBeamUnitTransmittance = mpDevice->createTexture2D(beamDim.x, beamDim.y, ResourceFormat::R16Float, 1, 1, nullptr, flags);
         }
         else
+        {
             mpBeamPixels = {};
+            mpBeamUnitTransmittance = nullptr;
+        }
         if (queue)
         {
             // Each list can hold every root point: corners and centres.
@@ -7739,6 +7775,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     if (overlapResolve)
                     {
                         var["hstrBeamPixels"] = ref<Texture>();
+                        var["hstrBeamUnitTransmittance"] = ref<Texture>();
                         var["hstrBeamPixelPrev"] = ref<Texture>();
                         var["hstrBeamDirtyArgs"] = ref<Buffer>();
                         var["hstrBeamWarpArgs"] = ref<Buffer>();
@@ -7813,7 +7850,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 (mParams.beamRefresh != 0 || unitMarch) ? mpBeamPixels[unitMarch ? 0u : mBeamParity] : ref<Texture>();
             // The unit march writes the same texture the resolve reads, so its read view goes away for this dispatch.
             if (unitMarch)
+            {
                 pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamPixels"] = ref<Texture>();
+                pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamUnitTransmittance"] = ref<Texture>();
+                pMarch->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamUnitTransmittanceOutput"] = mpBeamUnitTransmittance;
+            }
         };
         if (queued)
         {
@@ -7862,6 +7903,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         dirtyVar["color"] = color;
                         dirtyVar["hstrBeamPixelOutput"] = mpBeamPixels[0];
                         dirtyVar["hstrBeamPixels"] = ref<Texture>();
+                        dirtyVar["hstrBeamUnitTransmittanceOutput"] = mpBeamUnitTransmittance;
+                        dirtyVar["hstrBeamUnitTransmittance"] = ref<Texture>();
                         // Overlapped, the warp arguments stay in their indirect state from the early resolve to the pixel pass.
                         if (overlapResolve)
                             dirtyVar["hstrBeamWarpArgs"] = ref<Buffer>();
@@ -8716,10 +8759,24 @@ void HSTRCloud::updateFormBTable(RenderContext* pRenderContext)
     mParams.formBTableDimX = uint32_t(2 * half + 1);
     mParams.formBTableDimY = uint32_t(std::ceil(desc.layerHeight / brick)) + 2u;
     mParams.formBTableDimZ = uint32_t(2 * half + 1);
-    mParams.formBRecordCapacity = 4u << 20;
-    mParams.formBChildCapacity = 48u << 20;
-    mParams.formBChildDistance1 = mFormBChildDistance1;
-    mParams.formBChildDistance0 = mFormBChildDistance0;
+    // formbs2 used 637k records and 3.6M children; 4M / 48M (448 MB) helped exhaust host commit when VRAM spilled (formbval2).
+    // formbval6: records for near single-layer fallback cells (which carry children) take 4.04M; at 1M the overflow turned every
+    // later cell into a fallback cell (0 texel reads). With resident-only children (formbval8): 1.86M records, 40.9M children
+    // (level-0 octant headers + children): 2M records + 44M children = 384 MB.
+    mParams.formBRecordCapacity = 2u << 20;
+    mParams.formBChildCapacity = 44u << 20;
+    // A sample reads level <= L where floor(log2(footprint / s) + cloudLodBias) <= L, i.e. nearer than s 2^(L + 1 - bias) / pixel
+    // angle; children reach that far plus the rebuild distance, so the table serves the camera until it is rebuilt.
+    // MEASURED (formbval4): fixed 1200 / 600 left most level-1 / level-0 samples on the level-2 word (95% of texels read another
+    // level than the old chain).
+    auto childDistance = [&](uint32_t level, float setting)
+    {
+        if (setting >= 0.f)
+            return setting;
+        return s * std::exp2(float(level + 1) - mParams.cloudLodBias) / std::max(mParams.cloudPixelAngle, 1e-9f) + mFormBRebuildDistance;
+    };
+    mParams.formBChildDistance1 = childDistance(1, mFormBChildDistance1);
+    mParams.formBChildDistance0 = childDistance(0, mFormBChildDistance0);
     const uint32_t cells = mParams.formBTableDimX * mParams.formBTableDimY * mParams.formBTableDimZ;
     const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
     if (!mpFormBTable || mpFormBTable->getElementCount() < cells)
@@ -8728,7 +8785,7 @@ void HSTRCloud::updateFormBTable(RenderContext* pRenderContext)
     {
         mpFormBRecords = mpDevice->createStructuredBuffer(4 * sizeof(uint32_t), mParams.formBRecordCapacity, flags);
         mpFormBChildren = mpDevice->createStructuredBuffer(2 * sizeof(uint32_t), mParams.formBChildCapacity, flags);
-        mpFormBCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 8u, flags);
+        mpFormBCounts = mpDevice->createStructuredBuffer(sizeof(uint32_t), 16u, flags);
     }
     pRenderContext->clearUAV(mpFormBCounts->getUAV().get(), uint4(0));
     bindRenderer(pRenderContext, mpFormBBuildPass);
@@ -8746,14 +8803,14 @@ void HSTRCloud::updateFormBTable(RenderContext* pRenderContext)
     var["hstrFormBTableOutput"] = ref<Buffer>();
     var["hstrFormBRecordsOutput"] = ref<Buffer>();
     var["hstrFormBChildrenOutput"] = ref<Buffer>();
-    const std::vector<uint32_t> stats = mpFormBCounts->getElements<uint32_t>(0, 5);
+    const std::vector<uint32_t> stats = mpFormBCounts->getElements<uint32_t>(0, 13);
     std::copy(stats.begin(), stats.end(), mFormBStats);
     mFormBCentre = camera;
     mFormBValid = true;
     ++mFormBBuilds;
-    logInfo("HSTRCloud: formB table {} x {} x {} level-2 bricks of {:.3f}: {} records, {} children, {} fallback / {} empty / {} two-layer "
-            "cells.", mParams.formBTableDimX, mParams.formBTableDimY, mParams.formBTableDimZ, brick, stats[0], stats[1], stats[2],
-            stats[3], stats[4]);
+    logInfo("HSTRCloud: formB table {} x {} x {} level-2 bricks of {:.3f}: {} records, {} children (level 1 within {:.0f}, level 0 within "
+            "{:.0f}), {} fallback / {} empty / {} two-layer cells.", mParams.formBTableDimX, mParams.formBTableDimY, mParams.formBTableDimZ,
+            brick, stats[0], stats[1], mParams.formBChildDistance1, mParams.formBChildDistance0, stats[2], stats[3], stats[4]);
 }
 
 /// Writes the reference (per component and half: rgb mean, a sample count) as one EXR per slice, so an expensive path-traced
