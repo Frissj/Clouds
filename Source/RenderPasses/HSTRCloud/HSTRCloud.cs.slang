@@ -40,6 +40,9 @@ import Atmosphere;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_QUERY_COMPACT
+#define HSTR_QUERY_COMPACT 0 // beamQueryCompact: the dirty query only lists the points it would march (marchBeamDirtyListed).
+#endif
 #ifndef HSTR_DIRTY_OVERLAP
 #define HSTR_DIRTY_OVERLAP 0 // beamFusedOverlap: the dirty query counts finished blocks into the fused queue for runBeamDirtyFused's tiles.
 #endif
@@ -104,6 +107,8 @@ RaytracingAccelerationStructure gHullTlas;
 #endif
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
+static uint gSunProbe[4];   ///< This thread's leanSunDepth answers by path (kBeamSunProbe).
+static uint gLookupProbe[3]; ///< This thread's brick lookups, wave-uniform by instance, by instance and page (kBeamLookupProbe).
 static uint gLayerTightZero; ///< This thread's layered samples in an undilated zero block (kBeamLayerSteps + 3).
 static uint gLayerMaskMismatch; ///< ... whose layer bits disagree with the block maximum (kBeamLayerSteps + 4; must be 0).
 static uint gLayerMaskEmpty[2]; ///< ... layer visits whose layer bit is clear (kBeamLayerSteps + 5, + 6).
@@ -166,7 +171,8 @@ static float gTileCurvature = -1.f; ///< >= 0: beamTileRefines takes this curvat
 #define HSTR_CACHE_VIEW 0 // worldCacheView: the lean march reads the camera-baked cache (worldCacheViewRadiance).
 #endif
 #ifndef HSTR_SUN_KNOCK
-#define HSTR_SUN_KNOCK 0 // ORACLE beamSunKnock, timing only (wrong image): 1 no far field, 2 no resolved bake, 4 no octave spread.
+#define HSTR_SUN_KNOCK 0 // ORACLE beamSunKnock, timing only (wrong image): 1 no far field, 2 no resolved bake, 4 no octave spread,
+                         // 8 no fallback (leanSunDepth's sunDepthAt when no resolved bake answers).
 #endif
 // MEASURED (sunknock1, sunset_motion 4K walk 2, frozen, worldCacheView, seaFarOverlap off; query / units ms, units listed over 20
 // frames): ship 1.254 / 1.301 (2.27M), again 1.233 / 1.357 (2.29M); no far 1.267 / 2.280 (4.85M); no bake 1.117 / 1.383 (2.76M);
@@ -5282,11 +5288,17 @@ struct HSTRCloudRenderer
     }
 
     /// Stamp: this frame into every entry, of every class, whose bakes read the change's cells.
-    void stampSunChange(uint entry, uint thread)
+    void stampSunChange(uint entry, uint thread, uint rowThread)
     {
         const HSTRCloudSunFrame frame = sunFrame();
         if (entry >= frame.changeCount)
             return;
+        // stampRows: this thread's share of the rows, every rows-th in the order the loops below meet them. The stores are the same
+        // idempotent epochs whoever writes them.
+        const uint rows = max(frame.stampRows, 1u);
+        if (rowThread >= rows)
+            return;
+        uint row = 0;
         // stampSplit: thread (entry, c) stamps class c only; otherwise thread 0 stamps every class.
         const uint classFirst = frame.stampSplit != 0 ? thread : 0u;
         const uint classEnd = frame.stampSplit != 0 ? thread + 1u : min(frame.classCount, kCloudSunClasses);
@@ -5319,9 +5331,13 @@ struct HSTRCloudRenderer
                 sunStampRange(lo, hi, sweep, level, dims, first, last);
                 const uint offset = block + hstrCloudSunFieldLevels[change.asset * kCloudSunFieldLevels + level];
                 for (int z = first.z; z <= last.z; ++z)
-                    for (int y = first.y; y <= last.y; ++y)
+                    for (int y = first.y; y <= last.y; ++y, ++row)
+                    {
+                        if (row % rows != rowThread)
+                            continue;
                         for (int x = first.x; x <= last.x; ++x)
                             hstrCloudSunField[sunFieldTexel(offset + uint(x + dims.x * (y + dims.y * z)))] = epoch;
+                    }
             }
         }
         // Levels 0-1: the positions of every class, in the nodes of the 32-voxel cells they lie in.
@@ -5351,8 +5367,10 @@ struct HSTRCloudRenderer
         }
         for (int cz = cellFirst.z; cz <= cellLast.z; ++cz)
             for (int cy = cellFirst.y; cy <= cellLast.y; ++cy)
-                for (int cx = cellFirst.x; cx <= cellLast.x; ++cx)
+                for (int cx = cellFirst.x; cx <= cellLast.x; ++cx, ++row)
                 {
+                    if (row % rows != rowThread)
+                        continue;
                     const int3 cell = int3(cx, cy, cz);
                     const uint node = sunFineNode(change.asset, uint3(cell));
                     if (node == kCloudRefNone)
@@ -5745,6 +5763,10 @@ struct HSTRCloudRenderer
 #if HSTR_LAYER_PROBE
         for (uint k = 0; k < 8; ++k)
             gLayerProbe[k] = 0;
+        for (uint k = 0; k < 4; ++k)
+            gSunProbe[k] = 0;
+        for (uint k = 0; k < 3; ++k)
+            gLookupProbe[k] = 0;
         gLayerTightZero = 0;
         gLayerMaskMismatch = 0;
         gLayerMaskEmpty[0] = 0;
@@ -5806,6 +5828,24 @@ struct HSTRCloudRenderer
             {
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[kBeamLayerProbe + k], sum, unused);
+            }
+        }
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint sum = WaveActiveSum(gSunProbe[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamSunProbe + k], sum, unused);
+            }
+        }
+        for (uint k = 0; k < 3; ++k)
+        {
+            const uint sum = WaveActiveSum(gLookupProbe[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamLookupProbe + k], sum, unused);
             }
         }
         for (uint k = 0; k < 16; ++k)
@@ -8475,6 +8515,18 @@ struct HSTRCloudRenderer
             }
             const float thinDensity = params.cloudThinDepth / max(scale * 3.4641f * instance.sourceVoxelWorld, 1e-12f);
             CloudSample sample;
+#if HSTR_LAYER_PROBE
+            {
+                // ORACLE (kBeamLookupProbe): would the active wave share this lookup? The page as cloudAssetBrickAt's first read keys it.
+                const uint level = min(uint(max(footprintLevel, 0.f)), instance.topLevel);
+                const uint3 c = (uint3(i) >> 3u) >> level;
+                const uint page = c.x | (c.y << 10) | (c.z << 20);
+                const bool sameInstance = WaveActiveAllEqual(instanceIndex);
+                ++gLookupProbe[0];
+                gLookupProbe[1] += sameInstance ? 1u : 0u;
+                gLookupProbe[2] += sameInstance && WaveActiveAllEqual(page) && WaveActiveAllEqual(level) ? 1u : 0u;
+            }
+#endif
 #if (HSTR_SHIP & 2048) != 0
             const bool found = cloudAssetBrickAtFlat(instance, x, uint(max(footprintLevel, 0.f)), true, thinDensity, sample);
 #else
@@ -8792,9 +8844,23 @@ struct HSTRCloudRenderer
 #if HSTR_WORKSET_PROBE
                 worksetMark(1u, resolved.x);
 #endif
+#if HSTR_LAYER_PROBE
+                ++gSunProbe[0];
+#endif
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }
+#if HSTR_LAYER_PROBE
+            ++gSunProbe[1];
+#endif
         }
+#if HSTR_LAYER_PROBE
+        else
+            ++gSunProbe[hit.entry != kCloudRefNone ? 2u : 3u];
+#endif
+#endif
+#if (HSTR_SUN_KNOCK & 8) != 0
+        // ORACLE (timing only, wrong image): what the lit samples without a resolved bake cost - sunDepthAt's search and live march.
+        return 1e-3f * hit.x.y;
 #endif
         CloudSample sample = {};
         sample.brick = hit.entry != kCloudRefNone;
@@ -11025,6 +11091,19 @@ struct HSTRCloudRenderer
         InterlockedAdd(hstrBeamQueueCounts[bucket], 1u, slot);
         if (slot < params.beamQueueCapacity)
             hstrBeamQueue[bucket * params.beamQueueCapacity + slot] = packBeamTile(position);
+    }
+
+    /// beamQueryCompact: appends the points of this wave that need a march to list 0, in the wave's lane order (one atomic a
+    /// wave), so marchBeamDirtyListed packs them into full waves while a block's points stay next to each other.
+    void beamListQuery(uint2 position, bool march)
+    {
+        const uint count = WaveActiveCountBits(march);
+        uint base = 0;
+        if (WaveIsFirstLane() && count != 0u)
+            InterlockedAdd(hstrBeamQueueCounts[0], count, base);
+        base = WaveReadLaneFirst(base) + WavePrefixCountBits(march);
+        if (march && base < params.beamQueueCapacity)
+            hstrBeamQueue[base] = packBeamTile(position);
     }
 
     /// One queued root query of list beamQueueBucket.
@@ -15528,6 +15607,10 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     bool centre;
     uint2 position = 0;
     const bool march = gHSTRCloud.beamDirtyRay(thread, point, centre) && gHSTRCloud.beamQueryNeedsMarch(point, centre, true, position);
+#if HSTR_QUERY_COMPACT
+    gHSTRCloud.beamListQuery(position, march);
+    return;
+#endif
 #if HSTR_DIRTY_OVERLAP == 2
     // beamFusedInline: no queue and no consumer. A block's rays are 8 aligned lanes of one wave (the host only selects this when
     // the wave width is a multiple of them), so every block of the wave is finished once the wave is past its march. Its lanes
@@ -15718,6 +15801,23 @@ void refineBeamSubTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Group
 void writeBeamSubUnitArgs()
 {
     writeFoldedDirtyArgs(18, gHSTRCloud.hstrBeamDirtyCount[3]);
+}
+
+/// beamQueryCompact: the dirty query's march over the points buildBeamDirtyQueries (HSTR_QUERY_COMPACT) listed, one a thread, so a
+/// wave marches 32 points instead of the ~6 of its 32 lanes whose point survived the carry and certificate tests in place.
+[numthreads(64, 1, 1)]
+void marchBeamDirtyListed(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint thread = dispatchThreadId.x;
+    if (thread >= min(gHSTRCloud.hstrBeamQueueCounts[0], gHSTRCloud.params.beamQueueCapacity))
+        return;
+    const uint2 position = gHSTRCloud.unpackBeamTile(gHSTRCloud.hstrBeamQueue[thread]);
+    BeamSample ray = {};
+    if (gHSTRCloud.params.beamQueryKnock == 0u)
+        ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    if (!(1.f - exp(-ray.depth) > 1e-4f))
+        ray.distance = 0.f; // As the in-place query leaves it.
+    gHSTRCloud.beamQueryMarched(position, ray);
 }
 
 [numthreads(64, 1, 1)]
@@ -16885,9 +16985,10 @@ void commitCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
 /// Occupancy of the staged bricks after their commit dispatches: cell (x, y, z) of a brick's 4^3 covers level voxels 2c and 2c + 1
 /// per axis, whose trilinear samples read core texels 2c - 1 to 2c + 2, clamped to the core as cloudBrickDensity clamps (the apron
 /// these once read is gone; the clamped set is exactly what the march reads, so the bound is as safe and tighter); its bit is set if
-/// any of those decodes to non-zero density (valueMin + valueRange t^2, so t > 0 or valueMin > 0). One thread per brick.
+/// any of those decodes to non-zero density (valueMin + valueRange t^2, so t > 0 or valueMin > 0). One thread per brick: kept as
+/// the reference for occupancyCloudBricks (cloudCommitParallel off, cloudCommitCheck).
 [numthreads(16, 1, 1)]
-void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
+void occupancyCloudBricksSerial(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     const HSTRCloudParams params = gHSTRCloud.params;
     if (dispatchThreadId.x >= params.cloudStagedCount)
@@ -16914,6 +17015,59 @@ void occupancyCloudBricks(uint3 dispatchThreadId: SV_DispatchThreadID)
             }
     for (uint w = 0; w < kCloudCellWords; ++w)
         gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + w] = words[w];
+}
+
+groupshared float gOccupancyTexel[512];
+groupshared uint gOccupancyCode[64];
+
+/// occupancyCloudBricksSerial with a group of 64 per brick: the brick's 512 core texels into groupshared (8 a thread), a thread per
+/// cell for its 4^3 clamped texels' maximum, then the nine words from the cells' codes. Equal to the serial pass word for word (a
+/// maximum and ORs of the same codes). One thread per brick left ~32 warps on the GPU for 1024 bricks: commitsplit1, 4K sunset
+/// walk, occupancy 0.346 ms a frame, latency-bound. MEASURED (commitpar1, same walk, arms alternating in one launch, profiled):
+/// occupancy 0.242 -> 0.011 ms a frame; equal word for word to the serial pass (cloudCommitCheck, 6144 bricks, 0 mismatches).
+[numthreads(64, 1, 1)]
+void occupancyCloudBricks(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    const HSTRCloudParams params = gHSTRCloud.params;
+    const uint staged = groupId.x;
+    if (staged >= params.cloudStagedCount)
+        return; // Uniform over the group.
+    const uint tid = groupThreadId.x;
+    const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[staged];
+    const uint3 origin = cloudDensityOrigin(info.slot, params.cloudAtlasShift);
+    for (uint i = tid; i < 512u; i += 64u)
+        gOccupancyTexel[i] = gHSTRCloud.hstrCloudAtlas.Load(int4(origin + uint3(i & 7u, (i >> 3) & 7u, i >> 6), 0));
+    GroupMemoryBarrierWithGroupSync();
+    const uint3 c = uint3(tid & 3u, (tid >> 2) & 3u, tid >> 4);
+    float t = 0.f;
+    for (uint z = 2 * c.z; z < 2 * c.z + 4; ++z)
+        for (uint y = 2 * c.y; y < 2 * c.y + 4; ++y)
+            for (uint x = 2 * c.x; x < 2 * c.x + 4; ++x)
+            {
+                const uint3 p = uint3(clamp(int3(x, y, z) - 1, 0, 7));
+                t = max(t, gOccupancyTexel[p.x + 8u * (p.y + 8u * p.z)]);
+            }
+    gOccupancyCode[tid] = cloudCellCode(t > 0.f ? info.valueMin + info.valueRange * t * t : info.valueMin);
+    GroupMemoryBarrierWithGroupSync();
+    if (tid < 8u)
+    {
+        uint word = 0;
+        for (uint k = 0; k < 8u; ++k)
+            word |= gOccupancyCode[8u * tid + k] << (k * 4u);
+        gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + tid] = word;
+    }
+    else if (tid == 8u)
+    {
+        // The octant (4 voxels) of a cell bounds all eight of its cells.
+        uint word = 0;
+        for (uint cell = 0; cell < 64u; ++cell)
+        {
+            const uint octant = ((cell & 3u) >> 1u) + 2u * (((cell >> 2) & 3u) >> 1u) + 4u * ((cell >> 4) >> 1u);
+            const uint shifted = octant * 4u;
+            word = (word & ~(15u << shifted)) | (max((word >> shifted) & 15u, gOccupancyCode[cell]) << shifted);
+        }
+        gHSTRCloud.hstrCloudOccupancyOutput[info.brick * kCloudCellWords + 8u] = word;
+    }
 }
 
 /// Clears only bitmap entries named by the previous compact queue.
@@ -17115,10 +17269,18 @@ void buildFormBTable(uint3 id: SV_DispatchThreadID)
 /// The sun bake every brick's samples read, per orientation class, resolved once a frame (after the frame's bakes and slot changes)
 /// so the lean march's lit samples read one pair instead of searching kCloudSunBakesPerBrick keys on the brick and its ancestors.
 [numthreads(64, 1, 1)]
-void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
+void resolveCloudSunSlots(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     uint bricks, stride;
     gHSTRCloud.hstrCloudBricks.GetDimensions(bricks, stride);
+    // cloudSunResolveList: thread i resolves the i-th listed brick.
+    uint3 id = dispatchThreadId;
+    if (gHSTRCloud.params.cloudSunResolveList != 0)
+    {
+        if (id.x >= gHSTRCloud.params.cloudSunResolveList)
+            return;
+        id.x = gHSTRCloud.hstrCloudSunTouchList[id.x];
+    }
     if (id.x >= bricks)
         return;
     if (gHSTRCloud.params.cloudSunTouchFrame != 0)
@@ -17433,9 +17595,10 @@ void cloudHaarStepInverse(uint base, uint offset, uint stride, uint n)
 
 /// Decodes the residual of every staged brick into hstrCloudResiduals (512 per staged brick) before the level dispatches of
 /// commitCloudBricks: the packed coefficients (packCoefficients in CloudFormat.h: significance bitmap, zigzag varints in scan
-/// order) dequantised by the brick's step, then the inverse transform (haarInverse). One thread per brick.
+/// order) dequantised by the brick's step, then the inverse transform (haarInverse). One thread per brick: kept as the reference
+/// for decodeCloudResiduals (cloudCommitParallel off, cloudCommitCheck).
 [numthreads(16, 1, 1)]
-void decodeCloudResiduals(uint3 dispatchThreadId: SV_DispatchThreadID)
+void decodeCloudResidualsSerial(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     const uint staged = dispatchThreadId.x;
     if (staged >= gHSTRCloud.params.cloudStagedCount)
@@ -17487,6 +17650,143 @@ void decodeCloudResiduals(uint3 dispatchThreadId: SV_DispatchThreadID)
             for (uint y = 0; y < n; ++y)
                 cloudHaarStepInverse(base, 8u * (y + 8u * z), 1u, n);
     }
+}
+
+groupshared uint gDecodeSig[16];      ///< The significance bitmap: bit s of word s / 32 for scan position s.
+groupshared uint gDecodeSigBefore[16]; ///< Significant positions in the words before.
+groupshared uint gDecodeEnd[512];     ///< Per varint, the stream byte that ends it.
+groupshared uint gDecodeScan[64];
+groupshared uint gDecodeFound;
+groupshared float gDecodeValue[512];
+
+/// decodeCloudResidualsSerial with a group of 64 per brick. The varints' boundaries come from the stream's bytes in parallel: a
+/// byte without bit 7 ends a varint, so a prefix count of those ends numbers them; the significance bitmap's prefix count names
+/// the varint of each significant scan position, and each thread decodes the eight positions it owns (scan order to position in
+/// closed form). The Haar steps run a line a thread in groupshared with the serial pass's arithmetic, so the residuals are equal
+/// bit for bit. One thread per brick left ~32 warps busy for 1024 bricks: commitsplit1, 4K sunset walk, decode 0.428 ms a frame.
+/// MEASURED (commitpar1, same walk, arms alternating in one launch, profiled): decode 0.285 -> 0.016 ms, the commit scope 0.543 ->
+/// 0.038 ms a frame; HSTRCloud GPU (gpuTime) 5.22 -> 3.73 ms over the arms' chunks; equal bit for bit to the serial pass
+/// (cloudCommitCheck: 6144 bricks' residuals and the occupancy table, 0 mismatches).
+[numthreads(64, 1, 1)]
+void decodeCloudResiduals(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    const uint staged = groupId.x;
+    if (staged >= gHSTRCloud.params.cloudStagedCount)
+        return; // Uniform over the group.
+    const HSTRCloudStaging info = gHSTRCloud.hstrCloudStagingInfo[staged];
+    if (info.coded == 0)
+        return;
+    const uint tid = groupThreadId.x;
+    const uint p = info.payloadWord;
+    if (tid < 16u)
+        gDecodeSig[tid] = gHSTRCloud.hstrCloudPayload[p + tid]; // Bytes 0-63, word-aligned.
+    if (tid == 0u)
+        gDecodeFound = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (tid == 0u)
+    {
+        uint sum = 0;
+        for (uint w = 0; w < 16u; ++w)
+        {
+            gDecodeSigBefore[w] = sum;
+            sum += countbits(gDecodeSig[w]);
+        }
+        gDecodeScan[0] = sum; // Read below as the varint count, before the scans reuse it.
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint varints = gDecodeScan[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Varint ends, 256 stream bytes a round (a word a thread) from byte 64.
+    for (uint round = 0; gDecodeFound < varints; ++round)
+    {
+        const uint word = round * 64u + tid;
+        const uint bytes = gHSTRCloud.hstrCloudPayload[p + 16u + word];
+        uint ends = 0;
+        for (uint b = 0; b < 4u; ++b)
+            ends |= ((bytes >> (8u * b + 7u)) & 1u) == 0u ? 1u << b : 0u;
+        gDecodeScan[tid] = countbits(ends);
+        GroupMemoryBarrierWithGroupSync();
+        for (uint step = 1; step < 64u; step *= 2u)
+        {
+            const uint add = tid >= step ? gDecodeScan[tid - step] : 0u;
+            GroupMemoryBarrierWithGroupSync();
+            gDecodeScan[tid] += add;
+            GroupMemoryBarrierWithGroupSync();
+        }
+        const uint found = gDecodeFound;
+        uint v = found + gDecodeScan[tid] - countbits(ends); // This thread's first end.
+        for (uint b = 0; b < 4u; ++b)
+            if ((ends >> b) & 1u)
+            {
+                if (v < varints)
+                    gDecodeEnd[v] = 64u + 4u * word + b;
+                ++v;
+            }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == 63u)
+            gDecodeFound = found + gDecodeScan[63];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    const uint lo[4] = { 0, 1, 2, 4 };
+    const uint hi[4] = { 1, 2, 4, 8 };
+    const uint first[4] = { 0, 1, 8, 64 };
+    for (uint position = tid; position < 512u; position += 64u)
+    {
+        const uint x = position & 7u, y = (position >> 3) & 7u, z = position >> 6;
+        const uint m = max(x, max(y, z));
+        const uint band = m == 0u ? 0u : m == 1u ? 1u : m < 4u ? 2u : 3u;
+        const uint h = hi[band], l = lo[band];
+        // Scan order: the band's h^3 cube in z, y, x order less the l^3 cube of the bands before.
+        const uint skipped = min(z, l) * l * l + (z < l ? min(y, l) * l + (y < l ? min(x, l) : 0u) : 0u);
+        const uint s = first[band] + (z * h + y) * h + x - skipped;
+        float value = 0.f;
+        const uint sig = gDecodeSig[s >> 5];
+        if ((sig >> (s & 31u)) & 1u)
+        {
+            const uint v = gDecodeSigBefore[s >> 5] + countbits(sig & ((1u << (s & 31u)) - 1u));
+            const uint end = gDecodeEnd[v];
+            uint u = 0;
+            uint shift = 0;
+            for (uint k = v == 0u ? 64u : gDecodeEnd[v - 1u] + 1u; k <= end; ++k, shift += 7u)
+                u |= (cloudPayloadByte(p, k) & 0x7Fu) << shift;
+            const int q = int(u >> 1) ^ -int(u & 1u);
+            value = float(q) * info.step;
+        }
+        gDecodeValue[position] = value;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (info.transform == kCloudTransformHaar)
+    {
+        const float r = 0.70710678f;
+        for (uint n = 2; n <= 8; n *= 2)
+            for (uint pass = 0; pass < 3u; ++pass)
+            {
+                if (tid < n * n)
+                {
+                    const uint a = tid / n, b = tid % n;
+                    // The serial pass's order: along z for each (x, y), then along y for each (x, z), then along x for (y, z).
+                    const uint offset = pass == 0u ? b + 8u * a : pass == 1u ? b + 64u * a : 8u * (b + 8u * a);
+                    const uint stride = pass == 0u ? 64u : pass == 1u ? 8u : 1u;
+                    float temp[8];
+                    for (uint k = 0; k < n / 2; ++k)
+                    {
+                        const float lowValue = gDecodeValue[offset + k * stride];
+                        const float detail = gDecodeValue[offset + (n / 2 + k) * stride];
+                        temp[2 * k] = (lowValue + detail) * r;
+                        temp[2 * k + 1] = (lowValue - detail) * r;
+                    }
+                    for (uint k = 0; k < n; ++k)
+                        gDecodeValue[offset + k * stride] = temp[k];
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+    }
+    const uint base = staged * 512u;
+    for (uint i = tid; i < 512u; i += 64u)
+        gHSTRCloud.hstrCloudResiduals[base + i] = gDecodeValue[i];
 }
 
 /// Scales every world cache deposit by worldCacheKeep: after a sun change the old estimate fades as new photons arrive.
@@ -17644,7 +17944,7 @@ void ageSunField(uint3 dispatchThreadId: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void stampSunChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    gHSTRCloud.stampSunChange(dispatchThreadId.x, dispatchThreadId.y);
+    gHSTRCloud.stampSunChange(dispatchThreadId.x, dispatchThreadId.y, dispatchThreadId.z);
 }
 
 [numthreads(256, 1, 1)]

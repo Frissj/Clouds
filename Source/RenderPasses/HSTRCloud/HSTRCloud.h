@@ -309,6 +309,17 @@ private:
     uint3 mBeamAllocatedDim = uint3(0); ///< The beam image size and tile size the beam resources were last sized for.
     uint32_t mBeamRefresh = 0; ///< Requested beamRefresh; the shader's copy is 0 where the build cannot refresh.
     bool mBeamQueue = false;   ///< Requested beamQueue; the shader's copy is 0 where the build cannot queue.
+    /// beamQueryCompact: the dirty query lists the points it has to march (queue list 0, in listed order) and marchBeamDirtyListed
+    /// marches them packed. Why it was tried (querytail1 / livedirty1, 4K walk): ~244k query threads a frame, the order probe's 15.2k
+    /// marched rays against 2,367 waves reaching the march read as ~6.4 of 32 lanes a wave.
+    /// MEASURED (compact2 / compact3, 4K walk, interleaved, 30 profiled frames an arm; mapped 171-218k of 243k): query 1.353 / 1.288,
+    /// 0.974 / 0.715, 1.128 / 1.099, 1.012 / 1.020 ms (base / compact) while units drifted alike (query / units 1.07 / 1.02, 1.09 /
+    /// 1.11, 1.02 / 1.02, 1.05 / 1.05). The listed march is 1.057 / 0.978 of it, the listing ~0.04. beamLayerProbe: 2,635 waves
+    /// march in place, 2,693 compacted, paid / lane steps 1.45 in both - the in-place waves were already full (the two probes do not
+    /// count the same rays), so packing has nothing to pack. Quality (compact1, SCORE 2): 5.73 / 5.56% vs base 5.49 / 5.34 / 6.16%,
+    /// knock sanity 53.9%. No gain; off.
+    bool mBeamQueryCompact = false;
+    LazyComputePass mpBeamDirtyListedPass;
     ref<Buffer> mpBeamQueue;
     ref<Buffer> mpBeamQueueCounts;
     ref<Buffer> mpBeamQueueArgs;
@@ -424,6 +435,9 @@ private:
     uint32_t mBeamStripProbe = 0;
     uint32_t mBeamSunKnock = 0; ///< ORACLE beamSunKnock (HSTR_SUN_KNOCK on the dirty passes), timing only.
     uint32_t mSeaFarOverlapLog = 0; ///< DIAGNOSTIC seaFarOverlapLog: frames whose far-sea + unit-march barriers are logged.
+    /// DIAGNOSTIC frameDispatchLog: frames whose every dispatch, clear and barrier is logged (DISPATCH / CLEAR / barrier lines),
+    /// to find the small dispatches and the barriers between them.
+    uint32_t mFrameDispatchLog = 0;
     bool mSeaFarOverlapScopes = true; ///< seaFarOverlapScopes: false drops the farSea / units profiler scopes while they overlap.
     /// seaFarBeside: the overlapped far-sea run beside the unit march (0) or the dirty query (1). The query leaves the GPU 6-9% busy
     /// (ngfxlive1, sm__throughput over its 0.6-0.9 ms), the march ~40%. Beside the query nothing may transition at the run: the far
@@ -873,7 +887,15 @@ private:
     uint32_t mCloudBrickPoolMB = 256;
     uint32_t mCloudPayloadPoolMB = 128; ///< GPU memory of the packed coefficients of resident pages.
     bool mCloudDirectStorage = true;    ///< Load page payloads with DirectStorage (GPU GDeflate, RTX IO); false: CPU decompression.
-    uint32_t mCloudBrickLoadsPerFrame = 1024;
+    /// Bricks committed a frame: a runtime cap, up to kCloudLoadCapacity (it used to rebuild the residency, so arms could not A/B it).
+    /// MEASURED (4K sunset walk at 2 units a frame, 120-frame chunks, interleaved): at 1024 the cap is hit on 112-115 of 120 frames
+    /// (loadcap3) - each async cut enters 50-100k bricks at once into a full atlas; at 4096 on 28-42, the rest draining the cut's
+    /// list. Chunk ends mapped / backlog: 226k / 18k vs 164k / 89k (cutcadence1), 213k / 31k vs 207k / 71k (loadcap3 chunk 1); wall
+    /// p50 3-5 ms lower (loadcap2). GPU time drifts 2.9 -> 5.3 ms over a run whatever the arm; the commit costs ~0.04 ms a 1024.
+    /// cloudCutMargin 8 / 4 / 2 (cutmargin1) leaves 2-4 cuts a 120 frames in every arm: the remaining lag is the walk itself, ~630 ms
+    /// of worker time a cut (cutcadence1: 1269 ms over 2 cuts, 1896 over 3, worker busy on 117-118 of 120 frames).
+    uint32_t mCloudBrickLoadsPerFrame = 4096;
+    static constexpr uint32_t kCloudLoadCapacity = 4096; ///< The residency's staging capacity (8 MB of residuals).
     uint32_t mCloudSeaTiles = 8;
     uint32_t mCloudSeaSeed = 1;
     float mCloudSeaCoverage = 0.85f;
@@ -961,8 +983,28 @@ private:
     /// MEASURED (stampsplit2, 4K sunset walk, two pairs, 60 profiled frames each): stamp 0.188 / 0.069 -> 0.000 / 0.031 ms a frame
     /// (it varies with the frame's changes), chunk-end sunStale 101k / 99k -> 104k / 96k.
     bool mCloudSunStampSplit = true;
+    /// cloudSunStampRows: threads per change and class in stampSunChanges, each stamping every nth row of its ranges (exact: the
+    /// same epoch stores). stamp1 (4K sunset walk, residency fixed): ~1.9k changes a run (14k before the dedupe), each class a
+    /// thread looping over long low-sun sweeps, 0.9 ms a scheduling run.
+    /// MEASURED, left at 1 (stamprows1, same walk, arms alternating in one launch, profiled): stamp 0.231 / 0.172 / 0.243 / 0.547 ms
+    /// a frame at 1 / 4 / 16 / 64 - not short of threads: each split repeats the ranges' setup, and the stores are the cost.
+    uint32_t mCloudSunStampRows = 1;
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
+    /// cloudSunLiveDirty: whether the dirty query and unit march keep it too. Off: compiled out of those two passes only.
+    /// MEASURED (4K sunset walk, residency fixed): sunprobe1 (beamLayerProbe, 8 counted frames) 508k lit samples a frame in the
+    /// dirty passes, every one answered by a resolved bake (0 unbaked, 0 coarse, 0 brickless) - the live march never runs there;
+    /// nolive2 (interleaved, profiled 30 frames each) query 1.418 / 1.290 -> 1.154 / 1.130 ms, units 1.287 / 1.197 -> 1.074 /
+    /// 1.121 ms with it compiled out: its untaken code costs the passes ~0.35 ms. livedirty1 (SCORE=2, 4 counted frames):
+    /// walk 427k / sprint 658k lit samples a frame, all resolved, 0 fallbacks; walk moving quality >0.02 base 5.87%, off
+    /// 4.95%, probe (on) 5.01% - p99.9 0.487 / 0.344 / 0.344: within the arm-to-arm spread, no loss.
+    /// Why (ngfx Shader Pipelines, ngfxlive2 on vs ngfxnolive1 off): buildBeamDirtyQueries 168 registers / 12 warps (160 live)
+    /// -> 128 / 16 (124 live); marchBeamDirtyUnits 128 / 16 in both (118 / 121 live). The query's L1 hit 77.6 -> 67.5%.
+    /// Next step (ngfxregs1, source lines; --debug-shaders puts the query back at 168, so its lines are not the shipped ones): the
+    /// units peak 124 is cloudOctantSkirt, the page / cell lookup around it 104-114, 74 lines above 96 holding 31% of samples - 20
+    /// warps (96) needs ~28 registers off the whole density lookup, bounded earlier at ~0.1-0.15 ms (occupancy slope). renderFarSea
+    /// 168 / 12 peaks in the same skirt (165, 155 without it), so the skirt alone cannot take it to 128.
+    bool mCloudSunLiveDirty = false;
     bool mCloudSunKeepStale = true;           ///< Outdated sun bakes answer until they rebake (CloudResidency::setSunKeepStale).
     uint32_t mCloudSunBakesCap = 0;           ///< Runtime cap on sun bakes a frame under cloudSunBakesPerFrame; 0: none.
     uint32_t mCloudSunBakesMoving = 256;      ///< Sun bakes a frame at most while the camera moves; 0: no cap.
@@ -1025,6 +1067,13 @@ private:
     LazyComputePass mpCommitCloudPass;
     LazyComputePass mpDecodeCloudPass;
     LazyComputePass mpOccupancyCloudPass;
+    LazyComputePass mpDecodeCloudSerialPass;    ///< The thread-a-brick reference (cloudCommitParallel off, cloudCommitCheck).
+    LazyComputePass mpOccupancyCloudSerialPass; ///< Likewise.
+    /// cloudCommitParallel: decode and occupancy of loaded bricks with a group of 64 a brick, not a thread.
+    bool mCloudCommitParallel = true;
+    uint32_t mCloudCommitCheck = 0;      ///< DIAGNOSTIC cloudCommitCheck: frames whose parallel outputs are compared with the serial.
+    uint32_t mCommitChecks = 0;          ///< DIAGNOSTIC: commits compared (cumulative).
+    uint32_t mCommitMismatches = 0;      ///< DIAGNOSTIC: residuals / occupancy words that differed (cumulative).
     LazyComputePass mpClearDirtyCloudPagesPass;
     LazyComputePass mpMarkDirtyCloudPagesPass;
     LazyComputePass mpCloudPageArgsPass;
@@ -1061,7 +1110,19 @@ private:
     /// check (cloudSunTouchCheck) never ran on an incremental frame.
     bool mCloudSunTouch = false;
     bool mCloudSunTouchCheck = false;           ///< DIAGNOSTIC: count incremental resolve entries differing from a full one.
+    /// cloudSunResolveLoads: between scheduling runs resolveCloudSunSlots resolves only the bricks loaded since the last resolve.
+    bool mCloudSunResolveLoads = true;
+    uint32_t mCloudSunResolveCheck = 0;  ///< DIAGNOSTIC cloudSunResolveCheck: frames compared with a full resolve over loaded bricks.
+    uint32_t mSunResolveListFrames = 0;  ///< DIAGNOSTIC: frames that resolved a list (cumulative).
+    uint32_t mSunResolveListBricks = 0;  ///< DIAGNOSTIC: bricks they resolved (cumulative).
+    uint32_t mSunResolveListChecks = 0;  ///< DIAGNOSTIC (cumulative).
+    uint32_t mSunResolveListMismatches = 0; ///< DIAGNOSTIC: loaded bricks' entries differing from the full resolve (cumulative).
     uint32_t mCloudSunEvery = 1;                ///< cloudSunEvery: the GPU sun scheduling runs every nth frame with n times the cap.
+    bool mCloudLoadsBesideCut = true;           ///< cloudLoadsBesideCut: CloudResidency loads while an async cut walk runs.
+    float mCloudCutStick = 0.f;                 ///< cloudCutStick: CloudView::cutStick (levels of priority).
+    bool mCloudCutThreshold = true;             ///< cloudCutThreshold: CloudView::cutThreshold (MEASURED there).
+    bool mCloudCutThresholdCheck = false;       ///< cloudCutThresholdCheck: CloudView::cutThresholdCheck (DIAGNOSTIC).
+    bool mCloudScatterUploads = true;           ///< cloudScatterUploads: CloudResidency uploads changed table elements by scatter.
     ref<Buffer> mpSunResolveCheck;
     ref<Buffer> mpSunCheckCount;
     uint64_t mSunResolveFrames = 0;      ///< Frames that resolved the sun slots.

@@ -4,6 +4,7 @@
 #pragma once
 #include "CloudSea.h"
 #include "CloudPayloadPool.h"
+#include "Core/Pass/ComputePass.h"
 
 #include <array>
 #include <atomic>
@@ -86,8 +87,31 @@ struct CloudView
     /// payload fills. 20 units a frame: 43 -> 37 ms. HSTRCloud defaults to 8.
     float cutMargin = 0.f;
     float cutTurn = 3.f;
+    /// Budget-bound (ordered) cut only: a brick the last cut refined is refined ahead of others by this many levels of priority, so
+    /// the cut does not trade the refinements it holds for ones barely ahead of them (stall1: ~140k of 243k desired bricks replaced
+    /// within ~100 walk frames; stick1: 50-107k a cut, and still ~100k a cut once parked - the mapped-children hysteresis feeds the
+    /// half-loaded mapped set back into the cut). Keyed on the cut's own last answer, not on what is mapped. 0: off.
+    /// MEASURED, left off (stick2, 4K sunset walk, arms in one launch, eviction beside the walk on): bricks entering per cut, stick
+    /// 1 / 0: 43k / 36k (2 cuts each; stick 3 took no cut in its chunks). The parked oscillation (stick1) was the load stall, not the
+    /// cut: with loads and evictions beside the walk the mapped set reaches all 243k desired within ~120 parked frames.
+    /// Keyed on mapped children instead (stick1 run): 53k entering at 1 against 107k at 0, one cut each - noise at that count.
+    /// stick3 (residency fixed, 120-frame arms x2 in one launch, 2-4 cuts an arm): entering a cut 89k / 62k / 45k / 38k at stick 0 /
+    /// 0.5 / 1 / 0 again, HSTRCloud GPU 3.36 / 4.07 / 4.11 / 3.56 ms a frame - less churn, no faster frame.
+    float cutStick = 0.f;
     /// The cut's walk runs on a worker while frames keep the last cut, and is applied in the first frame after it returns.
     bool cutAsync = false;
+    /// Budget-bound cut by threshold: the parallel walk expands only bricks at or above a slack below the last cut's admission
+    /// threshold, and a walk over the budget keeps the bricks whose refining parent ranks highest (admission priority), parents
+    /// first, instead of walking again single-threaded with a heap. The same set as the heap's greedy wherever priorities fall
+    /// from parent to child (cutphase1: 268 of ~800k children rose).
+    /// MEASURED (4K sunset walk, 2 units a frame, 120-frame chunks, one launch; cutphase1 / cutthresh1): the heap cut ran on every
+    /// walking cut (the parallel walk desired 750-820k against the 243k budget): ~500-650 ms of worker time a cut (parallel 180-235,
+    /// heap 250-370), one cut every ~60 frames. Threshold: the heap set and the threshold set differ in 96 of 243,302 bricks
+    /// (check), 6 cuts in 120 frames against 1-2, ~290 ms a cut, the pruned walk desiring 344-444k. Walks straddle the arms, so the
+    /// per-arm totals mix them.
+    bool cutThreshold = true;
+    /// DIAGNOSTIC: unpruned threshold cut beside the heap cut (which is taken on); counts the bricks the two sets differ in.
+    bool cutThresholdCheck = false;
 };
 
 /// Virtual memory for cloud density. The cut through every nearby instance's brick pyramid is chosen by importance each frame:
@@ -114,6 +138,36 @@ public:
         uint32_t payloadAllocFailed = 0; ///< DIAGNOSTIC: load requests refused by a full payload pool (cumulative).
         uint32_t releaseNowFrames = 0; ///< DIAGNOSTIC: frames that released every unused store at once (cumulative).
         uint32_t committed = 0;
+        uint64_t committedTotal = 0;  ///< DIAGNOSTIC: bricks committed (cumulative) ...
+        uint32_t committedCapped = 0; ///< ... and frames that committed the full load cap (cumulative).
+        double cutWalkMsTotal = 0.0;  ///< DIAGNOSTIC: worker milliseconds of the cuts taken on (cumulative) ...
+        uint32_t cutBusyFrames = 0;   ///< ... frames that found a walk still running ...
+        uint32_t cutIdleFrames = 0;   ///< ... and frames with no walk running that did not start one (cumulative).
+        double cutParallelMsTotal = 0.0;   ///< DIAGNOSTIC: the walks' parallel phases (cumulative) ...
+        double cutHeapMsTotal = 0.0;       ///< ... and ordered heap cuts (cumulative).
+        uint32_t cutUnorderedDesired = 0;  ///< DIAGNOSTIC: the last walk's parallel desired count (budget: 0.9 x atlas).
+        uint64_t cutPriorityRises = 0;     ///< DIAGNOSTIC: children prioritised above their parent (cumulative).
+        uint32_t cutThresholdTrims = 0;    ///< Threshold cuts trimmed to the budget (cumulative) ...
+        uint32_t cutUnderfilled = 0;       ///< ... and pruned walks that desired under 95% of it (cumulative).
+        uint64_t cutCheckBricks = 0;       ///< DIAGNOSTIC (cutThresholdCheck): heap cut bricks compared (cumulative) ...
+        uint64_t cutCheckMismatches = 0;   ///< ... and bricks in one set but not the other (cumulative).
+        // DIAGNOSTIC: why loads stall once the camera moves (mapped 243k -> ~100k on the walk, framelog1). Cumulative except where noted.
+        uint32_t commitFails = 0;     ///< Frames whose loads stopped on a full atlas that eviction could not free.
+        uint32_t evictCalls = 0;      ///< Evictions run.
+        uint32_t evictFreed = 0;      ///< Bricks they unloaded.
+        uint32_t evictCandidates = 0; ///< Last eviction: loaded, unmapped, undesired leaves found.
+        uint32_t loadHeld = 0;        ///< Last frame: desired bricks skipped because their parent was not loaded.
+        uint32_t loadScanned = 0;     ///< Last frame: load-list entries visited.
+        uint32_t freeSlots = 0;       ///< Last frame: free atlas slots.
+        uint32_t freeBricks = 0;      ///< Last frame: free brick table entries.
+        uint32_t uploadRuns = 0;      ///< DIAGNOSTIC: dirty-block runs uploaded by setBlob (nodes, bricks, sun tables; cumulative).
+        uint64_t uploadBytes = 0;     ///< DIAGNOSTIC: their bytes, and the scatter packs' (cumulative).
+        uint32_t scatterJobs = 0;     ///< DIAGNOSTIC: tables uploaded by the scatter instead (cumulative).
+        uint32_t scatterChecks = 0;   ///< DIAGNOSTIC: frames whose GPU tables were compared with the CPU's (cumulative).
+        uint32_t sunStampRuns = 0;    ///< DIAGNOSTIC: change uploads for stampSunChanges (cumulative).
+        uint32_t sunStampRaw = 0;     ///< DIAGNOSTIC: changes before the dedupe (cumulative).
+        uint32_t sunStampChanges = 0; ///< DIAGNOSTIC: changes stamped (cumulative).
+        uint32_t scatterMismatches = 0; ///< DIAGNOSTIC: entries that differed (cumulative).
         uint32_t slotsUsed = 0;
         uint32_t nodesUsed = 0;
         uint32_t pagesLoaded = 0;
@@ -130,6 +184,10 @@ public:
         uint32_t sunStale = 0;      ///< Bakes dropped this frame because their neighbourhood was mapped or unmapped since.        // The last cut.
         uint32_t cutPops = 0;      ///< Bricks refined.
         bool cutOrdered = false;   ///< Whether the atlas budget bound, forcing the priority-ordered cut.
+        uint32_t cutOrderedCount = 0; ///< DIAGNOSTIC: cuts taken on that were ordered (cumulative).
+        uint32_t cutEntered = 0;      ///< DIAGNOSTIC: bricks entering the desired set over all cuts taken on (cumulative).
+        uint32_t cutLeft = 0;         ///< DIAGNOSTIC: bricks leaving it (cumulative).
+        std::array<uint32_t, 8> cutEnteredLevel{}; ///< DIAGNOSTIC: cutEntered by level (cumulative).
         double cutTotalMs = 0.0;
         float cutMargin = 0.f; ///< The motion envelope of the last cut, in voxels.
         uint32_t cuts = 0;     ///< Cuts run so far.
@@ -191,6 +249,8 @@ public:
     void bindPageUpdates(const ShaderVar& var) const;
     ref<Texture> getAtlas() const { return mpAtlas; }
     ref<Buffer> getOccupancy() const { return mpOccupancy; }
+    ref<Buffer> getResiduals() const { return mpResiduals; } ///< DIAGNOSTIC (cloudCommitCheck).
+    bool isBrickLoaded(uint32_t gpu) const { return gpu < mBrickOwner.size() && mBrickOwner[gpu] != kNoHandle; } ///< DIAGNOSTIC
     ref<Texture> getSunAtlas() const { return mpSunAtlas; }
     ref<Texture> getSunPacked() const { return mpSunPacked; } ///< CloudResidencyDesc::sunPacked (null when off).
     /// Sun bakes staged this frame (bakeCloudSun runs over them after the commits).
@@ -214,7 +274,13 @@ public:
     void setSunScanWave(bool scanWave) { mSunScanWave = scanWave; }
     /// Whether stampSunChanges runs a thread per change and class (HSTRCloudSunFrame::stampSplit).
     void setSunStampSplit(bool stampSplit) { mSunStampSplit = stampSplit; }
+    void setSunStampRows(uint32_t rows) { mSunStampRows = std::max(rows, 1u); }
     void setSunEvery(uint32_t every) { mSunEvery = std::max(every, 1u); }
+    void setLoadsBesideCut(bool on) { mLoadsBesideCut = on; }
+    /// Bricks committed a frame, at most desc.loadsPerFrame (the staging capacity); a runtime cap, so it changes without a rebuild.
+    void setLoadCap(uint32_t cap) { mLoadCap = std::clamp(cap, 1u, mDesc.loadsPerFrame); }
+    void setScatterUploads(bool on) { mScatterUploads = on; }
+    void addScatterChecks(uint32_t frames) { mScatterCheck += frames; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
@@ -306,6 +372,8 @@ private:
         uint32_t id = 0;      ///< The cut (mCutId) that desired the brick last in this slot.
         float priority = 0.f;
         uint16_t sunClasses = 0; ///< Orientation classes of the instances that desired it (bit per class).
+        uint16_t refined = 0;    ///< The ordered cut refined it (its children were desired too).
+        float admit = 0.f;       ///< CloudView::cutThreshold: the highest priority of a parent that refined into it (seeds: max).
     };
 
     struct Brick
@@ -415,7 +483,9 @@ private:
     float transmittance(const CloudSea& sea, const CloudView& view, float3 target) const;
     bool inFrustum(const CloudView& view, float3 lo, float3 hi) const;
 
-    bool commit(uint64_t handle);
+    bool commit(uint64_t handle, bool evictOk);
+    void loadReady(bool evictOk); ///< Commits desired bricks from the load cursor, loadsPerFrame at most.
+    void stageCommits();          ///< Orders this frame's staged bricks coarsest level first, one commit group per level.
     bool evict(uint32_t slotsNeeded, uint32_t metasNeeded);
     void unload(uint64_t handle);
     bool map(uint64_t handle);
@@ -512,6 +582,45 @@ private:
     size_t mDirectoryDirty[2] = {SIZE_MAX, 0};
     std::vector<uint8_t> mNodeBlocksDirty;  ///< Per 256 nodes.
     std::vector<uint8_t> mBrickBlocksDirty; ///< Per 4096 bricks.
+    /// The elements of a GPU table changed this frame (beside its block flags): uploadTables scatters them (CloudScatter.cs.slang)
+    /// while they are few, and falls back to the dirty blocks' runs otherwise.
+    struct ScatterSet
+    {
+        std::vector<uint32_t> list;
+        std::vector<uint8_t> flag;
+        void reset(size_t elements)
+        {
+            flag.assign(elements, 0);
+            list.clear();
+        }
+        void mark(uint32_t element)
+        {
+            if (element < flag.size() && !flag[element])
+            {
+                flag[element] = 1;
+                list.push_back(element);
+            }
+        }
+        void clear()
+        {
+            for (uint32_t element : list)
+                flag[element] = 0;
+            list.clear();
+        }
+    };
+    ScatterSet mNodeScatter;  ///< Page nodes (64 words each).
+    ScatterSet mBrickScatter; ///< HSTRCloudBrick.
+    ScatterSet mSchedScatter; ///< HSTRCloudSunSched (gpuSun).
+    ScatterSet mStateScatter; ///< Live sun scheduler states (gpuSun).
+    bool mScatterUploads = true;
+    uint32_t mScatterCheck = 0; ///< DIAGNOSTIC: frames left to compare the GPU tables with the CPU's.
+    std::vector<uint32_t> mScatterIndex;
+    std::vector<uint32_t> mScatterData;
+    ref<Buffer> mpScatterIndex;
+    ref<Buffer> mpScatterData;
+    ref<ComputePass> mpScatterUints;
+    ref<ComputePass> mpScatterBricks;
+    ref<ComputePass> mpScatterSched;
     bool mInstancesDirty = true;
     std::vector<HSTRCloudInstance> mInstances;
 
@@ -545,7 +654,10 @@ private:
     bool mSunLevelStamps = true;
     bool mSunScanWave = false;
     bool mSunStampSplit = false;
+    uint32_t mSunStampRows = 1;
     uint32_t mSunEvery = 1;
+    bool mLoadsBesideCut = true; ///< Loads run on the frames a walk is on the worker (free slots only).
+    uint32_t mLoadCap = 1024;    ///< setLoadCap.
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.
@@ -684,6 +796,7 @@ private:
         uint64_t handle;
         float priority;
         uint32_t slot;
+        float admit; ///< The refining parent's priority (CutState::admit).
     };
     /// The top brick of a slot's instance, if the instance needs fine bricks at all.
     bool cutSeed(const CloudSea& sea, const CloudView& view, uint32_t slot, CutEntry& entry);
@@ -698,7 +811,17 @@ private:
         uint32_t pops = 0;
         uint32_t id = 0;      ///< The cut's mCutId.
         bool ordered = false; ///< The atlas budget bound, forcing the priority-ordered cut.
+        uint32_t entered = 0;                ///< DIAGNOSTIC: desired bricks the last cut did not desire.
+        std::array<uint32_t, 8> enteredLevel{}; ///< ... by level.
         double milliseconds = 0.0;
+        double parallelMs = 0.0;        ///< DIAGNOSTIC: the two parallel phases ...
+        double heapMs = 0.0;            ///< ... and the ordered (heap) cut, when the budget binds.
+        uint32_t unorderedDesired = 0;  ///< DIAGNOSTIC: what the parallel walk desired (over the budget when ordered).
+        uint32_t priorityRises = 0;     ///< DIAGNOSTIC: children the parallel walk gave a higher priority than their parent.
+        bool thresholdTrimmed = false;  ///< CloudView::cutThreshold: trimmed to the budget ...
+        bool underfilled = false;       ///< ... or pruned to under 95% of it.
+        uint32_t checkBricks = 0;       ///< DIAGNOSTIC (cutThresholdCheck): the heap cut's bricks ...
+        uint32_t checkMismatches = 0;   ///< ... and the bricks the threshold and heap sets differ in.
         std::vector<uint64_t> desired; ///< Parents before children.
         std::vector<uint64_t> toLoad;  ///< Coarsest level first, then by priority.
         std::vector<uint64_t> toMap;
@@ -748,6 +871,7 @@ private:
     uint32_t mCutCommits = 0; ///< Bricks committed or pages arrived since the last cut.
     float mCutMarginWorld = 0.f; ///< The motion envelope the running (or last) cut is chosen for, in world units.
     float mCutMarginScale = 1.f; ///< Share of CloudView::cutMargin that fitted the atlas budget lately.
+    float mCutPrune = 0.f;       ///< CloudView::cutThreshold: the next walk expands nothing below this priority (0: everything).
     Stats mStats;
     bool mWarnedNodes = false;
 };

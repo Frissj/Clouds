@@ -14,6 +14,7 @@ target_sources(HSTRCloud PRIVATE
     CloudPayloadPool.h
     CloudResidency.cpp
     CloudResidency.h
+    CloudScatter.cs.slang
     CloudSea.cpp
     CloudSea.h
     HSTRCloud.cpp

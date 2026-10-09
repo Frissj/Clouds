@@ -491,6 +491,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamOrderProbe = uint32_t(value);
             continue;
         }
+        if (key == "beamQueryCompact")
+        {
+            mBeamQueryCompact = value;
+            continue;
+        }
         if (key == "beamDirtySegments")
         {
             // Threads per ray must divide the 64-thread group, or a ray's slices would straddle two groups' shared memory.
@@ -548,6 +553,62 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "cloudSunResolveAlways")
         {
             mSunResolveAlways = bool(value);
+            continue;
+        }
+        if (key == "cloudLoadsBesideCut")
+        {
+            mCloudLoadsBesideCut = bool(value);
+            continue;
+        }
+        if (key == "cloudScatterUploads")
+        {
+            mCloudScatterUploads = bool(value);
+            continue;
+        }
+        if (key == "cloudSunLiveDirty")
+        {
+            mCloudSunLiveDirty = bool(value);
+            continue;
+        }
+        if (key == "cloudSunResolveLoads")
+        {
+            mCloudSunResolveLoads = bool(value);
+            continue;
+        }
+        if (key == "cloudSunResolveCheck")
+        {
+            mCloudSunResolveCheck += uint32_t(value);
+            continue;
+        }
+        if (key == "cloudCommitParallel")
+        {
+            mCloudCommitParallel = bool(value);
+            continue;
+        }
+        if (key == "cloudCommitCheck")
+        {
+            mCloudCommitCheck += uint32_t(value);
+            continue;
+        }
+        if (key == "cloudScatterCheck")
+        {
+            if (mpCloudResidency)
+                mpCloudResidency->addScatterChecks(uint32_t(value));
+            continue;
+        }
+        if (key == "cloudCutStick")
+        {
+            mCloudCutStick = float(value);
+            continue;
+        }
+        if (key == "cloudCutThreshold")
+        {
+            mCloudCutThreshold = value;
+            continue;
+        }
+        if (key == "cloudCutThresholdCheck")
+        {
+            mCloudCutThresholdCheck = value;
             continue;
         }
         if (key == "cloudSunEvery")
@@ -633,6 +694,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "seaFarOverlapLog")
         {
             mSeaFarOverlapLog = uint32_t(value);
+            continue;
+        }
+        if (key == "frameDispatchLog")
+        {
+            mFrameDispatchLog = uint32_t(value);
             continue;
         }
         if (key == "seaFarOverlapScopes")
@@ -1012,6 +1078,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "cloudSunStampSplit")
         {
             mCloudSunStampSplit = bool(value);
+            continue;
+        }
+        if (key == "cloudSunStampRows")
+        {
+            mCloudSunStampRows = std::max(uint32_t(value), 1u);
             continue;
         }
         if (key == "beamUnitRefill")
@@ -1588,7 +1659,7 @@ void HSTRCloud::setProperties(const Properties& props)
             mCloudLibraryPath,
             mCloudProxyResolution,
             mCloudBrickPoolMB,
-            mCloudBrickLoadsPerFrame,
+            kCloudLoadCapacity, // cloudBrickLoadsPerFrame is a runtime cap (CloudResidency::setLoadCap): no rebuild.
             mCloudSeaTiles,
             mCloudSeaSeed,
             mCloudSeaCoverage,
@@ -1846,6 +1917,7 @@ Properties HSTRCloud::getProperties() const
     props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamOrderProbe"] = mParams.beamOrderProbe;
+    props["beamQueryCompact"] = mBeamQueryCompact;
     props["beamDirtyFused"] = mBeamDirtyFused;
     props["beamFusedStage"] = mParams.beamFusedStage;
     props["beamFusedUnits"] = mBeamFusedUnits;
@@ -1976,6 +2048,41 @@ Properties HSTRCloud::getProperties() const
         cloud["payloadAllocFailed"] = stats.payloadAllocFailed;
         cloud["releaseNowFrames"] = stats.releaseNowFrames;
         cloud["committed"] = stats.committed;
+        cloud["committedTotal"] = stats.committedTotal;
+        cloud["committedCapped"] = stats.committedCapped;
+        cloud["cutWalkMsTotal"] = stats.cutWalkMsTotal;
+        cloud["cutBusyFrames"] = stats.cutBusyFrames;
+        cloud["cutIdleFrames"] = stats.cutIdleFrames;
+        cloud["cutParallelMsTotal"] = stats.cutParallelMsTotal;
+        cloud["cutHeapMsTotal"] = stats.cutHeapMsTotal;
+        cloud["cutUnorderedDesired"] = stats.cutUnorderedDesired;
+        cloud["cutPriorityRises"] = stats.cutPriorityRises;
+        cloud["cutThresholdTrims"] = stats.cutThresholdTrims;
+        cloud["cutUnderfilled"] = stats.cutUnderfilled;
+        cloud["cutCheckBricks"] = stats.cutCheckBricks;
+        cloud["cutCheckMismatches"] = stats.cutCheckMismatches;
+        cloud["commitFails"] = stats.commitFails;
+        cloud["uploadRuns"] = stats.uploadRuns;
+        cloud["uploadBytes"] = double(stats.uploadBytes);
+        cloud["scatterJobs"] = stats.scatterJobs;
+        cloud["scatterChecks"] = stats.scatterChecks;
+        cloud["commitChecks"] = mCommitChecks;
+        cloud["sunStampRuns"] = stats.sunStampRuns;
+        cloud["sunStampRaw"] = stats.sunStampRaw;
+        cloud["sunStampChanges"] = stats.sunStampChanges;
+        cloud["sunResolveListFrames"] = mSunResolveListFrames;
+        cloud["sunResolveListBricks"] = mSunResolveListBricks;
+        cloud["sunResolveListChecks"] = mSunResolveListChecks;
+        cloud["sunResolveListMismatches"] = mSunResolveListMismatches;
+        cloud["commitMismatches"] = mCommitMismatches;
+        cloud["scatterMismatches"] = stats.scatterMismatches;
+        cloud["evictCalls"] = stats.evictCalls;
+        cloud["evictFreed"] = stats.evictFreed;
+        cloud["evictCandidates"] = stats.evictCandidates;
+        cloud["loadHeld"] = stats.loadHeld;
+        cloud["loadScanned"] = stats.loadScanned;
+        cloud["freeSlots"] = stats.freeSlots;
+        cloud["freeBricks"] = stats.freeBricks;
         cloud["slotsUsed"] = stats.slotsUsed;
         cloud["nodesUsed"] = stats.nodesUsed;
         cloud["pagesLoaded"] = stats.pagesLoaded;
@@ -2036,6 +2143,11 @@ Properties HSTRCloud::getProperties() const
         cloud["staleFades"] = audit.stale;
         cloud["cutPops"] = stats.cutPops;
         cloud["cutOrdered"] = stats.cutOrdered;
+        cloud["cutOrderedCount"] = stats.cutOrderedCount;
+        cloud["cutEntered"] = stats.cutEntered;
+        cloud["cutLeft"] = stats.cutLeft;
+        for (uint32_t k = 0; k < 8; ++k)
+            cloud[fmt::format("cutEnteredL{}", k)] = stats.cutEnteredLevel[k];
         cloud["cutTotalMs"] = stats.cutTotalMs;
         cloud["cutMargin"] = stats.cutMargin;
         cloud["cuts"] = stats.cuts;
@@ -2368,6 +2480,12 @@ Properties HSTRCloud::getProperties() const
             const char* layerNames[8] = {"NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2"};
             for (uint32_t k = 0; k < 8; ++k)
                 cloud[std::string("beamLayer") + layerNames[k]] = mBeamLevelCounts[kBeamLayerProbe + k];
+            const char* sunNames[4] = {"Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick"};
+            for (uint32_t k = 0; k < 4; ++k)
+                cloud[std::string("beamSun") + sunNames[k]] = mBeamLevelCounts[kBeamSunProbe + k];
+            const char* lookupNames[3] = {"Lanes", "SameInstance", "SamePage"};
+            for (uint32_t k = 0; k < 3; ++k)
+                cloud[std::string("beamLookup") + lookupNames[k]] = mBeamLevelCounts[kBeamLookupProbe + k];
             cloud["beamLayerLaneSteps"] = mBeamLevelCounts[kBeamLayerSteps];
             cloud["beamLayerPaidSteps"] = mBeamLevelCounts[kBeamLayerSteps + 1];
             cloud["beamLayerWarps"] = mBeamLevelCounts[kBeamLayerSteps + 2];
@@ -2708,6 +2826,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamDescendArgsPass = createPass("writeBeamDescendArgs");
     mpBeamDirtyArgsPass = createPass("writeBeamDirtyArgs");
     mpBeamDirtyQueryPass = createPass("buildBeamDirtyQueries");
+    mpBeamDirtyListedPass = createPass("marchBeamDirtyListed");
     mpBeamDirtyMarchPass = createPass("marchBeamDirtyUnits");
     mpBeamDirtyMarchRefillPass = createPass("marchBeamDirtyUnitsRefillPass");
     mpBeamDirtyQueryStripPass = createPass("buildBeamDirtyQueries");
@@ -2762,6 +2881,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCommitCloudPass = createPass("commitCloudBricks");
     mpDecodeCloudPass = createPass("decodeCloudResiduals");
     mpOccupancyCloudPass = createPass("occupancyCloudBricks");
+    mpDecodeCloudSerialPass = createPass("decodeCloudResidualsSerial");
+    mpOccupancyCloudSerialPass = createPass("occupancyCloudBricksSerial");
     mpClearDirtyCloudPagesPass = createPass("clearDirtyCloudPages");
     mpMarkDirtyCloudPagesPass = createPass("markDirtyCloudPages");
     mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
@@ -3328,7 +3449,7 @@ void HSTRCloud::buildCloudDomain()
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         mCloudSunPacked,
         mCloudBrickPoolMB,
-        mCloudBrickLoadsPerFrame,
+        kCloudLoadCapacity,
         mCloudLodPixels,
         mCloudFadeFrames,
         mCloudPayloadPoolMB,
@@ -3345,7 +3466,7 @@ void HSTRCloud::buildCloudDomain()
         hstrcloud::CloudResidencyDesc residencyDesc;
         residencyDesc.files = mCloudLibraryFiles;
         residencyDesc.poolMB = mCloudBrickPoolMB;
-        residencyDesc.loadsPerFrame = mCloudBrickLoadsPerFrame;
+        residencyDesc.loadsPerFrame = kCloudLoadCapacity;
         residencyDesc.lodPixels = mCloudLodPixels;
         residencyDesc.fadeFrames = mCloudFadeFrames;
         residencyDesc.payloadPoolMB = mCloudPayloadPoolMB;
@@ -3899,6 +4020,9 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.maxDistance = mParams.seaViewDistance;
     view.cutMargin = mCloudCutMargin;
     view.cutTurn = mCloudCutTurn;
+    view.cutStick = mCloudCutStick;
+    view.cutThreshold = mCloudCutThreshold;
+    view.cutThresholdCheck = mCloudCutThresholdCheck;
     view.cutAsync = mCloudCutAsync;
     bool densityChanged = false;
     // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
@@ -3908,7 +4032,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setSunLevelStamps(mCloudSunLevelStamps);
     mpCloudResidency->setSunScanWave(mCloudSunScanWave);
     mpCloudResidency->setSunStampSplit(mCloudSunStampSplit);
+    mpCloudResidency->setSunStampRows(mCloudSunStampRows);
     mpCloudResidency->setSunEvery(mCloudSunEvery);
+    mpCloudResidency->setLoadsBesideCut(mCloudLoadsBesideCut);
+    mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame);
+    mpCloudResidency->setScatterUploads(mCloudScatterUploads);
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
@@ -3947,27 +4075,76 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     {
         FALCOR_PROFILE(pRenderContext, "commitBricks");
         mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
-        bindResidencyPass(pRenderContext, mpDecodeCloudPass, false);
-        mpDecodeCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
-        mParams.cloudStagedCount = 0;
-        for (const auto& group : mpCloudResidency->getCommitGroups())
+        // DIAGNOSTIC cloudCommitCheck: the parallel passes' outputs against the serial passes' on the same staged bricks.
+        const bool commitCheck = mCloudCommitCheck > 0 && mCloudCommitParallel;
+        const uint32_t staged = mParams.cloudStagedCount;
+        auto compareWords = [&](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b)
         {
-            mParams.cloudCommitOffset = group.offset;
-            mParams.cloudCommitCount = group.count;
-            if (bindResidencyPass(pRenderContext, mpCommitCloudPass, false))
-                bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
-            mpCommitCloudPass->execute(pRenderContext, uint3(kCloudDensityEdge, kCloudDensityEdge, kCloudDensityEdge * group.count));
+            for (size_t i = 0; i < std::min(a.size(), b.size()); ++i)
+                mCommitMismatches += a[i] != b[i] ? 1u : 0u;
+        };
+        {
+            FALCOR_PROFILE(pRenderContext, "decode");
+            if (mCloudCommitParallel)
+            {
+                bindResidencyPass(pRenderContext, mpDecodeCloudPass, false);
+                mpDecodeCloudPass->execute(pRenderContext, uint3(staged * 64u, 1, 1));
+            }
+            else
+            {
+                bindResidencyPass(pRenderContext, mpDecodeCloudSerialPass, false);
+                mpDecodeCloudSerialPass->execute(pRenderContext, uint3(staged, 1, 1));
+            }
+        }
+        if (commitCheck)
+        {
+            const auto parallel = mpCloudResidency->getResiduals()->getElements<uint32_t>(0, staged * 512u);
+            bindResidencyPass(pRenderContext, mpDecodeCloudSerialPass, false);
+            mpDecodeCloudSerialPass->execute(pRenderContext, uint3(staged, 1, 1));
+            // Uncoded bricks are skipped by both and hold whatever was there: compare coded bricks' values only.
+            const auto serial = mpCloudResidency->getResiduals()->getElements<uint32_t>(0, staged * 512u);
+            compareWords(parallel, serial);
+            mCommitChecks += staged;
+        }
+        mParams.cloudStagedCount = 0;
+        {
+            FALCOR_PROFILE(pRenderContext, "reconstruct");
+            for (const auto& group : mpCloudResidency->getCommitGroups())
+            {
+                mParams.cloudCommitOffset = group.offset;
+                mParams.cloudCommitCount = group.count;
+                if (bindResidencyPass(pRenderContext, mpCommitCloudPass, false))
+                    bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
+                mpCommitCloudPass->execute(pRenderContext, uint3(kCloudDensityEdge, kCloudDensityEdge, kCloudDensityEdge * group.count));
+            }
         }
         mParams.cloudCommitCount = 0;
         // Then their occupancy, from the reconstructed atlas texels, for the camera marches' empty-cell skipping.
         mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
-        if (bindResidencyPass(pRenderContext, mpOccupancyCloudPass, false))
+        auto runOccupancy = [&](const ref<ComputePass>& pPass, uint32_t threads)
         {
-            ShaderVar occupancyVar = mpOccupancyCloudPass->getRootVar()["CB"]["gHSTRCloud"];
-            occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
-            occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
+            if (bindResidencyPass(pRenderContext, pPass, false))
+            {
+                ShaderVar occupancyVar = pPass->getRootVar()["CB"]["gHSTRCloud"];
+                occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
+                occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
+            }
+            pPass->execute(pRenderContext, uint3(threads, 1, 1));
+        };
+        {
+            FALCOR_PROFILE(pRenderContext, "occupancy");
+            if (mCloudCommitParallel)
+                runOccupancy(mpOccupancyCloudPass, mParams.cloudStagedCount * 64u);
+            else
+                runOccupancy(mpOccupancyCloudSerialPass, mParams.cloudStagedCount);
         }
-        mpOccupancyCloudPass->execute(pRenderContext, uint3(mParams.cloudStagedCount, 1, 1));
+        if (commitCheck)
+        {
+            const auto parallel = mpCloudResidency->getOccupancy()->getElements<uint32_t>();
+            runOccupancy(mpOccupancyCloudSerialPass, mParams.cloudStagedCount);
+            compareWords(parallel, mpCloudResidency->getOccupancy()->getElements<uint32_t>());
+            --mCloudCommitCheck;
+        }
         mParams.cloudStagedCount = 0;
     }
     // The CPU hierarchy is canonical. Regions touched by paint/replace are marked into a persistent bitmap, atomically compacted,
@@ -4049,8 +4226,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     }
     // Sun bakes last: they read the bricks and occupancy committed above.
     bool sunSlotsChanged = false;
+    bool sunRan = false; // A scheduling run (not cloudSunEvery's release-only frames).
     if (mCloudGpuSun)
     {
+        sunRan = mpCloudResidency->getGpuSunFrame().run;
         sunSlotsChanged = dispatchSunScheduling(pRenderContext);
         mpCloudResidency->gpuSunDispatched();
     }
@@ -4080,10 +4259,83 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                                  uint32_t(reinterpret_cast<uintptr_t>(mpCloudResidency->getSunResolved().get())));
     const bool sunResolveDirty = mSunResolveAlways || !mSunResolveValid || sunSlotsChanged || densityChanged || mpCloudResidency->fadesRunning() ||
                                  any(sunResolveInputs != mSunResolveInputs);
+    // cloudSunResolveLoads: between scheduling runs only the bricks loaded since the last resolve. A brick's answer reads its own and
+    // its ancestors' slot pairs, levels and parents. Pairs change only in a scheduling run or a release; a release clears an unloaded
+    // brick's, and an unloaded brick is a leaf (evict takes no brick with loaded children), so no loaded brick reads it; levels and
+    // parents change only with a load; fades and maps change none of them. Every other frame resolved all 270k bricks for fades.
+    // MEASURED (sunlist1, 4K sunset walk, arms alternating in one launch, profiled): resolveCloudSun 0.193 -> 0.049 ms a frame (full
+    // on the scheduling frames, ~1k listed bricks on the others); HSTRCloud GPU 5.11 -> 4.85 ms over the arms' chunks. Exact
+    // (cloudSunResolveCheck): every loaded brick's entries equal to a full resolve on 12 checked frames, 0 mismatches.
+    const bool sunLoadsOnly = mCloudSunResolveLoads && mCloudGpuSun && !sunRan && mSunResolveValid && !mSunResolveAlways &&
+                              all(sunResolveInputs == mSunResolveInputs) &&
+                              mpCloudResidency->getSunTouchList().size() <= mpCloudResidency->getBrickCapacity();
     if ((beamShipDefine() & 2048u) == 0)
     {
         mSunResolveValid = false; // Nothing keeps the table while it is not read.
         mpCloudResidency->getSunTouchList().clear();
+    }
+    else if (sunLoadsOnly)
+    {
+        auto& touchList = mpCloudResidency->getSunTouchList();
+        if (!touchList.empty())
+        {
+            FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
+            if (!mpSunTouchListBuffer)
+                mpSunTouchListBuffer = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), mpCloudResidency->getBrickCapacity(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+            mpSunTouchListBuffer->setBlob(touchList.data(), 0, touchList.size() * sizeof(uint32_t));
+            mParams.cloudSunResolveList = uint32_t(touchList.size());
+            if (bindResidencyPass(pRenderContext, mpResolveCloudSunSlotsPass, false))
+            {
+                ShaderVar sunVar = mpResolveCloudSunSlotsPass->getRootVar()["CB"]["gHSTRCloud"];
+                sunVar["hstrCloudSunResolved"] = ref<Buffer>();
+                sunVar["hstrCloudSunResolvedOutput"] = mpCloudResidency->getSunResolved();
+                sunVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
+            }
+            mpResolveCloudSunSlotsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrCloudSunTouchList"] = mpSunTouchListBuffer;
+            mpResolveCloudSunSlotsPass->execute(pRenderContext, uint3(mParams.cloudSunResolveList, 1, 1));
+            mParams.cloudSunResolveList = 0;
+            ++mSunResolveListFrames;
+            mSunResolveListBricks += uint32_t(touchList.size());
+            touchList.clear();
+        }
+        // DIAGNOSTIC (cloudSunResolveCheck): a full resolve into a scratch table, compared on the CPU over the loaded bricks (an
+        // unloaded brick's rows go stale here by design). Blocking readbacks.
+        if (mCloudSunResolveCheck > 0)
+        {
+            --mCloudSunResolveCheck;
+            const uint32_t entries = mpCloudResidency->getBrickCapacity() * kCloudSunClasses;
+            if (!mpSunResolveCheck)
+            {
+                mpSunResolveCheck = mpDevice->createStructuredBuffer(
+                    sizeof(uint2), entries, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+                mpSunCheckCount = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+            }
+            if (bindResidencyPass(pRenderContext, mpResolveCloudSunCheckPass, false))
+            {
+                ShaderVar checkVar = mpResolveCloudSunCheckPass->getRootVar()["CB"]["gHSTRCloud"];
+                checkVar["hstrCloudSunResolved"] = ref<Buffer>();
+                checkVar["hstrCloudSunResolvedOutput"] = mpSunResolveCheck;
+            }
+            mpResolveCloudSunCheckPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+            const auto full = mpSunResolveCheck->getElements<uint2>();
+            const auto kept = mpCloudResidency->getSunResolved()->getElements<uint2>();
+            for (uint32_t b = 0; b < mpCloudResidency->getBrickCapacity(); ++b)
+            {
+                if (!mpCloudResidency->isBrickLoaded(b))
+                    continue;
+                for (uint32_t c = 0; c < kCloudSunClasses; ++c)
+                    mSunResolveListMismatches += any(full[b * kCloudSunClasses + c] != kept[b * kCloudSunClasses + c]) ? 1u : 0u;
+            }
+            ++mSunResolveListChecks;
+        }
     }
     else if (sunResolveDirty)
     {
@@ -4284,7 +4536,7 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
     if (info.nodeResets > 0)
         run("resetNodes", mpResetSunNodesPass, uint3(kCloudSunFineEntries, info.nodeResets, 1));
     if (info.changeCount > 0)
-        run("stamp", mpStampSunPass, uint3(info.changeCount, info.stampSplit != 0 ? info.classCount : 1u, 1));
+        run("stamp", mpStampSunPass, uint3(info.changeCount, info.stampSplit != 0 ? info.classCount : 1u, std::max(info.stampRows, 1u)));
     run("scan", mpScanSunPass, uint3(info.capacity, 1, 1));
     run("select", mpSelectSunPass, uint3(1));
     run("emit", mpEmitSunPass, uint3(info.capacity, 1, 1));
@@ -5784,7 +6036,9 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
 {
     // The same march program as every other beam march. Without HSTR_SHIP the dirty passes compiled every switch as a live branch:
     // 4K walk 16.0 -> 13.5 ms with it, sprint 15.9 -> 12.7, the same frame.
-    pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch ? "1" : "0");
+    // cloudSunLiveDirty: the dirty passes compile sunDepthAt's live march out even where the other passes keep it (a sample with no
+    // bake in its brick's chain then reads the voxel sun field). The code alone costs them: see mCloudSunLiveDirty.
+    pPass->getProgram()->addDefine("HSTR_SUN_LIVE", mCloudSunLiveMarch && mCloudSunLiveDirty ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SHIP", std::to_string(beamShipDefine()));
     pPass->getProgram()->addDefine("HSTR_STRIP", "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_PROBE", mBeamLayerProbe ? "1" : "0");
@@ -6246,7 +6500,19 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pTimer = mpGpuTimers[slot].get();
         pTimer->begin();
     }
+    const bool logFrame = mFrameDispatchLog > 0;
+    if (logFrame)
+    {
+        logInfo("FRAMELOG begin {}", mExecuteFrames + 1);
+        pRenderContext->setLogBarriers(true);
+    }
     executeFrame(pRenderContext, renderData);
+    if (logFrame)
+    {
+        pRenderContext->setLogBarriers(false);
+        logInfo("FRAMELOG end");
+        --mFrameDispatchLog;
+    }
     if (pTimer)
     {
         pTimer->end();
@@ -7157,9 +7423,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             mpBeamPixels = {};
             mpBeamUnitTransmittance = nullptr;
         }
-        if (queue)
+        if (queue || mBeamQueryCompact)
         {
-            // Each list can hold every root point: corners and centres.
+            // Each list can hold every root point: corners and centres (beamQueryCompact lists into list 0).
             const uint32_t capacity = (mParams.beamTileDims.x + 1) * (mParams.beamTileDims.y + 1) + tileCount;
             mParams.beamQueueCapacity = capacity;
             if (!mpBeamQueue || mpBeamQueue->getElementCount() != capacity * kBeamQueueBuckets)
@@ -7762,6 +8028,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     );
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0");
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "0");
+                                    // beamQueryCompact: this pass only lists the points to march; marchBeamDirtyListed marches them.
+                                    const bool compactQuery = mBeamQueryCompact && mpBeamQueue && mpBeamQueueCounts && mpBeamQueueArgs &&
+                                                              mParams.beamQueue == 0 && !mBeamRepairProbe && !(mPushProbe && mPushShare) &&
+                                                              mParams.beamDirtySegments <= 1 && mParams.beamQueryWaveOrder == 0;
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_QUERY_COMPACT", compactQuery ? "1" : "0");
                                     if (mParams.beamOrderProbe != 0)
                                     {
                                         if (!mpBeamOrderProbe)
@@ -7834,9 +8105,23 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         pRenderContext->resourceBarrier(mpFarField[mFarCurrent].get(), Resource::State::ShaderResource);
                                         pRenderContext->resourceBarrier(mpFarDistance[mFarCurrent].get(), Resource::State::ShaderResource);
                                     }
+                                    if (compactQuery)
+                                        pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                                    if (compactQuery)
+                                    {
+                                        FALCOR_PROFILE(pRenderContext, "listed");
+                                        writeBeamQueueArgs(pRenderContext, 1);
+                                        mpBeamDirtyListedPass->getProgram()->addDefine(
+                                            "HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0"
+                                        );
+                                        setBeamDirtyMarchDefines(mpBeamDirtyListedPass);
+                                        bindRenderer(pRenderContext, mpBeamDirtyListedPass);
+                                        bindOutput(mpBeamDirtyListedPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                        mpBeamDirtyListedPass->executeIndirect(pRenderContext, mpBeamQueueArgs.get(), 0);
+                                    }
                                     if (farBesideQuery)
                                     {
                                         // The query leaves the GPU 6-9% busy (ngfxlive1: sm__throughput over its 0.6-0.9 ms, a few

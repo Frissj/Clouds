@@ -53,7 +53,13 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 480;
+static const uint kBeamCountSlots = 484;
+/// beamLayerProbe ORACLE: the lean marches' brick lookups (lanes), and of those the lanes whose whole active wave looks up the same
+/// instance, and the same instance and level page - what a wave-uniform (scalarised) lookup could share.
+/// MEASURED (lookupuni1, 4K sunset walk, residency fixed, 4 counted frames): 1.31M lookup lanes a frame, 88% in waves on one
+/// instance, 1.2% (15.6k) on one page. Stop rule (build only above 50% on one page) fails; a same-instance load is already a
+/// broadcast. Scalarising the lookup is closed.
+static const uint kBeamLookupProbe = 480;
 /// worksetProbe (hstrWorkset): four counters, then one bit set of kWorksetSetWords words for brick indices and one for sun slots.
 static const uint kWorksetHeader = 8;
 static const uint kWorksetSetWords = 32768;
@@ -170,6 +176,9 @@ static const uint kBeamQueryWaveQuarter = 381;
 /// work lies at 512-2048 units, where a 4K pixel (~0.37 units at 1000, 46-degree vertical field) is still under a source voxel
 /// (~0.86 units: 5.16-unit sea voxels of ~6 source voxels) - no coarser level of detail to take there either.
 static const uint kBeamProbeDistanceBins = 12;
+/// beamLayerProbe: the dirty marches' leanSunDepth answers - 0 a resolved bake, 1 no bake in the brick's chain, 2 a brick coarser
+/// than the footprint asks for or no near reach (both take sunDepthAt), 3 no brick (proxy regime).
+static const uint kBeamSunProbe = 464;
 static const uint kBeamProbeDistance = 385;
 /// formR 2 (HSTR_FORM_R 2, counting probe: no jump): over the lean marches, hull queries, march steps taken while outside every
 /// hull (what formR 1 jumps over), brick density samples outside every hull (must be 0: else the hulls drop cloud), proxy density
@@ -449,6 +458,9 @@ struct HSTRCloudSunFrame
     uint levelStamps;  ///< 1: a change stamps only the bakes of its brick's level or finer (stampSunChange).
     uint scanWave;     ///< 1: scanSunBakes sums its histogram and counter adds per wave and bin before the atomics (exact).
     uint stampSplit;   ///< 1: stampSunChanges runs a thread per change and orientation class instead of per change (exact).
+    /// stampSunChanges' threads per change and class (dispatch z): thread r stamps every stampRows-th row of the change's ranges
+    /// (z rows of the pair-block levels, then cell rows of levels 0-1). 1: one thread stamps every row.
+    uint stampRows;
 };
 
 /// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed
@@ -2069,6 +2081,9 @@ struct HSTRCloudParams
     uint cloudSunTouchCount = 0; ///< stampCloudSunTouched's entries.
     /// DIAGNOSTIC (wrong image, read for time): 1 skips the dirty query's ray march, keeping everything around it.
     uint beamQueryKnock = 0;
+    /// resolveCloudSunSlots resolves only the bricks in hstrCloudSunTouchList (this many): the bricks loaded since the last resolve,
+    /// on frames without a scheduling run (cloudSunResolveLoads). 0 resolves every brick.
+    uint cloudSunResolveList = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

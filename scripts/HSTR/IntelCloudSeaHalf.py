@@ -19,7 +19,8 @@ g.addPass(createPass("HSTRCloud", {
     "cloudSeaTiles": tiles,
     "cloudSeaCoverage": 1.0,
     "cloudBrickPoolMB": int(os.environ.get("HSTR_CLOUD_POOL_MB", "256")),
-    "cloudBrickLoadsPerFrame": int(os.environ.get("HSTR_CLOUD_LOADS", "1024")),
+    # 4096: 1024 was saturated on 112-115 of 120 walk frames (loadcap3); see HSTRCloud.h mCloudBrickLoadsPerFrame.
+    "cloudBrickLoadsPerFrame": int(os.environ.get("HSTR_CLOUD_LOADS", "4096")),
     # Clamped to the resident window of tiles around the camera.
     "seaViewDistance": 20000.0,
     "worldCacheCellVoxels": int(os.environ.get("HSTR_SEA_CELL", "4")),

@@ -31,9 +31,13 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "densityChangedFrames", "cuts", "cutTotalMs", "cutPops", "skirtMaskChecks", "skirtMaskMismatches",
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
             "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
-            "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames")
+            "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames", "uploadRuns", "uploadBytes", "scatterJobs", "scatterChecks", "scatterMismatches", "commitChecks", "commitMismatches", "sunResolveListFrames", "sunResolveListBricks", "sunResolveListChecks",
+            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "cutOrderedCount", "cutEntered", "cutLeft") + tuple(
+            f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
-          "beamMarchTiles", "bindCpuMs") + tuple(  # rtSpanProbe's last frame (present only while it is on).
+          "beamMarchTiles", "bindCpuMs", "loaded", "slotsUsed", "freeSlots", "freeBricks", "committed", "commitFails",
+          "evictCalls", "evictFreed", "evictCandidates", "loadHeld", "loadScanned", "undesiredFadingOut", "undesiredHeld",
+          "undesiredIdle", "activeFades", "cuts", "cutEntered") + tuple(  # rtSpanProbe's last frame (present only while it is on).
           f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
           f"rtProbeBin{b}" for b in range(8)) + tuple(  # rasterProbe's last frame (present only while it is on).
           f"raster{n}" for n in ("Boxes", "Items", "Fragments", "Culled", "Empty", "Unbaked", "Subdivided", "NoSlice", "QueueOverflow",
@@ -52,6 +56,10 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardRescued", "beamGuardHeld") +
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, density samples by layers with density, and the
          # marches' lane steps, warp-paid steps and warps.
+         tuple(f"beamSun{n}" for n in ("Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick")) +
+         tuple(f"beamLookup{n}" for n in ("Lanes", "SameInstance", "SamePage")) +
+         # beamOrderProbe: the dirty query's rays, steps, max steps (2) and log2 step histogram (6-17).
+         tuple(f"beamOrderProbe{i}" for i in range(21)) +
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2",
                                          "LaneSteps", "PaidSteps", "Warps", "TightZero", "MaskMismatch", "MaskEmpty0", "MaskEmpty1",
                                          "VoxelEmpty", "VoxelDense", "TightRun", "BlockDense", "BlockDenseSum", "BlockDenseEdge",
@@ -348,6 +356,25 @@ for speed in speeds:
             for k, v in delta(before, cloud_stats()).items():
                 arm_counts[name][k] = round(arm_counts[name].get(k, 0) + v, 2)
             arm_levels[name].append(levels(cloud_stats()))
+            # Per chunk: residency and the timestamp pair's GPU time, so a slow drift and an arm's own effect can be told apart.
+            now = cloud_stats()
+            d = {k: (now.get(k) or 0) - (before.get(k) or 0) for k in ("gpuTimeSum", "gpuTimeFrames", "committedTotal",
+                                                                      "committedCapped", "cuts", "cutEntered", "evictFreed",
+                                                                      "cutWalkMsTotal", "cutBusyFrames", "cutIdleFrames",
+                                                                      "cutParallelMsTotal", "cutHeapMsTotal", "cutPriorityRises",
+                                                                      "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
+                                                                      "cutCheckBricks", "cutCheckMismatches")}
+            gpu = float(d.get("gpuTimeSum") or 0) / max(float(d.get("gpuTimeFrames") or 0), 1.0) / 1000.0
+            print(f"MOTION {tag} chunk {cycle} {name}: gpu {gpu:.3f} ms ({d.get('gpuTimeFrames')} frames), wall p50 "
+                  f"{sorted(walls)[len(walls) // 2]:.2f} ms, mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
+                  f"pending {now.get('pending')} committed {d.get('committedTotal')} ({d.get('committedCapped')} frames at the cap), "
+                  f"cuts {d.get('cuts')} entered {d.get('cutEntered')} evicted {d.get('evictFreed')} "
+                  f"fading out {now.get('undesiredFadingOut')} free {now.get('freeSlots')}, walk {d.get('cutWalkMsTotal'):.0f} ms "
+                  f"worker, {d.get('cutBusyFrames')} frames busy, {d.get('cutIdleFrames')} idle; parallel "
+                  f"{d.get('cutParallelMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
+                  f"unordered desired {now.get('cutUnorderedDesired')}, priority rises {d.get('cutPriorityRises')}; threshold trims "
+                  f"{d.get('cutThresholdTrims')} underfilled {d.get('cutUnderfilled')} check {d.get('cutCheckMismatches')} of "
+                  f"{d.get('cutCheckBricks')}", flush=True)
             if COUNT:
                 arm_dirty[name] += counted(COUNT, speed)
             if SCORE:

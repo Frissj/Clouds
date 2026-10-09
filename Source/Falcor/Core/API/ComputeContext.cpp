@@ -39,8 +39,17 @@ ComputeContext::ComputeContext(Device* pDevice, gfx::ICommandQueue* pQueue) : Co
 
 ComputeContext::~ComputeContext() {}
 
+/// DIAGNOSTIC (setLogBarriers): the dispatch's entry point, between the barriers it records.
+static std::string dispatchEntryName(ComputeState* pState)
+{
+    const auto& groups = pState->getProgram()->getDesc().entryPointGroups;
+    return groups.empty() || groups[0].entryPoints.empty() ? std::string("?") : groups[0].entryPoints[0].name;
+}
+
 void ComputeContext::dispatch(ComputeState* pState, ProgramVars* pVars, const uint3& dispatchSize)
 {
+    if (mLogBarriers)
+        logInfo("DISPATCH {} {}x{}x{}", dispatchEntryName(pState), dispatchSize.x, dispatchSize.y, dispatchSize.z);
     pVars->prepareDescriptorSets(this);
 
     auto computeEncoder = mpLowLevelData->getComputeCommandEncoder();
@@ -51,6 +60,8 @@ void ComputeContext::dispatch(ComputeState* pState, ProgramVars* pVars, const ui
 
 void ComputeContext::dispatchIndirect(ComputeState* pState, ProgramVars* pVars, const Buffer* pArgBuffer, uint64_t argBufferOffset)
 {
+    if (mLogBarriers)
+        logInfo("DISPATCH {} indirect", dispatchEntryName(pState));
     pVars->prepareDescriptorSets(this);
     resourceBarrier(pArgBuffer, Resource::State::IndirectArg);
 
@@ -62,6 +73,8 @@ void ComputeContext::dispatchIndirect(ComputeState* pState, ProgramVars* pVars, 
 
 void ComputeContext::clearUAV(const UnorderedAccessView* pUav, const float4& value)
 {
+    if (mLogBarriers)
+        logInfo("CLEAR {}", fmt::ptr(pUav->getResource()));
     resourceBarrier(pUav->getResource(), Resource::State::UnorderedAccess);
 
     auto resourceEncoder = mpLowLevelData->getResourceCommandEncoder();
@@ -73,6 +86,8 @@ void ComputeContext::clearUAV(const UnorderedAccessView* pUav, const float4& val
 
 void ComputeContext::clearUAV(const UnorderedAccessView* pUav, const uint4& value)
 {
+    if (mLogBarriers)
+        logInfo("CLEAR {}", fmt::ptr(pUav->getResource()));
     resourceBarrier(pUav->getResource(), Resource::State::UnorderedAccess);
 
     auto resourceEncoder = mpLowLevelData->getResourceCommandEncoder();
