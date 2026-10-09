@@ -417,6 +417,11 @@ bool CopyContext::textureBarrier(const Texture* pTexture, Resource::State newSta
         resourceEncoder->textureBarrier(
             1, &textureResource, getGFXResourceState(pTexture->getGlobalState()), getGFXResourceState(newState)
         );
+        if (mLogBarriers)
+            logInfo(
+                "BARRIER texture '{}' {} {}x{}x{} format {} {} -> {}", pTexture->getName(), fmt::ptr(pTexture), pTexture->getWidth(), pTexture->getHeight(),
+                pTexture->getDepth(), int(pTexture->getFormat()), int(pTexture->getGlobalState()), int(newState)
+            );
         mCommandsPending = true;
         recorded = true;
     }
@@ -435,6 +440,8 @@ bool CopyContext::bufferBarrier(const Buffer* pBuffer, Resource::State newState)
         auto resourceEncoder = getLowLevelData()->getResourceCommandEncoder();
         gfx::IBufferResource* bufferResource = pBuffer->getGfxBufferResource();
         resourceEncoder->bufferBarrier(1, &bufferResource, getGFXResourceState(pBuffer->getGlobalState()), getGFXResourceState(newState));
+        if (mLogBarriers)
+            logInfo("BARRIER buffer '{}' ({} B) {} -> {}", pBuffer->getName(), pBuffer->getSize(), int(pBuffer->getGlobalState()), int(newState));
         pBuffer->setGlobalState(newState);
         mCommandsPending = true;
         recorded = true;
@@ -470,6 +477,8 @@ void CopyContext::apiSubresourceBarrier(
 void CopyContext::uavBarrier(const Resource* pResource)
 {
     auto resourceEncoder = getLowLevelData()->getResourceCommandEncoder();
+    if (mLogBarriers)
+        logInfo("BARRIER uav '{}'", pResource->getName());
 
     if (pResource->getType() == Resource::Type::Buffer)
     {

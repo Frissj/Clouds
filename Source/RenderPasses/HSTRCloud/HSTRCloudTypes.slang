@@ -1922,6 +1922,10 @@ struct HSTRCloudParams
     /// off 1.97 / 2.36%, on 1.81 / 2.57%, sanity 2.53%; sprint on 2.88 / 6.16%, off 2.60 / 4.64%, on 2.71 / 8.83% (one chunk 25%),
     /// sanity 12.17%. Walk -0.09 ms, sprint +0.19 ms; residency at half its desired bricks the whole flight (mapped 102-136k of
     /// 243k). Not a measurable win at 4K: kept off.
+    /// MEASURED (packview2, sunset launcher 4K walk 2, RG8 shared set before a settle that baked every brick - sunWaiting 271k -> 0,
+    /// sunset_motion's compile pass no longer freezes the settle - frozen arms, worldCacheView, seaFarOverlap off; units + query
+    /// ms): off 2.517 / 2.474, packed read 2.422 / 2.502. Neutral with every bake present too (packview1, settle frozen with 271k
+    /// unbaked, the same). The read's full-build passes now compile it as well (sunPackedDefine), so a hill gate can see it.
     uint cloudSunPackedAtlas = 0;
     /// The far layer's reprojection (seaFarBand, seaFarSourceDistance). A texel whose march lit the near / far fade (stored with
     /// its distance negative) marches again every run: the fade moves with the camera, so no reprojection carries that content. A
@@ -1964,6 +1968,13 @@ struct HSTRCloudParams
     /// ~2.8 ms of units + query (-1.7 ms), before real lighting (the oracle lights as proxy samples). The step count, set by the
     /// resolved brick's voxel size, not the lookup, is what the layers cost; 04675421's layer cuts (instance / box 1.02 ms, chain
     /// 1.46) changed the steps the same way.
+    /// MEASURED (layeroracle3, 2026-10-09, today's frame: sunset_motion 4K walk 2, frozen after a settle that baked every brick,
+    /// worldCacheView, seaFarOverlap off; ms, warp-paid steps a frame from beamLayerProbe twins, 4 counted frames): query ship 1.192 /
+    /// 1.208 (12.02M paid, 0.100 ns a step), oracle both 0.314 (3.29M, 0.095 ns); units ship 1.267 / 1.344 (9.58M, 0.137 ns), oracle
+    /// 0.184 (1.90M, 0.097 ns; its units list fell 2.3M -> 1.0M, so the units' per-step figure compares different units). At ship's
+    /// steps a one-read structure saves ~0.06 ms of query and at most ~0.4 of units - under the 0.5 ms stop rule: no world table
+    /// rebuild (Form B's successor). Ship's lookups a frame: 2.60M find density, 2.91M walk the chain to an empty brick (voxel
+    /// mask clear for only 14.9k of them), 7.33M answered by the block mask, 2.62M by the voxel mask. The cost is the step count.
     uint cloudLayerOracle = 0;
     /// formR: the y range of every hull instance in the hull TLAS (sea voxels). A lean march counts hull faces from where its ray
     /// leaves this band backwards, so the count starts outside every hull.
@@ -1993,7 +2004,11 @@ struct HSTRCloudParams
     uint seaFarBricks = 0;
     /// DIAGNOSTIC (beamResolveProbe, wrong images, read for time): the pixel resolve stops after the beam mapping (bit 0), skips the
     /// warp (bit 1), skips the sky behind the clouds (bit 2), stops after the level read (bit 3); bit 4 (A/B, right images): the sky
-    /// and far sea behind are read even under 1e-4 transmittance, as before that skip.
+    /// and far sea behind are read even under 1e-4 transmittance, as before that skip. Wrong images, read for time: bit 5 skips the
+    /// far sea behind, bit 6 the aerial haze, bit 7 the basis reads (the pixel reads one corner instead of ten).
+    /// MEASURED (resolvesplit1 / 2, sunset_motion 4K walk 2, frozen, anchors 0.539 / 0.526 and 0.558 / 0.552 ms resolve/pixels):
+    /// mapping only 0.096, through the level read 0.218; without the warp 0.502, the far sea behind 0.512, the haze 0.514, the
+    /// sky 0.473, all three 0.409, one corner 0.488. The cost is spread: no single part is over 0.15 ms.
     uint beamResolveProbe = 0;
     /// ORACLE (beamRimCentroid, n > 0): every lean-march step with density is read at n taps for an exact tau and lit at its
     /// opacity-weighted centroid (leanCentroidTaps). Slow; read for quality.
@@ -2025,6 +2040,35 @@ struct HSTRCloudParams
     /// hold its record pass too): units lane steps 7.78M -> ~3.96M timed, warp-paid 10.25M -> ~5.65M (-45%), for no time at all.
     /// The leading empty run is free: its steps are mask-skips. Step counts are not the march's cost - price oracles in time.
     uint beamUnitOracle = 0;
+    /// worldCacheView: the camera marches read the cache as one texel of radiance towards the camera, baked a frame at each cell
+    /// centre (bakeWorldCacheView), times the sample's own modulation - instead of five SH texels and two SH evaluations per lit
+    /// sample. An approximation: the view direction is the cell centre's, not the sample's (HSTR_CACHE_VIEW on the march passes).
+    /// MEASURED (cacheview1, sunset_motion 4K walk 2, frozen, seaFarOverlap off, beamDirtyStats, arms alternated): units 1.809 /
+    /// 1.717 -> 1.261 / 1.293 ms, query 1.336 / 1.351 -> 1.228 / 1.299, bake (worldCache/worldCacheView) 0.097 / 0.099: about
+    /// -0.47 ms net. Units listed unchanged (2.27M / 2.33M off, 2.31M / 2.39M on over 20 frames): ~15.5 -> ~11 ns a unit.
+    /// MEASURED (cacheviewpt2, sunset_hill full frame against the saved 326 spp trace, beam rebuilt from reset, 16 frames): squared
+    /// excess 0.020690 -> 0.020766 (+0.4%, rms 0.1438 -> 0.1441), 8x8 block log 0.0480 -> 0.0482, p99 0.4871 / p99.9 0.6889 / max
+    /// 0.721 unchanged; anchors repeat to the digit, sanity (beamTolerance 10) 0.025293. cacheviewpt1 was identical to the digit
+    /// because the full-build passes lacked the define - every march pass that sets HSTR_UNIT_START sets HSTR_CACHE_VIEW too.
+    uint worldCacheView = 0;
+    /// resolveBeamResidualPixel: the group evaluates each unit its pixels read once, in groupshared memory (exact). 0: per pixel.
+    /// MEASURED (residshared1, sunset_motion 4K walk 2, frozen, alternated): resolve/residual 0.214 / 0.223 -> 0.093 / 0.093 ms,
+    /// resolve/pixels unchanged. Exact (residexact1, path trace: per pixel and shared 0.023703 both twice, p99 / p99.9 / max equal;
+    /// sanity 0.028843).
+    uint beamResidualShared = 1;
+    /// testBeamDirtyTileDense: the group's centreless corner logs evaluated once in groupshared memory (exact). 0: per tile.
+    /// MEASURED (tilecorner1, sunset_motion 4K walk 2, frozen, alternated): dirtyTiles 0.104 / 0.107 -> 0.083 / 0.083 ms; units a
+    /// listed block 7.33 / 7.00 off, 7.49 / 7.05 on (the walk's stretch, not the test: the same calls on the same corners).
+    uint beamTileCornerShared = 1;
+    /// The changed bricks' page regions widened by an octant of the asset's top level (hstrCloudSkirtRegions): the masks
+    /// resolveCloudSkirtRegions rewrites this frame. 0 when the full pass (resolveCloudSkirtMasks) runs instead.
+    uint cloudSkirtRegionCount = 0;
+    /// resolveCloudSunSlots resolves only bricks whose pairs or ancestors' pairs the scheduler stamped with this frame
+    /// (hstrCloudSunTouched); 0 resolves every brick.
+    uint cloudSunTouchFrame = 0;
+    uint cloudSunTouchCount = 0; ///< stampCloudSunTouched's entries.
+    /// DIAGNOSTIC (wrong image, read for time): 1 skips the dirty query's ray march, keeping everything around it.
+    uint beamQueryKnock = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

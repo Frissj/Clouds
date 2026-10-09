@@ -19,11 +19,40 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # A quality trade the owner took (2026-10-08): camera step 4 -> 5 sea voxels. Measured (IntelCloudSeaHalf.py's notes, qualfront /
     # qualtime4): +0.5% excess squared log error against the 326-spp path trace, units + query -0.43 ms on the 4K walk, motion
     # slightly less stable. Step 6 (+2.3% in hillcent1, -0.9 ms) was offered and not taken.
-    "minStepVoxels": 5.0,
+    # 2026-10-09, toward 2 ms (owner: take the trades): step 7, beamOctScale 0.42, tile tolerance 0.6 (policy ceiling 1.4).
+    # MEASURED (combo1, 4K walk, frozen after a baking settle, worldCacheView, overlaps off): units + query 2.50 / 2.38 -> 1.62 ms
+    # (-0.82); moving frames against a fresh rebuild 2.32% over 0.02 vs ship 2.34 / 2.63% (scale 0.42 + tolerance 0.6 alone scored
+    # 4.51% in the same run - motion scores are position-dependent, see 24429297). Against the 326-spp path trace (combopt1): excess
+    # 0.020766 -> 0.022117 (+6.5%), p99 0.4871 / p99.9 0.6889 unchanged, max 0.721 -> 0.790; anchors repeat to the digit, sanity
+    # 0.025365. Alone (tradetime1 / tradept1): scale 0.42 -0.59 ms +3.6%, tolerance 0.6 -0.29 ms +0.8%, step 7 -0.28 ms +2.5%,
+    # step 6 -0.09 ms (not worth it).
+    # Then (tradetime2 / tradept2, same conditions): beamOctScale 0.42 -> 0.35, units + query 1.62 / 1.57 -> 1.40 ms, excess +2.9%;
+    # far sea at scale 4, farSea 0.65 / 0.74 -> 0.415 ms, +4.4%; both 0.022117 -> 0.023703 (+7.2%), p99 / p99.9 unchanged, max
+    # 0.790 -> 0.727. No gain (same run): far sea to 10000, step 8, tolerance 0.8 (-0.04 ms), refresh 16 (-0.09 ms).
+    # Then (tradetime3 / tradept3, same conditions, anchors ship 0.659 query / 0.701 units / 0.409 farSea ms): far sea scale 8
+    # query 0.544, units 0.603, farSea 0.324 (-0.30 ms), excess 0.023703 -> 0.025976 (+9.6%), p99 / p99.9 unchanged, max 0.893.
+    # Not taken: beamOctScale 0.30 (-0.10 ms, +2.8%), 0.25 (-0.17 ms, +6.9%, residual +0.03); 0.25 with far scale 8 breaks p99
+    # (0.4871 -> 0.5793, excess +15.6%). Sanity tol 10: 0.028843, anchors repeat to the digit.
+    # Then beamOctScale 0.30 with far scale 8 (tradept4): excess 0.025976 -> 0.026557 (+2.2%), p99 / p99.9 / max unchanged (0.4871
+    # / 0.6889 / 0.893), sanity 0.031137, anchors repeat to the digit; time from tradetime3 (scale 0.30 alone, -0.10 ms).
+    # Then beamOctScale 0.25 with far scale 6 (tradept5 / tradetime4): excess 0.026567 -> 0.026733 (+0.6%), p99 / p99.9 unchanged,
+    # max 0.893 -> 0.820; query + units + dirtyTiles + resolve + farSea 2.283 / 2.345 -> 2.241 / 2.273 ms (-0.057; farSea +0.05,
+    # the beam passes -0.11). Same run, each breaking p99 (0.4871 -> 0.5793): scale 0.27 (+2.4%), tolerance 0.7, step 7.5.
+    "minStepVoxels": 7.0,
+    "beamOctScale": 0.25,
+    "seaFarScale": 6,
+    "beamTolerance": 0.6,
+    "beamPolicyTolerance": 1.4,
     # Two layers ask for about twice the sun bakes of one; until a brick's bake lands its samples take the live sun march. 1024 a frame
     # (bakeCloudSun ~0.2-2 ms while baking). NOT MEASURED against 256: the A/B that seemed to show it (1871ae53) changed the rate at
     # runtime, which did not rebuild the residency then, so its second arm was the first one settled longer.
     "cloudSunBakesPerFrame": 1024,
+    # The GPU sun scheduling every 4th frame with 4x the moving cap (the frames between release only). MEASURED (sunevery1, 4K walk
+    # 2, live residency, one launch, every 1 / 2 / 4 / 1 / 2): cloudSea 0.446 / 0.286 / 0.144 / 0.417 / 0.230 ms (scheduleSun 0.295
+    # / 0.213 / 0.114 / 0.293 / 0.168, resolveCloudSun 0.143 / 0.066 / 0.024 / 0.118 / 0.055); query + units within the anchors'
+    # spread (1.59 / 1.63 / 1.53 / 1.38 / 1.38); bakes waiting at the arms' ends 180k / 189k / 187k / 211k / 209k, stale 116k /
+    # 108k / 107k / 107k / 105k - the backlog drains as fast.
+    "cloudSunEvery": 4,
     # The low sun's horizontal banding: past the fine near reach the sun depth comes from the domain's coarse sheared field (5.16-unit
     # layers), which at 4 degrees of elevation draws a bright/dark band per layer on the lit faces (~30 px apart at 4K). A reach of 8
     # sea voxels (~41 world units) takes the handoff deep enough that the bands are gone (4 leaves faint ones, 32 is no better than 8).

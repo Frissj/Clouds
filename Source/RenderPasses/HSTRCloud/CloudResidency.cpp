@@ -182,6 +182,10 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         sizeof(uint32_t), 3, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, zeros.data(), false
     );
     mDirtyPageRegions.reserve(2u * brickCapacity);
+    mpSkirtRegions = mpDevice->createStructuredBuffer(
+        sizeof(HSTRCloudDirtyPageRegion), 2u * brickCapacity, shaderResource, MemoryType::DeviceLocal, nullptr, false
+    );
+    mSkirtRegions.reserve(2u * brickCapacity);
     // Read-write: advanceCloudFades runs the fades in it.
     mpBricks = mpDevice->createStructuredBuffer(
         sizeof(HSTRCloudBrick), uint32_t(mBricks.size()), shaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
@@ -270,6 +274,8 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mSunStateBlocksDirty.assign(mBrickBlocksDirty.size(), 0);
         mpSunState = create(sizeof(uint32_t), brickCapacity, mSunState[0].data());
         mpSunFrames = create(sizeof(uint32_t), uint32_t(mSunBakeFrames.size()), mSunBakeFrames.data());
+        const std::vector<uint32_t> untouched(brickCapacity, 0u); // Residency frames start at 1.
+        mpSunTouched = create(sizeof(uint32_t), brickCapacity, untouched.data());
         mpSunFree = create(sizeof(uint32_t), uint32_t(mFreeSunSlots.size()), mFreeSunSlots.data());
         const uint32_t freeTop = uint32_t(mFreeSunSlots.size());
         mpSunFreeTop = create(sizeof(uint32_t), 1, &freeTop);
@@ -933,6 +939,8 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     ++mFrame;
     mDirtyPageRegions.clear();
     mDirtyPageWorkCount = 0;
+    mSkirtRegions.clear();
+    mSkirtWorkCount = 0;
     bool changed = false;
     const auto& tiles = sea.getInstanceTiles();
     auto* pRenderContext = mpDevice->getRenderContext();
@@ -1661,6 +1669,8 @@ bool CloudResidency::commit(uint64_t handle)
     gpu.minValue = b.record.valueMin;
     gpu.range = b.record.valueRange;
     touchBrick(b.gpu);
+    // Its level and parent are what resolveCloudSunSlots reads of the brick table (maps and fades change neither).
+    mSunTouchList.push_back(b.gpu);
 
     const uint32_t n = uint32_t(mStaged.size());
     mStaged.push_back(handle);
@@ -2194,6 +2204,37 @@ void CloudResidency::dirtyPages(uint32_t assetID, const BrickHeader& record)
     FALCOR_ASSERT(volume <= UINT32_MAX && uint64_t(mDirtyPageWorkCount) + volume <= UINT32_MAX);
     mDirtyPageWorkCount += uint32_t(volume);
     mDirtyPageRegions.push_back({origin, assetID, extent, mDirtyPageWorkCount});
+    // The skirt masks this change can reach (resolveCloudSkirtRegions). Per axis, a page at level l (octant edge s = 2^(l - 1))
+    // reads its own coordinate, origin - 1 or origin + s, its octant's origin a multiple of s. So page c is read from
+    // [c + 1, c + s] where c + 1 is a multiple of s, and from [c - s, c - 1] where c is: a margin of 1 to 2^(topLevel - 1) on
+    // each side, exact. MEASURED (skirtwork1 / skirtregions2, 4K live walk 2): ~4,300 changed bricks a frame, ~10 pages each,
+    // against 14.4M pages in the full pass; widened by the largest octant (8 pages) on every side they summed to ~10M a frame.
+    // A neighbour counts only where it is mapped at the reader's level or coarser, and this brick's pages move between its level
+    // L and its parent's (the hierarchy is closed under parents), so only readers up to level L + 1 see the change: octant edges
+    // to 2^L. MEASURED (skirtexact1, every octant edge to 2^(topLevel - 1)): 0 stale masks over 120 checked live frames; 31 of 48
+    // skirt frames through the regions at ~5.1M pages each, 17 full; skirtMasks 0.183 ms against 0.316 / 0.468 for the full
+    // pass in skirtregions2 / skirtwork1 (other launches). With edges to 2^L (skirtexact2): all 47 skirt frames through the
+    // regions at ~1.07M pages each, skirtMasks 0.023 ms a live frame, 0 stale masks over 120 checked live frames.
+    const uint32_t topLevel = mAssetRecords[assetID]->topLevel;
+    const uint32_t largest = topLevel > 0 ? 1u << std::min(uint32_t(record.level), topLevel - 1u) : 0u;
+    uint3 skirtLo = origin, skirtHi = hi;
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        for (uint32_t c = origin[axis]; c < hi[axis]; ++c)
+            for (uint32_t s = 1; s <= largest; s *= 2)
+            {
+                if ((c + 1) % s == 0)
+                    skirtHi[axis] = std::max(skirtHi[axis], std::min(c + s + 1, dims[axis]));
+                if (c % s == 0)
+                    skirtLo[axis] = std::min(skirtLo[axis], c >= s ? c - s : 0u);
+            }
+    const uint3 skirtExtent = skirtHi - skirtLo;
+    if (mSkirtWorkCount == UINT64_MAX)
+        return;
+    mSkirtWorkCount += uint64_t(skirtExtent.x) * skirtExtent.y * skirtExtent.z;
+    if (mSkirtWorkCount <= UINT32_MAX && mSkirtRegions.size() < mpSkirtRegions->getElementCount())
+        mSkirtRegions.push_back({skirtLo, assetID, skirtExtent, uint32_t(mSkirtWorkCount)});
+    else
+        mSkirtWorkCount = UINT64_MAX; // Past capacity: the full pass runs (getSkirtWorkCount over the page count).
 }
 
 void CloudResidency::touchDirectory(size_t index)
@@ -2216,6 +2257,8 @@ void CloudResidency::upload()
 {
     if (!mDirtyPageRegions.empty())
         mpDirtyPageRegions->setBlob(mDirtyPageRegions.data(), 0, mDirtyPageRegions.size() * sizeof(HSTRCloudDirtyPageRegion));
+    if (!mSkirtRegions.empty() && mSkirtWorkCount < getPageCount())
+        mpSkirtRegions->setBlob(mSkirtRegions.data(), 0, mSkirtRegions.size() * sizeof(HSTRCloudDirtyPageRegion));
     if (mInstancesDirty)
     {
         mpInstances->setBlob(mInstances.data(), 0, mInstances.size() * sizeof(HSTRCloudInstance));
@@ -2491,6 +2534,22 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
             mStats.sunBakesFrame = 0;
             return;
         }
+        // cloudSunEvery n: the scheduling runs every nth frame with n times the bake cap, so its capacity-wide passes (scan, emit,
+        // the stamps' field) run 1 / n as often for the same bakes. The frames between run only the releases: an unloaded brick's
+        // pairs are cleared before a load can reuse its index (which would read them meanwhile). Changes and resets wait.
+        if (mSunEvery > 1 && mFrame % mSunEvery != 0)
+        {
+            mStats.sunBakesFrame = 0;
+            const uint32_t releases = uint32_t(std::min(mSunRelease.size(), mSunSched.size()));
+            if (releases > 0)
+            {
+                mpSunRelease->setBlob(mSunRelease.data(), 0, releases * sizeof(uint32_t));
+                mSunRelease.clear();
+                mGpuSunFrame.releaseOnly = true;
+                mGpuSunFrame.info.releaseCount = releases;
+            }
+            return;
+        }
         for (size_t c = 0; c < mSunClasses.size(); ++c)
             mSunDirections[c] = float4(normalize(mul(mSunClasses[c], sunDirection)), 0.f);
         mpSunDirections->setBlob(mSunDirections.data(), 0, mSunDirections.size() * sizeof(float4));
@@ -2502,7 +2561,8 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunRan = true;
         mGpuSunFrame.info.releaseCount = releases;
         mGpuSunFrame.info.classCount = uint32_t(mSunClasses.size());
-        mGpuSunFrame.info.bakeMax = mSunBakesCap > 0 ? std::min(mSunBakesCap, mDesc.sunBakesPerFrame) : mDesc.sunBakesPerFrame;
+        mGpuSunFrame.info.bakeMax =
+            mSunBakesCap > 0 ? std::min(mSunBakesCap * std::max(mSunEvery, 1u), mDesc.sunBakesPerFrame) : mDesc.sunBakesPerFrame;
         mGpuSunFrame.info.capacity = uint32_t(mSunSched.size());
         mGpuSunFrame.info.sunSlots = mSunSlotCount;
         mGpuSunFrame.info.keepStale = mSunKeepStale ? 1u : 0u;
@@ -2793,6 +2853,7 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
 void CloudResidency::bindPageUpdates(const ShaderVar& var) const
 {
     var["hstrCloudDirtyRegions"] = mpDirtyPageRegions;
+    var["hstrCloudSkirtRegions"] = mpSkirtRegions;
     var["hstrCloudDirtyBits"] = mpDirtyPageBits;
     var["hstrCloudDirtyPages"] = mpDirtyPages;
     var["hstrCloudDirtyPageCount"] = mpDirtyPageCount;
@@ -2807,6 +2868,7 @@ void CloudResidency::bindGpuSun(const ShaderVar& var) const
     var["hstrCloudSunSched"] = mpSunSched;
     var["hstrCloudSunState"] = mpSunState;
     var["hstrCloudSunFrames"] = mpSunFrames;
+    var["hstrCloudSunTouched"] = mpSunTouched;
     var["hstrCloudSunFree"] = mpSunFree;
     var["hstrCloudSunFreeTop"] = mpSunFreeTop;
     var["hstrCloudSunCounters"] = mpSunCounters;

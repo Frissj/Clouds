@@ -34,6 +34,9 @@ import Atmosphere;
 /// one step 0.034 / 0.033, density 0.917 / 0.903, density + sun 1.126 / 1.094, density + cache 1.469 / 1.167, full 1.723-1.767 /
 /// 1.335-1.366 (anchor repeated). Ray setup and the first step are ~2% of a unit: the time is per step. Density walk 52% of units,
 /// sun +0.21 (12%), cache lighting +0.55 (31%); in the query density 67%, sun +0.19, cache +0.26.
+/// MEASURED viewstrip1 (same, worldCacheView on): full 1.308-1.420 / 1.155-1.198, density 0.820 / 0.865, density + sun 1.141 /
+/// 1.123, density + cache 1.010 / 0.963. Units: density walk ~60%, sun ~25%, cache ~15%; query: density ~73%, sun ~22%, cache
+/// ~8%. Frame leaves: far sea 0.71-0.79, resolve/pixels 0.33-0.41, residual 0.21, dirtyTiles 0.16, cache bake 0.10, warp 0.09.
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
@@ -147,9 +150,29 @@ static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched
 #define HSTR_BEAM_PATH 0
 #endif
 static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
+// resolveBeamResidualPixel: the box of units the group's pixels read, and each of those units evaluated once.
+groupshared uint2 gResidualLo;
+groupshared uint2 gResidualHi;
+groupshared float3 gResidualUnits[64];
+// testBeamDirtyTileDense (beamTileCornerShared): whether any of the group's 8 x 8 tiles is tested, and the corner logs those
+// tiles' curvature reads (tiles -1 .. 9 of the group per axis, 11 x 11).
+groupshared uint gTileCornerAny;
+groupshared float3 gTileCornerLog[121];
+static float gTileCurvature = -1.f; ///< >= 0: beamTileRefines takes this curvature instead of computing it.
 #ifndef HSTR_STRIP
 #define HSTR_STRIP 0
 #endif
+#ifndef HSTR_CACHE_VIEW
+#define HSTR_CACHE_VIEW 0 // worldCacheView: the lean march reads the camera-baked cache (worldCacheViewRadiance).
+#endif
+#ifndef HSTR_SUN_KNOCK
+#define HSTR_SUN_KNOCK 0 // ORACLE beamSunKnock, timing only (wrong image): 1 no far field, 2 no resolved bake, 4 no octave spread.
+#endif
+// MEASURED (sunknock1, sunset_motion 4K walk 2, frozen, worldCacheView, seaFarOverlap off; query / units ms, units listed over 20
+// frames): ship 1.254 / 1.301 (2.27M), again 1.233 / 1.357 (2.29M); no far 1.267 / 2.280 (4.85M); no bake 1.117 / 1.383 (2.76M);
+// neither 1.106 / 0.755 (1.57M); no octave 1.262 / 1.318 (2.32M); none 1.074 / 0.850 (1.44M). The query's blocks are the same in
+// every arm, so it prices the parts: the resolved lookup + bake fetch ~0.13 ms, the far field and the octave fetch ~0. The units
+// list follows the changed image, so its times do not split.
 #ifndef HSTR_BEAM_WARP
 #define HSTR_BEAM_WARP 0
 #endif
@@ -488,6 +511,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrCloudSkirtMasksOutput;
     RWStructuredBuffer<uint> hstrCloudSkirtCheck;       ///< DIAGNOSTIC (cloudSkirtCheck): stale skirt masks counted.
     StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudDirtyRegions;
+    StructuredBuffer<HSTRCloudDirtyPageRegion> hstrCloudSkirtRegions; ///< resolveCloudSkirtRegions' work (cloudSkirtRegionCount).
     RWStructuredBuffer<uint> hstrCloudDirtyBits;
     RWStructuredBuffer<uint> hstrCloudDirtyPages;
     RWStructuredBuffer<uint> hstrCloudDirtyPageCount;
@@ -540,6 +564,8 @@ struct HSTRCloudRenderer
     StructuredBuffer<HSTRCloudSunSched> hstrCloudSunSched;  ///< Per GPU brick.
     StructuredBuffer<uint> hstrCloudSunState;               ///< Per GPU brick: flags and priority bin (kCloudSunBinShift).
     RWStructuredBuffer<uint> hstrCloudSunFrames;            ///< Per pair: the residency frame it was baked in.
+    RWStructuredBuffer<uint> hstrCloudSunTouched;           ///< Per GPU brick: the last scheduler frame that wrote its slot pairs.
+    StructuredBuffer<uint> hstrCloudSunTouchList;           ///< stampCloudSunTouched: the bricks the CPU loaded.
     RWStructuredBuffer<uint> hstrCloudSunFree;              ///< Free sun atlas slots, a stack.
     RWStructuredBuffer<uint> hstrCloudSunFreeTop;           ///< Its size.
     RWStructuredBuffer<uint> hstrCloudSunCounters;          ///< kCloudSunCounters entries.
@@ -594,6 +620,8 @@ struct HSTRCloudRenderer
     // The cache means baked for the camera: slot s = 3k + c of the 27 in texture s / 4, channel s % 4, trilinear by hardware.
     Texture3D<float4> hstrWorldCacheTexture[kWorldCacheTextures];
     RWTexture3D<float4> hstrWorldCacheTextureOutput[kWorldCacheTextures];
+    Texture3D<float4> hstrWorldCacheView;            ///< worldCacheView: the cache's radiance towards the camera, unmodulated.
+    RWTexture3D<float4> hstrWorldCacheViewOutput;
     StructuredBuffer<float> hstrWorldCacheRingKernel; ///< worldCacheSunOrder 4: ring edge cosines (kWorldCacheRings).
     Texture2D<float4> hstrWorldCacheRingTable;        ///< worldCacheSunOrder 4: ring phase table.
     Texture2D<float4> hstrFarField;                   ///< Per texel: the far sea's radiance (hazed) less the sky it hides, and its transmittance.
@@ -2010,7 +2038,11 @@ struct HSTRCloudRenderer
         if (all(octaves.yzw == 0.f))
             return params.residualStrength * params.sunRadiance * octaves.x * exp(-depth);
         // Octaves 1-3 are multiply scattered: they arrive from the scatterers around v, not along v's own sun ray.
+#if (HSTR_SUN_KNOCK & 4) != 0
+        const float4 spread = float4(0.5f, 0.25f, 0.125f, 1.f) * (1.f + 1e-3f * v.y);
+#else
         const float4 spread = hstrSunOctaves.SampleLevel(hstrLinearSampler, (v + 0.5f) / (2.f * float3(params.hstrOctaveDims)), 0.f);
+#endif
         const float b = params.octaveExtinction;
         const float3 local = exp(-depth * float3(b, b * b, b * b * b));
         const float3 multiple = (spread.rgb + 1e-3f * local) / (spread.a + 1e-3f);
@@ -3607,8 +3639,10 @@ struct HSTRCloudRenderer
         const float transmittance = exp(-depth);
         const float3 radiance =
             beamRadiance(cache, single, depth, w, albedo) +
-            (withFar && (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u) ? transmittance * farSeaExtra(w) : 0.f);
-        if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f))
+            (withFar && (params.beamResolveProbe & 32u) == 0u && (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u)
+                 ? transmittance * farSeaExtra(w)
+                 : 0.f);
+        if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f) || (params.beamResolveProbe & 64u) != 0u)
             return radiance;
         const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
         const float4 aerial = atmosphereAerial(hstrAtmosphere, hstrAtmosphereAerial, hstrLinearClampSampler, w, distance);
@@ -4900,6 +4934,36 @@ struct HSTRCloudRenderer
         return worldCacheRadianceTextured(v, w, modulation, ringModulation);
     }
 
+    /// worldCacheView: one cell's cache radiance towards the camera, evaluated at its centre (where the trilinear fetch returns the
+    /// cell's own texels) for the direction from the camera to the centre's nearest wrapped image - the one the near march sees,
+    /// since the march reaches 2000 world units and the domain repeats every ~5,300. Unmodulated: without the ring slots the
+    /// modulation scales the whole read (worldCacheRadianceTextured), so the march multiplies its own sample's back in.
+    void bakeWorldCacheViewCell(uint3 cell)
+    {
+        if (any(cell >= params.worldCacheDims))
+            return;
+        const float3 centre = (float3(cell) + 0.5f) * float(params.worldCacheCellVoxels);
+        const float3 camera = worldToVoxel(gScene.camera.data.posW, gScene.getGridVolume(0)) - float3(params.hstrGridMin);
+        const float3 dims = float3(params.hstrExtinctionDims);
+        float3 d = centre - camera;
+        d.xz -= round(d.xz / dims.xz) * dims.xz;
+        // Only cells the near march can read: its samples lie within seaViewDistance of the camera, and a trilinear read reaches
+        // the next cell centre, so two cell diagonals of margin. The rest keep an older frame's value and are never read.
+        // MEASURED (sunknock1 against cacheview1, 4K walk): worldCacheView 0.097-0.104 -> 0.052-0.055 ms.
+        const float reach = params.seaViewDistance + 2.f * 1.7321f * float(params.worldCacheCellVoxels) * max(params.seaVoxelSize.x, params.seaVoxelSize.z);
+        if (dot(d * params.seaVoxelSize, d * params.seaVoxelSize) > reach * reach)
+            return;
+        const float3 w = normalize(d * params.seaVoxelSize);
+        hstrWorldCacheViewOutput[cell] = float4(worldCacheRadianceTextured(centre, w, 1.f, 0.f), 0.f);
+    }
+
+    /// worldCacheView: worldCacheRadiance read from the camera bake - one trilinear texel times the sample's modulation.
+    float3 worldCacheViewRadiance(float3 v)
+    {
+        const float3 uvw = seaVoxel(v) / (float(params.worldCacheCellVoxels) * float3(params.worldCacheDims));
+        return worldCacheModulation(v) * hstrWorldCacheView.SampleLevel(hstrLinearSampler, uvw, 0.f).rgb;
+    }
+
     /// DIAGNOSTIC (cacheOracle): what worldCacheRadiance estimates, by paths traced from v with the exact phase function and the
     /// real sky - everything arriving at v but direct sunlight, scattered towards the camera looking along w. Through the transport
     /// proxy it is the cache without its cells and its SH; through the fine bricks (bit 8) it is the path tracer's own answer.
@@ -5338,6 +5402,7 @@ struct HSTRCloudRenderer
         if (entry >= sunFrame().releaseCount)
             return;
         const uint base = hstrCloudSunRelease[entry] * kCloudSunBakesPerBrick;
+        hstrCloudSunTouched[hstrCloudSunRelease[entry]] = sunFrame().frame;
         for (uint k = 0; k < kCloudSunBakesPerBrick; ++k)
         {
             const uint slot = hstrCloudSunSlotsOutput[2u * (base + k) + 1u];
@@ -5414,7 +5479,10 @@ struct HSTRCloudRenderer
                     if (frame.keepStale != 0 && !missing)
                         staleMask |= 1u << k;
                     else
+                    {
                         hstrCloudSunSlotsOutput[2u * (base + k)] = kCloudRefNone;
+                        hstrCloudSunTouched[b] = frame.frame;
+                    }
                     ++stale;
                 }
             }
@@ -5587,6 +5655,7 @@ struct HSTRCloudRenderer
             pushSunSlot(slot);
         hstrCloudSunSlotsOutput[2u * pair] = kCloudRefNone;
         hstrCloudSunSlotsOutput[2u * pair + 1u] = kCloudRefNone;
+        hstrCloudSunTouched[pair / kCloudSunBakesPerBrick] = sunFrame().frame;
     }
 
     /// Assign: a candidate takes a pair holding a slot it may reuse, else an empty pair and a free slot, and writes its bake job.
@@ -5640,6 +5709,7 @@ struct HSTRCloudRenderer
                 hstrCloudSunSlotsOutput[2u * (base + chosen)] = (frame.generation << 4) | sunClass;
                 hstrCloudSunSlotsOutput[2u * (base + chosen) + 1u] = slot;
                 hstrCloudSunFrames[base + chosen] = frame.frame;
+                hstrCloudSunTouched[b] = frame.frame;
                 const HSTRCloudAsset asset = hstrCloudAssets[s.asset];
                 job.brick = b;
                 job.slot = slot;
@@ -8692,6 +8762,12 @@ struct HSTRCloudRenderer
         {
             const float sourceVoxelWorld = hit.scale;
             const float near = params.sunNearVoxels * hit.near;
+#if (HSTR_SUN_KNOCK & 2) != 0
+            {
+                const float3 knockFar = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
+                return ((HSTR_SUN_KNOCK & 1) != 0 ? 0.f : fineSunAt(knockFar)) + 1e-3f * hit.x.y;
+            }
+#endif
 #if HSTR_SUN_PACKED
             if ((hit.levels & kLeanHitPackedSun) != 0u)
             {
@@ -8711,7 +8787,7 @@ struct HSTRCloudRenderer
                 // opaque early-out did, which put one more memory round trip in series on every lit sample. Exact.
                 // MEASURED (leanchain1, 4K, errors identical): walk 6.02 / 6.02 -> 5.97 ms, sprint 7.50 / 7.51 -> 7.46.
                 const float3 far = seaVoxel(seaVoxel(v) + near * params.sunVoxelDirection);
-                const float farDepth = fineSunAt(far);
+                const float farDepth = (HSTR_SUN_KNOCK & 1) != 0 ? 1e-3f * far.y : fineSunAt(far);
                 const float baked = cloudBrickSunAt(resolved.y >> 24, resolved.x, hit.x, sourceVoxelWorld, hit.near);
 #if HSTR_WORKSET_PROBE
                 worksetMark(1u, resolved.x);
@@ -9117,7 +9193,11 @@ struct HSTRCloudRenderer
                     // MEASURED and REMOVED (sunhit3, errors identical): the view direction recomputed per lit sample, normalize(ray.direction),
                     // instead of held along the ray - no change (walk 2.074 -> 2.071 ms, sprint 2.400 -> 2.409).
                     if (withSource && HSTR_STRIP != 4 && HSTR_STRIP != 5)
+#if HSTR_CACHE_VIEW
+                        radiance += transmittance * alpha * (cached ? worldCacheViewRadiance(midpoint) : sourceAtVoxel(midpoint));
+#else
                         radiance += transmittance * alpha * (cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint));
+#endif
                 }
                 opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
                 transmittance *= 1.f - alpha;
@@ -11144,6 +11224,12 @@ struct HSTRCloudRenderer
     {
         const uint s = beamTileEdge(level);
         const uint2 origin = uint2(beamPosition) / s * s;
+        if ((params.beamResolveProbe & 128u) != 0u)
+        {
+            const float4 a = beamVerifierAt(origin, 0, sparse);
+            const float4 b = beamVerifierAt(origin, 1, sparse);
+            return hazedBeamRadiance(max(a.rgb, 0.f), max(b.rgb, 0.f), max(a.a, 0.f), b.a, w, gScene.getGridVolume(0).data.albedo);
+        }
         const float4 a00 = beamVerifierAt(origin, 0, sparse);
         const float4 a10 = beamVerifierAt(origin + uint2(s, 0), 0, sparse);
         const float4 a01 = beamVerifierAt(origin + uint2(0, s), 0, sparse);
@@ -11253,7 +11339,7 @@ struct HSTRCloudRenderer
                                                                           : beamPolicyTolerance();
         if (centreless)
         {
-            bool refine = beamCornerCurvature(tile, sparse) > tolerance;
+            bool refine = (gTileCurvature >= 0.f ? gTileCurvature : beamCornerCurvature(tile, sparse)) > tolerance;
             if (!refine && params.beamEdgeContrast > 0.f)
                 refine = (edgeAware ? range : beamTransmittanceRange(level, tile, sparse)) > params.beamEdgeContrast;
             return refine;
@@ -11465,13 +11551,49 @@ struct HSTRCloudRenderer
     /// testBeamDirtyTile over the tile grid instead of each listed block's padded square: a thread per tile, testing it when any
     /// listed block's points are read by it. The same tiles as the owner rule (a tile with a listed reader is in that reader's
     /// padded square), launched once each rather than once per padded square that holds it (36 items a block at side 2).
-    void testBeamDirtyTileDense(uint2 tile)
+    void testBeamDirtyTileDense(uint2 tile, uint lane)
     {
         const uint side = max(params.beamDirtyBlockEdge / max(params.beamTileSize, 1u), 1u);
         bool failed = false;
-        if (all(tile < params.beamTileDims) && all(tile * beamTileEdge(0) < params.beamFrameDim) && beamTileOnScreen(0, tile) &&
-            beamDirtyTileOwner(tile, side) != 0xFFFFFFFFu && params.beamFusedStage != 8u)
+        const bool testing = all(tile < params.beamTileDims) && all(tile * beamTileEdge(0) < params.beamFrameDim) &&
+                             beamTileOnScreen(0, tile) && beamDirtyTileOwner(tile, side) != 0xFFFFFFFFu && params.beamFusedStage != 8u;
+        // beamTileCornerShared: the centreless curvature reads 20 corner logs a tile (beamCornerCurvature), each a lighting
+        // evaluation, and a tile shares nearly all of them with its neighbours. A group with any tile to test evaluates its
+        // 11 x 11 corners once (the same beamCornerLog, so exact) and its tiles take their curvature from them.
+        if (params.beamTileCornerShared != 0u && params.beamCentreless != 0u && params.beamOracle == 0u)
+        {
+            if (lane == 0u)
+                gTileCornerAny = 0u;
+            GroupMemoryBarrierWithGroupSync();
+            if (testing)
+                InterlockedOr(gTileCornerAny, 1u);
+            GroupMemoryBarrierWithGroupSync();
+            if (gTileCornerAny != 0u) // Group-uniform.
+            {
+                const int2 origin = int2(tile & ~7u) - 1;
+                for (uint k = lane; k < 121u; k += 64u)
+                    gTileCornerLog[k] = beamCornerLog(origin + int2(k % 11u, k / 11u), false);
+                GroupMemoryBarrierWithGroupSync();
+                if (testing)
+                {
+                    const int2 t = int2(tile & 7u) + 1; // This tile's corner (0, 0) in the table.
+                    float curvature = 0.f;
+                    for (uint k = 0; k < 4; ++k)
+                    {
+                        const int2 c = t + int2(k & 1u, k >> 1);
+                        const uint at = uint(c.x + 11 * c.y);
+                        const float3 centre = gTileCornerLog[at];
+                        const float3 dxx = gTileCornerLog[at - 1u] - 2.f * centre + gTileCornerLog[at + 1u];
+                        const float3 dyy = gTileCornerLog[at - 11u] - 2.f * centre + gTileCornerLog[at + 11u];
+                        curvature = max(curvature, max(maxComponent(abs(dxx)), maxComponent(abs(dyy))));
+                    }
+                    gTileCurvature = curvature;
+                }
+            }
+        }
+        if (testing)
             failed = testBeamDirtyTileNow(tile);
+        gTileCurvature = -1.f;
         listBeamFailedTileUnits(tile, failed);
     }
 
@@ -12250,30 +12372,72 @@ struct HSTRCloudRenderer
     /// One 64-thread group per 8 x 8 resolve group that had a residual pixel, one thread per pixel, and only the pixels its mask
     /// names go on - so the pass costs the failed pixels, and its queue is three uints per screen group rather than one per pixel.
     /// A per-pixel list cost 31.6 MiB at 4K; this is 1.5 MiB. A full-frame dispatch testing every pixel cost 0.13-0.20 ms.
+    ///
+    /// The group's pixels share their units: at beamOctScale 0.35 a unit lies under ~8 screen pixels, and each pixel read four,
+    /// so every unit's beamUnitRadiance (direction decode, level read, stored value + far sea or a basis reconstruction) ran ~32
+    /// times. The group first finds the box of units its pixels' bilinears touch, evaluates each once into groupshared memory, and
+    /// the pixels blend from there - the same four values, so exact. A box over 64 units (a warp spreading the group) reads
+    /// directly as before.
     void resolveBeamResidualPixel(uint entry, uint lane)
     {
         if (entry >= min(hstrBeamResidualArgs[0], beamResidualGroups()))
-            return;
+            return; // The whole group: entry is the group's.
+        if (lane == 0u)
+        {
+            gResidualLo = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+            gResidualHi = uint2(0u, 0u);
+        }
         const uint packed = hstrBeamResidualList[3 * entry];
-        if ((hstrBeamResidualList[3 * entry + 1 + (lane >> 5)] & (1u << (lane & 31u))) == 0)
-            return;
         const uint2 pixel = uint2(packed & 0xFFFFu, packed >> 16) * 8u + uint2(lane & 7u, lane >> 3);
-        float2 beamPosition;
-        if (!beamPixelPosition(float2(pixel) + 0.5f, beamPosition))
-            return;
+        bool active = (hstrBeamResidualList[3 * entry + 1 + (lane >> 5)] & (1u << (lane & 31u))) != 0;
+        float2 beamPosition = 0.f;
+        if (active)
+            active = beamPixelPosition(float2(pixel) + 0.5f, beamPosition);
 #if HSTR_BEAM_WARP
-        if (beamGapMarked(uint2(beamPosition)))
+        if (active && beamGapMarked(uint2(beamPosition)))
         {
             color[pixel] = float4(hstrBeamRepair[uint2(beamPosition)].rgb, 1.f);
-            return;
+            active = false;
         }
-        gHistory = beamHistoryHeld(beamPosition); // As resolveBeamPixel decided for this pixel.
-        if (!beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
-            beamPosition = beamWarpedPosition(beamPosition);
+        if (active)
+        {
+            gHistory = beamHistoryHeld(beamPosition); // As resolveBeamPixel decided for this pixel.
+            if (!beamWarpEdgeRepaired(beamPosition) && (params.beamHistoryLive == 0 || gHistory))
+                beamPosition = beamWarpedPosition(beamPosition);
+        }
 #endif
         const float2 texel = beamPosition - 0.5f;
         const int2 base = clamp(int2(floor(texel)), int2(0), int2(params.beamFrameDim) - 2);
         const float2 g = saturate(texel - float2(base));
+        GroupMemoryBarrierWithGroupSync();
+        if (active)
+        {
+            uint unused;
+            InterlockedMin(gResidualLo.x, uint(base.x), unused);
+            InterlockedMin(gResidualLo.y, uint(base.y), unused);
+            InterlockedMax(gResidualHi.x, uint(base.x) + 1u, unused);
+            InterlockedMax(gResidualHi.y, uint(base.y) + 1u, unused);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint2 lo = gResidualLo;
+        const uint2 size = gResidualHi + 1u - lo;
+        const bool shared = params.beamResidualShared != 0u && gResidualHi.x >= lo.x && size.x * size.y <= 64u; // Group-uniform.
+        if (shared)
+        {
+            if (lane < size.x * size.y)
+                gResidualUnits[lane] = beamUnitRadiance(lo + uint2(lane % size.x, lane / size.x));
+            GroupMemoryBarrierWithGroupSync();
+            if (!active)
+                return;
+            const uint2 o = uint2(base) - lo;
+            const uint at = o.x + size.x * o.y;
+            const float3 v = lerp(lerp(gResidualUnits[at], gResidualUnits[at + 1u], g.x),
+                                  lerp(gResidualUnits[at + size.x], gResidualUnits[at + size.x + 1u], g.x), g.y);
+            color[pixel] = float4(v, 1.f);
+            return;
+        }
+        if (!active)
+            return;
         const float3 v = lerp(
             lerp(beamUnitRadiance(uint2(base)), beamUnitRadiance(uint2(base + int2(1, 0))), g.x),
             lerp(beamUnitRadiance(uint2(base + int2(0, 1))), beamUnitRadiance(uint2(base + int2(1, 1))), g.x), g.y
@@ -15199,9 +15363,9 @@ void testBeamDirtyTiles(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Group
 }
 
 [numthreads(8, 8, 1)]
-void testBeamDirtyTilesDense(uint3 dispatchThreadId: SV_DispatchThreadID)
+void testBeamDirtyTilesDense(uint3 dispatchThreadId: SV_DispatchThreadID, uint groupIndex: SV_GroupIndex)
 {
-    gHSTRCloud.testBeamDirtyTileDense(dispatchThreadId.xy);
+    gHSTRCloud.testBeamDirtyTileDense(dispatchThreadId.xy, groupIndex);
 }
 
 [numthreads(64, 1, 1)]
@@ -15449,7 +15613,10 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
 #else
     if (!march)
         return;
-    BeamSample ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    // DIAGNOSTIC (beamQueryKnock 1, wrong image, read for time): the ray is not marched; everything around it runs.
+    BeamSample ray = {};
+    if (gHSTRCloud.params.beamQueryKnock == 0u)
+        ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
 #if HSTR_STRIP != 0
     gHSTRCloud.beamStripSink(ray);
     return;
@@ -16529,6 +16696,12 @@ void bakeWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
 }
 
 [numthreads(4, 4, 4)]
+void bakeWorldCacheView(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.bakeWorldCacheViewCell(dispatchThreadId);
+}
+
+[numthreads(4, 4, 4)]
 void updateCameraLighting(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.writeCameraLighting(dispatchThreadId);
@@ -16813,6 +16986,30 @@ void resolveCloudSkirtMasks(uint3 id: SV_DispatchThreadID)
     }
 }
 
+/// The skirt masks a frame's page changes can reach, not all of them: a mask reads its own page and neighbours across its octant's
+/// faces, at most an octant of the asset's top level away, so each changed brick's page region widened by that octant
+/// (CloudResidency::dirtyPages) holds every mask it can change. Regions overlap; their pages write the same value.
+[numthreads(256, 1, 1)]
+void resolveCloudSkirtRegions(uint3 id: SV_DispatchThreadID)
+{
+    const uint count = gHSTRCloud.params.cloudSkirtRegionCount;
+    if (count == 0 || id.x >= gHSTRCloud.hstrCloudSkirtRegions[count - 1u].workEnd) return;
+    uint lo = 0, hi = count;
+    while (lo < hi)
+    {
+        const uint mid = (lo + hi) >> 1u;
+        if (id.x < gHSTRCloud.hstrCloudSkirtRegions[mid].workEnd) hi = mid; else lo = mid + 1u;
+    }
+    const HSTRCloudDirtyPageRegion region = gHSTRCloud.hstrCloudSkirtRegions[lo];
+    const uint begin = lo == 0 ? 0u : gHSTRCloud.hstrCloudSkirtRegions[lo - 1u].workEnd;
+    const uint local = id.x - begin;
+    const uint3 p = uint3(local % region.extent.x, (local / region.extent.x) % region.extent.y,
+                          local / (region.extent.x * region.extent.y)) + region.origin;
+    const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[region.asset];
+    const uint3 dims = asset.dims >> 3u;
+    gHSTRCloud.hstrCloudSkirtMasksOutput[asset.pageOffset + p.x + dims.x * (p.y + dims.y * p.z)] = gHSTRCloud.cloudSkirtMask(asset, p);
+}
+
 /// DIAGNOSTIC (cloudSkirtCheck): counts the pages whose stored skirt mask differs from one recomputed from the current pages.
 [numthreads(256, 1, 1)]
 void checkCloudSkirtMasks(uint3 id: SV_DispatchThreadID)
@@ -16924,6 +17121,24 @@ void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
     gHSTRCloud.hstrCloudBricks.GetDimensions(bricks, stride);
     if (id.x >= bricks)
         return;
+    if (gHSTRCloud.params.cloudSunTouchFrame != 0)
+    {
+        // Only the scheduler's slot writes changed since the last resolve (cloudSunTouchFrame, the frame they were stamped with):
+        // a brick's answer reads its own pairs and its ancestors' up to cloudSunAncestors, so it changes only if one of those was
+        // written. The climb reads the parent links alone.
+        bool touched = false;
+        uint entry = id.x;
+        for (uint level = 0;; ++level)
+        {
+            touched = touched || gHSTRCloud.hstrCloudSunTouched[entry] == gHSTRCloud.params.cloudSunTouchFrame;
+            const uint parent = gHSTRCloud.hstrCloudBricks[entry].parent;
+            if (touched || level >= gHSTRCloud.params.cloudSunAncestors || parent == kCloudRefNone)
+                break;
+            entry = parent;
+        }
+        if (!touched)
+            return;
+    }
     if (gHSTRCloud.params.cloudSunResolveFused != 0)
     {
         // cloudSunSlotUp for every class at once: each level's keys are read once, and the classes still unresolved climb together
@@ -17001,6 +17216,26 @@ void resolveCloudSunSlots(uint3 id: SV_DispatchThreadID)
         gHSTRCloud.hstrCloudSunResolvedOutput[id.x * kCloudSunClasses + c] =
             uint2(slot, entry | ((gHSTRCloud.hstrCloudBricks[entry].info & 15u) << 24));
     }
+}
+
+/// The bricks the CPU loaded since the last resolve (hstrCloudSunTouchList, cloudSunTouchCount) stamped for the incremental
+/// resolveCloudSunSlots, as the scheduler stamps the bricks whose pairs it writes.
+[numthreads(64, 1, 1)]
+void stampCloudSunTouched(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x < gHSTRCloud.params.cloudSunTouchCount)
+        gHSTRCloud.hstrCloudSunTouched[gHSTRCloud.hstrCloudSunTouchList[id.x]] = gHSTRCloud.params.cloudSunTouchFrame;
+}
+
+/// DIAGNOSTIC (cloudSunTouchCheck): entries of the incremental resolve (hstrCloudSunResolved) differing from a full resolve
+/// (hstrCloudSunResolvedOutput), counted in hstrCloudSkirtCheck[0].
+[numthreads(64, 1, 1)]
+void compareCloudSunResolved(uint3 id: SV_DispatchThreadID)
+{
+    uint entries, stride;
+    gHSTRCloud.hstrCloudSunResolvedOutput.GetDimensions(entries, stride);
+    if (id.x < entries && any(gHSTRCloud.hstrCloudSunResolved[id.x] != gHSTRCloud.hstrCloudSunResolvedOutput[id.x]))
+        InterlockedAdd(gHSTRCloud.hstrCloudSkirtCheck[0], 1u);
 }
 
 #ifndef HSTR_BAKE_PROBE

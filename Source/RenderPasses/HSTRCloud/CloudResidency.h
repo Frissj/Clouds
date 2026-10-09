@@ -214,6 +214,7 @@ public:
     void setSunScanWave(bool scanWave) { mSunScanWave = scanWave; }
     /// Whether stampSunChanges runs a thread per change and class (HSTRCloudSunFrame::stampSplit).
     void setSunStampSplit(bool stampSplit) { mSunStampSplit = stampSplit; }
+    void setSunEvery(uint32_t every) { mSunEvery = std::max(every, 1u); }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
@@ -226,6 +227,9 @@ public:
     const ref<Buffer>& getSkirtMasks() const { return mpSkirtMasks; }
     uint32_t getPageCount() const { return uint32_t(mPages.size()); }
     const ref<Buffer>& getSunResolved() const { return mpSunResolved; }
+    const ref<Buffer>& getSunTouched() const { return mpSunTouched; }
+    /// GPU bricks whose level or parent the CPU wrote since the last resolveCloudSunSlots (loads), for hstrCloudSunTouched.
+    std::vector<uint32_t>& getSunTouchList() { return mSunTouchList; }
     /// Bricks whose density settled since the caller last cleared this (fade-in ends, unmaps), as asset, level, packed coordinates,
     /// 0: what the persistent beam image invalidates (markBeamChanges). The caller clears it every frame.
     std::vector<uint4>& getBeamChanges() { return mBeamChanges; }
@@ -236,6 +240,9 @@ public:
     const ref<Buffer>& getDirtyPageArgs() const { return mpDirtyPageArgs; }
     uint32_t getDirtyPageRegionCount() const { return uint32_t(mDirtyPageRegions.size()); }
     uint32_t getDirtyPageWorkCount() const { return mDirtyPageWorkCount; }
+    /// The skirt masks this frame's page changes can reach (resolveCloudSkirtRegions); UINT64_MAX past the region buffer.
+    uint32_t getSkirtRegionCount() const { return uint32_t(mSkirtRegions.size()); }
+    uint64_t getSkirtWorkCount() const { return mSkirtWorkCount; }
     void readPageStats() { mStats.pageUnique = mpDirtyPageCount->getElement<uint32_t>(0); }
     void pageUpdatesDispatched()
     {
@@ -243,6 +250,8 @@ public:
         mStats.pageExpanded = mDirtyPageWorkCount;
         mDirtyPageRegions.clear();
         mDirtyPageWorkCount = 0;
+        mSkirtRegions.clear();
+        mSkirtWorkCount = 0;
     }
     const ref<Buffer>& getFadeFrame() const { return mpFadeFrame; }
     void waitForCut() const
@@ -255,6 +264,7 @@ public:
     struct GpuSunFrame
     {
         bool run = false;        ///< The scheduling passes run (ageSunField runs whenever info.ageRows > 0).
+        bool releaseOnly = false; ///< cloudSunEvery's frames between runs: only the release pass (info.releaseCount).
         HSTRCloudSunFrame info = {}; ///< Uploaded to hstrCloudSunFrameInfo.
     };
     const GpuSunFrame& getGpuSunFrame() const { return mGpuSunFrame; }
@@ -488,6 +498,9 @@ private:
     std::vector<HSTRCloudVirtualPage> mPages;
     std::vector<HSTRCloudDirtyPageRegion> mDirtyPageRegions;
     uint32_t mDirtyPageWorkCount = 0;
+    std::vector<HSTRCloudDirtyPageRegion> mSkirtRegions; ///< dirtyPages' regions widened by the skirt reach.
+    uint64_t mSkirtWorkCount = 0;
+    ref<Buffer> mpSkirtRegions;
     std::vector<uint32_t> mFreeNodes;
     std::vector<HSTRCloudBrick> mBricks;
     std::vector<uint32_t> mFreeBricks;
@@ -532,6 +545,7 @@ private:
     bool mSunLevelStamps = true;
     bool mSunScanWave = false;
     bool mSunStampSplit = false;
+    uint32_t mSunEvery = 1;
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
     std::vector<float3x3> mSunClasses; ///< Signed permutation of each orientation class (HSTRCloudInstance::sunClass).
     /// What the last scheduleSunBakes read, when it staged nothing: an unchanged repeat would stage nothing again, so it is skipped.
@@ -598,6 +612,8 @@ private:
     ref<Buffer> mpSunSched;
     ref<Buffer> mpSunState;
     ref<Buffer> mpSunFrames;
+    ref<Buffer> mpSunTouched; ///< Per GPU brick: the last scheduler frame that wrote its slot pairs (resolveCloudSunSlots).
+    std::vector<uint32_t> mSunTouchList;
     ref<Buffer> mpSunFree;
     ref<Buffer> mpSunFreeTop;
     ref<Buffer> mpSunCounters;

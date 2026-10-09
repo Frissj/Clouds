@@ -153,6 +153,10 @@ public:
     void setAutoUavBarriers(bool enabled) { mAutoUavBarriers = enabled; }
     bool getAutoUavBarriers() const { return mAutoUavBarriers; }
 
+    /// DIAGNOSTIC: log every state transition and UAV barrier recorded while enabled (resource name, old and new state), to find
+    /// what serialises two dispatches meant to overlap.
+    void setLogBarriers(bool enabled) { mLogBarriers = enabled; }
+
     /**
      * Copy an entire resource
      */
@@ -281,5 +285,6 @@ protected:
     std::unique_ptr<LowLevelContextData> mpLowLevelData;
     bool mCommandsPending = false;
     bool mAutoUavBarriers = true;
+    bool mLogBarriers = false;
 };
 } // namespace Falcor

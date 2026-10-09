@@ -48,6 +48,10 @@ g.addPass(createPass("HSTRCloud", {
     # (-0.28), +1.5%, motion 3.34%; tolerance 0.3 + step 6 +1.6%. The step pays for the tolerance but costs motion stability.
     "minStepVoxels": 4.0,
     "maxStepVoxels": 2.0,
+    # The cache read as one camera-baked texel a lit sample (bakeWorldCacheView) instead of five SH texels and two evaluations:
+    # 4K walk units + query -0.47 ms net of its 0.10 ms bake, squared excess against the path trace +0.4% (cacheview1 /
+    # cacheviewpt2; numbers beside worldCacheView). An explicit approximation (the cell centre's view direction), owner-approved.
+    "worldCacheView": True,
     # The shipping switch mask (11773) with transmittance-scaled steps (bit 32768: behind transmittance T a step grows by up to
     # 1 / sqrt(T), 4x at most): walk 4.14 -> 3.91 ms at 0.425 -> 0.513% (budgetstep1).
     "beamShipMask": 11773 | 32768,

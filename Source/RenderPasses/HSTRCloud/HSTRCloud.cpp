@@ -315,7 +315,7 @@ void HSTRCloud::parseProperties(const Properties& props)
             key == "probeX" || key == "probeY" || key == "cloudVisibilityFloor" || key == "cloudTraceSlot" ||
             key == "cloudOutsideImportance" || key == "cacheOracle" || key == "worldCacheRingModulation" || key == "worldCacheRingDepth" ||
             key == "seaFarField" || key == "seaFarDistance" || key == "seaFarProbe" || key == "seaFarScale" || key == "seaFarRefresh" ||
-            key == "seaFarOverlap" || key == "seaFarBricks" || key == "seaFarFadeWidth" || key == "beamResolveProbe" || key == "beamRimCentroid" || key == "cloudSkirtCheck" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
+            key == "seaFarOverlap" || key == "seaFarBricks" || key == "seaFarFadeWidth" || key == "beamResolveProbe" || key == "beamRimCentroid" || key == "cloudSkirtCheck" || key == "cloudSkirtRegions" || key == "beamQueryKnock" || key == "seaFarBeside" || key == "worldCacheRingCount" || key == "worldCacheRingLayout" ||
             key == "beamDirtyStats" || key == "beamCacheTolerance" || key == "beamSunTolerance" || key == "compareSquared")
         {
             if (key == "compareSquared")
@@ -332,6 +332,12 @@ void HSTRCloud::parseProperties(const Properties& props)
                 mParams.worldCacheRingLayout = std::min(uint32_t(value), 1u);
             else if (key == "cloudSkirtCheck")
                 mCloudSkirtCheck = bool(value);
+            else if (key == "cloudSkirtRegions")
+                mCloudSkirtRegions = bool(value);
+            else if (key == "beamQueryKnock")
+                mParams.beamQueryKnock = uint32_t(value);
+            else if (key == "seaFarBeside")
+                mSeaFarBeside = uint32_t(value);
             else if (key == "seaFarOverlap")
                 mSeaFarOverlap = bool(value);
             else if (key == "seaFarScale")
@@ -544,6 +550,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mSunResolveAlways = bool(value);
             continue;
         }
+        if (key == "cloudSunEvery")
+        {
+            mCloudSunEvery = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == "cloudSunTouch")
+        {
+            mCloudSunTouch = bool(value);
+            continue;
+        }
+        if (key == "cloudSunTouchCheck")
+        {
+            mCloudSunTouchCheck = bool(value);
+            continue;
+        }
         if (key == "spanProbe")
         {
             mSpanProbe = bool(value);
@@ -597,6 +618,36 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamUnitStartOracle")
         {
             mBeamUnitStartOracle = bool(value);
+            continue;
+        }
+        if (key == "worldCacheView")
+        {
+            mParams.worldCacheView = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "beamSunKnock")
+        {
+            mBeamSunKnock = uint32_t(value);
+            continue;
+        }
+        if (key == "seaFarOverlapLog")
+        {
+            mSeaFarOverlapLog = uint32_t(value);
+            continue;
+        }
+        if (key == "seaFarOverlapScopes")
+        {
+            mSeaFarOverlapScopes = bool(value);
+            continue;
+        }
+        if (key == "beamResidualShared")
+        {
+            mParams.beamResidualShared = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "beamTileCornerShared")
+        {
+            mParams.beamTileCornerShared = bool(value) ? 1u : 0u;
             continue;
         }
         if (key == "beamSubTiles")
@@ -1650,6 +1701,7 @@ Properties HSTRCloud::getProperties() const
     props["seaFarRefresh"] = mParams.seaFarRefresh;
     props["seaFarOverlap"] = mSeaFarOverlap;
     props["cloudSkirtCheck"] = mCloudSkirtCheck;
+    props["cloudSkirtRegions"] = mCloudSkirtRegions;
     props["beamDirtyStats"] = mBeamDirtyStats;
     props["beamCacheTolerance"] = mParams.beamCacheTolerance;
     props["beamSunTolerance"] = mParams.beamSunTolerance;
@@ -1947,6 +1999,18 @@ Properties HSTRCloud::getProperties() const
         cloud["farSeaRuns"] = mFarSeaRuns;
         cloud["skirtMaskChecks"] = mSkirtMaskChecks;
         cloud["skirtMaskMismatches"] = mSkirtMaskMismatches;
+        cloud["skirtFrames"] = mSkirtFrames;
+        cloud["skirtRegionFrames"] = mSkirtRegionFrames;
+        cloud["skirtRegionPages"] = mSkirtRegionPages;
+        cloud["skirtFullPages"] = mSkirtFullPages;
+        cloud["skirtDirtyRegions"] = mSkirtDirtyRegions;
+        cloud["skirtDirtyWork"] = mSkirtDirtyWork;
+        cloud["gpuTimeSum"] = mGpuTimeSumUs;
+        cloud["gpuTimeFrames"] = mGpuTimeFrames;
+        cloud["sunResolveFrames"] = mSunResolveFrames;
+        cloud["sunResolveTouchFrames"] = mSunResolveTouchFrames;
+        cloud["sunTouchChecks"] = mSunTouchChecks;
+        cloud["sunTouchMismatches"] = mSunTouchMismatches;
         cloud["dirtyStatFrames"] = mDirtyStatFrames;
         cloud["dirtyStatBlocks"] = mDirtyStatBlocks;
         cloud["dirtyStatUnits"] = mDirtyStatUnits;
@@ -2521,6 +2585,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpWorldCachePhotonPass = nullptr;
     mpWorldCacheResolvePass = nullptr;
     mpWorldCacheBakePass = nullptr;
+    mpWorldCacheViewPass = nullptr;
     mpWorldCacheAdvancePass = nullptr;
     mpBlurOctavesPass = nullptr;
     mpReferencePass = nullptr;
@@ -2607,6 +2672,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpWorldCachePhotonPass = createPass("traceWorldCachePhotons");
     mpWorldCacheResolvePass = createPass("resolveWorldCache");
     mpWorldCacheBakePass = createPass("bakeWorldCache");
+    mpWorldCacheViewPass = createPass("bakeWorldCacheView");
     mpWorldCacheAdvancePass = createPass("advanceWorldCachePhotons");
     mpBlurOctavesPass = createPass("blurSunOctaves");
     mpReferencePass = createPass("referencePathTrace");
@@ -2701,8 +2767,12 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCloudPageArgsPass = createPass("writeDirtyCloudPageArgs");
     mpResolveDirtyCloudPagesPass = createPass("resolveDirtyCloudPages");
     mpResolveSkirtMasksPass = createPass("resolveCloudSkirtMasks");
+    mpResolveSkirtRegionsPass = createPass("resolveCloudSkirtRegions");
     mpCheckSkirtMasksPass = createPass("checkCloudSkirtMasks");
     mpResolveCloudSunSlotsPass = createPass("resolveCloudSunSlots");
+    mpResolveCloudSunCheckPass = createPass("resolveCloudSunSlots");
+    mpCompareCloudSunPass = createPass("compareCloudSunResolved");
+    mpStampCloudSunTouchedPass = createPass("stampCloudSunTouched");
     mpFormBBuildPass = createPass("buildFormBTable");
     mpBakeCloudSunPass = createPass("bakeCloudSun");
     mpReleaseSunPass = createPass("releaseSunBakes");
@@ -3838,6 +3908,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setSunLevelStamps(mCloudSunLevelStamps);
     mpCloudResidency->setSunScanWave(mCloudSunScanWave);
     mpCloudResidency->setSunStampSplit(mCloudSunStampSplit);
+    mpCloudResidency->setSunEvery(mCloudSunEvery);
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
@@ -3930,15 +4001,32 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             pageVar["hstrCloudLevelPages"] = ref<Buffer>();
             pageVar["hstrCloudLevelPagesOutput"] = residency.getLevelPages();
             mpResolveDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
-            // The skirt masks read the pages just resolved, all of them (resolveCloudSkirtMasks).
+            // The skirt masks read the pages just resolved: those the changes can reach (resolveCloudSkirtRegions), or all of them
+            // (resolveCloudSkirtMasks) when that is no less work.
             FALCOR_PROFILE(pRenderContext, "skirtMasks");
-            if (bindResidencyPass(pRenderContext, mpResolveSkirtMasksPass, false))
+            const uint64_t skirtWork = residency.getSkirtWorkCount();
+            const bool regions = mCloudSkirtRegions && skirtWork < residency.getPageCount();
+            const auto& pSkirtPass = regions ? mpResolveSkirtRegionsPass : mpResolveSkirtMasksPass;
+            mParams.cloudSkirtRegionCount = regions ? residency.getSkirtRegionCount() : 0u;
+            if (bindResidencyPass(pRenderContext, pSkirtPass, false))
             {
-                ShaderVar skirtVar = mpResolveSkirtMasksPass->getRootVar()["CB"]["gHSTRCloud"];
+                ShaderVar skirtVar = pSkirtPass->getRootVar()["CB"]["gHSTRCloud"];
                 skirtVar["hstrCloudSkirtMasks"] = ref<Buffer>();
                 skirtVar["hstrCloudSkirtMasksOutput"] = residency.getSkirtMasks();
+                residency.bindPageUpdates(skirtVar);
             }
-            mpResolveSkirtMasksPass->execute(pRenderContext, uint3(residency.getPageCount(), 1, 1));
+            pSkirtPass->execute(pRenderContext, uint3(regions ? uint32_t(skirtWork) : residency.getPageCount(), 1, 1));
+            mParams.cloudSkirtRegionCount = 0;
+            ++mSkirtFrames;
+            mSkirtDirtyRegions += residency.getDirtyPageRegionCount();
+            mSkirtDirtyWork += residency.getDirtyPageWorkCount();
+            if (regions)
+            {
+                ++mSkirtRegionFrames;
+                mSkirtRegionPages += skirtWork;
+            }
+            else
+                mSkirtFullPages += residency.getPageCount();
         }
         mParams.cloudPageRegionCount = 0;
         residency.pageUpdatesDispatched();
@@ -3993,19 +4081,88 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     const bool sunResolveDirty = mSunResolveAlways || !mSunResolveValid || sunSlotsChanged || densityChanged || mpCloudResidency->fadesRunning() ||
                                  any(sunResolveInputs != mSunResolveInputs);
     if ((beamShipDefine() & 2048u) == 0)
+    {
         mSunResolveValid = false; // Nothing keeps the table while it is not read.
+        mpCloudResidency->getSunTouchList().clear();
+    }
     else if (sunResolveDirty)
     {
+        // cloudSunTouch: only the bricks whose chain changed are resolved again. A brick's answer reads its own and its ancestors'
+        // slot pairs (written by the scheduler, which stamps the brick) and their levels and parents (written by the CPU's loads,
+        // stamped by stampCloudSunTouched); fades change neither. Both stamp hstrCloudSunTouched with the scheduler frame.
+        auto& touchList = mpCloudResidency->getSunTouchList();
+        const bool incremental = mCloudSunTouch && mCloudGpuSun && mpCloudResidency->getSunTouched() && mSunResolveValid &&
+                                 !mSunResolveAlways && all(sunResolveInputs == mSunResolveInputs) &&
+                                 touchList.size() <= mpCloudResidency->getBrickCapacity();
         mSunResolveValid = true;
         mSunResolveInputs = sunResolveInputs;
         FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
+        mParams.cloudSunTouchFrame = incremental ? mpCloudResidency->getGpuSunFrame().info.frame : 0u;
+        if (incremental && !touchList.empty())
+        {
+            if (!mpSunTouchListBuffer)
+                mpSunTouchListBuffer = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), mpCloudResidency->getBrickCapacity(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+            mpSunTouchListBuffer->setBlob(touchList.data(), 0, touchList.size() * sizeof(uint32_t));
+            mParams.cloudSunTouchCount = uint32_t(touchList.size());
+            if (bindResidencyPass(pRenderContext, mpStampCloudSunTouchedPass, false))
+            {
+                ShaderVar stampVar = mpStampCloudSunTouchedPass->getRootVar()["CB"]["gHSTRCloud"];
+                stampVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
+                stampVar["hstrCloudSunTouchList"] = mpSunTouchListBuffer;
+            }
+            mpStampCloudSunTouchedPass->execute(pRenderContext, uint3(mParams.cloudSunTouchCount, 1, 1));
+            mParams.cloudSunTouchCount = 0;
+        }
+        touchList.clear();
         if (bindResidencyPass(pRenderContext, mpResolveCloudSunSlotsPass, false))
         {
             ShaderVar sunVar = mpResolveCloudSunSlotsPass->getRootVar()["CB"]["gHSTRCloud"];
             sunVar["hstrCloudSunResolved"] = ref<Buffer>();
             sunVar["hstrCloudSunResolvedOutput"] = mpCloudResidency->getSunResolved();
+            sunVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
         }
         mpResolveCloudSunSlotsPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+        mParams.cloudSunTouchFrame = 0;
+        ++mSunResolveFrames;
+        mSunResolveTouchFrames += incremental ? 1u : 0u;
+        // DIAGNOSTIC (cloudSunTouchCheck): the full resolve into a scratch table, entries differing from the one just written
+        // counted. A blocking readback per frame.
+        if (mCloudSunTouchCheck && incremental)
+        {
+            const uint32_t entries = mpCloudResidency->getBrickCapacity() * kCloudSunClasses;
+            if (!mpSunResolveCheck)
+            {
+                mpSunResolveCheck = mpDevice->createStructuredBuffer(
+                    sizeof(uint2), entries, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+                mpSunCheckCount = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+                    nullptr, false
+                );
+            }
+            if (bindResidencyPass(pRenderContext, mpResolveCloudSunCheckPass, false))
+            {
+                ShaderVar checkVar = mpResolveCloudSunCheckPass->getRootVar()["CB"]["gHSTRCloud"];
+                checkVar["hstrCloudSunResolved"] = ref<Buffer>();
+                checkVar["hstrCloudSunResolvedOutput"] = mpSunResolveCheck;
+            }
+            mpResolveCloudSunCheckPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+            pRenderContext->clearUAV(mpSunCheckCount->getUAV().get(), uint4(0));
+            if (bindResidencyPass(pRenderContext, mpCompareCloudSunPass, false))
+            {
+                ShaderVar compareVar = mpCompareCloudSunPass->getRootVar()["CB"]["gHSTRCloud"];
+                compareVar["hstrCloudSunResolved"] = mpCloudResidency->getSunResolved();
+                compareVar["hstrCloudSunResolvedOutput"] = mpSunResolveCheck;
+                compareVar["hstrCloudSkirtCheck"] = mpSunCheckCount;
+            }
+            mpCompareCloudSunPass->execute(pRenderContext, uint3(entries, 1, 1));
+            mSunTouchMismatches += mpSunCheckCount->getElement<uint32_t>(0);
+            ++mSunTouchChecks;
+        }
     }
     if (mpCloudResidency->getStats().sunBakesFrame > 0)
         ++mSunBakeFrames;
@@ -4110,7 +4267,13 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
     if (info.ageRows > 0)
         run("age", mpAgeSunPass, uint3(kCloudSunFieldWidth, info.ageRows, 1));
     if (!sun.run)
-        return false; // The counters keep the last run's (the stats read them).
+    {
+        // cloudSunEvery's frames between runs: the releases alone (their slots go back, their pairs clear).
+        if (!sun.releaseOnly || info.releaseCount == 0)
+            return false; // The counters keep the last run's (the stats read them).
+        run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
+        return true;
+    }
     pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
     if (info.releaseCount > 0)
@@ -5006,6 +5169,8 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     for (uint32_t i = 0; i < kWorldCacheTextures; ++i)
         if (mpWorldCacheTextures[i])
             var["hstrWorldCacheTexture"][i] = mpWorldCacheTextures[i];
+    if (mpWorldCacheView)
+        var["hstrWorldCacheView"] = mpWorldCacheView;
     // The indirect argument buffer is bound only by the pass that writes it: a dispatch cannot read it as arguments and
     // hold it as a UAV.
     var["hstrBeamLattice"] = mpBeamLattice;
@@ -5136,7 +5301,12 @@ void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Tex
 /// stretch of its ray.
 void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
 {
-    FALCOR_PROFILE(pRenderContext, "farSea");
+    // A profiler scope writes GPU timestamps, which wait for all earlier work: around a run meant to overlap the unit march it
+    // serialises the two. seaFarOverlapScopes false drops this scope and the march's "units" scope while they overlap, so only
+    // "march" times the pair.
+    std::optional<ScopedProfilerEvent> scope;
+    if (!mFarBesideNow || mSeaFarOverlapScopes)
+        scope.emplace(pRenderContext, "farSea");
     const ref<ComputePass>& pPass = mpFarSeaPass;
     // seaFarBricks: the lean march's brick density and resolved / packed sun need the march program's switches.
     if (mParams.seaFarBricks != 0)
@@ -5145,7 +5315,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     {
         for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_WORKSET_PROBE", "HSTR_LAYER_WRAP_SELECT",
                                  "HSTR_LAYER_RUN_DISTANCE", "HSTR_UNIT_START", "HSTR_SUN_PACKED", "HSTR_FORM_B", "HSTR_LAYER_ORACLE",
-                                 "HSTR_FORM_R"})
+                                 "HSTR_FORM_R", "HSTR_CACHE_VIEW"})
             pPass->getProgram()->removeDefine(name);
     }
     mFarSeaMarchDefines = mParams.seaFarBricks != 0;
@@ -5166,6 +5336,12 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     var["hstrBeamPixelPrev"] = ref<Texture>();
     var["hstrBeamDirtyArgs"] = ref<Buffer>();
     var["hstrBeamWarpArgs"] = ref<Buffer>();
+    // Beside the dirty query (seaFarBeside 1): the beam-sized textures the march writes, which bound here would be transitioned
+    // to shader reads at this dispatch and wait for the query (farquery1: a 1119 x 1119 texture 7 -> 9 at every run; farquery3:
+    // the lattice, which the query writes).
+    var["hstrBeamRepair"] = ref<Texture>();
+    var["hstrBeamPixelsSnapshot"] = ref<Texture>();
+    var["hstrBeamLattice"] = ref<Texture>();
     const bool counting = (mParams.seaFarProbe & 64u) != 0;
     if (counting)
     {
@@ -5616,6 +5792,8 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+    pPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+    pPass->getProgram()->addDefine("HSTR_SUN_KNOCK", std::to_string(mBeamSunKnock));
     // formB reads the packed (density, sun) texel and hands its bake to leanSunDepth's packed branch.
     const bool formB = mFormB != 0 && mFormBValid;
     pPass->getProgram()->addDefine("HSTR_SUN_PACKED", (mCloudSunPackedRead || formB) && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
@@ -6050,6 +6228,35 @@ void HSTRCloud::updateAtmosphere(RenderContext* pRenderContext)
 
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    // The pass's GPU time from two timestamps alone (gpuTimeSum / gpuTimeFrames): every profiler scope inside writes timestamps
+    // that wait for all earlier work, so with the profiler on no two dispatches overlap. Three timers, read two frames late.
+    GpuTimer* pTimer = nullptr;
+    if (mGpuTiming)
+    {
+        if (!mpGpuTimers[0])
+            for (auto& pNew : mpGpuTimers)
+                pNew = GpuTimer::create(mpDevice);
+        const uint32_t slot = mGpuTimerFrame % 3u;
+        if (mGpuTimerFrame >= 2u)
+        {
+            const uint32_t ready = (mGpuTimerFrame - 2u) % 3u;
+            mGpuTimeSumUs += uint64_t(mpGpuTimers[ready]->getElapsedTime() * 1000.0);
+            ++mGpuTimeFrames;
+        }
+        pTimer = mpGpuTimers[slot].get();
+        pTimer->begin();
+    }
+    executeFrame(pRenderContext, renderData);
+    if (pTimer)
+    {
+        pTimer->end();
+        pTimer->resolve();
+        ++mGpuTimerFrame;
+    }
+}
+
+void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& renderData)
+{
     ++mExecuteFrames;
     if (mpScene)
     {
@@ -6474,6 +6681,22 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             mpWorldCacheBakePass->execute(pRenderContext, dims);
             mWorldCacheBakeDirty = false;
             ++mWorldCacheBakes;
+        }
+        // worldCacheView: every frame, after the cache textures, before any camera march.
+        if (mParams.worldCacheView != 0 && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && mpWorldCacheTextures[0])
+        {
+            FALCOR_PROFILE(pRenderContext, "worldCacheView");
+            if (!mpWorldCacheView || mpWorldCacheView->getWidth() != dims.x || mpWorldCacheView->getHeight() != dims.y ||
+                mpWorldCacheView->getDepth() != dims.z)
+                mpWorldCacheView = mpDevice->createTexture3D(
+                    dims.x, dims.y, dims.z, ResourceFormat::RGBA16Float, 1, nullptr,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                );
+            bindRenderer(pRenderContext, mpWorldCacheViewPass);
+            ShaderVar var = mpWorldCacheViewPass->getRootVar()["CB"]["gHSTRCloud"];
+            var["hstrWorldCacheView"] = ref<Texture>();
+            var["hstrWorldCacheViewOutput"] = mpWorldCacheView;
+            mpWorldCacheViewPass->execute(pRenderContext, dims);
         }
     }
 
@@ -6983,6 +7206,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
         const bool temporal = mParams.beamTemporal != 0;
         const float3 cameraPosition = mpScene->getCamera()->getPosition();
         const float3 cameraTarget = mpScene->getCamera()->getTarget();
@@ -7048,6 +7273,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
                     for (uint32_t level = 0; level < mParams.beamLevels; ++level)
                     {
@@ -7154,6 +7381,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                             if (queue)
                                 pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                             // Launch over the screen box, not the whole beam image. beamPointOnScreen keeps a point while any
@@ -7513,9 +7742,14 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                                                mParams.beamLevels == 1u && mBeamUnitRefill == false
                                                            ? 1u
                                                            : 0u;
+                                // seaFarBeside 1: the deferred far-sea run (seaFarOverlap) goes right behind the dirty query instead
+                                // of beside the unit march, with no barrier between them.
+                                const bool farBesideQuery = !mBeamFusedBuild && mFarRunDeferred && mSeaFarBeside == 1u;
                                 if (!mBeamFusedBuild)
                                 {
-                                    FALCOR_PROFILE(pRenderContext, "query");
+                                    std::optional<ScopedProfilerEvent> queryScope;
+                                    if (!farBesideQuery || mSeaFarOverlapScopes)
+                                        queryScope.emplace(pRenderContext, "query");
                                     // Corners and centres in one dispatch: at a few hundred rays a dispatch costs the latency of its
                                     // longest ray, so the two it used to be cost two of those back to back.
                                     // One thread per ray compiles without the slice composition (beamDirtySegments).
@@ -7591,9 +7825,48 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                         bindRenderer(pRenderContext, mpBeamDirtyQueryStripPass);
                                         mpBeamDirtyQueryStripPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                                     }
+                                    if (farBesideQuery)
+                                    {
+                                        // The far layer's ping-pong pair in the states its run binds them in, before the query: a
+                                        // transition at the run would wait for the query (farquery1: four at every run).
+                                        pRenderContext->resourceBarrier(mpFarField[mFarCurrent ^ 1u].get(), Resource::State::UnorderedAccess);
+                                        pRenderContext->resourceBarrier(mpFarDistance[mFarCurrent ^ 1u].get(), Resource::State::UnorderedAccess);
+                                        pRenderContext->resourceBarrier(mpFarField[mFarCurrent].get(), Resource::State::ShaderResource);
+                                        pRenderContext->resourceBarrier(mpFarDistance[mFarCurrent].get(), Resource::State::ShaderResource);
+                                    }
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                                    if (farBesideQuery)
+                                    {
+                                        // The query leaves the GPU 6-9% busy (ngfxlive1: sm__throughput over its 0.6-0.9 ms, a few
+                                        // thousand long rays). The far sea reads nothing the query writes and writes only next
+                                        // frame's layer, so it follows with no barrier and runs in the query's shadow; the rebuild
+                                        // after it waits for both. DIAGNOSTIC seaFarOverlapLog: the barriers recorded for it.
+                                        if (mSeaFarOverlapLog > 0)
+                                        {
+                                            logInfo(
+                                                "BARRIER --- far sea beside the query (frame {}); pixels0 {} pixels1 {} repair {} lattice {} "
+                                                "unitT {} warpField {} history0 {} history1 {}",
+                                                mExecuteFrames, fmt::ptr(mpBeamPixels[0].get()), fmt::ptr(mpBeamPixels[1].get()),
+                                                fmt::ptr(mpBeamRepair.get()), fmt::ptr(mpBeamLattice.get()),
+                                                fmt::ptr(mpBeamUnitTransmittance.get()), fmt::ptr(mpBeamWarpField.get()),
+                                                fmt::ptr(mpBeamHistory[0].get()), fmt::ptr(mpBeamHistory[1].get())
+                                            );
+                                            pRenderContext->setLogBarriers(true);
+                                        }
+                                        pRenderContext->setAutoUavBarriers(false);
+                                        mFarBesideNow = true;
+                                        dispatchFarSea(pRenderContext);
+                                        mFarBesideNow = false;
+                                        pRenderContext->setAutoUavBarriers(true);
+                                        if (mSeaFarOverlapLog > 0)
+                                        {
+                                            pRenderContext->setLogBarriers(false);
+                                            logInfo("BARRIER --- end");
+                                            --mSeaFarOverlapLog;
+                                        }
+                                    }
                                 }
                                 if (!mBeamFusedBuild)
                                 {
@@ -7614,6 +7887,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "bucket" + std::to_string(bucket));
@@ -7882,7 +8157,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             if (!late)
                 return;
             {
-                FALCOR_PROFILE(pRenderContext, "pixels");
+                // seaFarOverlapScopes false: no "pixels" scope while it overlaps the march (its timestamp would wait for the march).
+                std::optional<ScopedProfilerEvent> pixelsScope;
+                if (!overlapResolve || mSeaFarOverlapScopes)
+                    pixelsScope.emplace(pRenderContext, "pixels");
                 // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
                 // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
                 // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
@@ -7962,6 +8240,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pMarch->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         // beamUnitStart in the full build too: the motion score's fresh rebuild then marches its units the same way.
         pMarch->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+        pMarch->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+        pMarch->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
         auto bindMarch = [&]()
         {
             bindRenderer(pRenderContext, pMarch);
@@ -8000,6 +8280,10 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 // regions the query and tile passes covered. Everything else already holds a residual for its own direction.
                 const uint32_t ts = std::max(mParams.beamTileSize, 1u);
                 mParams.beamUnitGenerated = 1;
+                // Its own scope: unscoped, it read as ~1.1 ms of march beside units (overlap2: march 1.95 / 2.03, units 0.77 / 0.91).
+                std::optional<ScopedProfilerEvent> regionsScope;
+                if (!mBeamGridRegions.empty())
+                    regionsScope.emplace(pRenderContext, "regions");
                 for (size_t r = 0; r < mBeamGridRegions.size(); ++r)
                 {
                     const uint4& region = mBeamGridRegions[r];
@@ -8012,6 +8296,7 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                 mParams.beamUnitGenerated = 0;
                 mParams.beamGridBlocks = 0;
                 mParams.beamGridOrigin = uint2(0);
+                regionsScope.reset();
                 // And the residual for the blocks translation invalidated, over the same list the query pass just used.
                 if (mBeamDirtyActive)
                 {
@@ -8023,6 +8308,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         dirtyVar["color"] = color;
                         dirtyVar["hstrBeamPixelOutput"] = mpBeamPixels[0];
                         dirtyVar["hstrBeamPixels"] = ref<Texture>();
+                        // bindRenderer's hstrBeamPixelPrev is mpBeamPixels[0] too in the reference frame (only beamRefresh reads it).
+                        // Bound beside the output, the dispatch recorded [0] UAV -> SRV -> UAV, and those transitions waited for the
+                        // far-sea run dispatched before it: the overlap never overlapped (overlaplog4; shiptrace1 farSea + units =
+                        // march to 0.004 ms).
+                        dirtyVar["hstrBeamPixelPrev"] = ref<Texture>();
                         dirtyVar["hstrBeamUnitTransmittanceOutput"] = mpBeamUnitTransmittance;
                         dirtyVar["hstrBeamUnitTransmittance"] = ref<Texture>();
                         // Overlapped, the warp arguments stay in their indirect state from the early resolve to the pixel pass.
@@ -8203,12 +8493,32 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         // dispatched with its own barriers; the march then follows with none, so the two overlap. Nothing in the march
                         // reads what the run writes (the layer for the next frame).
                         pRenderContext->resourceBarrier(mpBeamDirtyArgs.get(), Resource::State::IndirectArg);
+                        // The march writes mpBeamPixels[0]: in its UAV state before the run, so its dispatch records no transition.
+                        pRenderContext->resourceBarrier(mpBeamPixels[0].get(), Resource::State::UnorderedAccess);
                         pRenderContext->uavBarrier(mpBeamPixels[0].get());
                         pRenderContext->uavBarrier(color.get());
+                        // DIAGNOSTIC (seaFarOverlapLog frames): every barrier from here to the end of the unit march, logged.
+                        if (mSeaFarOverlapLog > 0)
+                        {
+                            logInfo(
+                                "BARRIER --- far sea dispatch (frame {}); pixels0 {} pixels1 {} repair {} guide {}", mExecuteFrames,
+                                fmt::ptr(mpBeamPixels[0].get()), fmt::ptr(mpBeamPixels[1].get()), fmt::ptr(mpBeamRepair.get()),
+                                fmt::ptr(mpBeamGuide.get())
+                            );
+                            pRenderContext->setLogBarriers(true);
+                        }
+                        mFarBesideNow = true;
                         dispatchFarSea(pRenderContext);
+                        mFarBesideNow = false;
+                        if (mSeaFarOverlapLog > 0)
+                            logInfo("BARRIER --- units dispatch");
                     }
                     {
-                        FALCOR_PROFILE(pRenderContext, "units");
+                        // Its end timestamp would wait for the march, so neither the far sea beside it nor the pixel resolve behind
+                        // it (overlapResolve) could overlap it.
+                        std::optional<ScopedProfilerEvent> unitsScope;
+                        if (!(farBeside || overlapResolve) || mSeaFarOverlapScopes)
+                            unitsScope.emplace(pRenderContext, "units");
                         // PROBE (beamUnitRefill): the same units, lanes refilled as their rays end.
                         const ref<ComputePass>& pUnits = mBeamUnitRefill ? mpBeamDirtyMarchRefillPass : mpBeamDirtyMarchPass;
                         if (mBeamUnitRefill)
@@ -8242,6 +8552,12 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
                         else
                             pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
+                        if (farBeside && mSeaFarOverlapLog > 0)
+                        {
+                            pRenderContext->setLogBarriers(false);
+                            logInfo("BARRIER --- end");
+                            --mSeaFarOverlapLog;
+                        }
                         // beamSubTiles: the centres just marched decide their sub-tiles; the sub-tiles that missed march their
                         // other two units. Inside this scope, so units times the whole residual either way.
                         if (mParams.beamSubTiles != 0u)

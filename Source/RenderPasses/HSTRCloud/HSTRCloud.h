@@ -116,6 +116,14 @@ public:
     void compile(RenderContext* pRenderContext, const CompileData& compileData) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
+    void executeFrame(RenderContext* pRenderContext, const RenderData& renderData);
+    /// gpuTiming: the pass's GPU time from a begin / end timestamp pair alone (gpuTimeSum in us, gpuTimeFrames), true with the
+    /// overlaps the profiler's inner scopes serialise.
+    bool mGpuTiming = true;
+    std::array<ref<GpuTimer>, 3> mpGpuTimers;
+    uint32_t mGpuTimerFrame = 0;
+    uint64_t mGpuTimeSumUs = 0;
+    uint64_t mGpuTimeFrames = 0;
     void renderUI(Gui::Widgets& widget) override;
 
 private:
@@ -198,6 +206,8 @@ private:
     uint32_t mWorldCacheRingShape = 0; ///< worldCacheRingCount * 16 + worldCacheRingLayout the ring buffers were built for.
     float mWorldCacheRingModulation = -1.f; ///< Ring slot modulation b; negative: the medium's transport attenuation.
     LazyComputePass mpWorldCacheBakePass;
+    LazyComputePass mpWorldCacheViewPass; ///< worldCacheView: bakeWorldCacheView.
+    ref<Texture> mpWorldCacheView;        ///< worldCacheView: the cache's radiance towards the camera, a frame (RGBA16F, cache cells).
     LazyComputePass mpWorldCacheAdvancePass;
     ref<Buffer> mpPhotonPool;                                           ///< Persistent light-tracing photons (48 bytes each).
     ref<Buffer> mpPhotonEmitted;                                        ///< Photons emitted by the pool since the last restart.
@@ -412,6 +422,19 @@ private:
     /// HSTR_STRIP = this: 1 returns after the ray setup, 2 marches one step, 3 the full march (the warm-cache calibration). The
     /// copies compute and never write, so the image and the next frame's work are the real passes'. 0: off.
     uint32_t mBeamStripProbe = 0;
+    uint32_t mBeamSunKnock = 0; ///< ORACLE beamSunKnock (HSTR_SUN_KNOCK on the dirty passes), timing only.
+    uint32_t mSeaFarOverlapLog = 0; ///< DIAGNOSTIC seaFarOverlapLog: frames whose far-sea + unit-march barriers are logged.
+    bool mSeaFarOverlapScopes = true; ///< seaFarOverlapScopes: false drops the farSea / units profiler scopes while they overlap.
+    /// seaFarBeside: the overlapped far-sea run beside the unit march (0) or the dirty query (1). The query leaves the GPU 6-9% busy
+    /// (ngfxlive1, sm__throughput over its 0.6-0.9 ms), the march ~40%. Beside the query nothing may transition at the run: the far
+    /// layer's pair is put in its states before the query and the beam lattice / repair / snapshot are unbound from it (farquery1-3
+    /// logged each). MEASURED (farquery4, 4K walk 2, live, profiler scopes off for the pair, arms interleaved serial / query / units
+    /// x2): HSTRCloud 3.275 / 2.847 / 2.695, 2.677 / 2.458 / 2.751 ms - beside the query -0.43 / -0.22 against the serial arm before
+    /// it; the query's scope grows 0.13-0.15 while the far sea's 0.36-0.45 goes. Exact: the run reads nothing either pass writes.
+    /// Timed without the profiler (gpuTiming, overlap6, live walk, interleaved x3): serial 3.238 / 3.091 / 2.707, beside the query
+    /// 2.724 / 2.583 / 2.863, and with beamOverlapResolve 2.447 / 2.708 / 2.829 ms - means 3.01 / 2.72 / 2.66.
+    uint32_t mSeaFarBeside = 1;
+    bool mFarBesideNow = false;       ///< Set while dispatchFarSea runs beside the unit march.
     LazyComputePass mpBeamDirtyQueryStripPass;
     LazyComputePass mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     LazyComputePass mpBeamWarpArgsPass;
@@ -699,6 +722,17 @@ private:
     const char* unitStartDefine() const
     {
         return mParams.beamUnitStart == 0.f ? "0" : (mParams.beamUnitSpan > 0.f ? "2" : "1");
+    }
+    /// HSTR_SUN_PACKED for the full-build passes (the dirty passes add formB in setBeamDirtyMarchDefines): without it a reset build
+    /// never reads the packed atlas, and the path-trace gate cannot see the read (hillpack2's on / off / on were identical).
+    const char* sunPackedDefine() const { return mCloudSunPackedRead && mParams.cloudSunPackedAtlas != 0 ? "1" : "0"; }
+    /// HSTR_CACHE_VIEW: worldCacheView where its bake can stand in for the cache read (textured light tracing, no ring slots).
+    const char* cacheViewDefine() const
+    {
+        return mParams.worldCacheView != 0 && mpWorldCacheView && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 &&
+                       mParams.worldCacheSunOrder != 4
+                   ? "1"
+                   : "0";
     }
     LazyComputePass mpBeamDirtyTilePass;
     LazyComputePass mpBeamDirtyTileDensePass;
@@ -996,6 +1030,14 @@ private:
     LazyComputePass mpCloudPageArgsPass;
     LazyComputePass mpResolveDirtyCloudPagesPass;
     LazyComputePass mpResolveSkirtMasksPass;
+    LazyComputePass mpResolveSkirtRegionsPass; ///< Only the masks the frame's page changes can reach (cloudSkirtRegions).
+    bool mCloudSkirtRegions = true;
+    uint64_t mSkirtFrames = 0;       ///< Frames that rewrote skirt masks.
+    uint64_t mSkirtRegionFrames = 0; ///< ... through the regions.
+    uint64_t mSkirtRegionPages = 0;  ///< Pages the region passes rewrote (overlaps counted).
+    uint64_t mSkirtFullPages = 0;    ///< Pages the full passes rewrote.
+    uint64_t mSkirtDirtyRegions = 0; ///< Changed bricks on those frames (dirtyPages regions).
+    uint64_t mSkirtDirtyWork = 0;    ///< Their pages, before the skirt widening (overlaps counted).
     LazyComputePass mpCheckSkirtMasksPass;    ///< DIAGNOSTIC (cloudSkirtCheck).
     bool mCloudSkirtCheck = false;            ///< DIAGNOSTIC: count stale skirt masks every frame (blocking readback).
     ref<Buffer> mpSkirtCheckCount;
@@ -1008,6 +1050,24 @@ private:
     uint32_t mDirtyStatBlocks = 0;            ///< Dirty blocks listed, summed over them (each block's 2 x stride^2 query rays).
     uint32_t mDirtyStatUnits = 0;             ///< Units listed for the unit march, summed over them.
     LazyComputePass mpResolveCloudSunSlotsPass; ///< Per frame, for the lean march's flat lookups (HSTR_SHIP bit 2048).
+    LazyComputePass mpResolveCloudSunCheckPass; ///< DIAGNOSTIC (cloudSunTouchCheck): the full resolve into mpSunResolveCheck.
+    LazyComputePass mpCompareCloudSunPass;      ///< DIAGNOSTIC (cloudSunTouchCheck).
+    LazyComputePass mpStampCloudSunTouchedPass; ///< The CPU's loads into hstrCloudSunTouched (cloudSunTouch).
+    ref<Buffer> mpSunTouchListBuffer;
+    /// cloudSunTouch: resolve only the bricks whose chain the scheduler's slot writes or the CPU's loads stamped. MEASURED (suntouch1 /
+    /// suntouch2, 4K walk 2, arms alternated in one launch): resolveCloudSun 0.114 / 0.118 ms full against 0.116 / 0.123 incremental
+    /// with every arm frame incremental - visiting the capacity's 268k bricks (brick record, parent links) is the cost, not their
+    /// slot pairs; on the live walk no frame qualified (0 of 112: an input changed every frame, full 0.203 ms). Off; its exactness
+    /// check (cloudSunTouchCheck) never ran on an incremental frame.
+    bool mCloudSunTouch = false;
+    bool mCloudSunTouchCheck = false;           ///< DIAGNOSTIC: count incremental resolve entries differing from a full one.
+    uint32_t mCloudSunEvery = 1;                ///< cloudSunEvery: the GPU sun scheduling runs every nth frame with n times the cap.
+    ref<Buffer> mpSunResolveCheck;
+    ref<Buffer> mpSunCheckCount;
+    uint64_t mSunResolveFrames = 0;      ///< Frames that resolved the sun slots.
+    uint64_t mSunResolveTouchFrames = 0; ///< ... incrementally.
+    uint64_t mSunTouchChecks = 0;
+    uint64_t mSunTouchMismatches = 0;
     LazyComputePass mpClearWorldCacheTilesPass;
     LazyComputePass mpAdvanceFadesPass;
     ref<Sampler> mpLinearClampSampler;

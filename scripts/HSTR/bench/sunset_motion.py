@@ -29,7 +29,9 @@ position = [float3(cam.position.x, cam.position.y, cam.position.z)]
 VIEW = float3(cam.target.x, cam.target.y, cam.target.z) - position[0]
 COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "seaTilesChanged", "sunBakeFrames",
             "densityChangedFrames", "cuts", "cutTotalMs", "cutPops", "skirtMaskChecks", "skirtMaskMismatches",
-            "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits")
+            "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
+            "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
+            "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames")
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
           "beamMarchTiles", "bindCpuMs") + tuple(  # rtSpanProbe's last frame (present only while it is on).
           f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
@@ -266,11 +268,13 @@ def profile(tag, frames, speed):
         print(f"MOTION {tag} profiled frame {kind} {frame:.2f} ms; top leaves:", flush=True)
         for value, name in means[:12]:
             print(f"MOTION {tag}   {value:6.3f} ms  {name.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}", flush=True)
-        # HSTR_MOTION_PROFILE_MATCH (a regex): these leaves always, with the frames they ran in and their mean over all frames - a
+        # HSTR_MOTION_PROFILE_MATCH (a regex): these scopes always, with the frames they ran in and their mean over all frames - a
         # pass that runs on some frames only (the sun stamp) drops out of the top list or reads its mean over its own frames.
+        # Any scope, not only leaves: the profiler keeps every event it has seen, so a scope whose children stopped running in
+        # this arm (march with seaFarOverlapScopes off) is never a leaf.
         match = os.environ.get("HSTR_MOTION_PROFILE_MATCH")
         if match and kind == "gpu_time":
-            for n, l in leaves.items():
+            for n, l in lanes.items():
                 if re.search(match, n):
                     records = l["records"]
                     print(f"MOTION {tag}   match {sum(records) / frames:6.3f} ms a frame ({len(records)} of {frames} frames, "
@@ -287,10 +291,15 @@ ARMS = eval(os.environ.get("HSTR_MOTION_ARMS", "None")) or [
 settle = int(os.environ.get("HSTR_MOTION_SETTLE", "1800"))
 for checkpoint in range(0, settle, 300):
     if checkpoint == 300:
-        # Every arm's programs compile during the settle, not in a measured chunk.
+        # Every arm's programs compile during the settle, not in a measured chunk. Then the settle goes on in its own state: it
+        # used to keep the first arm's, so an arm with cloudResidencyFrozen froze residency 300 frames into the settle, and every
+        # frozen run measured with ~271k mapped bricks never sun-baked (sunWaiting / sunSlotsFree identical in every later settle
+        # chunk; sunBakesFrame is the last run's count). Found 2026-10-09 (packview1).
+        before = {k: hstr.properties.get(k) for _, props in ARMS for k in props}
         for _, props in ARMS[::-1]:
             hstr.set_properties(props)
             fly(3, 0.0)
+        hstr.set_properties({k: v for k, v in before.items() if v is not None})
     walls, _ = fly(300, 0.0)
     print(f"MOTION settle{checkpoint // 300}: {summary(walls)} {levels(cloud_stats())}", flush=True)
 walls, _ = fly(60, 0.0)
@@ -360,7 +369,9 @@ for speed in speeds:
     if os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0":
         for name, props in ARMS:
             hstr.set_properties(props)
-            fly(5, speed)
+            # HSTR_MOTION_PROFILE_LEAD: frames flown before the profile, so an arm whose properties rebuild the beam (beamOctScale)
+            # is timed after its rebuild, not during it.
+            fly(int(os.environ.get("HSTR_MOTION_PROFILE_LEAD", "5")), speed)
             profile(f"{tag} arm {name}", int(os.environ.get("HSTR_MOTION_PROFILE_FRAMES", "20")), speed)
     hstr.set_properties(ARMS[0][1])
     # Back to parked: how long the backlog takes to drain.
