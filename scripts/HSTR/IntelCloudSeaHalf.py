@@ -104,7 +104,15 @@ g.addPass(createPass("HSTRCloud", {
     # 256 again 0.63 / 2.73%; bakeexit1 256 1.01 / 2.41%, 128 0.50 / 2.25%, 256 again 0.80 / 2.26%. Sprint scores swung 3-11% on
     # the 256 anchor alone (one bad chunk decides them), with 128 at 2.9%: no sign of bake lag there either. Parked keeps the
     # full rate, so the backlog still drains when the camera stops.
-    "cloudSunBakesMoving": 128,
+    # 128 -> 64 (sunbake2-4, 4K sunset walk, arms 128 / 64 / 32 / sanity 8 / 128): bakeCloudSun 0.136 / 0.101 -> 0.069 ms (32 0.032,
+    # 8 0.010). The motion score cannot see bake rate (sanity 8 scored 5.53% against 5.49 / 5.77%: its fresh rebuild reads the same
+    # bakes), so sunbake4 counted the march's lit samples resolved from an ancestor's bake (kBeamSunAncestor), 240-frame chunks:
+    # ship 81% (1.47 levels up), 64 78% (1.59), sanity 8 85% (1.63), ship again 62% (1.75) - 64 inside the anchors' drift (the
+    # backlog drained 378k -> 275k over the run), the sanity arm above it. Unbaked / coarse fallbacks 0 in every arm; units and
+    # query unchanged (probe on: 2.98 / 3.10 vs 3.16, query 1.12 / 1.12 vs 1.10). Known limit, not caused by this: while walking,
+    # 60-85% of lit samples light from an ancestor's bake ~1.5 levels coarser (300-400k bakes waiting); the path-trace gate, run
+    # parked and fully baked, never sees it.
+    "cloudSunBakesMoving": 64,
     # Sun bake step, level voxels (default 0.5). An explicit approximation. The bake's cost is its density steps: ~92 a texel, 98.5%
     # of texels marching to the full reach (bake probe, HSTR_SUN_BAKE_PROBE). bakestep4 (4K sunset walk, bakes kept across arms):
     # bakeCloudSun 0.5 0.557 / 0.412 ms, 1 0.229, 2 0.123. Quality (sunset_hill_bakestep5, every arm fully rebaked, 960 x 540 exact

@@ -38,6 +38,11 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # Then beamOctScale 0.25 with far scale 6 (tradept5 / tradetime4): excess 0.026567 -> 0.026733 (+0.6%), p99 / p99.9 unchanged,
     # max 0.893 -> 0.820; query + units + dirtyTiles + resolve + farSea 2.283 / 2.345 -> 2.241 / 2.273 ms (-0.057; farSea +0.05,
     # the beam passes -0.11). Same run, each breaking p99 (0.4871 -> 0.5793): scale 0.27 (+2.4%), tolerance 0.7, step 7.5.
+    # A lower internal resolution for an upscaler (DLSS) - MEASURED and closed (resprice1, 4K walk, sunset_motion per-arm "_res",
+    # the beam's angle held at 4K's 0.25 by scaling beamOctScale): resolve 0.466 / 0.477 at 4K (anchors) -> 0.239 at 2560x1440
+    # (0.375), 0.161 at 1920x1080 (0.5); march 0.836 / 0.930 -> 0.988 / 0.775 (inside the anchors' spread). The beam already marches
+    # at a quarter of 4K's angle, so only the pixel passes scale: ~0.31 ms saved at 1080p before the upscaler's own cost (not
+    # measured here) and its ghosting on volumes. Stop rule was 0.5 ms.
     "minStepVoxels": 7.0,
     "beamOctScale": 0.25,
     "seaFarScale": 6,
@@ -52,6 +57,9 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # / 0.213 / 0.114 / 0.293 / 0.168, resolveCloudSun 0.143 / 0.066 / 0.024 / 0.118 / 0.055); query + units within the anchors'
     # spread (1.59 / 1.63 / 1.53 / 1.38 / 1.38); bakes waiting at the arms' ends 180k / 189k / 187k / 211k / 209k, stale 116k /
     # 108k / 107k / 107k / 105k - the backlog drains as fast.
+    # Re-measured with 4096 loads a frame (sunevery2, 4K walk, 240-frame chunks, every 4 / 8 / 16 / sanity 1 / 4): stamp 0.126 /
+    # 0.089 / 0.103 / 0.160 / 0.112 ms a frame; changes stamped per 240 frames 83.7k / 71.1k / 95.2k / 143.6k - dedupe over a longer
+    # interval barely shrinks the stamp's work (~350 cell changes a frame), so a longer interval buys ~0.03 ms. Left at 4.
     "cloudSunEvery": 4,
     # The low sun's horizontal banding: past the fine near reach the sun depth comes from the domain's coarse sheared field (5.16-unit
     # layers), which at 4 degrees of elevation draws a bright/dark band per layer on the lit faces (~30 px apart at 4K). A reach of 8

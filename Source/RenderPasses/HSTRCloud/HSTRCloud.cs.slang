@@ -108,6 +108,7 @@ RaytracingAccelerationStructure gHullTlas;
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
 static uint gSunProbe[4];   ///< This thread's leanSunDepth answers by path (kBeamSunProbe).
+static uint gSunAncestor[2]; ///< ... resolved from an ancestor's bake, and the levels climbed (kBeamSunAncestor).
 static uint gLookupProbe[10]; ///< This thread's brick lookups, wave-uniform by instance, by instance and page (kBeamLookupProbe);
                               ///< lookup waves, distinct keys now, in lockstep at the mean / minimum distance, the lane-0 sanity
                               ///< keys, and the transform check's lanes and misses (kBeamLockstepProbe).
@@ -5850,6 +5851,7 @@ struct HSTRCloudRenderer
             gLayerProbe[k] = 0;
         for (uint k = 0; k < 4; ++k)
             gSunProbe[k] = 0;
+        gSunAncestor[0] = gSunAncestor[1] = 0;
         for (uint k = 0; k < 10; ++k)
             gLookupProbe[k] = 0;
         gLayerTightZero = 0;
@@ -5922,6 +5924,15 @@ struct HSTRCloudRenderer
             {
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[kBeamSunProbe + k], sum, unused);
+            }
+        }
+        for (uint k = 0; k < 2; ++k)
+        {
+            const uint sum = WaveActiveSum(gSunAncestor[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamSunAncestor + k], sum, unused);
             }
         }
         for (uint k = 0; k < 10; ++k)
@@ -8972,6 +8983,9 @@ struct HSTRCloudRenderer
 #endif
 #if HSTR_LAYER_PROBE
                 ++gSunProbe[0];
+                const uint climbed = (resolved.y >> 24) > (hit.levels & 255u) ? (resolved.y >> 24) - (hit.levels & 255u) : 0u;
+                gSunAncestor[0] += climbed > 0u ? 1u : 0u;
+                gSunAncestor[1] += climbed;
 #endif
                 return baked > kCloudSunDepthOpaque ? baked : baked + farDepth;
             }

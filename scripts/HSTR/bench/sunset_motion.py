@@ -56,7 +56,7 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          tuple(f"beamGuardFail{level}" for level in range(12)) + ("beamGuardRescued", "beamGuardHeld") +
          # beamLayerProbe: the layered lookups of the dirty marches by outcome, density samples by layers with density, and the
          # marches' lane steps, warp-paid steps and warps.
-         tuple(f"beamSun{n}" for n in ("Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick")) +
+         tuple(f"beamSun{n}" for n in ("Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick", "Ancestor", "AncestorLevels")) +
          tuple(f"beamLookup{n}" for n in ("Lanes", "SameInstance", "SamePage")) +
          # Lockstep oracle: lookup waves, distinct (instance, level, page) keys now and at the wave's mean camera distance.
          tuple(f"beamLockstep{n}" for n in ("Waves", "KeysNow", "KeysLockstep", "KeysMin", "KeysFirst", "TransformChecked",
@@ -289,9 +289,10 @@ def profile(tag, frames, speed):
         if match and kind == "gpu_time":
             for n, l in lanes.items():
                 if re.search(match, n):
-                    records = l["records"]
-                    print(f"MOTION {tag}   match {sum(records) / frames:6.3f} ms a frame ({len(records)} of {frames} frames, "
-                          f"{sum(records) / max(len(records), 1):.3f} when run)  {n.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}",
+                    # Falcor records 0 for an event on a frame it did not run: count the frames it ran by their non-zero records.
+                    ran = [r for r in l["records"] if r > 0.0]
+                    print(f"MOTION {tag}   match {sum(ran) / frames:6.3f} ms a frame ({len(ran)} of {frames} frames, "
+                          f"{sum(ran) / max(len(ran), 1):.3f} when run)  {n.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}",
                           flush=True)
 
 
@@ -300,6 +301,19 @@ ARMS = eval(os.environ.get("HSTR_MOTION_ARMS", "None")) or [
     ("live", {"cloudResidencyFrozen": False, "beamInvalidate": True}),
     ("frozen", {"cloudResidencyFrozen": True, "beamInvalidate": True}),
     ("noInval", {"cloudResidencyFrozen": False, "beamInvalidate": False})]
+
+# An arm's "_res": "WxH" renders it at that frame size (every arm without one at HSTR_RES), so resolutions share one settle. A resize
+# drops the beam image: time such arms after a lead (HSTR_MOTION_PROFILE_LEAD) long enough for the moving frame to settle again.
+RES_DEFAULT = os.environ.get("HSTR_RES", "3840x2160")
+res_now = [RES_DEFAULT]
+
+
+def set_arm(props):
+    res = props.get("_res", RES_DEFAULT)
+    if res != res_now[0]:
+        m.resizeFrameBuffer(*[int(v) for v in res.split("x")])
+        res_now[0] = res
+    hstr.set_properties({k: v for k, v in props.items() if not k.startswith("_")})
 
 settle = int(os.environ.get("HSTR_MOTION_SETTLE", "1800"))
 for checkpoint in range(0, settle, 300):
@@ -310,9 +324,10 @@ for checkpoint in range(0, settle, 300):
         # chunk; sunBakesFrame is the last run's count). Found 2026-10-09 (packview1).
         before = {k: hstr.properties.get(k) for _, props in ARMS for k in props}
         for _, props in ARMS[::-1]:
-            hstr.set_properties(props)
+            set_arm(props)
             fly(3, 0.0)
-        hstr.set_properties({k: v for k, v in before.items() if v is not None})
+        hstr.set_properties({k: v for k, v in before.items() if v is not None and not k.startswith("_")})
+        set_arm({})  # Back to the launch size.
     walls, _ = fly(300, 0.0)
     print(f"MOTION settle{checkpoint // 300}: {summary(walls)} {levels(cloud_stats())}", flush=True)
 walls, _ = fly(60, 0.0)
@@ -329,7 +344,7 @@ if SCORE:
 speeds = [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split(",")]
 # The live flights (and the --ngfx trace taken in the first) run in the first arm's state. Since the settle restores its own state
 # after compiling the arms (packview1), they had run in the launcher's: halftrace1 traced resolveBeam with beamHalfResolve armed.
-hstr.set_properties(ARMS[0][1])
+set_arm(ARMS[0][1])
 for speed in speeds:
     tag = f"v{speed:g}"
     before = cloud_stats()
@@ -357,7 +372,7 @@ for speed in speeds:
     arm_levels = {name: [] for name, _ in ARMS}
     for cycle in range(int(os.environ.get("HSTR_MOTION_CYCLES", "4"))):
         for name, props in ARMS:
-            hstr.set_properties(props)
+            set_arm(props)
             before = cloud_stats()
             walls, _ = fly(CHUNK, speed)
             arm_walls[name] += walls[DROP:]
@@ -405,12 +420,12 @@ for speed in speeds:
                   f"{100 * sum(x['marched'] for x in e) / len(e):.1f}%; per score {e}", flush=True)
     if os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0":
         for name, props in ARMS:
-            hstr.set_properties(props)
+            set_arm(props)
             # HSTR_MOTION_PROFILE_LEAD: frames flown before the profile, so an arm whose properties rebuild the beam (beamOctScale)
             # is timed after its rebuild, not during it.
             fly(int(os.environ.get("HSTR_MOTION_PROFILE_LEAD", "5")), speed)
             profile(f"{tag} arm {name}", int(os.environ.get("HSTR_MOTION_PROFILE_FRAMES", "20")), speed)
-    hstr.set_properties(ARMS[0][1])
+    set_arm(ARMS[0][1])
     # Back to parked: how long the backlog takes to drain.
     for window in range(3):
         walls, _ = fly(60, 0.0)

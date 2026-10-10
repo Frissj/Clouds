@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 497;
+static const uint kBeamCountSlots = 499;
 /// beamHalfResolve counters (always on with it): filled pixels, and the exact ones because a neighbour was not from a basis, or
 /// because the neighbours disagreed past beamHalfContrast; then the shaded half's basis pixels; the fill's waves, and those with
 /// any lane resolved exactly (which pays the whole resolve for the wave). Counted only under beamHalfProbe.
@@ -194,6 +194,9 @@ static const uint kBeamProbeDistanceBins = 12;
 /// beamLayerProbe: the dirty marches' leanSunDepth answers - 0 a resolved bake, 1 no bake in the brick's chain, 2 a brick coarser
 /// than the footprint asks for or no near reach (both take sunDepthAt), 3 no brick (proxy regime).
 static const uint kBeamSunProbe = 464;
+/// beamLayerProbe: of the resolved sun answers (kBeamSunProbe + 0), those whose bake is an ancestor's (coarser than the sampled
+/// brick: its own bake has not landed), and the levels they climbed in total - what a lower moving bake rate costs the image.
+static const uint kBeamSunAncestor = 497;
 static const uint kBeamProbeDistance = 385;
 /// formR 2 (HSTR_FORM_R 2, counting probe: no jump): over the lean marches, hull queries, march steps taken while outside every
 /// hull (what formR 1 jumps over), brick density samples outside every hull (must be 0: else the hulls drop cloud), proxy density

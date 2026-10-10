@@ -2544,6 +2544,8 @@ Properties HSTRCloud::getProperties() const
             const char* sunNames[4] = {"Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick"};
             for (uint32_t k = 0; k < 4; ++k)
                 cloud[std::string("beamSun") + sunNames[k]] = mBeamLevelCounts[kBeamSunProbe + k];
+            cloud["beamSunAncestor"] = mBeamLevelCounts[kBeamSunAncestor];
+            cloud["beamSunAncestorLevels"] = mBeamLevelCounts[kBeamSunAncestor + 1];
             const char* lookupNames[3] = {"Lanes", "SameInstance", "SamePage"};
             for (uint32_t k = 0; k < 3; ++k)
                 cloud[std::string("beamLookup") + lookupNames[k]] = mBeamLevelCounts[kBeamLookupProbe + k];
