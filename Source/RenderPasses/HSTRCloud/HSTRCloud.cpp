@@ -8518,19 +8518,15 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 }
                 pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             }
-            if (!late)
-                return;
+            // beamHalfResolve: its buffers and the exact list's count are made ready here, before the unit march, as the residual
+            // queue's are above. Cleared in the late part, the count's IndirectArgument -> UnorderedAccess transition and its clear sat
+            // between the unit march and the shaded half and made the shade wait for the whole march (halftrace2, API calls 283-284:
+            // the shade started 0.1 ms after the march's last wave, never inside its 0.2-0.25 ms drain), so halfres1-4 timed the half
+            // resolve without beamOverlapResolve (overlap2: worth 0.15-0.19 ms).
+            if (half && early)
             {
-                // seaFarOverlapScopes false: no "pixels" scope while it overlaps the march (its timestamp would wait for the march).
-                std::optional<ScopedProfilerEvent> pixelsScope;
-                if (!overlapResolve || mSeaFarOverlapScopes)
-                    pixelsScope.emplace(pRenderContext, "pixels");
-                // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
-                // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
-                // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
-                // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
-                if (half && (!mpBeamHalfFlag || mpBeamHalfFlag->getWidth() != (mParams.frameDim.x + 1u) / 2u ||
-                             mpBeamHalfFlag->getHeight() != mParams.frameDim.y))
+                if (!mpBeamHalfFlag || mpBeamHalfFlag->getWidth() != (mParams.frameDim.x + 1u) / 2u ||
+                    mpBeamHalfFlag->getHeight() != mParams.frameDim.y)
                 {
                     mpBeamHalfFlag = mpDevice->createTexture2D(
                         (mParams.frameDim.x + 1u) / 2u, mParams.frameDim.y, ResourceFormat::R8Uint, 1, 1, nullptr,
@@ -8547,8 +8543,19 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                                  ResourceBindFlags::IndirectArg
                     );
                 }
-                if (half)
-                    pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
+                pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
+            }
+            if (!late)
+                return;
+            {
+                // seaFarOverlapScopes false: no "pixels" scope while it overlaps the march (its timestamp would wait for the march).
+                std::optional<ScopedProfilerEvent> pixelsScope;
+                if (!overlapResolve || mSeaFarOverlapScopes)
+                    pixelsScope.emplace(pRenderContext, "pixels");
+                // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
+                // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
+                // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
+                // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
                 auto bindPixels = [&](const ref<ComputePass>& pPass)
                 {
                     bindRenderer(pRenderContext, pPass);
