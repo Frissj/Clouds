@@ -1093,6 +1093,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamHalfProbe = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "beamHalfDense")
+        {
+            mParams.beamHalfDense = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "beamHalfFillSkip")
+        {
+            mParams.beamHalfFillSkip = bool(value) ? 1u : 0u;
+            continue;
+        }
         if (key == "beamQueryStepCap")
         {
             mParams.beamQueryStepCap = uint32_t(value);
@@ -2537,6 +2547,9 @@ Properties HSTRCloud::getProperties() const
             const char* lookupNames[3] = {"Lanes", "SameInstance", "SamePage"};
             for (uint32_t k = 0; k < 3; ++k)
                 cloud[std::string("beamLookup") + lookupNames[k]] = mBeamLevelCounts[kBeamLookupProbe + k];
+            const char* lockstepNames[7] = {"Waves", "KeysNow", "KeysLockstep", "KeysMin", "KeysFirst", "TransformChecked", "TransformMiss"};
+            for (uint32_t k = 0; k < 7; ++k)
+                cloud[std::string("beamLockstep") + lockstepNames[k]] = mBeamLevelCounts[kBeamLockstepProbe + k];
             const char* halfNames[6] = {"Filled", "NotBasis", "Contrast", "ShadedBasis", "FillWaves", "FillWavesExact"};
             for (uint32_t k = 0; k < 6; ++k)
                 cloud[std::string("beamHalf") + halfNames[k]] = mBeamLevelCounts[kBeamHalfProbe + k];
@@ -8613,7 +8626,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                         sizeof(uint32_t), 7, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
                                                  ResourceBindFlags::IndirectArg
                     );
+                    mpBeamHalfShaded.reset();
                 }
+                if (mParams.beamHalfDense != 0 && !mpBeamHalfShaded)
+                    mpBeamHalfShaded =
+                        mpDevice->createStructuredBuffer(2u * sizeof(uint32_t), (mParams.frameDim.x + 1u) / 2u * mParams.frameDim.y);
                 pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
             }
             if (!late)
@@ -8635,6 +8652,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     if (half)
                     {
                         var["hstrBeamHalfFlag"] = mpBeamHalfFlag;
+                        if (mParams.beamHalfDense != 0)
+                            var["hstrBeamHalfShaded"] = mpBeamHalfShaded;
                         var["hstrBeamResidualEntry"] = mpBeamResidualEntry;
                         var["hstrBeamHalfExactList"] = mpBeamHalfExactList;
                         var["hstrBeamHalfExactArgs"] = mpBeamHalfExactArgs;
@@ -8675,7 +8694,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                         shadeScope.emplace(pRenderContext, "shade");
                     dispatch(pResolve, pResolveWarp);
                 }
-                if (half)
+                const bool fill = half && mParams.beamHalfFillSkip == 0; // beamHalfFillSkip: the oracle drops the fill and exact passes.
+                if (fill)
                 {
                     std::optional<ScopedProfilerEvent> fillScope;
                     if (pixelsScope)
@@ -8684,6 +8704,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     // barrier also waits for the unit march: the fill alone gives up the overlap.
                     pRenderContext->uavBarrier(color.get());
                     pRenderContext->uavBarrier(mpBeamHalfFlag.get());
+                    if (mParams.beamHalfDense != 0)
+                        pRenderContext->uavBarrier(mpBeamHalfShaded.get());
                     pRenderContext->uavBarrier(mpBeamResidualEntry.get());
                     if (mpBeamResidualList)
                     {
@@ -8693,7 +8715,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     bindPixels(mpBeamHalfFillPass);
                     mpBeamHalfFillPass->execute(pRenderContext, threads);
                 }
-                if (half)
+                if (fill)
                 {
                     // The fill's listed pixels, exactly, in their own dispatch (the resolve's registers stay out of the fill).
                     std::optional<ScopedProfilerEvent> exactScope;

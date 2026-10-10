@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 490;
+static const uint kBeamCountSlots = 497;
 /// beamHalfResolve counters (always on with it): filled pixels, and the exact ones because a neighbour was not from a basis, or
 /// because the neighbours disagreed past beamHalfContrast; then the shaded half's basis pixels; the fill's waves, and those with
 /// any lane resolved exactly (which pays the whole resolve for the wave). Counted only under beamHalfProbe.
@@ -64,6 +64,17 @@ static const uint kBeamHalfProbe = 484;
 /// instance, 1.2% (15.6k) on one page. Stop rule (build only above 50% on one page) fails; a same-instance load is already a
 /// broadcast. Scalarising the lookup is closed.
 static const uint kBeamLookupProbe = 480;
+/// beamLayerProbe ORACLE (lockstep waves): the lean marches' brick lookups counted once a wave, and over those waves the distinct
+/// (instance, level, page) keys the active lanes read now, and the keys they would read if every lane sat at the wave's mean camera
+/// distance along its own ray (same instance; lanes not at a lookup are not moved in). Stop rule: lockstep mean over 4 keys a wave
+/// closes lockstep waves.
+/// MEASURED (lockstep1, 4K sunset walk, 4 counted frames; anchor as lookupuni1: 88.1% one instance, 1.15% one page): 102.7k lookup
+/// waves a frame of 12.1 active lanes, 9.82 distinct keys a wave now, 7.15 in lockstep at the mean distance (no sanity check yet).
+/// lockstep2 (same, with sanity): 109.6k waves; KeysFirst 109,591.5 = Waves exactly; TransformMiss 36.5 of 1.24M checked lanes
+/// (0.003%) - the counting and the counterfactual are right. Keys a wave: now 9.74, lockstep at the mean distance 7.08, at the
+/// minimum 6.89. Stop rule fails: at one shared distance a wave still reads ~7 pages - neighbouring units are more than a brick
+/// apart where the march samples, so lockstep cannot turn the lookup chain into broadcasts. Closed.
+static const uint kBeamLockstepProbe = 490;
 /// worksetProbe (hstrWorkset): four counters, then one bit set of kWorksetSetWords words for brick indices and one for sun slots.
 static const uint kWorksetHeader = 8;
 static const uint kWorksetSetWords = 32768;
@@ -2122,6 +2133,23 @@ struct HSTRCloudParams
     /// continuation (GPU trace conttrace1, cap 32 x 16 slices) the query range is 1.03 / 1.08 ms against 1.02 / 1.03 shipped
     /// (warplines1) - the continuation's 0.23 ms replaces the drain it removes.
     uint beamQueryContinueSlices = 0;
+    /// beamHalfDense (with beamHalfResolve): the shade also writes its pixels, colour as f16 (the colour target's format, so the
+    /// fill's values are bit-identical) with the basis flag, to a dense half-width buffer, and the fill reads its four neighbours
+    /// there - four structured loads instead of four colour and four flag texture reads (halftrace3: fill stalls LGSB 39% /
+    /// TEXTHR 27%).
+    /// MEASURED, left off (halfdense1, 4K walk, 30 profiled frames an arm, seaFarOverlapScopes on): fill 0.151 / 0.150 ms shipped
+    /// (anchors before and after) against 0.279 dense; shade 0.131 / 0.057 vs 0.088 (overlapped, noisy); sanity arm (contrast 0)
+    /// moved exact 0.06 -> 0.248, so the scopes see the change. Why the structured reads are slower is unknown without a trace.
+    uint beamHalfDense = 0;
+    /// ORACLE (beamHalfFillSkip), wrong image: beamHalfResolve without its fill and exact dispatches, so the other parity keeps last
+    /// frame's colour. With the overlap, the HSTRCloud time it saves bounds what moving the fill into the shade dispatch (beside the
+    /// unit march, no barrier) could win. Stop rule: under 0.1 ms closes that fusion.
+    /// MEASURED (fillskip1, profiled, overlap scopes off: HSTRCloud totals swung 3.02 / 3.40 between the ship anchors and the
+    /// half-off sanity arm read 2.65 against the traced -0.12 ms win, so the totals cannot decide; resolve 0.440 / 0.337 -> 0.221).
+    /// GPU trace (fillskiptrace1 against halftrace3, same settings, 2 frames): resolve range 0.523 / 0.557 -> 0.391 / 0.343 ms,
+    /// -0.13 to -0.21. Passes the stop rule, but that is the whole fill + exact work deleted; a fused fill still pays its own
+    /// work (fill scope 0.15 ms) plus a shaded halo (~30% more shade), only beside the march instead of behind it.
+    uint beamHalfFillSkip = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

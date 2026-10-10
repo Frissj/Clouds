@@ -58,6 +58,9 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # marches' lane steps, warp-paid steps and warps.
          tuple(f"beamSun{n}" for n in ("Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick")) +
          tuple(f"beamLookup{n}" for n in ("Lanes", "SameInstance", "SamePage")) +
+         # Lockstep oracle: lookup waves, distinct (instance, level, page) keys now and at the wave's mean camera distance.
+         tuple(f"beamLockstep{n}" for n in ("Waves", "KeysNow", "KeysLockstep", "KeysMin", "KeysFirst", "TransformChecked",
+                                             "TransformMiss")) +
          # beamHalfResolve: filled pixels, exact ones (a neighbour not from a basis / past the contrast), the shaded half's basis pixels.
          tuple(f"beamHalf{n}" for n in ("Filled", "NotBasis", "Contrast", "ShadedBasis", "FillWaves", "FillWavesExact")) +
          # beamOrderProbe: the dirty query's rays, steps, max steps (2) and log2 step histogram (6-17).

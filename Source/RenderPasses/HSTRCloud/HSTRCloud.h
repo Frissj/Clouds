@@ -475,6 +475,7 @@ private:
     LazyComputePass mpBeamHalfExactPass;           ///< beamHalfResolve: exactBeamHalf (the fill's listed pixels).
     LazyComputePass mpBeamHalfExactWarpPass;       ///< exactBeamHalf with HSTR_BEAM_WARP 1.
     ref<Texture> mpBeamHalfFlag;                   ///< beamHalfResolve: hstrBeamHalfFlag, R8Uint, (width + 1) / 2 x height.
+    ref<Buffer> mpBeamHalfShaded;                  ///< beamHalfDense: hstrBeamHalfShaded, uint2 x (width + 1) / 2 x height.
     ref<Buffer> mpBeamResidualEntry;               ///< beamHalfResolve: hstrBeamResidualEntry, one uint per 8 x 8 screen group.
     ref<Buffer> mpBeamHalfExactList;               ///< beamHalfResolve: hstrBeamHalfExactList, three uints per fill group.
     ref<Buffer> mpBeamHalfExactArgs;               ///< beamHalfResolve: hstrBeamHalfExactArgs (count, two dispatches).

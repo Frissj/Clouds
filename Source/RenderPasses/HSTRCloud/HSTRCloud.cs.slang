@@ -108,7 +108,9 @@ RaytracingAccelerationStructure gHullTlas;
 #if HSTR_LAYER_PROBE
 static uint gLayerProbe[8]; ///< This thread's kBeamLayerProbe counts since its marchBeam began.
 static uint gSunProbe[4];   ///< This thread's leanSunDepth answers by path (kBeamSunProbe).
-static uint gLookupProbe[3]; ///< This thread's brick lookups, wave-uniform by instance, by instance and page (kBeamLookupProbe).
+static uint gLookupProbe[10]; ///< This thread's brick lookups, wave-uniform by instance, by instance and page (kBeamLookupProbe);
+                              ///< lookup waves, distinct keys now, in lockstep at the mean / minimum distance, the lane-0 sanity
+                              ///< keys, and the transform check's lanes and misses (kBeamLockstepProbe).
 static uint gLayerTightZero; ///< This thread's layered samples in an undilated zero block (kBeamLayerSteps + 3).
 static uint gLayerMaskMismatch; ///< ... whose layer bits disagree with the block maximum (kBeamLayerSteps + 4; must be 0).
 static uint gLayerMaskEmpty[2]; ///< ... layer visits whose layer bit is clear (kBeamLayerSteps + 5, + 6).
@@ -130,6 +132,27 @@ static float gTailTransmittance;
 static uint gRayLayerWalks[2]; ///< beamLayerProbe: the ray's brick walks per layer (kBeamLayerRayHint).
 static uint gRayLayerDense[2]; ///< ... and its density samples per layer.
 static uint gRunSkip[4];       ///< beamLayerProbe: the layer-free run skip (kBeamRunSkip).
+
+/// The distinct keys among the active lanes (kBeamLockstepProbe): one key retired a round, wave-uniform result.
+uint waveDistinctKeys(uint2 key)
+{
+    bool left = true;
+    uint distinct = 0;
+    [loop]
+    for (;;)
+    {
+        if (left)
+        {
+            // The first lane still left names this round's key; every lane holding it retires.
+            if (all(WaveReadLaneFirst(key) == key))
+                left = false;
+        }
+        ++distinct;
+        if (!WaveActiveAnyTrue(left))
+            break;
+    }
+    return distinct;
+}
 #endif
 static float gUnitOracleFirst = -2.f; ///< beamUnitOracle 2: this unit's recorded first-density distance (-1: none, -2: no oracle).
 #if HSTR_UNIT_START
@@ -156,6 +179,7 @@ static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched
 #endif
 static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
 static bool gResolvedByBasis = false; ///< beamHalfResolve: resolveBeamPixel wrote the pixel from a tile's basis.
+static float3 gBasisColor;            ///< ... and the colour it wrote (beamHalfDense).
 static bool gQueryMarch = false; ///< Set by buildBeamDirtyQueries (constant per kernel): its marches take beamQueryStepCap.
 static float gMarchStop = -1.f;  ///< marchBeamLean: where (segment units) a march stopped at its step cap while still open; else -1.
 // resolveBeamResidualPixel: the box of units the group's pixels read, and each of those units evaluated once.
@@ -776,6 +800,8 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamResidualList;
     RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch, [4..6] its warped one.
     RWTexture2D<uint> hstrBeamHalfFlag;          ///< beamHalfResolve: 1 where the shaded pixel (x, y) came from a basis, at (x / 2, y).
+    RWStructuredBuffer<uint2> hstrBeamHalfShaded; ///< beamHalfDense: the shaded pixel (x, y) at y * ((width + 1) / 2) + x / 2: r, g f16;
+                                                  ///< b f16 and bit 16 set where a basis wrote it.
     RWStructuredBuffer<uint> hstrBeamResidualEntry; ///< beamHalfResolve: each 8 x 8 screen group's residual queue entry, or ~0u.
     RWStructuredBuffer<uint> hstrBeamHalfExactList; ///< beamHalfResolve: fill groups with lanes to resolve exactly (group, mask x2).
     RWStructuredBuffer<uint> hstrBeamHalfExactArgs; ///< beamHalfResolve: [0] their count, [1..3] / [4..6] plain / warped dispatch.
@@ -5824,7 +5850,7 @@ struct HSTRCloudRenderer
             gLayerProbe[k] = 0;
         for (uint k = 0; k < 4; ++k)
             gSunProbe[k] = 0;
-        for (uint k = 0; k < 3; ++k)
+        for (uint k = 0; k < 10; ++k)
             gLookupProbe[k] = 0;
         gLayerTightZero = 0;
         gLayerMaskMismatch = 0;
@@ -5898,13 +5924,13 @@ struct HSTRCloudRenderer
                 InterlockedAdd(hstrBeamCounts[kBeamSunProbe + k], sum, unused);
             }
         }
-        for (uint k = 0; k < 3; ++k)
+        for (uint k = 0; k < 10; ++k)
         {
             const uint sum = WaveActiveSum(gLookupProbe[k]);
             if (WaveIsFirstLane())
             {
                 uint unused;
-                InterlockedAdd(hstrBeamCounts[kBeamLookupProbe + k], sum, unused);
+                InterlockedAdd(hstrBeamCounts[(k < 3 ? kBeamLookupProbe : kBeamLockstepProbe - 3) + k], sum, unused);
             }
         }
         for (uint k = 0; k < 16; ++k)
@@ -8584,6 +8610,47 @@ struct HSTRCloudRenderer
                 ++gLookupProbe[0];
                 gLookupProbe[1] += sameInstance ? 1u : 0u;
                 gLookupProbe[2] += sameInstance && WaveActiveAllEqual(page) && WaveActiveAllEqual(level) ? 1u : 0u;
+                // ORACLE (kBeamLockstepProbe): the keys the wave reads now, and at the wave's mean camera distance on each lane's ray.
+                const float distance = ray.entryDistance + tSample * ray.worldLength;
+                const float shared = WaveActiveSum(distance) / float(WaveActiveCountBits(true));
+                const float nearest = WaveActiveMin(distance);
+                const float tShared = tSample + (shared - distance) / max(ray.worldLength, 1e-12f);
+                const float3 d = ray.direction * (float(params.hstrCellWidth) * (tShared - tSample));
+                const float3 xl = x + float3(dot(instance.row0.xyz, d), dot(instance.row1.xyz, d), dot(instance.row2.xyz, d));
+                const uint3 il = uint3(clamp(int3(floor(xl + 0.5f)), 0, int3(dims) - 1));
+                const uint3 cl = (il >> 3u) >> level;
+                const uint pageLockstep = cl.x | (cl.y << 10) | (cl.z << 20);
+                const float3 dm = ray.direction * (float(params.hstrCellWidth) * (nearest - distance) / max(ray.worldLength, 1e-12f));
+                const float3 xm = x + float3(dot(instance.row0.xyz, dm), dot(instance.row1.xyz, dm), dot(instance.row2.xyz, dm));
+                const uint3 cm = (uint3(clamp(int3(floor(xm + 0.5f)), 0, int3(dims) - 1)) >> 3u) >> level;
+                const uint pageMin = cm.x | (cm.y << 10) | (cm.z << 20);
+                const uint2 key = uint2(instanceIndex | (level << 24), page);
+                gLookupProbe[3] += WaveIsFirstLane() ? 1u : 0u;
+                const uint now = waveDistinctKeys(key);
+                const uint lockstep = waveDistinctKeys(uint2(key.x, pageLockstep));
+                const uint atMin = waveDistinctKeys(uint2(key.x, pageMin));
+                // SANITY: every lane on lane 0's key must count exactly one a wave (KeysFirst == Waves).
+                const uint first = waveDistinctKeys(WaveReadLaneFirst(key));
+                gLookupProbe[4] += WaveIsFirstLane() ? now : 0u;
+                gLookupProbe[5] += WaveIsFirstLane() ? lockstep : 0u;
+                gLookupProbe[6] += WaveIsFirstLane() ? atMin : 0u;
+                gLookupProbe[7] += WaveIsFirstLane() ? first : 0u;
+                // SANITY: the transform's lockstep page against the real lookup at that point (cloudInstanceAt), on the lanes that stay
+                // in this instance and level: TransformMiss must be ~0 of TransformChecked.
+                {
+                    uint checkIndex;
+                    float3 checkX;
+                    float checkLevel;
+                    HSTRCloudInstance checkInstance;
+                    const float3 vl = (ray.position + tShared * ray.direction) * float(params.hstrCellWidth);
+                    if (cloudInstanceAt(vl, footprint, checkIndex, checkX, checkLevel, checkInstance, layer) && checkIndex == instanceIndex &&
+                        all(checkX >= -0.5f) && all(checkX < float3(dims) - 0.5f))
+                    {
+                        const uint3 cc = (uint3(int3(floor(checkX + 0.5f))) >> 3u) >> level;
+                        ++gLookupProbe[8];
+                        gLookupProbe[9] += (cc.x | (cc.y << 10) | (cc.z << 20)) != pageLockstep ? 1u : 0u;
+                    }
+                }
             }
 #endif
 #if (HSTR_SHIP & 2048) != 0
@@ -12506,7 +12573,8 @@ struct HSTRCloudRenderer
             // pass has already found the pixel, so it says so, and the resolveBeam entry queues its 8 x 8 group with a mask.
             return params.beamRefFrame != 0;
         }
-        color[pixel] = float4(beamReconstruct(level, beamPosition, w, false), 1.f);
+        gBasisColor = beamReconstruct(level, beamPosition, w, false);
+        color[pixel] = float4(gBasisColor, 1.f);
         gResolvedByBasis = true;
         return false;
     }
@@ -12517,7 +12585,16 @@ struct HSTRCloudRenderer
         gResolvedByBasis = false;
         const bool queued = resolveBeamPixel(pixel);
         if (all(pixel < params.frameDim))
-            hstrBeamHalfFlag[uint2(pixel.x >> 1, pixel.y)] = gResolvedByBasis ? 1u : 0u;
+        {
+            if (params.beamHalfDense != 0)
+            {
+                const uint3 h = gResolvedByBasis ? f32tof16(gBasisColor) : 0u;
+                hstrBeamHalfShaded[pixel.y * ((params.frameDim.x + 1u) >> 1) + (pixel.x >> 1)] =
+                    uint2(h.x | (h.y << 16), h.z | (gResolvedByBasis ? 0x10000u : 0u));
+            }
+            else
+                hstrBeamHalfFlag[uint2(pixel.x >> 1, pixel.y)] = gResolvedByBasis ? 1u : 0u;
+        }
         const uint shaded = WaveActiveCountBits(gResolvedByBasis);
         if (params.beamHalfProbe != 0 && WaveIsFirstLane())
         {
@@ -12549,8 +12626,18 @@ struct HSTRCloudRenderer
         for (uint k = 0; k < 4; ++k)
         {
             const uint2 q = uint2(clamp(n[k], int2(0), last));
-            basis = basis && hstrBeamHalfFlag[uint2(q.x >> 1, q.y)] != 0u;
-            const float3 c = color[q].rgb;
+            float3 c;
+            if (params.beamHalfDense != 0)
+            {
+                const uint2 h = hstrBeamHalfShaded[q.y * ((params.frameDim.x + 1u) >> 1) + (q.x >> 1)];
+                basis = basis && (h.y & 0x10000u) != 0u;
+                c = f16tof32(uint3(h.x, h.x >> 16, h.y));
+            }
+            else
+            {
+                basis = basis && hstrBeamHalfFlag[uint2(q.x >> 1, q.y)] != 0u;
+                c = color[q].rgb;
+            }
             sum += c;
             const float3 l = log(1.f + max(c, 0.f));
             lo = min(lo, l);
