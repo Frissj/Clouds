@@ -1093,6 +1093,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamHalfProbe = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "beamQueryStepCap")
+        {
+            mParams.beamQueryStepCap = uint32_t(value);
+            continue;
+        }
+        if (key == "beamQueryContinueSlices")
+        {
+            // A power of two up to 64, so a ray's threads stay within one group.
+            const uint32_t slices = std::min(uint32_t(value), 64u);
+            uint32_t power = 1;
+            while (power * 2u <= slices)
+                power *= 2u;
+            mParams.beamQueryContinueSlices = slices == 0 ? 0u : power;
+            continue;
+        }
         if (key == "cloudSunBakeStep")
         {
             mParams.cloudSunBakeStep = std::clamp(float(value), 0.125f, 4.f);
@@ -2760,6 +2775,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamHalfShadeWarpPass = nullptr;
     mpBeamHalfFillPass = nullptr;
     mpBeamHalfExactArgsPass = nullptr;
+    mpBeamContinuePass = nullptr;
+    mpBeamContinueArgsPass = nullptr;
     mpBeamHalfExactPass = nullptr;
     mpBeamHalfExactWarpPass = nullptr;
     mpBeamResidualResolveWarpPass = nullptr;
@@ -2855,6 +2872,8 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamHalfShadeWarpPass = createPass("resolveBeamHalf");
     mpBeamHalfFillPass = createPass("fillBeamHalf");
     mpBeamHalfExactArgsPass = createPass("writeBeamHalfExactArgs");
+    mpBeamContinuePass = createPass("continueBeamQueries");
+    mpBeamContinueArgsPass = createPass("writeBeamContinueArgs");
     mpBeamHalfExactPass = createPass("exactBeamHalf");
     mpBeamHalfExactWarpPass = createPass("exactBeamHalf");
     mpBeamResidualResolveWarpPass = createPass("resolveBeamResidual");
@@ -8166,8 +8185,34 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     }
                                     if (compactQuery)
                                         pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
+                                    // beamQueryContinueSlices: only on the plain one-thread-a-ray query.
+                                    const bool continueQuery = mParams.beamQueryContinueSlices > 0 && mParams.beamQueryStepCap > 0 &&
+                                                               !compactQuery && !mBeamRepairProbe && mParams.beamDirtySegments <= 1;
+                                    if (continueQuery)
+                                    {
+                                        if (!mpBeamContinueList)
+                                        {
+                                            // Room for 262k cut rays (the walk's whole query is ~15k rays).
+                                            mpBeamContinueList = mpDevice->createStructuredBuffer(4 * sizeof(uint32_t), 3u * 262144u);
+                                            mpBeamContinueArgs = mpDevice->createStructuredBuffer(
+                                                sizeof(uint32_t), 4, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                                                         ResourceBindFlags::IndirectArg
+                                            );
+                                        }
+                                        pRenderContext->clearUAV(mpBeamContinueArgs->getUAV().get(), uint4(0));
+                                    }
+                                    const uint32_t continueSlices = mParams.beamQueryContinueSlices;
+                                    if (!continueQuery)
+                                        mParams.beamQueryContinueSlices = 0; // The query appends only when its continuation runs.
                                     bindRenderer(pRenderContext, mpBeamDirtyQueryPass);
+                                    mParams.beamQueryContinueSlices = continueSlices;
                                     bindOutput(mpBeamDirtyQueryPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                    if (continueQuery)
+                                    {
+                                        ShaderVar var = mpBeamDirtyQueryPass->getRootVar()["CB"]["gHSTRCloud"];
+                                        var["hstrBeamContinueList"] = mpBeamContinueList;
+                                        var["hstrBeamContinueArgs"] = mpBeamContinueArgs;
+                                    }
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
                                     if (compactQuery)
                                     {
@@ -8180,6 +8225,34 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         bindRenderer(pRenderContext, mpBeamDirtyListedPass);
                                         bindOutput(mpBeamDirtyListedPass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
                                         mpBeamDirtyListedPass->executeIndirect(pRenderContext, mpBeamQueueArgs.get(), 0);
+                                    }
+                                    if (continueQuery)
+                                    {
+                                        // The query's cut rays, finished in slices, with the far sea dispatched right behind (below)
+                                        // so it fills this pass's drain instead of the query's. MEASURED (contsweep1, 4K walk,
+                                        // profiled): with the far sea between the query and this pass, its barrier waited for the far
+                                        // sea, which ran ~2x longer alone - query range ship 1.07 / 0.98, cap 32 x 8 / 16 slices
+                                        // 1.28 / 1.17, cap 24 x 16 1.21, cap 48 x 16 1.08 ms.
+                                        FALCOR_PROFILE(pRenderContext, "continue");
+                                        auto bindContinue = [&](const ref<ComputePass>& pPass)
+                                        {
+                                            bindRenderer(pRenderContext, pPass);
+                                            ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+                                            var["hstrBeamContinueList"] = mpBeamContinueList;
+                                            var["hstrBeamContinueArgs"] = mpBeamContinueArgs;
+                                        };
+                                        bindContinue(mpBeamContinueArgsPass);
+                                        mpBeamContinueArgsPass->execute(pRenderContext, uint3(1));
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_BEAM_REPAIR_PROBE", "0");
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_PUSH_SHARE", "0");
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_BEAM_DIRTY_SLICES", "0");
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0");
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "0");
+                                        mpBeamContinuePass->getProgram()->addDefine("HSTR_QUERY_COMPACT", "0");
+                                        setBeamDirtyMarchDefines(mpBeamContinuePass);
+                                        bindContinue(mpBeamContinuePass);
+                                        bindOutput(mpBeamContinuePass, "hstrBeamLatticeOutput", mpBeamLattice, "hstrBeamLattice");
+                                        mpBeamContinuePass->executeIndirect(pRenderContext, mpBeamContinueArgs.get(), 4);
                                     }
                                     if (farBesideQuery)
                                     {
@@ -8518,19 +8591,13 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 }
                 pRenderContext->clearUAV(mpBeamResidualArgs->getUAV().get(), uint4(0));
             }
-            if (!late)
-                return;
+            // beamHalfResolve's buffers and its exact list's clear, here with the residual queue's: a clear after the unit march is
+            // dispatched is a transition that waits for the march, which kept the overlapped shade from starting beside it
+            // (halftrace2: the shade began 0.1 ms after the march's last wave).
+            if (half && early)
             {
-                // seaFarOverlapScopes false: no "pixels" scope while it overlaps the march (its timestamp would wait for the march).
-                std::optional<ScopedProfilerEvent> pixelsScope;
-                if (!overlapResolve || mSeaFarOverlapScopes)
-                    pixelsScope.emplace(pRenderContext, "pixels");
-                // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
-                // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
-                // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
-                // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
-                if (half && (!mpBeamHalfFlag || mpBeamHalfFlag->getWidth() != (mParams.frameDim.x + 1u) / 2u ||
-                             mpBeamHalfFlag->getHeight() != mParams.frameDim.y))
+                if (!mpBeamHalfFlag || mpBeamHalfFlag->getWidth() != (mParams.frameDim.x + 1u) / 2u ||
+                    mpBeamHalfFlag->getHeight() != mParams.frameDim.y)
                 {
                     mpBeamHalfFlag = mpDevice->createTexture2D(
                         (mParams.frameDim.x + 1u) / 2u, mParams.frameDim.y, ResourceFormat::R8Uint, 1, 1, nullptr,
@@ -8547,8 +8614,19 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                                  ResourceBindFlags::IndirectArg
                     );
                 }
-                if (half)
-                    pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
+                pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
+            }
+            if (!late)
+                return;
+            {
+                // seaFarOverlapScopes false: no "pixels" scope while it overlaps the march (its timestamp would wait for the march).
+                std::optional<ScopedProfilerEvent> pixelsScope;
+                if (!overlapResolve || mSeaFarOverlapScopes)
+                    pixelsScope.emplace(pRenderContext, "pixels");
+                // Overlapped: no automatic UAV barriers, and nothing bound that the unit march holds in another state (the beam
+                // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
+                // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
+                // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
                 auto bindPixels = [&](const ref<ComputePass>& pPass)
                 {
                     bindRenderer(pRenderContext, pPass);

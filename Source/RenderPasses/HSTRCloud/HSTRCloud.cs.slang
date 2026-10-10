@@ -156,6 +156,8 @@ static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched
 #endif
 static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
 static bool gResolvedByBasis = false; ///< beamHalfResolve: resolveBeamPixel wrote the pixel from a tile's basis.
+static bool gQueryMarch = false; ///< Set by buildBeamDirtyQueries (constant per kernel): its marches take beamQueryStepCap.
+static float gMarchStop = -1.f;  ///< marchBeamLean: where (segment units) a march stopped at its step cap while still open; else -1.
 // resolveBeamResidualPixel: the box of units the group's pixels read, and each of those units evaluated once.
 groupshared uint2 gResidualLo;
 groupshared uint2 gResidualHi;
@@ -777,6 +779,8 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<uint> hstrBeamResidualEntry; ///< beamHalfResolve: each 8 x 8 screen group's residual queue entry, or ~0u.
     RWStructuredBuffer<uint> hstrBeamHalfExactList; ///< beamHalfResolve: fill groups with lanes to resolve exactly (group, mask x2).
     RWStructuredBuffer<uint> hstrBeamHalfExactArgs; ///< beamHalfResolve: [0] their count, [1..3] / [4..6] plain / warped dispatch.
+    RWStructuredBuffer<uint4> hstrBeamContinueList; ///< beamQueryContinueSlices: per cut ray three uint4 (beamQueryContinueAppend).
+    RWStructuredBuffer<uint> hstrBeamContinueArgs;  ///< beamQueryContinueSlices: [0] cut rays, [1..3] continueBeamQueries' dispatch.
     /// beamWarpAuto (writeBeamWarpArgs): [0..2] the warp field's dispatch, [3..5] the warped resolve's, [6..8] the plain resolve's -
     /// one of the two resolves gets no groups - and [9] the decision (1: warp), kept across builds that do not classify.
     /// beamPolicy (decideBeamPolicy): [11] the tile tolerance, as float bits ([10] unused).
@@ -4107,7 +4111,8 @@ struct HSTRCloudRenderer
 
     /// seaFarSky: everything behind the near march along w - the far sea over the sky - in one layer fetch plus the sun disk; the
     /// full sky where the layer has no texel for w.
-    /// MEASURED: pending (seafarsky1).
+    /// MEASURED (halfres1, 4K walk): resolve/pixels 0.398 / 0.376 -> 0.356 / 0.291 ms; path trace (sunset_hill_farsky2) excess
+    /// 0.024075 -> 0.023937, max 0.861 -> 0.828. On in IntelCloudSeaHalf.py.
     float3 farSeaBehind(float3 w)
     {
         const bool background = (params.hstComponents & kComponentBackground) != 0;
@@ -5806,6 +5811,7 @@ struct HSTRCloudRenderer
     BeamSample marchBeam(float3 direction, float2 segment, float startDistance = 0.f)
     {
         BeamSample result = {};
+        gMarchStop = -1.f;
 #if HSTR_UNIT_START
         gFirstDistance = -1.f;
 #endif
@@ -9076,7 +9082,11 @@ struct HSTRCloudRenderer
         // wave lit the parked samples together once pending * K >= lanes in the loop. Walk 6.01 / 6.03 -> 9.34 / 6.57 / 6.37 ms at
         // K = 1 / 2 / 4, sprint 7.47 / 7.50 -> 11.53 / 8.31 / 8.03. The light waits on memory, not on lanes: fuller waves do not
         // hide its latency better, and the parked state and the stalled traversal cost more.
-        const uint maxSteps = HSTR_STRIP == 2 ? 1u : params.maxMarchSteps; // PROBE: one step.
+        // PROBE: one step. ORACLE (beamQueryStepCap): the dirty query's rays stop after that many steps - wrong image, read for
+        // the time the query's long-ray tail costs.
+        const uint maxSteps = HSTR_STRIP == 2 ? 1u
+                              : gQueryMarch && params.beamQueryStepCap != 0 ? min(params.maxMarchSteps, params.beamQueryStepCap)
+                                                                            : params.maxMarchSteps;
 #if HSTR_FORM_B >= 2
         for (uint k = 0; k < kFormBProbeSlots; ++k)
             gFormBCount[k] = 0u;
@@ -9345,6 +9355,9 @@ struct HSTRCloudRenderer
             gTailTransmittance = transmittance;
 #endif
         }
+        // beamQueryContinueSlices: a query ray cut by its step cap while still open is finished by continueBeamQueries from here.
+        if (gQueryMarch)
+            gMarchStop = steps >= maxSteps && t < segment.y && transmittance > params.cloudMinTransmittance ? t : -1.f;
 #if HSTR_FORM_B >= 2
         [unroll]
         for (uint k = 0; k < kFormBProbeSlots; ++k)
@@ -13490,6 +13503,25 @@ struct HSTRCloudRenderer
     }
 
     /// What a marched query writes: the point itself, and the guard entry it is now entitled to vouch for.
+    /// beamQueryContinueSlices: a dirty-query ray its step cap cut while still open (gMarchStop) is listed with its partial result
+    /// instead of written: position, stop, first-density distance and steps; cache and depth; single and the opacity-weighted
+    /// distance. continueBeamQueries finishes it. Past the list's capacity the partial is written as it is.
+    void beamQueryContinueAppend(uint2 position, BeamSample ray)
+    {
+        uint slot;
+        InterlockedAdd(hstrBeamContinueArgs[0], 1u, slot);
+        uint capacity, stride;
+        hstrBeamContinueList.GetDimensions(capacity, stride);
+        if (3u * slot + 2u >= capacity)
+        {
+            beamQueryMarched(position, ray);
+            return;
+        }
+        hstrBeamContinueList[3u * slot] = uint4(position.x | (position.y << 16), asuint(gMarchStop), asuint(beamFirstDistance()), asuint(ray.steps));
+        hstrBeamContinueList[3u * slot + 1u] = uint4(asuint(ray.cache), asuint(ray.depth));
+        hstrBeamContinueList[3u * slot + 2u] = uint4(asuint(ray.single), asuint(ray.distance * (1.f - exp(-ray.depth))));
+    }
+
     void beamQueryMarched(uint2 position, BeamSample q)
     {
 #if HSTR_ORDER_PROBE
@@ -15719,6 +15751,7 @@ groupshared float2 gDirtyExtra[64];  ///< Per slice: opacity-weighted distance t
 [numthreads(64, 1, 1)]
 void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
 {
+    gQueryMarch = true;
     uint thread = foldedDirtyThread(groupId, groupThreadId.x);
 #if HSTR_LAYER_PROBE
     const uint listedGroup = thread / 64u;
@@ -15836,6 +15869,12 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     gHSTRCloud.beamStripSink(ray);
     return;
 #endif
+    // beamQueryContinueSlices: cut by beamQueryStepCap while still open - continueBeamQueries finishes and writes it.
+    if (gHSTRCloud.params.beamQueryContinueSlices != 0 && gMarchStop >= 0.f)
+    {
+        gHSTRCloud.beamQueryContinueAppend(position, ray);
+        return;
+    }
     if (!(1.f - exp(-ray.depth) > 1e-4f))
         ray.distance = 0.f; // As the sliced composition leaves it.
     gHSTRCloud.beamQueryMarched(position, ray);
@@ -15900,6 +15939,82 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     ray.distance = opacity > 1e-4f ? weighted / opacity : 0.f;
     gHSTRCloud.beamQueryMarched(position, ray);
 #endif
+}
+
+groupshared float gContinueFirst[64]; ///< continueBeamQueries: each slice's first-density distance.
+
+/// beamQueryContinueSlices: dispatch arguments for the rays the dirty query listed, beamQueryContinueSlices threads each.
+[numthreads(1, 1, 1)]
+void writeBeamContinueArgs()
+{
+    uint capacity, stride;
+    gHSTRCloud.hstrBeamContinueList.GetDimensions(capacity, stride);
+    const uint rays = min(gHSTRCloud.hstrBeamContinueArgs[0], capacity / 3u);
+    const uint slices = clamp(gHSTRCloud.params.beamQueryContinueSlices, 1u, 64u);
+    gHSTRCloud.hstrBeamContinueArgs[1] = min((rays * slices + 63u) / 64u, 65535u);
+    gHSTRCloud.hstrBeamContinueArgs[2] = 1u;
+    gHSTRCloud.hstrBeamContinueArgs[3] = 1u;
+}
+
+/// beamQueryContinueSlices: the dirty query's long rays, finished. The query marches at most beamQueryStepCap steps; a ray still
+/// open there is listed with its partial result, and here beamQueryContinueSlices consecutive threads march equal slices of the
+/// rest of it and its lead composes partial and slices front to back, (C, T) = (C_a + T_a C_b, T_a T_b), as the sliced query does,
+/// then writes it. The last rays no longer drain alone on an idle GPU: a ray of n steps past the cap takes ~n / slices. Each slice
+/// starts fresh (step, transmittance-driven step size, cell traversal), as the sliced query's do: not the unbroken march.
+[numthreads(64, 1, 1)]
+void continueBeamQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_GroupThreadID)
+{
+    const uint slices = clamp(gHSTRCloud.params.beamQueryContinueSlices, 1u, 64u);
+    const uint thread = groupId.x * 64u + groupThreadId.x;
+    const uint entry = thread / slices;
+    const uint slice = thread % slices;
+    const uint lead = groupThreadId.x - slice;
+    uint capacity, stride;
+    gHSTRCloud.hstrBeamContinueList.GetDimensions(capacity, stride);
+    const bool valid = entry < min(gHSTRCloud.hstrBeamContinueArgs[0], capacity / 3u);
+    const uint4 head = valid ? gHSTRCloud.hstrBeamContinueList[3u * entry] : uint4(0u);
+    const uint2 position = uint2(head.x & 0xFFFFu, head.x >> 16);
+    BeamSample sample = {};
+    float first = -1.f;
+    if (valid)
+    {
+        const float start = asfloat(head.y);
+        const float2 segment = start + (1.f - start) * float2(float(slice), float(slice + 1u)) / float(slices);
+        sample = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), segment);
+        first = gHSTRCloud.beamFirstDistance();
+    }
+    gBeamDepthCache[groupThreadId.x] = float4(sample.cache, sample.depth);
+    gBeamSingle[groupThreadId.x] = float4(sample.single, 0.f);
+    gDirtyExtra[groupThreadId.x] = float2(sample.distance * (1.f - exp(-sample.depth)), sample.steps);
+    gContinueFirst[groupThreadId.x] = first;
+    GroupMemoryBarrierWithGroupSync();
+    if (!valid || slice != 0)
+        return;
+    const uint4 cacheDepth = gHSTRCloud.hstrBeamContinueList[3u * entry + 1u];
+    const uint4 singleWeighted = gHSTRCloud.hstrBeamContinueList[3u * entry + 2u];
+    BeamSample ray = {};
+    ray.cache = asfloat(cacheDepth.xyz);
+    ray.depth = asfloat(cacheDepth.w);
+    ray.single = asfloat(singleWeighted.xyz);
+    ray.steps = asfloat(head.w);
+    float weighted = asfloat(singleWeighted.w);
+    first = asfloat(head.z);
+    for (uint k = 0; k < slices; ++k)
+    {
+        const float transmittance = exp(-ray.depth);
+        ray.cache += transmittance * gBeamDepthCache[lead + k].rgb;
+        ray.single += transmittance * gBeamSingle[lead + k].rgb;
+        weighted += transmittance * gDirtyExtra[lead + k].x;
+        ray.depth += gBeamDepthCache[lead + k].a;
+        ray.steps += gDirtyExtra[lead + k].y;
+        first = first >= 0.f ? first : gContinueFirst[lead + k];
+    }
+    const float opacity = 1.f - exp(-ray.depth);
+    ray.distance = opacity > 1e-4f ? weighted / opacity : 0.f;
+#if HSTR_UNIT_START
+    gFirstDistance = first; // beamQueryMarched writes beamFirstDistance(): the ray's, not the lead slice's.
+#endif
+    gHSTRCloud.beamQueryMarched(position, ray);
 }
 
 /// The first listed unit the units pass marches: after the fused chain, the ones it did not take.

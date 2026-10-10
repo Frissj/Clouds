@@ -478,6 +478,10 @@ private:
     ref<Buffer> mpBeamResidualEntry;               ///< beamHalfResolve: hstrBeamResidualEntry, one uint per 8 x 8 screen group.
     ref<Buffer> mpBeamHalfExactList;               ///< beamHalfResolve: hstrBeamHalfExactList, three uints per fill group.
     ref<Buffer> mpBeamHalfExactArgs;               ///< beamHalfResolve: hstrBeamHalfExactArgs (count, two dispatches).
+    LazyComputePass mpBeamContinuePass;            ///< beamQueryContinueSlices: continueBeamQueries.
+    LazyComputePass mpBeamContinueArgsPass;        ///< beamQueryContinueSlices: writeBeamContinueArgs.
+    ref<Buffer> mpBeamContinueList;                ///< hstrBeamContinueList: three uint4 a cut ray.
+    ref<Buffer> mpBeamContinueArgs;                ///< hstrBeamContinueArgs: count, then the dispatch.
     LazyComputePass mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
     ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.
     uint32_t mBeamWarpHeld = 0;   ///< The compared frame's guard blocks held (hstrBeamDirtyCount[2]) ...

@@ -88,6 +88,17 @@ g.addPass(createPass("HSTRCloud", {
     # farSea 0.650 / 0.636 -> 0.578 (1) / 0.499 (2) / 0.470 ms (8). Path trace, horizon band of sunset_hill_farfoot1 (6.9k px):
     # rms log 0.1476 / 0.1477 -> 0.1470 (2), p99 0.495 -> 0.502; sanity cap 32 0.1593 / 0.589.
     "seaFarFootprint": 2.0,
+    # The far layer stored over the smooth sky: the resolve takes sky and far sea behind in one fetch. halfres1 (4K walk):
+    # resolve/pixels 0.398 / 0.376 -> 0.356 / 0.291 ms. Path trace (sunset_hill_farsky2): excess 0.024075 -> 0.023937, p99 0.4871
+    # both, max 0.861 -> 0.828.
+    "seaFarSky": True,
+    # Checkerboard resolve: one parity resolved, the other the mean of its four neighbours where all came from a basis and agree
+    # within beamHalfContrast, the rest resolved exactly. An explicit approximation. GPU trace, 4K walk, same frames: HSTRCloud
+    # 2.98 / 3.34 (warplines1) -> 2.86 / 3.21 ms (halftrace3), resolve range 0.66 / 0.67 -> 0.52 / 0.56. Path trace
+    # (sunset_hill_farsky2, 960 x 540 - fewer pixels a beam unit than 4K, so the mean errs more there): excess 0.024075 ->
+    # 0.024076. Moving (halfscore2, with seaFarSky, alternated at matched positions, % over 0.02): off 6.48 / 5.41 / 6.07 / 6.14,
+    # on 6.52 / 2.17 / 6.14 / 5.62.
+    "beamHalfResolve": True,
     # Sun bakes a frame while the camera moves (HSTRCloud.cpp's default 256 was tuned on frame time alone, when a bake cost less).
     # 4K sunset walk, bakeCloudSun ms / over 0.02 (motion score 2): bakes1 256 0.73 / 2.52%, 128 0.35 / 2.28%, 64 0.19 / 2.26%,
     # 256 again 0.63 / 2.73%; bakeexit1 256 1.01 / 2.41%, 128 0.50 / 2.25%, 256 again 0.80 / 2.26%. Sprint scores swung 3-11% on

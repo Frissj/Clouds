@@ -2101,12 +2101,27 @@ struct HSTRCloudParams
     uint seaFarSky = 0;
     /// beamHalfResolve: the pixel resolve shades one checkerboard parity (resolveBeamHalf) and fills the other (fillBeamHalf) from
     /// its four neighbours where all came from a basis and agree within beamHalfContrast (log(1 + radiance) per channel), else
-    /// resolves it exactly. An explicit approximation.
+    /// resolves it exactly. An explicit approximation. On in IntelCloudSeaHalf.py (MEASURED there: -0.12 ms a frame in the GPU
+    /// trace, quality within the anchors). Its exact list's clear runs with the residual queue's, before the unit march: after it,
+    /// the clear's transition waited for the march and the shade lost the overlap (halftrace2: resolve range 0.81-0.82 ms).
     uint beamHalfResolve = 0;
     float beamHalfContrast = 0.05f;
     /// DIAGNOSTIC (beamHalfProbe): the kBeamHalfProbe counters. Off by default: a wave atomic on the same few addresses from every
     /// wave of the 4K resolve is itself expensive.
     uint beamHalfProbe = 0;
+    /// ORACLE (beamQueryStepCap, 0 off): the dirty query's marches stop after this many steps (marchBeamLean). Wrong image; the
+    /// time it saves bounds what any long-ray continuation of the query can win (querytail1: mean 21 steps, max 95).
+    uint beamQueryStepCap = 0;
+    /// beamQueryContinueSlices (0 off; a power of two up to 64, with beamQueryStepCap): the query's rays cut by the cap while still
+    /// open are finished by continueBeamQueries, this many threads a ray. The cap stops being an oracle: no ray loses its rest.
+    /// Ceiling (querycap1, 4K walk, query / resolve leaves in the same frames, seaFarOverlapScopes on): ship 1.81 / 1.74, cap 48
+    /// 1.46, 32 1.12, 24 1.02 - the far sea beside the query (the default) already fills part of that idle tail.
+    /// MEASURED, left off: quality holds (contscore1, % over 0.02 at matched positions: ship 5.94 / 5.58 / 5.78, cap 32 x 4 slices
+    /// 5.79 / 4.82 / 5.08; the cap alone 5.71 / 6.15 / 5.64 - the score barely sees the tail). Time does not: with the far sea
+    /// between query and continuation, every arm was slower (contsweep1, noted at the dispatch); with the far sea behind the
+    /// continuation (GPU trace conttrace1, cap 32 x 16 slices) the query range is 1.03 / 1.08 ms against 1.02 / 1.03 shipped
+    /// (warplines1) - the continuation's 0.23 ms replaces the drain it removes.
+    uint beamQueryContinueSlices = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.
