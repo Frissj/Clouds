@@ -280,6 +280,9 @@ public:
     /// Bricks committed a frame, at most desc.loadsPerFrame (the staging capacity); a runtime cap, so it changes without a rebuild.
     void setLoadCap(uint32_t cap) { mLoadCap = std::clamp(cap, 1u, mDesc.loadsPerFrame); }
     void setScatterUploads(bool on) { mScatterUploads = on; }
+    /// A table scatters whenever its changed elements cost fewer bytes than its dirty blocks (up to half the table), not only up
+    /// to an eighth of it.
+    void setScatterDense(bool on) { mScatterDense = on; }
     void addScatterChecks(uint32_t frames) { mScatterCheck += frames; }
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
@@ -613,6 +616,7 @@ private:
     ScatterSet mSchedScatter; ///< HSTRCloudSunSched (gpuSun).
     ScatterSet mStateScatter; ///< Live sun scheduler states (gpuSun).
     bool mScatterUploads = true;
+    bool mScatterDense = false; ///< setScatterDense.
     uint32_t mScatterCheck = 0; ///< DIAGNOSTIC: frames left to compare the GPU tables with the CPU's.
     std::vector<uint32_t> mScatterIndex;
     std::vector<uint32_t> mScatterData;

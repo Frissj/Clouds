@@ -60,9 +60,9 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mSchedScatter.reset(brickCapacity);
     mStateScatter.reset(brickCapacity);
     {
-        // Each table scatters up to an eighth of its elements a frame; more go as runs of dirty blocks.
-        const uint32_t indices = nodeCapacity / 8 + 3 * (brickCapacity / 8) + 4;
-        const uint32_t words = (nodeCapacity / 8) * 64 + (brickCapacity / 8) * (8 + 2 + 1) + 4;
+        // Each table scatters up to half its elements a frame (an eighth without setScatterDense); more go as runs of dirty blocks.
+        const uint32_t indices = nodeCapacity / 2 + 3 * (brickCapacity / 2) + 4;
+        const uint32_t words = (nodeCapacity / 2) * 64 + (brickCapacity / 2) * (8 + 2 + 1) + 4;
         mScatterIndex.reserve(indices);
         mScatterData.reserve(words);
         mpScatterIndex = mpDevice->createStructuredBuffer(
@@ -2513,10 +2513,18 @@ void CloudResidency::upload()
     std::vector<ScatterJob> jobs;
     mScatterIndex.clear();
     mScatterData.clear();
-    auto scatter = [&](ScatterSet& set, std::vector<uint8_t>& blocks, const void* pTable, uint32_t words, ComputePass* pPass,
-                       Buffer* pTarget, const char* var)
+    auto scatter = [&](ScatterSet& set, std::vector<uint8_t>& blocks, size_t blockElements, const void* pTable, uint32_t words,
+                       ComputePass* pPass, Buffer* pTarget, const char* var)
     {
-        const bool taken = mScatterUploads && !set.list.empty() && set.list.size() <= set.flag.size() / 8;
+        // setScatterDense: whichever sends fewer bytes - the changed elements with their indices, or the dirty blocks whole - up to
+        // half the table; otherwise the elements while they are at most an eighth of it.
+        bool cheaper = set.list.size() <= set.flag.size() / 8;
+        if (mScatterDense)
+        {
+            const size_t dirtyBlocks = size_t(std::count_if(blocks.begin(), blocks.end(), [](uint8_t b) { return b != 0; }));
+            cheaper = set.list.size() <= set.flag.size() / 2 && set.list.size() * (words + 1) <= dirtyBlocks * blockElements * words;
+        }
+        const bool taken = mScatterUploads && !set.list.empty() && cheaper;
         if (taken)
         {
             const uint32_t count = uint32_t(set.list.size());
@@ -2535,16 +2543,16 @@ void CloudResidency::upload()
         set.clear();
         return taken;
     };
-    if (!scatter(mNodeScatter, mNodeBlocksDirty, mNodes.data(), 64, mpScatterUints.get(), mpNodes.get(), "gUints"))
+    if (!scatter(mNodeScatter, mNodeBlocksDirty, kNodeBlock, mNodes.data(), 64, mpScatterUints.get(), mpNodes.get(), "gUints"))
         uploadRuns(mNodeBlocksDirty, size_t(kNodeBlock) * 64, mNodes.data(), mNodes.size(), sizeof(uint32_t), mpNodes.get());
-    if (!scatter(mBrickScatter, mBrickBlocksDirty, mBricks.data(), 8, mpScatterBricks.get(), mpBricks.get(), "gBricks"))
+    if (!scatter(mBrickScatter, mBrickBlocksDirty, kBrickBlock, mBricks.data(), 8, mpScatterBricks.get(), mpBricks.get(), "gBricks"))
         uploadRuns(mBrickBlocksDirty, kBrickBlock, mBricks.data(), mBricks.size(), sizeof(HSTRCloudBrick), mpBricks.get());
     if (mDesc.gpuSun)
     {
-        if (!scatter(mSchedScatter, mSunSchedBlocksDirty, mSunSched.data(), 2, mpScatterSched.get(), mpSunSched.get(), "gSched"))
+        if (!scatter(mSchedScatter, mSunSchedBlocksDirty, kBrickBlock, mSunSched.data(), 2, mpScatterSched.get(), mpSunSched.get(), "gSched"))
             uploadRuns(mSunSchedBlocksDirty, kBrickBlock, mSunSched.data(), mSunSched.size(), sizeof(HSTRCloudSunSched), mpSunSched.get());
         const auto& state = mSunState[mSunStateLive];
-        if (!scatter(mStateScatter, mSunStateBlocksDirty, state.data(), 1, mpScatterUints.get(), mpSunState.get(), "gUints"))
+        if (!scatter(mStateScatter, mSunStateBlocksDirty, kBrickBlock, state.data(), 1, mpScatterUints.get(), mpSunState.get(), "gUints"))
             uploadRuns(mSunStateBlocksDirty, kBrickBlock, state.data(), state.size(), sizeof(uint32_t), mpSunState.get());
     }
     if (!jobs.empty())
@@ -2837,7 +2845,10 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         // cloudSunEvery n: the scheduling runs every nth frame with n times the bake cap, so its capacity-wide passes (scan, emit,
         // the stamps' field) run 1 / n as often for the same bakes. The frames between run only the releases: an unloaded brick's
         // pairs are cleared before a load can reuse its index (which would read them meanwhile). Changes and resets wait.
-        if (mSunEvery > 1 && mFrame % mSunEvery != 0)
+        // Only under a cap (the camera moving): uncapped, a run bakes at most sunBakesPerFrame (the bake buffer's size), so every
+        // nth frame drained a parked backlog at 1 / n the rate (sunset_hill_farsky1: 154k bakes still waiting after the 600-frame
+        // settle at 255 bakes a frame, against 0 at 1024 a frame in sunset_hill_bakestep5 - the hill gates scored a half-baked sun).
+        if (mSunEvery > 1 && mSunBakesCap > 0 && mFrame % mSunEvery != 0)
         {
             mStats.sunBakesFrame = 0;
             const uint32_t releases = uint32_t(std::min(mSunRelease.size(), mSunSched.size()));

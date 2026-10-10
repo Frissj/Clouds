@@ -565,6 +565,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudScatterUploads = bool(value);
             continue;
         }
+        if (key == "cloudScatterDense")
+        {
+            mCloudScatterDense = bool(value);
+            continue;
+        }
         if (key == "cloudSunLiveDirty")
         {
             mCloudSunLiveDirty = bool(value);
@@ -1058,6 +1063,34 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "seaFarFootprint")
         {
             mParams.seaFarFootprint = float(value);
+            continue;
+        }
+        if (key == "seaFarSky")
+        {
+            // The layer's meaning changes: rebuild it, and read no layer until then. Stored beam units change meaning too (set
+            // beamReset with it).
+            const uint32_t on = bool(value) ? 1u : 0u;
+            if (on != mParams.seaFarSky)
+            {
+                mFarSeaDirty = true;
+                mFarLayerValid = false;
+            }
+            mParams.seaFarSky = on;
+            continue;
+        }
+        if (key == "beamHalfResolve")
+        {
+            mParams.beamHalfResolve = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "beamHalfContrast")
+        {
+            mParams.beamHalfContrast = float(value);
+            continue;
+        }
+        if (key == "beamHalfProbe")
+        {
+            mParams.beamHalfProbe = bool(value) ? 1u : 0u;
             continue;
         }
         if (key == "cloudSunBakeStep")
@@ -1902,6 +1935,9 @@ Properties HSTRCloud::getProperties() const
     props["beamUnitSpanDilate"] = mParams.beamUnitSpanDilate;
     props["seaFarCap"] = mParams.seaFarCap;
     props["seaFarFootprint"] = mParams.seaFarFootprint;
+    props["seaFarSky"] = mParams.seaFarSky != 0;
+    props["beamHalfResolve"] = mParams.beamHalfResolve != 0;
+    props["beamHalfContrast"] = mParams.beamHalfContrast;
     props["cloudSunBakeStepResets"] = mCloudSunBakeStepResets;
     props["cloudSunScanWave"] = mCloudSunScanWave;
     props["cloudSunStampSplit"] = mCloudSunStampSplit;
@@ -2486,6 +2522,9 @@ Properties HSTRCloud::getProperties() const
             const char* lookupNames[3] = {"Lanes", "SameInstance", "SamePage"};
             for (uint32_t k = 0; k < 3; ++k)
                 cloud[std::string("beamLookup") + lookupNames[k]] = mBeamLevelCounts[kBeamLookupProbe + k];
+            const char* halfNames[6] = {"Filled", "NotBasis", "Contrast", "ShadedBasis", "FillWaves", "FillWavesExact"};
+            for (uint32_t k = 0; k < 6; ++k)
+                cloud[std::string("beamHalf") + halfNames[k]] = mBeamLevelCounts[kBeamHalfProbe + k];
             cloud["beamLayerLaneSteps"] = mBeamLevelCounts[kBeamLayerSteps];
             cloud["beamLayerPaidSteps"] = mBeamLevelCounts[kBeamLayerSteps + 1];
             cloud["beamLayerWarps"] = mBeamLevelCounts[kBeamLayerSteps + 2];
@@ -2717,6 +2756,12 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamWarpArgsPass = nullptr;
     mpBeamPolicyPass = nullptr;
     mpBeamResolveWarpPass = nullptr;
+    mpBeamHalfShadePass = nullptr;
+    mpBeamHalfShadeWarpPass = nullptr;
+    mpBeamHalfFillPass = nullptr;
+    mpBeamHalfExactArgsPass = nullptr;
+    mpBeamHalfExactPass = nullptr;
+    mpBeamHalfExactWarpPass = nullptr;
     mpBeamResidualResolveWarpPass = nullptr;
     mpBeamMarchPass = nullptr;
     mpBeamClassifyPass = nullptr;
@@ -2806,6 +2851,12 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
     mpBeamPolicyPass = createPass("decideBeamPolicy");
     mpBeamResolveWarpPass = createPass("resolveBeam");
+    mpBeamHalfShadePass = createPass("resolveBeamHalf");
+    mpBeamHalfShadeWarpPass = createPass("resolveBeamHalf");
+    mpBeamHalfFillPass = createPass("fillBeamHalf");
+    mpBeamHalfExactArgsPass = createPass("writeBeamHalfExactArgs");
+    mpBeamHalfExactPass = createPass("exactBeamHalf");
+    mpBeamHalfExactWarpPass = createPass("exactBeamHalf");
     mpBeamResidualResolveWarpPass = createPass("resolveBeamResidual");
     mpBeamSparseResolvePass = createPass("resolveBeamSparse");
     mpBeamResidualResolvePass = createPass("resolveBeamResidual");
@@ -4037,6 +4088,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setLoadsBesideCut(mCloudLoadsBesideCut);
     mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame);
     mpCloudResidency->setScatterUploads(mCloudScatterUploads);
+    mpCloudResidency->setScatterDense(mCloudScatterDense);
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
@@ -5551,7 +5603,7 @@ void bindOutput(const ref<ComputePass>& pPass, const char* output, const ref<Tex
 
 /// This frame's far-sea run (renderFarSea), writing the layer the composites read next frame. Four threads a texel, one per
 /// stretch of its ray.
-void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
+void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext, uint32_t rowOffset, uint32_t rowStride, bool last)
 {
     // A profiler scope writes GPU timestamps, which wait for all earlier work: around a run meant to overlap the unit march it
     // serialises the two. seaFarOverlapScopes false drops this scope and the march's "units" scope while they overlap, so only
@@ -5576,7 +5628,12 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
     // is register-bound (31% of its time waiting on register allocation, viewv2000 trace), but dropping these counters changed
     // its allocation for the worse.
     pPass->getProgram()->addDefine("HSTR_FAR_PROBE", (mParams.seaFarProbe & 128u) != 0 ? "0" : "1");
+    mParams.seaFarRowOffset = rowOffset;
+    mParams.seaFarRowStride = std::max(rowStride, 1u);
+    const uint32_t rows = mFarRunDims.y > rowOffset ? (mFarRunDims.y - rowOffset + mParams.seaFarRowStride - 1) / mParams.seaFarRowStride : 0u;
     bindRenderer(pRenderContext, pPass);
+    mParams.seaFarRowOffset = 0;
+    mParams.seaFarRowStride = 1;
     ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
     var["hstrFarFieldOutput"] = mpFarField[mFarCurrent ^ 1u];
     var["hstrFarDistanceOutput"] = mpFarDistance[mFarCurrent ^ 1u];
@@ -5602,7 +5659,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
         pRenderContext->clearUAV(mpFarCounts->getUAV().get(), uint4(0));
         var["hstrFarCounts"] = mpFarCounts;
     }
-    pPass->execute(pRenderContext, uint3(mFarRunDims, 1));
+    pPass->execute(pRenderContext, uint3(mFarRunDims.x, rows, 1));
     if (counting)
     {
         // DIAGNOSTIC: stalls for the readback.
@@ -5635,7 +5692,8 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext)
             mFarSeaRuns, c[23], c[24], c[25]
         );
     }
-    mFarRunDeferred = false;
+    if (last)
+        mFarRunDeferred = false;
 }
 
 void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
@@ -8010,7 +8068,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                                            : 0u;
                                 // seaFarBeside 1: the deferred far-sea run (seaFarOverlap) goes right behind the dirty query instead
                                 // of beside the unit march, with no barrier between them.
-                                const bool farBesideQuery = !mBeamFusedBuild && mFarRunDeferred && mSeaFarBeside == 1u;
+                                // seaFarBeside 2: its even rows there, its odd rows beside the unit march.
+                                const bool farBesideQuery = !mBeamFusedBuild && mFarRunDeferred && mSeaFarBeside >= 1u;
                                 if (!mBeamFusedBuild)
                                 {
                                     std::optional<ScopedProfilerEvent> queryScope;
@@ -8142,7 +8201,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         }
                                         pRenderContext->setAutoUavBarriers(false);
                                         mFarBesideNow = true;
-                                        dispatchFarSea(pRenderContext);
+                                        mFarSplitRest = mSeaFarBeside == 2u;
+                                        if (mFarSplitRest)
+                                            dispatchFarSea(pRenderContext, 0, 2, false);
+                                        else
+                                            dispatchFarSea(pRenderContext);
                                         mFarBesideNow = false;
                                         pRenderContext->setAutoUavBarriers(true);
                                         if (mSeaFarOverlapLog > 0)
@@ -8278,7 +8341,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         auto resolve = [&](bool early, bool late)
         {
             FALCOR_PROFILE(pRenderContext, late ? "resolve" : "resolveEarly");
-            const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : mpBeamResolvePass;
+            // beamHalfResolve: the shaded parity takes the resolve's place (its fill follows it, with the same defines).
+            const bool half = mParams.beamHalfResolve != 0 && !mBeamSparseBuilt;
+            const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : half ? mpBeamHalfShadePass : mpBeamResolvePass;
+            const ref<ComputePass>& pResolveWarp = half ? mpBeamHalfShadeWarpPass : mpBeamResolveWarpPass;
             // A define, not a branch on a parameter: compiled in, the warp cost the resolve 0.45 -> 0.74 ms at 4K whether it was
             // on or off (budgetwarp2) - registers, as with the residual below.
             const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
@@ -8295,7 +8361,20 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             const char* path = mParams.beamPathCode != 0 && mpBeamGuardWhy ? "1" : "0";
             pResolve->getProgram()->addDefine("HSTR_BEAM_PATH", path);
             if (warpAuto)
-                mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+                pResolveWarp->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+            if (half)
+            {
+                // The exact pass resolves the pixels the fill could not fill, so it compiles as the shaded half does.
+                mpBeamHalfExactPass->getProgram()->addDefine("HSTR_BEAM_WARP", warp && !warpAuto ? "1" : "0");
+                mpBeamHalfExactPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+                mpBeamHalfExactPass->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+                if (warpAuto)
+                {
+                    mpBeamHalfExactWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
+                    mpBeamHalfExactWarpPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+                    mpBeamHalfExactWarpPass->getProgram()->addDefine("HSTR_BEAM_PATH", path);
+                }
+            }
             if (late && mParams.beamPathCode != 0)
             {
                 if (!mpBeamPathCode || mpBeamPathCode->getWidth() != mParams.frameDim.x || mpBeamPathCode->getHeight() != mParams.frameDim.y)
@@ -8308,7 +8387,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             mpBeamResidualResolvePass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
             if (warpAuto)
             {
-                mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
+                pResolveWarp->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
                 mpBeamResidualResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_HISTORY", history);
             }
             if (warp)
@@ -8450,11 +8529,38 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 // pixels it writes, the dirty arguments it was launched from, the warp arguments it left unbound), since any state
                 // transition would wait for the march as surely as a barrier. The pixel pass reads none of them. hstrBeamPixelPrev is the
                 // same texture as the beam pixels in the reference frame (ngfx9: its UAV -> SRV transition was the one barrier left).
+                if (half && (!mpBeamHalfFlag || mpBeamHalfFlag->getWidth() != (mParams.frameDim.x + 1u) / 2u ||
+                             mpBeamHalfFlag->getHeight() != mParams.frameDim.y))
+                {
+                    mpBeamHalfFlag = mpDevice->createTexture2D(
+                        (mParams.frameDim.x + 1u) / 2u, mParams.frameDim.y, ResourceFormat::R8Uint, 1, 1, nullptr,
+                        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+                    );
+                    mpBeamResidualEntry = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), ((mParams.frameDim.x + 7u) / 8u) * ((mParams.frameDim.y + 7u) / 8u)
+                    );
+                    mpBeamHalfExactList = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 3u * ((mParams.frameDim.x + 15u) / 16u) * ((mParams.frameDim.y + 7u) / 8u)
+                    );
+                    mpBeamHalfExactArgs = mpDevice->createStructuredBuffer(
+                        sizeof(uint32_t), 7, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource |
+                                                 ResourceBindFlags::IndirectArg
+                    );
+                }
+                if (half)
+                    pRenderContext->clearUAV(mpBeamHalfExactArgs->getUAV().get(), uint4(0));
                 auto bindPixels = [&](const ref<ComputePass>& pPass)
                 {
                     bindRenderer(pRenderContext, pPass);
                     ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
                     var["color"] = color;
+                    if (half)
+                    {
+                        var["hstrBeamHalfFlag"] = mpBeamHalfFlag;
+                        var["hstrBeamResidualEntry"] = mpBeamResidualEntry;
+                        var["hstrBeamHalfExactList"] = mpBeamHalfExactList;
+                        var["hstrBeamHalfExactArgs"] = mpBeamHalfExactArgs;
+                    }
                     if (overlapResolve)
                     {
                         var["hstrBeamPixels"] = ref<Texture>();
@@ -8466,19 +8572,70 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 };
                 if (overlapResolve)
                     pRenderContext->setAutoUavBarriers(false);
-                if (warpAuto)
+                // beamHalfResolve: a thread per pixel of one parity, 8 x 8 threads a 16 x 8 pixel group (resolveBeamHalfGroup).
+                const uint3 threads = half ? uint3((mParams.frameDim.x + 15u) / 16u * 8u, mParams.frameDim.y, 1) : uint3(mParams.frameDim, 1);
+                auto dispatch = [&](const ref<ComputePass>& pPlain, const ref<ComputePass>& pWarp)
                 {
-                    // Bytes: the warped resolve's arguments at [3..5], the plain one's at [6..8].
-                    mpBeamResolveWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
-                    bindPixels(mpBeamResolveWarpPass);
-                    mpBeamResolveWarpPass->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 12);
-                    bindPixels(pResolve);
-                    pResolve->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 24);
+                    if (warpAuto)
+                    {
+                        // Bytes: the warped resolve's arguments at [3..5], the plain one's at [6..8].
+                        pWarp->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
+                        bindPixels(pWarp);
+                        pWarp->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 12);
+                        bindPixels(pPlain);
+                        pPlain->executeIndirect(pRenderContext, mpBeamWarpArgs.get(), 24);
+                    }
+                    else
+                    {
+                        bindPixels(pPlain);
+                        pPlain->execute(pRenderContext, threads);
+                    }
+                };
+                {
+                    std::optional<ScopedProfilerEvent> shadeScope;
+                    if (half && pixelsScope)
+                        shadeScope.emplace(pRenderContext, "shade");
+                    dispatch(pResolve, pResolveWarp);
                 }
-                else
+                if (half)
                 {
-                    bindPixels(pResolve);
-                    pResolve->execute(pRenderContext, uint3(mParams.frameDim, 1));
+                    std::optional<ScopedProfilerEvent> fillScope;
+                    if (pixelsScope)
+                        fillScope.emplace(pRenderContext, "fill");
+                    // The fill reads the shaded half's colour and flags, and adds to its residual entries. With the overlap, this
+                    // barrier also waits for the unit march: the fill alone gives up the overlap.
+                    pRenderContext->uavBarrier(color.get());
+                    pRenderContext->uavBarrier(mpBeamHalfFlag.get());
+                    pRenderContext->uavBarrier(mpBeamResidualEntry.get());
+                    if (mpBeamResidualList)
+                    {
+                        pRenderContext->uavBarrier(mpBeamResidualList.get());
+                        pRenderContext->uavBarrier(mpBeamResidualArgs.get());
+                    }
+                    bindPixels(mpBeamHalfFillPass);
+                    mpBeamHalfFillPass->execute(pRenderContext, threads);
+                }
+                if (half)
+                {
+                    // The fill's listed pixels, exactly, in their own dispatch (the resolve's registers stay out of the fill).
+                    std::optional<ScopedProfilerEvent> exactScope;
+                    if (pixelsScope)
+                        exactScope.emplace(pRenderContext, "exact");
+                    pRenderContext->uavBarrier(mpBeamHalfExactArgs.get());
+                    pRenderContext->uavBarrier(mpBeamHalfExactList.get());
+                    pRenderContext->uavBarrier(color.get());
+                    bindPixels(mpBeamHalfExactArgsPass);
+                    mpBeamHalfExactArgsPass->execute(pRenderContext, uint3(1));
+                    pRenderContext->uavBarrier(mpBeamHalfExactArgs.get());
+                    // Bytes: the plain dispatch after the count, the warped one after that (writeBeamHalfExactArgs).
+                    bindPixels(mpBeamHalfExactPass);
+                    mpBeamHalfExactPass->executeIndirect(pRenderContext, mpBeamHalfExactArgs.get(), 4);
+                    if (warpAuto)
+                    {
+                        mpBeamHalfExactWarpPass->getProgram()->addDefine("HSTR_BEAM_WARP", "1");
+                        bindPixels(mpBeamHalfExactWarpPass);
+                        mpBeamHalfExactWarpPass->executeIndirect(pRenderContext, mpBeamHalfExactArgs.get(), 16);
+                    }
                 }
                 pRenderContext->setAutoUavBarriers(true);
             }
@@ -8793,7 +8950,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                             pRenderContext->setLogBarriers(true);
                         }
                         mFarBesideNow = true;
-                        dispatchFarSea(pRenderContext);
+                        if (mFarSplitRest)
+                            dispatchFarSea(pRenderContext, 1, 2, true);
+                        else
+                            dispatchFarSea(pRenderContext);
+                        mFarSplitRest = false;
                         mFarBesideNow = false;
                         if (mSeaFarOverlapLog > 0)
                             logInfo("BARRIER --- units dispatch");

@@ -53,7 +53,11 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 484;
+static const uint kBeamCountSlots = 490;
+/// beamHalfResolve counters (always on with it): filled pixels, and the exact ones because a neighbour was not from a basis, or
+/// because the neighbours disagreed past beamHalfContrast; then the shaded half's basis pixels; the fill's waves, and those with
+/// any lane resolved exactly (which pays the whole resolve for the wave). Counted only under beamHalfProbe.
+static const uint kBeamHalfProbe = 484;
 /// beamLayerProbe ORACLE: the lean marches' brick lookups (lanes), and of those the lanes whose whole active wave looks up the same
 /// instance, and the same instance and level page - what a wave-uniform (scalarised) lookup could share.
 /// MEASURED (lookupuni1, 4K sunset walk, residency fixed, 4 counted frames): 1.31M lookup lanes a frame, 88% in waves on one
@@ -834,6 +838,9 @@ struct HSTRCloudParams
 
     uint cloudSunOldestGeneration = 0; ///< Oldest sun generation whose bakes still answer (only the sun direction changed since).
     float cloudThinDepth = 0.f; ///< Camera marches treat brick cells whose density bound gives at most this optical depth across as empty.
+    /// MEASURED (thintime1, 4K sunset walk, residency fixed, 30 profiled frames an arm; query + units): base 1.516, thin 0.05 1.448,
+    /// cloudMinTransmittance 0.02 1.430, both 1.418, base again 1.462 ms - within the anchors' 0.05 ms spread, against their known
+    /// error cost. Neither taken.
     /// 1: camera steps with a zero majorant cross the whole zero 16-voxel block (hstrMajorantZero). MEASURED (4K c15): sea 32.0 ->
     /// 29.1 ms, near 38.2 -> 40.7 ms - it pays where a view crosses a lot of empty sea and costs a little where it does not.
     /// Above 1, how many consecutive empty blocks one step may cross. The sea marches 30.00 steps a pixel of which 17.81 are these
@@ -2084,6 +2091,22 @@ struct HSTRCloudParams
     /// resolveCloudSunSlots resolves only the bricks in hstrCloudSunTouchList (this many): the bricks loaded since the last resolve,
     /// on frames without a scheduling run (cloudSunResolveLoads). 0 resolves every brick.
     uint cloudSunResolveList = 0;
+    /// seaFarBeside 2: a far-sea dispatch covers rows seaFarRowOffset + k * seaFarRowStride (half beside the query, half beside the
+    /// unit march).
+    uint seaFarRowOffset = 0;
+    uint seaFarRowStride = 1;
+    /// seaFarSky: the far layer is stored as the far sea over the smooth sky (sky-view LUT, no sun disk), so the beam composite takes
+    /// sky and far sea behind in one fetch (farSeaBehind) plus the disk; stored units are kept without their background. The
+    /// legacy per-pixel paths (beamRefresh's marchBeamAt, beamSubTiles' corner means) are not converted: off with it.
+    uint seaFarSky = 0;
+    /// beamHalfResolve: the pixel resolve shades one checkerboard parity (resolveBeamHalf) and fills the other (fillBeamHalf) from
+    /// its four neighbours where all came from a basis and agree within beamHalfContrast (log(1 + radiance) per channel), else
+    /// resolves it exactly. An explicit approximation.
+    uint beamHalfResolve = 0;
+    float beamHalfContrast = 0.05f;
+    /// DIAGNOSTIC (beamHalfProbe): the kBeamHalfProbe counters. Off by default: a wave atomic on the same few addresses from every
+    /// wave of the 4K resolve is itself expensive.
+    uint beamHalfProbe = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

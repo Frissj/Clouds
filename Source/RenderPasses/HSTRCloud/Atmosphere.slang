@@ -271,9 +271,21 @@ float atmosphereViewHeight(AtmosphereParams a, float worldY) { return a.planetRa
 /// to the top of the atmosphere (sky.frag; pl-sky has that attenuation commented out, which leaves a white sun at the horizon).
 float3 atmosphereSky(AtmosphereParams a, Texture2D<float4> skyLut, Texture2D<float4> transmissionLut, SamplerState s, float3 direction)
 {
+    return atmosphereSkyLut(a, skyLut, s, direction) + atmosphereSunDisk(a, transmissionLut, s, direction);
+}
+
+/// atmosphereSky's smooth part: the sky-view LUT alone.
+float3 atmosphereSkyLut(AtmosphereParams a, Texture2D<float4> skyLut, SamplerState s, float3 direction)
+{
     uint2 skySize;
     skyLut.GetDimensions(skySize.x, skySize.y);
-    float3 color = skyLut.SampleLevel(s, pl_to_sky_lut(direction, skySize, a.viewRadius, a.planetRadius), 0.f).rgb;
+    return skyLut.SampleLevel(s, pl_to_sky_lut(direction, skySize, a.viewRadius, a.planetRadius), 0.f).rgb;
+}
+
+/// atmosphereSky's sun disk.
+float3 atmosphereSunDisk(AtmosphereParams a, Texture2D<float4> transmissionLut, SamplerState s, float3 direction)
+{
+    float3 color = 0.f;
     float disk = pl_sun_disk(direction, a.sunDirection, a.sunAngularRadius);
     const float3 camera = float3(0.f, a.viewRadius, 0.f);
     if (pl_final_ray_sphere_nearest(camera, normalize(direction), a.planetRadius) >= 0.f)

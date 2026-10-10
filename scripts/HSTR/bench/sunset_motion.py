@@ -58,6 +58,8 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
          # marches' lane steps, warp-paid steps and warps.
          tuple(f"beamSun{n}" for n in ("Resolved", "Unbaked", "CoarseOrNoNear", "NoBrick")) +
          tuple(f"beamLookup{n}" for n in ("Lanes", "SameInstance", "SamePage")) +
+         # beamHalfResolve: filled pixels, exact ones (a neighbour not from a basis / past the contrast), the shaded half's basis pixels.
+         tuple(f"beamHalf{n}" for n in ("Filled", "NotBasis", "Contrast", "ShadedBasis", "FillWaves", "FillWavesExact")) +
          # beamOrderProbe: the dirty query's rays, steps, max steps (2) and log2 step histogram (6-17).
          tuple(f"beamOrderProbe{i}" for i in range(21)) +
          tuple(f"beamLayer{n}" for n in ("NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy", "Dense0", "Dense1", "Dense2",
@@ -322,6 +324,9 @@ if SCORE:
     fly(30, 0.0)
 
 speeds = [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split(",")]
+# The live flights (and the --ngfx trace taken in the first) run in the first arm's state. Since the settle restores its own state
+# after compiling the arms (packview1), they had run in the launcher's: halftrace1 traced resolveBeam with beamHalfResolve armed.
+hstr.set_properties(ARMS[0][1])
 for speed in speeds:
     tag = f"v{speed:g}"
     before = cloud_stats()
@@ -363,7 +368,8 @@ for speed in speeds:
                                                                       "cutWalkMsTotal", "cutBusyFrames", "cutIdleFrames",
                                                                       "cutParallelMsTotal", "cutHeapMsTotal", "cutPriorityRises",
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
-                                                                      "cutCheckBricks", "cutCheckMismatches")}
+                                                                      "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
+                                                                      "scatterJobs", "scatterChecks", "scatterMismatches")}
             gpu = float(d.get("gpuTimeSum") or 0) / max(float(d.get("gpuTimeFrames") or 0), 1.0) / 1000.0
             print(f"MOTION {tag} chunk {cycle} {name}: gpu {gpu:.3f} ms ({d.get('gpuTimeFrames')} frames), wall p50 "
                   f"{sorted(walls)[len(walls) // 2]:.2f} ms, mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
@@ -374,7 +380,8 @@ for speed in speeds:
                   f"{d.get('cutParallelMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
                   f"unordered desired {now.get('cutUnorderedDesired')}, priority rises {d.get('cutPriorityRises')}; threshold trims "
                   f"{d.get('cutThresholdTrims')} underfilled {d.get('cutUnderfilled')} check {d.get('cutCheckMismatches')} of "
-                  f"{d.get('cutCheckBricks')}", flush=True)
+                  f"{d.get('cutCheckBricks')}; upload {float(d.get('uploadBytes') or 0) / 1e6:.1f} MB in {d.get('uploadRuns')} runs + "
+                  f"{d.get('scatterJobs')} scatters, checks {d.get('scatterChecks')} mismatches {d.get('scatterMismatches')}", flush=True)
             if COUNT:
                 arm_dirty[name] += counted(COUNT, speed)
             if SCORE:

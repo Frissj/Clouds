@@ -155,6 +155,7 @@ static bool gUnitRepair = false; ///< beamWarpGap: the listed unit being marched
 #define HSTR_BEAM_PATH 0
 #endif
 static bool gHistory = false; ///< beamWarpHistory: read the beam state as it stood before this build's dirty query and march.
+static bool gResolvedByBasis = false; ///< beamHalfResolve: resolveBeamPixel wrote the pixel from a tile's basis.
 // resolveBeamResidualPixel: the box of units the group's pixels read, and each of those units evaluated once.
 groupshared uint2 gResidualLo;
 groupshared uint2 gResidualHi;
@@ -772,6 +773,10 @@ struct HSTRCloudRenderer
     /// Reference frame: per 8 x 8 resolve group holding failed-tile pixels, its packed group position and a 64-bit pixel mask.
     RWStructuredBuffer<uint> hstrBeamResidualList;
     RWStructuredBuffer<uint> hstrBeamResidualArgs; ///< [0] groups queued, [1..3] the residual resolve's dispatch, [4..6] its warped one.
+    RWTexture2D<uint> hstrBeamHalfFlag;          ///< beamHalfResolve: 1 where the shaded pixel (x, y) came from a basis, at (x / 2, y).
+    RWStructuredBuffer<uint> hstrBeamResidualEntry; ///< beamHalfResolve: each 8 x 8 screen group's residual queue entry, or ~0u.
+    RWStructuredBuffer<uint> hstrBeamHalfExactList; ///< beamHalfResolve: fill groups with lanes to resolve exactly (group, mask x2).
+    RWStructuredBuffer<uint> hstrBeamHalfExactArgs; ///< beamHalfResolve: [0] their count, [1..3] / [4..6] plain / warped dispatch.
     /// beamWarpAuto (writeBeamWarpArgs): [0..2] the warp field's dispatch, [3..5] the warped resolve's, [6..8] the plain resolve's -
     /// one of the two resolves gets no groups - and [9] the decision (1: warp), kept across builds that do not classify.
     /// beamPolicy (decideBeamPolicy): [11] the tile tolerance, as float bits ([10] unused).
@@ -3634,6 +3639,20 @@ struct HSTRCloudRenderer
         return atmosphereSky(hstrAtmosphere, hstrAtmosphereSky, hstrAtmosphereTransmission, hstrLinearClampSampler, direction);
     }
 
+    /// skyRadianceAt split for seaFarSky: the smooth sky the far layer carries, and the sun disk added per pixel.
+    float3 skySmoothAt(float3 direction)
+    {
+        if (params.skyModel == 0)
+            return skyRadianceAt(direction);
+        return atmosphereSkyLut(hstrAtmosphere, hstrAtmosphereSky, hstrLinearClampSampler, direction);
+    }
+    float3 skyDiskAt(float3 direction)
+    {
+        if (params.skyModel == 0)
+            return 0.f;
+        return atmosphereSunDisk(hstrAtmosphere, hstrAtmosphereTransmission, hstrLinearClampSampler, direction);
+    }
+
     /// A pixel's radiance with aerial perspective (skyModel 2): the air between the camera and the cloud dims it and scatters light
     /// in over its opacity, at the beam's opacity-weighted distance to it (BeamSample::distance). The background part (exp(-depth)
     /// sky) already is the sky, atmosphere included. A display effect only: the path-traced reference has no air, so quality gates
@@ -3643,11 +3662,18 @@ struct HSTRCloudRenderer
     {
         // The far sea behind only where it shows (as the sky in beamRadiance: under 1e-4 transmittance).
         const float transmittance = exp(-depth);
-        const float3 radiance =
-            beamRadiance(cache, single, depth, w, albedo) +
-            (withFar && (params.beamResolveProbe & 32u) == 0u && (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u)
-                 ? transmittance * farSeaExtra(w)
-                 : 0.f);
+        float3 radiance;
+        if (params.seaFarSky != 0)
+            // seaFarSky: the sky and far sea behind in one layer fetch; without withFar (a stored unit) no background at all - the
+            // unit's read adds it (beamUnitRadiance).
+            radiance = beamRadiance(cache, single, depth, w, albedo, false) +
+                       (withFar && transmittance > 1e-4f ? transmittance * farSeaBehind(w) : 0.f);
+        else
+            radiance =
+                beamRadiance(cache, single, depth, w, albedo) +
+                (withFar && (params.beamResolveProbe & 32u) == 0u && (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u)
+                     ? transmittance * farSeaExtra(w)
+                     : 0.f);
         if (params.skyModel != 2 || !(distance > 0.f) || !(hstrAtmosphere.aerialDistance > 0.f) || (params.beamResolveProbe & 64u) != 0u)
             return radiance;
         const float3 cloud = albedo * (phaseHG(dot(normalize(params.sunDirection), w)) * single + cache);
@@ -4046,8 +4072,17 @@ struct HSTRCloudRenderer
             }
         }
         // Stored as what it adds behind the near march - its radiance less the sky it hides - so the composite is one fetch.
-        const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
-        hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
+        // seaFarSky: stored with the smooth sky behind it instead (far over sky), so the composite skips the sky lookup.
+        if (params.seaFarSky != 0)
+        {
+            const float3 smooth = far.a > 0.f && (params.hstComponents & kComponentBackground) != 0 ? skySmoothAt(w) : 0.f;
+            hstrFarFieldOutput[texel] = float4(far.rgb + far.a * smooth, far.a);
+        }
+        else
+        {
+            const float3 sky = far.a < 1.f && (params.hstComponents & kComponentBackground) != 0 ? skyRadianceAt(w) : 0.f;
+            hstrFarFieldOutput[texel] = float4(far.rgb - (1.f - far.a) * sky, far.a);
+        }
         hstrFarDistanceOutput[texel] = banded && params.seaFarBand != 0 && farDistance > 0.f ? -farDistance : farDistance;
     }
 
@@ -4063,7 +4098,25 @@ struct HSTRCloudRenderer
             return 0.f;
         // Bilinear over the far layer's texels (seaFarScale pixels each).
         const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
-        return hstrFarField.SampleLevel(hstrLinearClampSampler, position / (float2(dims) * float(params.seaFarScale)), 0.f).rgb;
+        const float3 layer = hstrFarField.SampleLevel(hstrLinearClampSampler, position / (float2(dims) * float(params.seaFarScale)), 0.f).rgb;
+        // seaFarSky: the layer holds far over the smooth sky; back to what it adds over the sky (off the hot resolve path).
+        if (params.seaFarSky != 0)
+            return layer - ((params.hstComponents & kComponentBackground) != 0 ? skySmoothAt(w) : 0.f);
+        return layer;
+    }
+
+    /// seaFarSky: everything behind the near march along w - the far sea over the sky - in one layer fetch plus the sun disk; the
+    /// full sky where the layer has no texel for w.
+    /// MEASURED: pending (seafarsky1).
+    float3 farSeaBehind(float3 w)
+    {
+        const bool background = (params.hstComponents & kComponentBackground) != 0;
+        float2 position;
+        if (params.seaFarField == 0 || !farProject(w, params.seaFarPrevU, params.seaFarPrevV, params.seaFarPrevW, position))
+            return background ? skyRadianceAt(w) : 0.f;
+        const uint2 dims = (params.frameDim + params.seaFarScale - 1u) / params.seaFarScale;
+        const float4 layer = hstrFarField.SampleLevel(hstrLinearClampSampler, position / (float2(dims) * float(params.seaFarScale)), 0.f);
+        return layer.rgb + (background ? layer.a * skyDiskAt(w) : 0.f);
     }
 
     /// Distance (world units along the ray) to the exit of v's majorant block (edge 4 voxels, or 16 for the occupancy
@@ -11163,13 +11216,13 @@ struct HSTRCloudRenderer
     float4 bilinear(float4 q00, float4 q10, float4 q01, float4 q11, float2 f) { return lerp(lerp(q00, q10, f.x), lerp(q01, q11, f.x), f.y); }
 
     /// Split-frame radiance from its terms (before albedo) for view direction w.
-    float3 beamRadiance(float3 cache, float3 single, float depth, float3 w, float3 albedo)
+    float3 beamRadiance(float3 cache, float3 single, float depth, float3 w, float3 albedo, bool withSky = true)
     {
         const float phase = phaseHG(dot(normalize(params.sunDirection), w));
         // The sky behind only where it shows: under 1e-4 transmittance it adds under 1e-4 of the sky's radiance (pixprobe1: the sky
         // lookup is 0.11 of the 4K pixel resolve's 0.64 ms).
         const float transmittance = exp(-depth);
-        const float3 background = (params.hstComponents & kComponentBackground) != 0 && (params.beamResolveProbe & 4u) == 0u &&
+        const float3 background = withSky && (params.hstComponents & kComponentBackground) != 0 && (params.beamResolveProbe & 4u) == 0u &&
                                           (transmittance > 1e-4f || (params.beamResolveProbe & 16u) != 0u)
                                       ? transmittance * skyRadianceAt(w)
                                       : 0.f;
@@ -11938,7 +11991,13 @@ struct HSTRCloudRenderer
             // was marched in until re-marched - a parked camera kept a stale far sea after any far-sea change (hillfar1: the same
             // settings 0.0206 -> 0.0248 excess squared log error against the path trace, the arm after a quarter-resolution one).
             if (held.a >= 0.f)
-                return held.rgb + hstrBeamUnitTransmittance[unit] * farSeaExtra(w);
+            {
+                const float transmittance = hstrBeamUnitTransmittance[unit];
+                // seaFarSky: the unit was stored without its background (hazedBeamRadiance), the layer brings sky and far sea.
+                if (params.seaFarSky != 0)
+                    return held.rgb + (transmittance > 1e-4f ? transmittance * farSeaBehind(w) : 0.f);
+                return held.rgb + transmittance * farSeaExtra(w);
+            }
             // A failed tile's unit the residual has not reached - outside the on-screen box it marches. Its finest basis
             // failed the surplus test, but it is still an estimate of this direction; the texel is not.
             return beamReconstruct(params.beamLevels - 1u, p, w, false);
@@ -12435,8 +12494,78 @@ struct HSTRCloudRenderer
             return params.beamRefFrame != 0;
         }
         color[pixel] = float4(beamReconstruct(level, beamPosition, w, false), 1.f);
+        gResolvedByBasis = true;
         return false;
     }
+
+    /// beamHalfResolve, first pass: one checkerboard parity resolved exactly, with whether its basis wrote it.
+    bool resolveBeamHalfShade(uint2 pixel)
+    {
+        gResolvedByBasis = false;
+        const bool queued = resolveBeamPixel(pixel);
+        if (all(pixel < params.frameDim))
+            hstrBeamHalfFlag[uint2(pixel.x >> 1, pixel.y)] = gResolvedByBasis ? 1u : 0u;
+        const uint shaded = WaveActiveCountBits(gResolvedByBasis);
+        if (params.beamHalfProbe != 0 && WaveIsFirstLane())
+        {
+            uint unused;
+            InterlockedAdd(hstrBeamCounts[kBeamHalfProbe + 3], shaded, unused);
+        }
+        return queued;
+    }
+
+    /// beamHalfResolve, second pass: a pixel of the other parity. Its four edge neighbours are all of the first parity; where each
+    /// came from a basis and they agree within beamHalfContrast (log(1 + radiance), per channel), it is their mean - inside a beam
+    /// cell the basis is bilinear in beam space, and the screen-to-beam map is near affine over two pixels, so the mean of the
+    /// neighbours is close to the pixel's own resolve. Elsewhere (residual and sky tiles, edges) false: the exact resolve, which
+    /// exactBeamHalf runs for the listed pixels alone, so this pass does not carry the resolve's registers.
+    /// MEASURED (halfres2, 4K walk, the first form with the exact resolve inline): fill 0.389 ms for 3.50M filled pixels, while
+    /// only 20% of its waves (25.6k of 129.6k) had an exact lane; shade 0.087, pixels 0.477 against 0.395 off.
+    bool fillBeamHalfPixel(uint2 pixel)
+    {
+        if (any(pixel >= params.frameDim))
+            return true;
+        const int2 p = int2(pixel);
+        const int2 last = int2(params.frameDim) - 1;
+        // At the frame's edge the missing neighbour is replaced by the opposite one (the same parity).
+        const int2 n[4] = { int2(p.x > 0 ? p.x - 1 : p.x + 1, p.y), int2(p.x < last.x ? p.x + 1 : p.x - 1, p.y),
+                            int2(p.x, p.y > 0 ? p.y - 1 : p.y + 1), int2(p.x, p.y < last.y ? p.y + 1 : p.y - 1) };
+        bool basis = true;
+        float3 sum = 0.f, lo = 3.4e38f, hi = -3.4e38f;
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint2 q = uint2(clamp(n[k], int2(0), last));
+            basis = basis && hstrBeamHalfFlag[uint2(q.x >> 1, q.y)] != 0u;
+            const float3 c = color[q].rgb;
+            sum += c;
+            const float3 l = log(1.f + max(c, 0.f));
+            lo = min(lo, l);
+            hi = max(hi, l);
+        }
+        const bool fill = basis && all(hi - lo <= params.beamHalfContrast);
+        if (params.beamHalfProbe != 0)
+        {
+            const uint filled = WaveActiveCountBits(fill), notBasis = WaveActiveCountBits(!basis),
+                       contrast = WaveActiveCountBits(basis && !fill);
+            const bool anyExact = WaveActiveAnyTrue(!fill);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamHalfProbe], filled, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHalfProbe + 1], notBasis, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHalfProbe + 2], contrast, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHalfProbe + 4], 1u, unused);
+                InterlockedAdd(hstrBeamCounts[kBeamHalfProbe + 5], anyExact ? 1u : 0u, unused);
+            }
+        }
+        if (fill)
+            color[pixel] = float4(0.25f * sum, 1.f);
+        return fill;
+    }
+
+    /// beamHalfResolve: fill groups (16 x 8 pixels, resolveBeamHalfGroup), the capacity of the exact list.
+    uint beamHalfGroups() { return ((params.frameDim.x + 15u) / 16u) * ((params.frameDim.y + 7u) / 8u); }
 
     /// 8 x 8 resolve groups in the frame: the capacity of the residual queue.
     uint beamResidualGroups() { return ((params.frameDim.x + 7u) / 8u) * ((params.frameDim.y + 7u) / 8u); }
@@ -15272,8 +15401,11 @@ void renderFarSea(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     float distanceSum;
     bool banded;
-    const float4 far = gHSTRCloud.farSeaTexelMarch(dispatchThreadId.xy, distanceSum, banded);
-    gHSTRCloud.farSeaFinish(dispatchThreadId.xy, far, distanceSum, banded);
+    const uint2 texel = uint2(
+        dispatchThreadId.x, dispatchThreadId.y * gHSTRCloud.params.seaFarRowStride + gHSTRCloud.params.seaFarRowOffset
+    );
+    const float4 far = gHSTRCloud.farSeaTexelMarch(texel, distanceSum, banded);
+    gHSTRCloud.farSeaFinish(texel, far, distanceSum, banded);
 }
 
 
@@ -16572,9 +16704,131 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_
     }
 }
 
+groupshared uint gHalfMask[4]; ///< beamHalfResolve: the residual masks of the group's two 8 x 8 screen groups.
+
+/// beamHalfResolve: an 8 x 8 group covers 16 x 8 pixels, one of each row's two checkerboard parities (phase 0 the shaded half,
+/// 1 the filled half), i.e. the 8 x 8 screen groups 2 group.x and 2 group.x + 1 of row group.y. The shaded half queues those with
+/// residual pixels as resolveBeam does and records each one's entry; the filled half's exact pixels (exactBeamHalf, active) add
+/// their residual pixels to that entry (or queue the group if the shaded half had none), so no group is queued twice.
+void resolveBeamHalfGroup(uint2 groupThread, uint2 group, uint groupIndex, uint phase, bool active = true)
+{
+    if (groupIndex < 4)
+        gHalfMask[groupIndex] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    const uint y = group.y * 8u + groupThread.y;
+    const uint2 pixel = uint2(group.x * 16u + 2u * groupThread.x + ((y + phase) & 1u), y);
+    bool queued = false;
+    if (phase == 0u)
+        queued = gHSTRCloud.resolveBeamHalfShade(pixel);
+    else if (active)
+        queued = gHSTRCloud.resolveBeamPixel(pixel);
+    if (queued)
+    {
+        const uint bit = (pixel.y & 7u) * 8u + (pixel.x & 7u);
+        InterlockedOr(gHalfMask[((pixel.x >> 3) & 1u) * 2u + (bit >> 5)], 1u << (bit & 31u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex >= 2)
+        return;
+    const uint2 screenGroups = (gHSTRCloud.params.frameDim + 7u) / 8u;
+    const uint2 screenGroup = uint2(group.x * 2u + groupIndex, group.y);
+    if (any(screenGroup >= screenGroups))
+        return;
+    const uint slot = screenGroup.y * screenGroups.x + screenGroup.x;
+    const uint m0 = gHalfMask[groupIndex * 2u], m1 = gHalfMask[groupIndex * 2u + 1u];
+    uint entry = 0xFFFFFFFFu;
+    if (phase != 0u)
+    {
+        if ((m0 | m1) == 0u)
+            return;
+        entry = gHSTRCloud.hstrBeamResidualEntry[slot];
+        if (entry != 0xFFFFFFFFu)
+        {
+            InterlockedOr(gHSTRCloud.hstrBeamResidualList[3 * entry + 1], m0);
+            InterlockedOr(gHSTRCloud.hstrBeamResidualList[3 * entry + 2], m1);
+            return;
+        }
+    }
+    if ((m0 | m1) != 0u)
+    {
+        uint queuedEntry;
+        InterlockedAdd(gHSTRCloud.hstrBeamResidualArgs[0], 1u, queuedEntry);
+        if (queuedEntry < gHSTRCloud.beamResidualGroups())
+        {
+            gHSTRCloud.hstrBeamResidualList[3 * queuedEntry] = screenGroup.x | (screenGroup.y << 16);
+            gHSTRCloud.hstrBeamResidualList[3 * queuedEntry + 1] = m0;
+            gHSTRCloud.hstrBeamResidualList[3 * queuedEntry + 2] = m1;
+            entry = queuedEntry;
+        }
+    }
+    if (phase == 0u)
+        gHSTRCloud.hstrBeamResidualEntry[slot] = entry;
+}
+
+[numthreads(8, 8, 1)]
+void resolveBeamHalf(uint3 groupThreadId: SV_GroupThreadID, uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
+{
+    resolveBeamHalfGroup(groupThreadId.xy, groupId.xy, groupIndex, 0u);
+}
+
 /// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
 /// a 4K frame has 129,600 resolve groups.
 static const uint kResidualRow = 32768;
+
+groupshared uint gHalfExact[2]; ///< beamHalfResolve: the fill group's lanes it could not fill.
+
+/// beamHalfResolve, the filled parity: each pixel the mean of its neighbours where it can be (fillBeamHalfPixel); the group's other
+/// lanes are listed, one entry per group with their mask, for exactBeamHalf.
+[numthreads(8, 8, 1)]
+void fillBeamHalf(uint3 groupThreadId: SV_GroupThreadID, uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
+{
+    if (groupIndex < 2)
+        gHalfExact[groupIndex] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    const uint y = groupId.y * 8u + groupThreadId.y;
+    const uint2 pixel = uint2(groupId.x * 16u + 2u * groupThreadId.x + ((y + 1u) & 1u), y);
+    if (!gHSTRCloud.fillBeamHalfPixel(pixel))
+        InterlockedOr(gHalfExact[groupIndex >> 5], 1u << (groupIndex & 31u));
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex != 0 || (gHalfExact[0] | gHalfExact[1]) == 0u)
+        return;
+    uint entry;
+    InterlockedAdd(gHSTRCloud.hstrBeamHalfExactArgs[0], 1u, entry);
+    if (entry < gHSTRCloud.beamHalfGroups())
+    {
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry] = groupId.x | (groupId.y << 16);
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry + 1] = gHalfExact[0];
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry + 2] = gHalfExact[1];
+    }
+}
+
+/// beamHalfResolve: dispatch arguments for the listed fill groups, plain [1..3] and warped [4..6] (as writeBeamResidualArgs).
+[numthreads(1, 1, 1)]
+void writeBeamHalfExactArgs()
+{
+    const uint groups = min(gHSTRCloud.hstrBeamHalfExactArgs[0], gHSTRCloud.beamHalfGroups());
+    const bool warped = gHSTRCloud.params.beamWarpAuto > 0.f && gHSTRCloud.hstrBeamWarpArgs[9] != 0;
+    const uint used = warped ? 4u : 1u;
+    const uint idle = warped ? 1u : 4u;
+    gHSTRCloud.hstrBeamHalfExactArgs[used] = min(groups, kResidualRow);
+    gHSTRCloud.hstrBeamHalfExactArgs[used + 1] = (groups + kResidualRow - 1u) / kResidualRow;
+    gHSTRCloud.hstrBeamHalfExactArgs[used + 2] = 1u;
+    gHSTRCloud.hstrBeamHalfExactArgs[idle] = 0u;
+    gHSTRCloud.hstrBeamHalfExactArgs[idle + 1] = 1u;
+    gHSTRCloud.hstrBeamHalfExactArgs[idle + 2] = 1u;
+}
+
+/// beamHalfResolve: one group per listed fill group, resolving exactly the lanes the fill could not fill.
+[numthreads(8, 8, 1)]
+void exactBeamHalf(uint3 groupThreadId: SV_GroupThreadID, uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
+{
+    const uint entry = groupId.y * kResidualRow + groupId.x;
+    if (entry >= min(gHSTRCloud.hstrBeamHalfExactArgs[0], gHSTRCloud.beamHalfGroups()))
+        return; // The whole group.
+    const uint packed = gHSTRCloud.hstrBeamHalfExactList[3 * entry];
+    const bool active = (gHSTRCloud.hstrBeamHalfExactList[3 * entry + 1 + (groupIndex >> 5)] & (1u << (groupIndex & 31u))) != 0u;
+    resolveBeamHalfGroup(groupThreadId.xy, uint2(packed & 0xFFFFu, packed >> 16), groupIndex, 1u, active);
+}
 
 /// beamWarpCover: one thread per lattice point of the warp field's box, right after the field.
 [numthreads(8, 8, 1)]
@@ -16660,7 +16914,11 @@ void writeBeamWarpArgs()
     gHSTRCloud.hstrBeamWarpArgs[0] = fieldGroups.x;
     gHSTRCloud.hstrBeamWarpArgs[1] = fieldGroups.y;
     gHSTRCloud.hstrBeamWarpArgs[2] = 1u;
-    const uint2 frameGroups = (gHSTRCloud.params.frameDim + 7u) / 8u;
+    // beamHalfResolve: a resolve group covers 16 x 8 pixels (resolveBeamHalfGroup).
+    const uint2 frameGroups =
+        uint2((gHSTRCloud.params.frameDim.x + (gHSTRCloud.params.beamHalfResolve != 0 ? 15u : 7u)) /
+                  (gHSTRCloud.params.beamHalfResolve != 0 ? 16u : 8u),
+              (gHSTRCloud.params.frameDim.y + 7u) / 8u);
     gHSTRCloud.hstrBeamWarpArgs[3] = warp ? frameGroups.x : 0u;
     gHSTRCloud.hstrBeamWarpArgs[4] = frameGroups.y;
     gHSTRCloud.hstrBeamWarpArgs[5] = 1u;

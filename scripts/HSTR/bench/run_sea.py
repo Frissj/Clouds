@@ -37,6 +37,9 @@ parser.add_argument("--ngfx", nargs=2, type=int, metavar=("START", "STOP"),
                          "reports at HSTR_results/ngfx/TAG_<motion>_<arm>_f<START>-<STOP>.ngfx-gputrace")
 parser.add_argument("--ngfx-metrics", default="Throughput Metrics", help="--ngfx: the Ada metric set name")
 parser.add_argument("--ngfx-source", action="store_true", help="--ngfx: shader debug info for source-line correlation (~10 min compile)")
+parser.add_argument("--ngfx-warp-lines", action="store_true",
+                    help="--ngfx: [BETA, 2026.2] active threads per warp per line/instruction (Inactive Thread Latency %% in the shader profiler)")
+parser.add_argument("--ngfx-multipass", action="store_true", help="--ngfx: multi-pass metrics (more counters per range, over several frames)")
 # sunset: sunset_motion.py (the sunset launcher's view) instead of sea_motion.py, its HSTR_MOTION_* settings given here as KEY=VALUE:
 # the elevated copy (--nsys / --ngfx) is started through ShellExecute and does not inherit the caller's environment. The sweep is
 # not used. With --ngfx, flight frames [START, STOP) of the first live flight are traced, once.
@@ -100,6 +103,8 @@ if args.ngfx:
                "--args", subprocess.list2cmdline(command[1:] + (["--debug-shaders"] if args.ngfx_source else [])),
                "--output-dir", str(RESULTS / "ngfx"), "--no-timeout", "--start-with-ngfx-sdk", "--stop-with-ngfx-sdk",
                "--architecture", "Ada", "--metric-set-name", args.ngfx_metrics, "--real-time-shader-profiler", "--auto-export"]
+    command += ["--per-line-active-threads-per-warp", "true"] if args.ngfx_warp_lines else []
+    command += ["--multi-pass-metrics"] if args.ngfx_multipass else []
 with open(log, "w") as f:
     (run_hidden if args.nsys or args.ngfx else subprocess.run)(command, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
 errors = [line for line in open(log, errors="replace") if "(Error)" in line or "Exception" in line or "Error when loading" in line or "RuntimeError" in line]

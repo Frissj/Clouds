@@ -160,7 +160,8 @@ private:
     bool mSunPagesDirty = false;
     std::vector<uint32_t> mSunPageSlots; ///< Sea tiles whose sun pages are stale (all tiles when mResidualDirty).
     void bindRenderer(RenderContext* pRenderContext, const ref<ComputePass>& pPass);
-    void dispatchFarSea(RenderContext* pRenderContext);
+    /// rowOffset / rowStride (seaFarBeside 2): only those rows of the run; the run counts as done after the dispatch with `last`.
+    void dispatchFarSea(RenderContext* pRenderContext, uint32_t rowOffset = 0, uint32_t rowStride = 1, bool last = true);
     void saveReference(RenderContext* pRenderContext, const std::string& path);
     void loadReference(RenderContext* pRenderContext, const std::string& path);
     void ensureCameraResources();
@@ -447,8 +448,14 @@ private:
     /// it; the query's scope grows 0.13-0.15 while the far sea's 0.36-0.45 goes. Exact: the run reads nothing either pass writes.
     /// Timed without the profiler (gpuTiming, overlap6, live walk, interleaved x3): serial 3.238 / 3.091 / 2.707, beside the query
     /// 2.724 / 2.583 / 2.863, and with beamOverlapResolve 2.447 / 2.708 / 2.829 ms - means 3.01 / 2.72 / 2.66.
+    /// 2: the run's even rows beside the query, its odd rows beside the unit march (HSTRCloudParams::seaFarRowOffset / Stride).
+    /// MEASURED and left off (ngfxb1noscope / ngfxsplit2, 4K walk, seaFarOverlapScopes false, residency fixed, frames 60-61):
+    /// HSTRCloud less cloudSea 2.82 / 2.75 ms (1) against 2.94 / 3.01 (2) - the march range grows 0.88-0.91 -> 1.11-1.18 while the
+    /// query side saves 0-0.09: the far rows do not hide behind the unit march. farsplit2's frozen gpuTime "win" (~0.6 ms) was
+    /// the laptop's two clock states (chunks at ~2.5-3.5 and ~5-6.4 ms whatever the arm).
     uint32_t mSeaFarBeside = 1;
     bool mFarBesideNow = false;       ///< Set while dispatchFarSea runs beside the unit march.
+    bool mFarSplitRest = false;       ///< seaFarBeside 2: the even rows ran beside the query; the odd rows go beside the unit march.
     LazyComputePass mpBeamDirtyQueryStripPass;
     LazyComputePass mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     LazyComputePass mpBeamWarpArgsPass;
@@ -461,6 +468,16 @@ private:
     float mBeamPolicyHeldHigh = 0.25f;
     float mBeamPolicyToleranceNow = 0.f; ///< The compared frame's tolerance (stats, read with the comparison).
     LazyComputePass mpBeamResolveWarpPass;         ///< resolveBeam with HSTR_BEAM_WARP 1, beside the plain one.
+    LazyComputePass mpBeamHalfShadePass;           ///< beamHalfResolve: resolveBeamHalf (the shaded parity).
+    LazyComputePass mpBeamHalfShadeWarpPass;       ///< resolveBeamHalf with HSTR_BEAM_WARP 1.
+    LazyComputePass mpBeamHalfFillPass;            ///< beamHalfResolve: fillBeamHalf (the filled parity, no resolve inside).
+    LazyComputePass mpBeamHalfExactArgsPass;       ///< beamHalfResolve: writeBeamHalfExactArgs.
+    LazyComputePass mpBeamHalfExactPass;           ///< beamHalfResolve: exactBeamHalf (the fill's listed pixels).
+    LazyComputePass mpBeamHalfExactWarpPass;       ///< exactBeamHalf with HSTR_BEAM_WARP 1.
+    ref<Texture> mpBeamHalfFlag;                   ///< beamHalfResolve: hstrBeamHalfFlag, R8Uint, (width + 1) / 2 x height.
+    ref<Buffer> mpBeamResidualEntry;               ///< beamHalfResolve: hstrBeamResidualEntry, one uint per 8 x 8 screen group.
+    ref<Buffer> mpBeamHalfExactList;               ///< beamHalfResolve: hstrBeamHalfExactList, three uints per fill group.
+    ref<Buffer> mpBeamHalfExactArgs;               ///< beamHalfResolve: hstrBeamHalfExactArgs (count, two dispatches).
     LazyComputePass mpBeamResidualResolveWarpPass; ///< resolveBeamResidual with HSTR_BEAM_WARP 1.
     ref<Buffer> mpBeamWarpArgs;                     ///< See hstrBeamWarpArgs.
     uint32_t mBeamWarpHeld = 0;   ///< The compared frame's guard blocks held (hstrBeamDirtyCount[2]) ...
@@ -1123,6 +1140,10 @@ private:
     bool mCloudCutThreshold = true;             ///< cloudCutThreshold: CloudView::cutThreshold (MEASURED there).
     bool mCloudCutThresholdCheck = false;       ///< cloudCutThresholdCheck: CloudView::cutThresholdCheck (DIAGNOSTIC).
     bool mCloudScatterUploads = true;           ///< cloudScatterUploads: CloudResidency uploads changed table elements by scatter.
+    /// cloudScatterDense: CloudResidency::setScatterDense. MEASURED (scatterdense2, 4K sunset walk 2, warm, arms interleaved,
+    /// 120 frames): upload MB per 1k committed bricks sparse 0.54 / 0.57 -> dense 0.28 / 0.33; residency/upload 0.122 / 0.100 ->
+    /// 0.116 / 0.061 ms; scatterdense1 check arm 20 compared uploads, 0 mismatches.
+    bool mCloudScatterDense = true;
     ref<Buffer> mpSunResolveCheck;
     ref<Buffer> mpSunCheckCount;
     uint64_t mSunResolveFrames = 0;      ///< Frames that resolved the sun slots.
