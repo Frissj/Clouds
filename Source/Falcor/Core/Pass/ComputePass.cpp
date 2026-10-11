@@ -30,6 +30,7 @@
 #include "Core/API/PythonHelpers.h"
 #include "Utils/Math/Common.h"
 #include "Utils/Scripting/ScriptBindings.h"
+#include <set>
 
 namespace Falcor
 {
@@ -66,6 +67,17 @@ void ComputePass::execute(ComputeContext* pContext, uint32_t nThreadX, uint32_t 
     FALCOR_ASSERT(mpVars);
     uint3 threadGroupSize = mpState->getProgram()->getReflector()->getThreadGroupSize();
     uint3 groups = div_round_up(uint3(nThreadX, nThreadY, nThreadZ), threadGroupSize);
+    // D3D12 drops (or truncates) a dispatch past 65535 groups in any dimension; the debug layer only says that one happened.
+    if (any(groups > uint3(65535u)))
+    {
+        static std::set<std::string> sWarned;
+        const auto& desc = mpState->getProgram()->getDesc();
+        const std::string name = desc.entryPointGroups.empty() || desc.entryPointGroups[0].entryPoints.empty()
+                                     ? std::string("?")
+                                     : desc.entryPointGroups[0].entryPoints[0].name;
+        if (sWarned.insert(name).second)
+            logWarning("ComputePass {}: dispatch of ({}, {}, {}) groups exceeds 65535 in a dimension.", name, groups.x, groups.y, groups.z);
+    }
     pContext->dispatch(mpState.get(), mpVars.get(), groups);
 }
 

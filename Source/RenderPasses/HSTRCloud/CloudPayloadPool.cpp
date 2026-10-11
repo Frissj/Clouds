@@ -239,9 +239,9 @@ int CloudPayloadPool::pollLoad(uint32_t ticket)
     return ok ? 1 : -1;
 }
 
-void CloudPayloadPool::upload(uint32_t word, const std::vector<uint8_t>& bytes)
+void CloudPayloadPool::upload(Falcor::CopyContext* pContext, uint32_t word, const std::vector<uint8_t>& bytes)
 {
     if (!bytes.empty())
-        mpBuffer->setBlob(bytes.data(), uint64_t(word) * 4, bytes.size());
+        pContext->updateBuffer(mpBuffer.get(), bytes.data(), uint64_t(word) * 4, bytes.size());
 }
 } // namespace hstrcloud

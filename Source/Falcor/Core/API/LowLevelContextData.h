@@ -46,8 +46,12 @@ public:
      * Constructor. Throws an exception if creation failed.
      * @param[in] pDevice Device.
      * @param[in] pQueue Command queue.
+     * @param[in] pTransientHeap The transient heap command buffers come from; null: the device's current one (the main context).
+     *            A second context recording beside the main one needs its own: a heap's command allocator takes one open list.
      */
-    LowLevelContextData(Device* pDevice, gfx::ICommandQueue* pQueue);
+    LowLevelContextData(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap = nullptr);
+    /// The transient heap the next openCommandBuffer takes its command buffer from (null: the device's current one).
+    void setTransientHeap(gfx::ITransientResourceHeap* pTransientHeap) { mpTransientHeap = pTransientHeap; }
     ~LowLevelContextData();
 
     gfx::ICommandQueue* getGfxCommandQueue() const { return mpGfxCommandQueue; }
@@ -94,6 +98,7 @@ public:
 private:
     Device* mpDevice;
     gfx::ICommandQueue* mpGfxCommandQueue;
+    gfx::ITransientResourceHeap* mpTransientHeap = nullptr;
     Slang::ComPtr<gfx::ICommandBuffer> mGfxCommandBuffer;
     ref<Fence> mpFence;
 

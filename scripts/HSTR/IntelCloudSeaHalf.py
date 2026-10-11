@@ -153,6 +153,11 @@ g.addPass(createPass("HSTRCloud", {
     "cloudMinTransmittance": 0.02,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
+    # Residency GPU work (uploads, commits, pages, sun scheduling and bakes, the sun resolve) on a COMPUTE queue beside the frame,
+    # published a frame late (HSTRCloud::mAsyncResidency). asyncab3 (4K sunset walk, profiler off, 6 cycles, chunk GPU over both
+    # queues): off 3.86 / off2 4.25, async 3.78 / async2 3.81 ms (-0.26, 5 of 6 cycles), sanity (serial +1.7 ms probe) 5.97; churn
+    # chunks at the load cap in 13-19 of 20 frames as off. asyncab1 motion score 2: off 5.75 / 5.57%, async 5.84 / 5.76% over 0.02.
+    "asyncResidency": True,
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
     # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
     # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:

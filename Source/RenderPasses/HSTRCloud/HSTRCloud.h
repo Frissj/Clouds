@@ -9,10 +9,17 @@
 #include "HSTRCloudTypes.slang"
 #include "CloudResidency.h"
 #include "Atmosphere.h"
+#include <d3d12.h>       // asyncProbe 4 / 5: the native compute queue,
+#include <d3dcompiler.h> // its kernel compiled with FXC.
+#include <dxgi1_4.h>     // queueOverlapTest's fresh device.
+#include "Core/API/NativeHandleTraits.h"
+#undef far               // minwindef.h's (FAR expands to it in the D3D headers above); HSTRCloud.cpp names variables far / near.
+#undef near
 
 #include <array>
 #include <functional>
 #include <memory>
+#include <set>
 
 using namespace Falcor;
 
@@ -368,7 +375,20 @@ private:
     ref<Buffer> mpBeamChangeSpheres;
     ref<Buffer> mpBeamChangeCount;
     /// After the frame's residency update and sun bakes: marks what changed (bakes: this frame's bake jobs) for the next build.
-    void markBeamChanges(RenderContext* pRenderContext, uint32_t bakes);
+    /// Under asyncResidency, a frame's changes are marked by the next frame (markResidencyChanges): this frame's march may read them
+    /// half-published, and their re-march must read them whole.
+    void markResidencyChanges(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t bakes);
+    /// Marks changes (the first bakes jobs of pBakes after them) into the change cells; then markBeamChangeCycle once a frame.
+    void markBeamChanges(RenderContext* pRenderContext, std::vector<uint4>& changes, uint32_t bakes, const ref<Buffer>& pBakes);
+    /// The change cells' listing every beamChangeInterval frames and the slice the frame's build applies.
+    void markBeamChangeCycle(RenderContext* pRenderContext);
+    /// The residency's changes and bake count of the last asyncResidency frame, and its bake jobs (copied on the compute queue into
+    /// mpDeferredSunBakes[frame parity]: the next run's assign overwrites the residency's list while the main queue marks).
+    std::vector<uint4> mDeferredBeamChanges;
+    uint32_t mDeferredBeamBakes = 0;
+    std::array<ref<Buffer>, 2> mpDeferredSunBakes;
+    uint32_t mDeferredSunBakesParity = 0;
+    std::vector<float4> mDeferredInvalidations; ///< invalidateBeamColumn's columns of the last asyncResidency frame.
     /// Binds the change list for reading (the invalidation passes).
     void bindBeamChanges(const ref<ComputePass>& pPass);
     /// Queues the column of the cloud layer over a world tile, and what its change reaches, for invalidateBeamGuardBlock.
@@ -1014,11 +1034,46 @@ private:
     /// dispatchSunScheduling's parts, in order: the readback, age, counter clears and releases; the field resets and stamps; scan
     /// to assign; the bakes.
     static constexpr uint32_t kSunPre = 1, kSunStamp = 2, kSunSelect = 4, kSunBake = 8, kSunAll = 15;
-    bool dispatchSunScheduling(RenderContext* pRenderContext, uint32_t phases = kSunAll);
+    /// pContext: the context the passes record into (the residency's: asyncResidency's compute queue, or the main context).
+    bool dispatchSunScheduling(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t phases = kSunAll);
     /// The bakes of the scheduling run dispatched last (dispatchSunScheduling's last part).
-    void bakeScheduledSun(RenderContext* pRenderContext);
+    void bakeScheduledSun(RenderContext* pRenderContext, ComputeContext* pContext);
     /// cloudSunBeside's deferred run: its stamps (unless they ran beside the dirty query), scan to assign and bakes, at the frame's end.
     void finishDeferredSun(RenderContext* pRenderContext);
+    /// asyncProbe: dispatched right after the dirty query (dispatchAsyncProbe); mode 1's main-queue wait at the frame's end
+    /// (finishAsyncProbe).
+    void dispatchAsyncProbe(RenderContext* pRenderContext);
+    void finishAsyncProbe(RenderContext* pRenderContext);
+    uint64_t mAsyncProbeDone = 0; ///< asyncProbe 1: the fence value the probe's queue signals, 0 when nothing is waiting.
+    /// asyncResidency: the residency's GPU work - uploads and scatters, fades, commits, pages and skirt masks, sun scheduling and
+    /// bakes, the sun resolve - records into a context on a COMPUTE queue (slang-gfx patched: see asyncProbe) and runs beside the
+    /// main queue's frame. Published a frame late: the main queue's frame N reads what the compute queue's frame N - 1 wrote, and
+    /// waits for it at frame N - 1's end; the compute queue's frame N waits for the main queue's frame N - 1 (the last that may map
+    /// what N frees: CloudResidency's slot quarantine). The beam marks those changes a frame late too (markResidencyChanges).
+    /// Serial (the main context) on frames a blocking diagnostic or cloudSunBeside runs, or without the GPU sun scheduler.
+    /// MEASURED (asyncab3, 4K sunset walk, profiler off, chunk GPU over both queues): off 3.86 / 4.25 ms, on 3.78 / 3.81 (-0.26, 5 of
+    /// 6 cycles); asyncab1 motion score unchanged (5.75 / 5.57% off, 5.84 / 5.76% on over 0.02). On in IntelCloudSeaHalf.py. Its
+    /// first A/B (asyncab2, -0.40) was partly starved: see CloudResidency::loadReady's evict-ahead.
+    bool mAsyncResidency = false;
+    bool mAsyncResidencyActive = false; ///< This frame records into mpResidencyContext (beginAsyncResidency).
+    Slang::ComPtr<gfx::ICommandQueue> mpResidencyQueue; ///< Declared before the context, which keeps a raw pointer to it.
+    std::array<Slang::ComPtr<gfx::ITransientResourceHeap>, 3> mpResidencyHeaps; ///< COMPUTE command lists, one per frame in a ring.
+    uint32_t mResidencyHeap = 0;
+    std::unique_ptr<ComputeContext> mpResidencyContext;
+    ref<Fence> mpResidencyFence;   ///< Signalled by the compute queue at each frame's end.
+    ref<Fence> mpMainFence;        ///< Signalled by the main queue after HSTRCloud's frame.
+    uint64_t mMainFenceValue = 0;  ///< Its last value (the compute queue's next frame waits for it).
+    bool mAsyncResidencyLastFrame = false; ///< The last frame's residency ran on the compute queue (mMainFenceValue covers it).
+    uint32_t mAsyncResidencyFrames = 0; ///< DIAGNOSTIC: frames recorded on the compute queue (cloudStats asyncResidencyFrames).
+    /// Opens this frame's compute-queue recording when asyncResidency applies; else the residency records into the main context.
+    void beginAsyncResidency(RenderContext* pRenderContext);
+    /// Submits HSTRCloud's main-queue work, then the compute queue's, and makes the main queue's later work wait for it.
+    void submitAsyncResidency(RenderContext* pRenderContext);
+    /// DIAGNOSTIC: logs the D3D12 debug layer's warnings and errors (run_sea.py --debug-layer).
+    void logD3D12Messages();
+    uint64_t mD3D12Messages = 0;
+    std::set<uint32_t> mD3D12MessageIds;
+    std::set<std::string> mD3D12MessageTexts;
     bool mSunResolveAlways = false; ///< cloudSunResolveAlways: resolve every frame (the A/B anchor for the dirty test).
     bool mSunResolveValid = false; ///< hstrCloudSunResolved holds the resolve of mSunResolveInputs and the current slot and brick tables.
     uint4 mSunResolveInputs = uint4(0); ///< Sun generation, oldest generation, ancestor reach, resolved buffer it was written to.
@@ -1044,6 +1099,73 @@ private:
     uint32_t mCloudSunStampFineCheck = 0; ///< DIAGNOSTIC cloudSunStampFineCheck: 1 misses, 2 extras of the fine stamp (dispatchSunScheduling).
     uint32_t mSunStampCheckTotal = 0;     ///< DIAGNOSTIC: those over every checked run (a blocking read per run; must stay 0).
     uint32_t mSunStampCheckRuns = 0;      ///< DIAGNOSTIC: the checked runs.
+    /// DIAGNOSTIC asyncProbe: does a second command queue overlap the dirty query on this GPU? HSTRAsyncProbe.cs.slang's fixed ALU
+    /// work (asyncProbeThreads x asyncProbeIters dependent multiply-adds), dispatched with the query: 1 on a second Graphics queue
+    /// (slang-gfx has no Compute queue type; the second queue waits for the work before the query and the main queue waits for the
+    /// probe at the frame's end), 2 on the main queue right behind the query with no barrier, 3 on the main queue after the query
+    /// behind a barrier, in its own scope (its time alone). 4 / 5 / 6: a native COMPUTE queue (below). 7: 1's queue at the frame's
+    /// start without the split. 0 off.
+    /// MEASURED (GPU traces, 4K sunset walk frames 60-64, 30720 threads x 150000 iterations; off: query 0.78-0.89, HSTRCloud
+    /// 2.72-3.11 ms): a second DIRECT queue time-slices with the main one (qtrace_direct7b: async-queue cycles 0%, query unchanged,
+    /// HSTRCloud +1.1 ms, the probe's whole time). The native COMPUTE queue time-slices too: in every range the two queues' active
+    /// shares (gr__compute_cycles_active_queue_sync + _async) sum to 93-99%, never above 100 - compute6b (30720 threads) query
+    /// 50.6 + 42.2, thin4 (7680) 32.4 + 65.8, thin16 (1920) 11.6 + 87.7 - and the query's range grows by the probe's duration
+    /// (0.78-0.89 -> 1.73-2.03 / 3.4-3.9 / ~10 ms). Why: hardware-accelerated GPU scheduling is OFF on this laptop (HwSchMode 1,
+    /// driver 617.42); NVIDIA: "Multiple asynchronous compute queues will not overlap, due to the OS scheduler, unless hardware
+    /// scheduling is enabled" (developer.nvidia.com/blog/advanced-api-performance-synchronization), while compute-over-compute
+    /// overlap is "very efficient" on Ampere and later. HAGS on (HwSchMode 2) changed nothing (qtrace_hcompute / hthin4: shares
+    /// still sum to <= 100%; hagsq1 untraced: 300k-iteration probe +1.0 ms over 150k).
+    /// ROOT CAUSE (scripts/HSTR/bench/queue_overlap.cpp, standalone D3D12, and queueOverlapTest inside Mogwai): on this GPU /
+    /// driver only the FIRST DIRECT queue alive in a process runs beside a COMPUTE queue. Standalone, one kernel per queue gated
+    /// together: 1.50 ms against 1.19 + 1.19 alone (also with 100 chained barriers / copies, 10 GB resident, DirectStorage, a CUDA
+    /// context). One idle DIRECT queue created before the test's: 2.65 ms (serialized); created after, or created and released
+    /// before: 1.50. A second DIRECT queue never overlaps the first (2.65). slang-gfx 2024.1.34 creates its internal
+    /// m_resourceCommandQueue (DIRECT) in DeviceImpl::initialize, before Falcor's main queue, so Falcor's main queue - and any
+    /// device or queue made later in the process (qoverlap2: a fresh device too) - serializes with every other queue: inside Mogwai
+    /// 2.81 ms against 2.54 alone, on Falcor's main queue as well (qoverlap5). Overlap needs the main queue to be the process's
+    /// first DIRECT queue and the side work on a COMPUTE queue with COMPUTE command lists (slang-gfx records DIRECT lists only).
+    /// FIXED by patching slang-gfx 2024.1.34 (built from source, C:/Users/Friss/Documents/slang-src; originals kept in
+    /// slang-build/orig): m_resourceCommandQueue created on first use, the timestamp frequency from a released temporary queue,
+    /// QueueType::Compute (a COMPUTE queue) and ITransientResourceHeap::Flags::ComputeCommandLists (COMPUTE lists, ShaderResource
+    /// barriers as NON_PIXEL_SHADER_RESOURCE). qoverlap6: on Falcor's main queue 1.49 ms against 1.27 + 1.27 alone (was 2.81).
+    /// Beside the query on
+    /// the main queue (2) hid about half of the Slang probe (asyncq4, normalised by the unit march: +0.61 against +1.14 serial).
+    /// The SM-throughput rise in compute6b's query (11% -> 38%) was whichever queue held the GPU being busier, not overlap. Modes 1, 4 and 5
+    /// split the frame's submission and starve the main queue (see dispatchComputeQueueProbe): not measurements of overlap.
+    uint32_t mAsyncProbe = 0;
+    uint32_t mAsyncProbeIters = 20000;
+    uint32_t mAsyncProbeThreads = 30720;
+    Slang::ComPtr<gfx::ICommandQueue> mpAsyncQueue;   ///< Declared before the context, which keeps a raw pointer to it.
+    /// The second context's own transient heaps, one per use in a ring (the device's are the main context's: a heap's allocator
+    /// takes one open list, asyncdbg1).
+    std::array<Slang::ComPtr<gfx::ITransientResourceHeap>, 3> mpAsyncHeaps;
+    uint32_t mAsyncHeap = 0;
+    /// asyncProbe 4 / 5: a native D3D12 COMPUTE queue (slang-gfx creates only DIRECT queues) running the same ALU loop compiled
+    /// with FXC and a root UAV, so it needs no descriptors. 4: beside the query; 5: the main queue waits for it before the query
+    /// (the same kernel serial: the reference for 4).
+    Slang::ComPtr<ID3D12CommandQueue> mpComputeQueue;
+    std::array<Slang::ComPtr<ID3D12CommandAllocator>, 4> mpComputeAllocators;
+    std::array<uint64_t, 4> mComputeAllocatorDone{}; ///< The fence value each allocator's last list signals.
+    uint32_t mComputeAllocator = 0;
+    Slang::ComPtr<ID3D12GraphicsCommandList> mpComputeList;
+    Slang::ComPtr<ID3D12RootSignature> mpComputeRootSignature;
+    Slang::ComPtr<ID3D12PipelineState> mpComputeProbePso;
+    void dispatchComputeQueueProbe(RenderContext* pRenderContext);
+    /// The probe kernel (FXC, root UAV) for the native queues on pDevice.
+    void createComputeProbePipeline(
+        ID3D12Device* pDevice,
+        Slang::ComPtr<ID3D12RootSignature>& pRootSignature,
+        Slang::ComPtr<ID3D12PipelineState>& pPso
+    );
+    /// DIAGNOSTIC queueOverlapTest: scripts/HSTR/bench/queue_overlap.cpp run once inside this process on Falcor's device (its own
+    /// native DIRECT and COMPUTE queues, the probe kernel on each, gated to start together); logs alone / together times. Standalone,
+    /// the two overlap (1.50 ms together against 1.19 + 1.19 alone); this says whether Falcor's device / process does.
+    bool mQueueOverlapTest = false;
+    void runQueueOverlapTest(ID3D12Device* pDevice, const char* label, ID3D12CommandQueue* pDirectQueue = nullptr);
+    std::unique_ptr<ComputeContext> mpAsyncContext;
+    ref<Fence> mpAsyncFence;
+    ref<ComputePass> mpAsyncProbePass;
+    ref<Buffer> mpAsyncProbeOut;
     /// cloudSunBeside: a scheduling run moves from the cloud sea's place to right behind the dirty query, with no barrier between
     /// them (the query and march read only the resolved table and the sun atlas, which scheduling does not write), and its bakes to
     /// the frame's end (they write the atlas the march samples). The next frame's beam marks and resolve take its changes.

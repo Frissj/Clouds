@@ -45,6 +45,7 @@ parser.add_argument("--ngfx-multipass", action="store_true", help="--ngfx: multi
 # not used. With --ngfx, flight frames [START, STOP) of the first live flight are traced, once.
 #   python scripts/HSTR/bench/run_sea.py sunset TAG none --ngfx 60 62 --env HSTR_MOTION_SPEEDS=2 "HSTR_MOTION_ARMS=[...]"
 parser.add_argument("--env", nargs="*", default=[], help="sunset harness: KEY=VALUE settings for sunset_motion.py")
+parser.add_argument("--debug-layer", action="store_true", help="D3D12 debug layer (Mogwai --enable-debug-layer): its messages go to the log")
 args = parser.parse_args()
 
 sys.path.insert(0, str(BENCH))
@@ -80,6 +81,8 @@ else:
     script = "scripts/HSTR/bench/sea_motion.py"
 log = RESULTS / f"{args.tag}.log"
 command = [str(MOGWAI), "--headless", f"--script={script}"]
+if args.debug_layer:
+    command.append("--enable-debug-layer")
 if args.nsys:
     # Mogwai starts under `nsys launch`, which traces nothing until told: sea_motion.py sends `nsys start` just before each timed
     # flight and `nsys stop` after it, so each report holds that flight's frames and not the ~1,200-frame settle (a whole-run

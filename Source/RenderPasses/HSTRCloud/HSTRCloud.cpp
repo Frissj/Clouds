@@ -11,11 +11,29 @@
 #include <chrono>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
+#pragma comment(lib, "d3dcompiler.lib") // asyncProbe 4 / 5 compile their kernel with FXC.
+#pragma comment(lib, "dxgi.lib")        // queueOverlapTest's fresh device.
+#pragma comment(lib, "d3d12.lib")
+#include <psapi.h> // queueOverlapTest's module list.
+#pragma comment(lib, "psapi.lib")
+
 namespace
 {
+/// A profiler scope when pRenderContext is set: asyncResidency's work records into a compute-queue context the profiler cannot time.
+struct OptionalProfile
+{
+    std::optional<ScopedProfilerEvent> event;
+    OptionalProfile(RenderContext* pRenderContext, const char* name)
+    {
+        if (pRenderContext)
+            event.emplace(pRenderContext, name);
+    }
+};
+
 const char kShaderFile[] = "RenderPasses/HSTRCloud/HSTRCloud.cs.slang";
 const char kColor[] = "color";
 const char kTransportError[] = "transportError";
@@ -273,6 +291,10 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
 HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
     parseProperties(props);
+    // DIAGNOSTIC (HSTR_QUEUE_TEST in the environment): queueOverlapTest before this pass creates anything (no residency, no
+    // DirectStorage) - against the same test later in the run.
+    if (std::getenv("HSTR_QUEUE_TEST"))
+        runQueueOverlapTest(mpDevice->getNativeHandle().as<ID3D12Device*>(), "construction");
 }
 
 void HSTRCloud::parseProperties(const Properties& props)
@@ -694,6 +716,31 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "worldCacheViewEvery")
         {
             mWorldCacheViewEvery = std::max(1u, uint32_t(value));
+            continue;
+        }
+        if (key == "asyncProbe")
+        {
+            mAsyncProbe = uint32_t(value);
+            continue;
+        }
+        if (key == "asyncProbeIters")
+        {
+            mAsyncProbeIters = uint32_t(value);
+            continue;
+        }
+        if (key == "asyncProbeThreads")
+        {
+            mAsyncProbeThreads = std::max(64u, uint32_t(value));
+            continue;
+        }
+        if (key == "asyncResidency")
+        {
+            mAsyncResidency = bool(value);
+            continue;
+        }
+        if (key == "queueOverlapTest")
+        {
+            mQueueOverlapTest = bool(value);
             continue;
         }
         if (key == "beamSunKnock")
@@ -1863,6 +1910,10 @@ Properties HSTRCloud::getProperties() const
     props["cacheOracle"] = mParams.cacheOracle;
     props["worldCacheRingModulation"] = mWorldCacheRingModulation;
     props["worldCacheViewEvery"] = mWorldCacheViewEvery;
+    props["asyncProbe"] = mAsyncProbe;
+    props["asyncProbeIters"] = mAsyncProbeIters;
+    props["asyncProbeThreads"] = mAsyncProbeThreads;
+    props["asyncResidency"] = mAsyncResidency;
     props["worldCacheRingDepth"] = mParams.worldCacheRingDepth;
     props["seaFarField"] = mSeaFarField;
     props["seaFarDistance"] = mParams.seaFarDistance;
@@ -2198,6 +2249,9 @@ Properties HSTRCloud::getProperties() const
         cloud["beamHistoryProbe02"] = mBeamHistoryProbeTotals[1];
         cloud["beamHistoryProbe10"] = mBeamHistoryProbeTotals[2];
         cloud["sunBesideRuns"] = mSunBesideRuns;
+        cloud["asyncProbeRan"] = mpAsyncProbeOut ? mpAsyncProbeOut->getElement<uint32_t>(0) : 0u;
+        cloud["asyncResidencyFrames"] = mAsyncResidencyFrames;
+        cloud["d3d12Messages"] = mD3D12Messages;
         cloud["sunSerialRuns"] = mSunSerialRuns;
         cloud["sunFineRuns"] = stats.sunFineRuns;
         cloud["sunFineFallbacks"] = stats.sunFineFallbacks;
@@ -3745,24 +3799,52 @@ void HSTRCloud::invalidateBeamColumn(int2 worldTile)
                          float(std::max(mParams.worldCacheCellVoxels, 1u)) * voxel + 2.f * voxel;
     const float3 lo = desc.origin + float3(float(worldTile.x), 0.f, float(worldTile.y)) * float3(desc.tileWorld, 0.f, desc.tileWorld);
     const float3 hi = lo + float3(desc.tileWorld, desc.layerHeight, desc.tileWorld);
-    mBeamInvalidations.push_back(float4(0.5f * (lo + hi), 0.5f * length(hi - lo) + margin));
+    // asyncResidency: the tile's bricks and pages change on the compute queue beside this frame; the next frame invalidates it.
+    (mAsyncResidencyActive ? mDeferredInvalidations : mBeamInvalidations).push_back(float4(0.5f * (lo + hi), 0.5f * length(hi - lo) + margin));
 }
 
-void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
+void HSTRCloud::markResidencyChanges(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t bakes)
 {
     std::vector<uint4>& changes = mpCloudResidency->getBeamChanges();
+    // The last asyncResidency frame's changes, published now (the main queue waited for them at that frame's end).
+    if (!mDeferredBeamChanges.empty() || mDeferredBeamBakes > 0)
+    {
+        markBeamChanges(pRenderContext, mDeferredBeamChanges, mDeferredBeamBakes, mpDeferredSunBakes[mDeferredSunBakesParity]);
+        mDeferredBeamChanges.clear();
+        mDeferredBeamBakes = 0;
+    }
+    if (mAsyncResidencyActive)
+    {
+        // This frame's wait for the next: the march beside the compute queue may read them half-written, so the re-march they
+        // cause must come after. The bake jobs are copied on the compute queue right behind the bakes, into the copy the next
+        // frame's marks read while the compute queue's next frame rewrites the residency's list.
+        std::swap(changes, mDeferredBeamChanges);
+        if (bakes > 0)
+        {
+            const ref<Buffer>& pJobs = mpCloudResidency->getSunBakes();
+            mDeferredSunBakesParity ^= 1u;
+            ref<Buffer>& pCopy = mpDeferredSunBakes[mDeferredSunBakesParity];
+            if (!pCopy || pCopy->getSize() != pJobs->getSize())
+                pCopy = mpDevice->createStructuredBuffer(
+                    sizeof(HSTRCloudSunBake), pJobs->getElementCount(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nullptr, false
+                );
+            pContext->copyBufferRegion(pCopy.get(), 0, pJobs.get(), 0, pJobs->getSize());
+            mDeferredBeamBakes = bakes;
+        }
+    }
+    else
+        markBeamChanges(pRenderContext, changes, bakes, mpCloudResidency->getSunBakes());
+    changes.clear();
+    markBeamChangeCycle(pRenderContext);
+}
+
+void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, std::vector<uint4>& changes, uint32_t bakes, const ref<Buffer>& pBakes)
+{
     // Only the guard-driven octahedral image keeps what it marched from frame to frame, and only its builds consume the list.
     const bool active = mBeamChangeCellVoxels != 0 && mBeamInvalidate && mParams.beamOct != 0 && mParams.beamGuard != 0 && mBeamRefFrame;
-    if (!active)
+    if (!active || (changes.empty() && bakes == 0))
     {
         changes.clear();
-        mParams.beamChangeCellVoxels = 0;
-        mBeamChangesPending = false;
-        return;
-    }
-    if (changes.empty() && bakes == 0 && !mBeamChangeCellsMarked && mBeamChangeApplying == 0)
-    {
-        mParams.beamChangeSlice = ~0u; // No slice: a build the tile columns invalidate leaves the GPU list alone.
         return;
     }
     FALCOR_PROFILE(pRenderContext, "markBeamChanges");
@@ -3801,6 +3883,7 @@ void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
         var["hstrBeamChangeCellsOutput"] = mpBeamChangeCells;
         var["hstrBeamChangeSpheresOutput"] = mpBeamChangeSpheres;
         var["hstrBeamChangeCountOutput"] = mpBeamChangeCount;
+        var["hstrCloudSunBakes"] = pBakes; // The residency's list, or a deferred frame's copy of it (markResidencyChanges).
     };
     if (mParams.beamChangeInputs + bakes > 0 && mBeamChangeAssetSlotsOn)
     {
@@ -3848,6 +3931,22 @@ void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
     mParams.beamChangeInputs = 0;
     mParams.beamChangeBakes = 0;
     changes.clear();
+}
+
+void HSTRCloud::markBeamChangeCycle(RenderContext* pRenderContext)
+{
+    const bool active = mBeamChangeCellVoxels != 0 && mBeamInvalidate && mParams.beamOct != 0 && mParams.beamGuard != 0 && mBeamRefFrame;
+    if (!active)
+    {
+        mParams.beamChangeCellVoxels = 0;
+        mBeamChangesPending = false;
+        return;
+    }
+    if (!mBeamChangeCellsMarked && mBeamChangeApplying == 0)
+    {
+        mParams.beamChangeSlice = ~0u; // No slice: a build the tile columns invalidate leaves the GPU list alone.
+        return;
+    }
     // The cells accumulate for mBeamChangeInterval frames and are then listed at once; over the next as many frames the list is
     // applied to one interleaved slice of the guard blocks each (invalidateBeamGuardBlock), so each block is re-marched at most once
     // a cycle and the work is spread over its frames. The sun scheduler bakes 256 bricks every frame, parked or not, largely over
@@ -3867,9 +3966,15 @@ void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
         mBeamChangeApplying = 0;
         if (mBeamChangeCellsMarked)
         {
+            FALCOR_PROFILE(pRenderContext, "markBeamChanges");
             pRenderContext->clearUAV(mpBeamChangeCount->getUAV().get(), uint4(0)); // The last cycle's list is fully applied.
-            bind(mpBeamCompactChangesPass);
-            mpBeamCompactChangesPass->execute(pRenderContext, uint3(words, 1, 1));
+            bindResidencyPass(pRenderContext, mpBeamCompactChangesPass, true);
+            ShaderVar var = mpBeamCompactChangesPass->getRootVar()["CB"]["gHSTRCloud"];
+            var["hstrBeamChangeInput"] = mpBeamChangeInput;
+            var["hstrBeamChangeCellsOutput"] = mpBeamChangeCells;
+            var["hstrBeamChangeSpheresOutput"] = mpBeamChangeSpheres;
+            var["hstrBeamChangeCountOutput"] = mpBeamChangeCount;
+            mpBeamCompactChangesPass->execute(pRenderContext, uint3(mpBeamChangeCells->getElementCount(), 1, 1));
             mBeamChangeCellsMarked = false;
             mBeamChangeApplying = mBeamChangeInterval;
         }
@@ -4241,6 +4346,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame);
     mpCloudResidency->setScatterUploads(mCloudScatterUploads);
     mpCloudResidency->setScatterDense(mCloudScatterDense);
+    // asyncResidency: everything from here to the sun resolve records into the compute queue's context (beginAsyncResidency), which
+    // has no profiler: its scopes time only on the main queue.
+    ComputeContext* pContext = mpCloudResidency->getContext();
+    RenderContext* pProfile = pContext == pRenderContext ? pRenderContext : nullptr;
     // While the camera moves, fewer sun bakes a frame: the dirty march is already paying for the move, and a brick short of its own
     // bake answers from a baked ancestor meanwhile (or its outdated bake, cloudSunKeepStale). Parked, the full rate drains the
     // backlog. MEASURED (sunset_motion8, 4K sunset sea, same process, arms alternating in 48-frame chunks): 1024 / 256 / 64 bakes a
@@ -4261,7 +4370,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         densityChanged = mpCloudResidency->update(*mpCloudSea, view, mpCloudSea->instanceSlots(changed));
         if (mpCloudResidency->fadesRunning())
         {
-            FALCOR_PROFILE(pRenderContext, "fades");
+            OptionalProfile scope(pProfile, "fades");
             if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), mpAdvanceFadesPass.get()) == mResidencyPassesBound.end())
             {
                 // Only the bricks and the fade frame, which live as long as the residency.
@@ -4270,16 +4379,17 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 var["hstrCloudFadeFrame"] = mpCloudResidency->getFadeFrame();
                 mResidencyPassesBound.push_back(mpAdvanceFadesPass.get());
             }
-            mpAdvanceFadesPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+            mpAdvanceFadesPass->execute(pContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
         }
     }
     // The staged bricks' residuals decode from the payload pool in one dispatch; then one reconstruction dispatch per level,
     // coarsest first: every brick predicts from a parent already in the atlas.
     if (!mpCloudResidency->getCommitGroups().empty())
     {
-        FALCOR_PROFILE(pRenderContext, "commitBricks");
+        OptionalProfile commitScope(pProfile, "commitBricks");
         mParams.cloudStagedCount = mpCloudResidency->getStagedCount();
-        // DIAGNOSTIC cloudCommitCheck: the parallel passes' outputs against the serial passes' on the same staged bricks.
+        // DIAGNOSTIC cloudCommitCheck: the parallel passes' outputs against the serial passes' on the same staged bricks (on the
+        // main queue: beginAsyncResidency keeps the frame serial while it runs).
         const bool commitCheck = mCloudCommitCheck > 0 && mCloudCommitParallel;
         const uint32_t staged = mParams.cloudStagedCount;
         auto compareWords = [&](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b)
@@ -4288,16 +4398,16 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 mCommitMismatches += a[i] != b[i] ? 1u : 0u;
         };
         {
-            FALCOR_PROFILE(pRenderContext, "decode");
+            OptionalProfile scope(pProfile, "decode");
             if (mCloudCommitParallel)
             {
                 bindResidencyPass(pRenderContext, mpDecodeCloudPass, false);
-                mpDecodeCloudPass->execute(pRenderContext, uint3(staged * 64u, 1, 1));
+                mpDecodeCloudPass->execute(pContext, uint3(staged * 64u, 1, 1));
             }
             else
             {
                 bindResidencyPass(pRenderContext, mpDecodeCloudSerialPass, false);
-                mpDecodeCloudSerialPass->execute(pRenderContext, uint3(staged, 1, 1));
+                mpDecodeCloudSerialPass->execute(pContext, uint3(staged, 1, 1));
             }
         }
         if (commitCheck)
@@ -4312,14 +4422,14 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         }
         mParams.cloudStagedCount = 0;
         {
-            FALCOR_PROFILE(pRenderContext, "reconstruct");
+            OptionalProfile scope(pProfile, "reconstruct");
             for (const auto& group : mpCloudResidency->getCommitGroups())
             {
                 mParams.cloudCommitOffset = group.offset;
                 mParams.cloudCommitCount = group.count;
                 if (bindResidencyPass(pRenderContext, mpCommitCloudPass, false))
                     bindOutput(mpCommitCloudPass, "hstrCloudAtlasOutput", mpCloudResidency->getAtlas(), "hstrCloudAtlas");
-                mpCommitCloudPass->execute(pRenderContext, uint3(kCloudDensityEdge, kCloudDensityEdge, kCloudDensityEdge * group.count));
+                mpCommitCloudPass->execute(pContext, uint3(kCloudDensityEdge, kCloudDensityEdge, kCloudDensityEdge * group.count));
             }
         }
         mParams.cloudCommitCount = 0;
@@ -4333,10 +4443,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 occupancyVar["hstrCloudOccupancy"] = ref<Buffer>();
                 occupancyVar["hstrCloudOccupancyOutput"] = mpCloudResidency->getOccupancy();
             }
-            pPass->execute(pRenderContext, uint3(threads, 1, 1));
+            pPass->execute(pContext, uint3(threads, 1, 1));
         };
         {
-            FALCOR_PROFILE(pRenderContext, "occupancy");
+            OptionalProfile scope(pProfile, "occupancy");
             if (mCloudCommitParallel)
                 runOccupancy(mpOccupancyCloudPass, mParams.cloudStagedCount * 64u);
             else
@@ -4354,24 +4464,27 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     // The CPU hierarchy is canonical. Regions touched by paint/replace are marked into a persistent bitmap, atomically compacted,
     // then resolved exactly once per unique page. Clearing follows last frame's compact queue, never the full virtual address space.
     {
-        FALCOR_PROFILE(pRenderContext, "updateCloudPages");
+        OptionalProfile pagesScope(pProfile, "updateCloudPages");
         auto& residency = *mpCloudResidency;
         if (bindResidencyPass(pRenderContext, mpClearDirtyCloudPagesPass, false))
             residency.bindPageUpdates(mpClearDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"]);
-        mpClearDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
-        pRenderContext->clearUAV(residency.getDirtyPageCount()->getUAV().get(), uint4(0));
+        mpClearDirtyCloudPagesPass->executeIndirect(pContext, residency.getDirtyPageArgs().get(), 0);
+        pContext->clearUAV(residency.getDirtyPageCount()->getUAV().get(), uint4(0));
 
         mParams.cloudPageRegionCount = residency.getDirtyPageRegionCount();
         if (mParams.cloudPageRegionCount > 0)
         {
             if (bindResidencyPass(pRenderContext, mpMarkDirtyCloudPagesPass, false))
                 residency.bindPageUpdates(mpMarkDirtyCloudPagesPass->getRootVar()["CB"]["gHSTRCloud"]);
-            mpMarkDirtyCloudPagesPass->execute(pRenderContext, uint3(residency.getDirtyPageWorkCount(), 1, 1));
+            const uint32_t work = residency.getDirtyPageWorkCount();
+            mpMarkDirtyCloudPagesPass->execute(
+                pContext, uint3(std::min(work, kCloudDirtyPageRowThreads), div_round_up(work, kCloudDirtyPageRowThreads), 1)
+            );
         }
         if (bindResidencyPass(pRenderContext, mpCloudPageArgsPass, false))
             residency.bindPageUpdates(mpCloudPageArgsPass->getRootVar()["CB"]["gHSTRCloud"]);
         mpCloudPageArgsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrCloudDirtyPageArgs"] = residency.getDirtyPageArgs();
-        mpCloudPageArgsPass->execute(pRenderContext, uint3(1));
+        mpCloudPageArgsPass->execute(pContext, uint3(1));
         if (mParams.cloudPageRegionCount > 0)
         {
             if (bindResidencyPass(pRenderContext, mpResolveDirtyCloudPagesPass, false))
@@ -4381,10 +4494,10 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             pageVar["hstrCloudPagesOutput"] = residency.getPages();
             pageVar["hstrCloudLevelPages"] = ref<Buffer>();
             pageVar["hstrCloudLevelPagesOutput"] = residency.getLevelPages();
-            mpResolveDirtyCloudPagesPass->executeIndirect(pRenderContext, residency.getDirtyPageArgs().get(), 0);
+            mpResolveDirtyCloudPagesPass->executeIndirect(pContext, residency.getDirtyPageArgs().get(), 0);
             // The skirt masks read the pages just resolved: those the changes can reach (resolveCloudSkirtRegions), or all of them
             // (resolveCloudSkirtMasks) when that is no less work.
-            FALCOR_PROFILE(pRenderContext, "skirtMasks");
+            OptionalProfile scope(pProfile, "skirtMasks");
             const uint64_t skirtWork = residency.getSkirtWorkCount();
             const bool regions = mCloudSkirtRegions && skirtWork < residency.getPageCount();
             const auto& pSkirtPass = regions ? mpResolveSkirtRegionsPass : mpResolveSkirtMasksPass;
@@ -4396,7 +4509,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 skirtVar["hstrCloudSkirtMasksOutput"] = residency.getSkirtMasks();
                 residency.bindPageUpdates(skirtVar);
             }
-            pSkirtPass->execute(pRenderContext, uint3(regions ? uint32_t(skirtWork) : residency.getPageCount(), 1, 1));
+            pSkirtPass->execute(pContext, uint3(regions ? uint32_t(skirtWork) : residency.getPageCount(), 1, 1));
             mParams.cloudSkirtRegionCount = 0;
             ++mSkirtFrames;
             mSkirtDirtyRegions += residency.getDirtyPageRegionCount();
@@ -4437,7 +4550,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         {
             // This frame's run: its first part here, its stamps behind the dirty query, the rest at the frame's end (finishDeferredSun).
             // Last frame's, if any, lands now.
-            dispatchSunScheduling(pRenderContext, kSunPre);
+            dispatchSunScheduling(pRenderContext, pRenderContext, kSunPre);
             mSunDeferred = true;
             mSunScheduled = false;
             sunRan = mSunBaked;
@@ -4446,7 +4559,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         else
         {
             sunRan = mpCloudResidency->getGpuSunFrame().run || mSunBaked;
-            sunSlotsChanged = dispatchSunScheduling(pRenderContext) || mSunBaked;
+            sunSlotsChanged = dispatchSunScheduling(pRenderContext, pContext) || mSunBaked;
             mpCloudResidency->gpuSunDispatched();
         }
         mSunBaked = false;
@@ -4465,8 +4578,9 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         mBeamReusable = false;
     }
     // What the frame settled and baked, for the beam image to re-verify (the bake jobs are still in hstrCloudSunBakes).
-    markBeamChanges(
+    markResidencyChanges(
         pRenderContext,
+        pContext,
         // FOUND (cloudSunBeside work): with the GPU scheduler this always passed 0 bakes - it read the frame's bakeMax after
         // gpuSunDispatched cleared it - so bakes never marked the beam. beamMarkBakes passes the run's bake jobs (mSunBakeMax).
         mCloudGpuSun ? (mBeamMarkBakes && sunRan ? mSunBakeMax : 0u) : mpCloudResidency->getSunBakeCount()
@@ -4499,13 +4613,13 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         auto& touchList = mpCloudResidency->getSunTouchList();
         if (!touchList.empty())
         {
-            FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
+            OptionalProfile scope(pProfile, "resolveCloudSun");
             if (!mpSunTouchListBuffer)
                 mpSunTouchListBuffer = mpDevice->createStructuredBuffer(
                     sizeof(uint32_t), mpCloudResidency->getBrickCapacity(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal,
                     nullptr, false
                 );
-            mpSunTouchListBuffer->setBlob(touchList.data(), 0, touchList.size() * sizeof(uint32_t));
+            pContext->updateBuffer(mpSunTouchListBuffer.get(), touchList.data(), 0, touchList.size() * sizeof(uint32_t));
             mParams.cloudSunResolveList = uint32_t(touchList.size());
             if (bindResidencyPass(pRenderContext, mpResolveCloudSunSlotsPass, false))
             {
@@ -4515,7 +4629,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 sunVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
             }
             mpResolveCloudSunSlotsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrCloudSunTouchList"] = mpSunTouchListBuffer;
-            mpResolveCloudSunSlotsPass->execute(pRenderContext, uint3(mParams.cloudSunResolveList, 1, 1));
+            mpResolveCloudSunSlotsPass->execute(pContext, uint3(mParams.cloudSunResolveList, 1, 1));
             mParams.cloudSunResolveList = 0;
             ++mSunResolveListFrames;
             mSunResolveListBricks += uint32_t(touchList.size());
@@ -4568,7 +4682,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                                  touchList.size() <= mpCloudResidency->getBrickCapacity();
         mSunResolveValid = true;
         mSunResolveInputs = sunResolveInputs;
-        FALCOR_PROFILE(pRenderContext, "resolveCloudSun");
+        OptionalProfile scope(pProfile, "resolveCloudSun");
         mParams.cloudSunTouchFrame = incremental ? mpCloudResidency->getGpuSunFrame().info.frame : 0u;
         if (incremental && !touchList.empty())
         {
@@ -4577,7 +4691,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                     sizeof(uint32_t), mpCloudResidency->getBrickCapacity(), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal,
                     nullptr, false
                 );
-            mpSunTouchListBuffer->setBlob(touchList.data(), 0, touchList.size() * sizeof(uint32_t));
+            pContext->updateBuffer(mpSunTouchListBuffer.get(), touchList.data(), 0, touchList.size() * sizeof(uint32_t));
             mParams.cloudSunTouchCount = uint32_t(touchList.size());
             if (bindResidencyPass(pRenderContext, mpStampCloudSunTouchedPass, false))
             {
@@ -4585,7 +4699,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 stampVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
                 stampVar["hstrCloudSunTouchList"] = mpSunTouchListBuffer;
             }
-            mpStampCloudSunTouchedPass->execute(pRenderContext, uint3(mParams.cloudSunTouchCount, 1, 1));
+            mpStampCloudSunTouchedPass->execute(pContext, uint3(mParams.cloudSunTouchCount, 1, 1));
             mParams.cloudSunTouchCount = 0;
         }
         touchList.clear();
@@ -4596,7 +4710,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             sunVar["hstrCloudSunResolvedOutput"] = mpCloudResidency->getSunResolved();
             sunVar["hstrCloudSunTouched"] = mpCloudResidency->getSunTouched();
         }
-        mpResolveCloudSunSlotsPass->execute(pRenderContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+        mpResolveCloudSunSlotsPass->execute(pContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
         mParams.cloudSunTouchFrame = 0;
         ++mSunResolveFrames;
         mSunResolveTouchFrames += incremental ? 1u : 0u;
@@ -4700,9 +4814,10 @@ bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<Compu
     return first;
 }
 
-bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t phases)
+bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t phases)
 {
     auto& residency = *mpCloudResidency;
+    RenderContext* pProfile = pContext == pRenderContext ? pRenderContext : nullptr; // The compute queue's context has no profiler.
     // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle. The copy was
     // recorded in an earlier frame, whose end submitted it, so the fence is signalled now rather than by flushing then.
     if ((phases & kSunPre) && mSunReadbackRecorded)
@@ -4719,12 +4834,12 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t ph
     }
     const auto& sun = residency.getGpuSunFrame();
     const HSTRCloudSunFrame& info = sun.info;
-    FALCOR_PROFILE(pRenderContext, "scheduleSun");
+    OptionalProfile scheduleScope(pProfile, "scheduleSun");
     // The scheduler passes read only the residency's buffers (their frame included, HSTRCloudSunFrame, so no params), which live as
     // long as it: each pass binds them once (as bindResidencyPass does) and then dispatches with nothing changed.
     auto run = [&](const char* name, const ref<ComputePass>& pPass, uint3 threads)
     {
-        FALCOR_PROFILE(pRenderContext, name);
+        OptionalProfile scope(pProfile, name);
         if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), pPass.get()) == mResidencyPassesBound.end())
         {
             // Only the residency's buffers: every other binding would still cost each dispatch its resource state tracking.
@@ -4742,7 +4857,7 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t ph
             }
             mResidencyPassesBound.push_back(pPass.get());
         }
-        pPass->execute(pRenderContext, threads);
+        pPass->execute(pContext, threads);
     };
     // The invalidation field ages every frame, idle or not.
     if ((phases & kSunPre) && info.ageRows > 0)
@@ -4757,8 +4872,8 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t ph
     }
     if (phases & kSunPre)
     {
-        pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
-        pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
+        pContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
+        pContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
         if (info.releaseCount > 0)
             run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
     }
@@ -4822,8 +4937,423 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t ph
         mSunBakeMax = info.bakeMax; // gpuSunDispatched clears the frame before a deferred run bakes.
     }
     if (phases & kSunBake)
-        bakeScheduledSun(pRenderContext);
+        bakeScheduledSun(pRenderContext, pContext);
     return true;
+}
+
+void HSTRCloud::createComputeProbePipeline(
+    ID3D12Device* pDevice,
+    Slang::ComPtr<ID3D12RootSignature>& pRootSignature,
+    Slang::ComPtr<ID3D12PipelineState>& pPso
+)
+{
+    if (pPso)
+        return;
+    // HSTRAsyncProbe.cs.slang's loop; one atomic a thread (FXC has no wave intrinsics).
+    static const char kSource[] = R"hlsl(
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer AsyncProbeCB : register(b0) { uint gIters; };
+RWStructuredBuffer<uint> gAsyncProbeOut : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    float x = 1.f + float(id.x) * 1e-7f;
+    [loop]
+    for (uint i = 0; i < gIters; ++i)
+        x = x * 0.99999f + 1e-5f;
+    InterlockedAdd(gAsyncProbeOut[0], 1u);
+    if (x == 1234.5f)
+        gAsyncProbeOut[1] = 1u;
+}
+)hlsl";
+    Slang::ComPtr<ID3DBlob> pCode, pErrors;
+    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "asyncProbe", nullptr, nullptr, "main", "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                          pCode.writeRef(), pErrors.writeRef())))
+        FALCOR_THROW("asyncProbe: {}", pErrors ? static_cast<const char*>(pErrors->GetBufferPointer()) : "compile failed");
+    if (FAILED(pDevice->CreateRootSignature(0, pCode->GetBufferPointer(), pCode->GetBufferSize(), IID_PPV_ARGS(pRootSignature.writeRef()))))
+        FALCOR_THROW("asyncProbe: could not create the root signature.");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = pRootSignature.get();
+    psoDesc.CS = {pCode->GetBufferPointer(), pCode->GetBufferSize()};
+    if (FAILED(pDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(pPso.writeRef()))))
+        FALCOR_THROW("asyncProbe: could not create the pipeline.");
+}
+
+void HSTRCloud::runQueueOverlapTest(ID3D12Device* pDevice, const char* label, ID3D12CommandQueue* pDirectQueue)
+{
+    // scripts/HSTR/bench/queue_overlap.cpp's measurement on pDevice: own DIRECT and COMPUTE queues, 232 groups x 400000 iterations
+    // on each, gated by one fence so they start together; each queue's timestamps say when it ran.
+    Slang::ComPtr<ID3D12RootSignature> pRootSignature;
+    Slang::ComPtr<ID3D12PipelineState> pPso;
+    createComputeProbePipeline(pDevice, pRootSignature, pPso);
+    Slang::ComPtr<ID3D12Resource> pOut;
+    {
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = 256;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(pDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(pOut.writeRef()))))
+            FALCOR_THROW("queueOverlapTest: setup failed.");
+    }
+    {
+        char path[MAX_PATH] = "not loaded";
+        if (HMODULE core = GetModuleHandleA("D3D12Core.dll"))
+            GetModuleFileNameA(core, path, MAX_PATH);
+        logInfo("HSTRCloud: queueOverlapTest on {}; D3D12Core: {}", label, path);
+    }
+    struct TestQueue
+    {
+        D3D12_COMMAND_LIST_TYPE type;
+        Slang::ComPtr<ID3D12CommandQueue> queue;
+        Slang::ComPtr<ID3D12CommandAllocator> allocator;
+        Slang::ComPtr<ID3D12GraphicsCommandList> list;
+        Slang::ComPtr<ID3D12QueryHeap> queries;
+        Slang::ComPtr<ID3D12Resource> readback;
+        Slang::ComPtr<ID3D12Fence> fence;
+        uint64_t fenceValue = 0;
+        uint64_t frequency = 1;
+    };
+    TestQueue queues[2] = {{D3D12_COMMAND_LIST_TYPE_DIRECT}, {D3D12_COMMAND_LIST_TYPE_COMPUTE}};
+    D3D12_HEAP_PROPERTIES readbackHeap = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC readbackDesc = {};
+    readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackDesc.Width = 2 * sizeof(uint64_t);
+    readbackDesc.Height = readbackDesc.DepthOrArraySize = readbackDesc.MipLevels = 1;
+    readbackDesc.SampleDesc.Count = 1;
+    readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (TestQueue& q : queues)
+    {
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {q.type};
+        D3D12_QUERY_HEAP_DESC queryDesc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2};
+        // pDirectQueue: an existing DIRECT queue (Falcor's main one) instead of a new one.
+        if (q.type == D3D12_COMMAND_LIST_TYPE_DIRECT && pDirectQueue)
+            q.queue = pDirectQueue;
+        else if (FAILED(pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(q.queue.writeRef()))))
+            FALCOR_THROW("queueOverlapTest: setup failed.");
+        if (
+            FAILED(pDevice->CreateCommandAllocator(q.type, IID_PPV_ARGS(q.allocator.writeRef()))) ||
+            FAILED(pDevice->CreateCommandList(0, q.type, q.allocator.get(), pPso.get(), IID_PPV_ARGS(q.list.writeRef()))) ||
+            FAILED(pDevice->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(q.queries.writeRef()))) ||
+            FAILED(pDevice->CreateCommittedResource(
+                &readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(q.readback.writeRef())
+            )) ||
+            FAILED(pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(q.fence.writeRef()))) || FAILED(q.queue->GetTimestampFrequency(&q.frequency)))
+            FALCOR_THROW("queueOverlapTest: setup failed.");
+        q.list->Close();
+    }
+    auto record = [&](TestQueue& q)
+    {
+        q.allocator->Reset();
+        q.list->Reset(q.allocator.get(), pPso.get());
+        q.list->EndQuery(q.queries.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        q.list->SetComputeRootSignature(pRootSignature.get());
+        q.list->SetComputeRoot32BitConstant(0, 400000u, 0);
+        q.list->SetComputeRootUnorderedAccessView(1, pOut->GetGPUVirtualAddress());
+        q.list->Dispatch(232, 1, 1);
+        q.list->EndQuery(q.queries.get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        q.list->ResolveQueryData(q.queries.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, q.readback.get(), 0);
+        q.list->Close();
+    };
+    auto finish = [](TestQueue& q)
+    {
+        q.queue->Signal(q.fence.get(), ++q.fenceValue);
+        while (q.fence->GetCompletedValue() < q.fenceValue)
+            ;
+    };
+    auto stamps = [](TestQueue& q, uint64_t& begin, uint64_t& end)
+    {
+        uint64_t* p = nullptr;
+        D3D12_RANGE range = {0, 2 * sizeof(uint64_t)};
+        q.readback->Map(0, &range, reinterpret_cast<void**>(&p));
+        begin = p[0];
+        end = p[1];
+        q.readback->Unmap(0, nullptr);
+    };
+    auto ms = [](const TestQueue& q, uint64_t ticks) { return 1000.0 * double(ticks) / double(q.frequency); };
+    Slang::ComPtr<ID3D12Fence> gate;
+    if (FAILED(pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(gate.writeRef()))))
+        FALCOR_THROW("queueOverlapTest: setup failed.");
+    for (uint32_t run = 0; run < 4; ++run)
+    {
+        double alone[2];
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            record(queues[i]);
+            ID3D12CommandList* lists[] = {queues[i].list.get()};
+            queues[i].queue->ExecuteCommandLists(1, lists);
+            finish(queues[i]);
+            uint64_t b, e;
+            stamps(queues[i], b, e);
+            alone[i] = ms(queues[i], e - b);
+        }
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            record(queues[i]);
+            queues[i].queue->Wait(gate.get(), run + 1);
+            ID3D12CommandList* lists[] = {queues[i].list.get()};
+            queues[i].queue->ExecuteCommandLists(1, lists);
+        }
+        gate->Signal(run + 1);
+        finish(queues[0]);
+        finish(queues[1]);
+        uint64_t b0, e0, b1, e1;
+        stamps(queues[0], b0, e0);
+        stamps(queues[1], b1, e1);
+        logInfo(
+            "HSTRCloud: queueOverlapTest {} run {}: direct alone {:.3f} ms, compute alone {:.3f} ms | together direct {:.3f}, compute {:.3f}, "
+            "union {:.3f} ms (sum of alone {:.3f})",
+            label, run, alone[0], alone[1], ms(queues[0], e0 - b0), ms(queues[1], e1 - b1), ms(queues[0], std::max(e0, e1) - std::min(b0, b1)),
+            alone[0] + alone[1]
+        );
+    }
+}
+
+void HSTRCloud::dispatchComputeQueueProbe(RenderContext* pRenderContext)
+{
+    ID3D12Device* pDevice = mpDevice->getNativeHandle().as<ID3D12Device*>();
+    if (!mpComputeQueue)
+    {
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        if (FAILED(pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(mpComputeQueue.writeRef()))))
+            FALCOR_THROW("asyncProbe: could not create a compute queue.");
+        for (auto& pAllocator : mpComputeAllocators)
+            if (FAILED(pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(pAllocator.writeRef()))))
+                FALCOR_THROW("asyncProbe: could not create a compute allocator.");
+        createComputeProbePipeline(pDevice, mpComputeRootSignature, mpComputeProbePso);
+        if (FAILED(pDevice->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, mpComputeAllocators[0].get(), mpComputeProbePso.get(),
+                IID_PPV_ARGS(mpComputeList.writeRef())
+            )))
+            FALCOR_THROW("asyncProbe: could not create the compute list.");
+        mpComputeList->Close();
+        if (!mpAsyncFence)
+            mpAsyncFence = mpDevice->createFence();
+        logInfo("HSTRCloud: asyncProbe compute queue created.");
+    }
+    ID3D12Fence* pFence = mpAsyncFence->getNativeHandle().as<ID3D12Fence*>();
+    // 4 / 5: everything recorded before the query goes to the GPU now; the compute queue starts when it has finished, as the query
+    // does. MEASURED: that split starves the main queue (qtrace_compute / qtrace_cserial: the rest of the frame waits for its CPU
+    // recording, inside the query's range - query 0.8 -> 2.5-3.9 ms while the compute queue was active 4% of HSTRCloud). 6 submits
+    // at the frame's start with no split and no wait (the real design: async work published a frame late).
+    const bool split = mAsyncProbe != 6;
+    uint64_t ready = 0;
+    if (split)
+    {
+        pRenderContext->submit();
+        ready = pRenderContext->signal(mpAsyncFence.get());
+    }
+    mComputeAllocator = (mComputeAllocator + 1) % uint32_t(mpComputeAllocators.size());
+    if (pFence->GetCompletedValue() < mComputeAllocatorDone[mComputeAllocator])
+        mpAsyncFence->wait(mComputeAllocatorDone[mComputeAllocator]);
+    ID3D12CommandAllocator* pAllocator = mpComputeAllocators[mComputeAllocator].get();
+    pAllocator->Reset();
+    mpComputeList->Reset(pAllocator, mpComputeProbePso.get());
+    mpComputeList->SetComputeRootSignature(mpComputeRootSignature.get());
+    mpComputeList->SetComputeRoot32BitConstant(0, mAsyncProbeIters, 0);
+    mpComputeList->SetComputeRootUnorderedAccessView(1, mpAsyncProbeOut->getGpuAddress());
+    mpComputeList->Dispatch((mAsyncProbeThreads + 63) / 64, 1, 1);
+    mpComputeList->Close();
+    if (split)
+        mpComputeQueue->Wait(pFence, ready);
+    ID3D12CommandList* lists[] = {mpComputeList.get()};
+    mpComputeQueue->ExecuteCommandLists(1, lists);
+    const uint64_t done = mpAsyncFence->updateSignaledValue();
+    mpComputeQueue->Signal(pFence, done);
+    mComputeAllocatorDone[mComputeAllocator] = done;
+    if (mAsyncProbe == 5)
+        pRenderContext->wait(mpAsyncFence.get(), done); // Serial: the query waits for the probe.
+    else if (split)
+        mAsyncProbeDone = done;
+}
+
+void HSTRCloud::dispatchAsyncProbe(RenderContext* pRenderContext)
+{
+    if (mAsyncProbe == 0)
+        return;
+    if (!mpAsyncProbePass)
+    {
+        mpAsyncProbePass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/HSTRAsyncProbe.cs.slang", "main");
+        mpAsyncProbeOut = mpDevice->createStructuredBuffer(sizeof(uint32_t), 2);
+        mpAsyncProbeOut->setName("HSTRCloud::asyncProbeOut");
+        pRenderContext->clearUAV(mpAsyncProbeOut->getUAV().get(), uint4(0));
+        mpAsyncProbePass->getRootVar()["gAsyncProbeOut"] = mpAsyncProbeOut;
+    }
+    mpAsyncProbePass->getRootVar()["AsyncProbeCB"]["gIters"] = mAsyncProbeIters;
+    if (mAsyncProbe == 4 || mAsyncProbe == 5 || mAsyncProbe == 6)
+    {
+        dispatchComputeQueueProbe(pRenderContext);
+        return;
+    }
+    if (mAsyncProbe == 1 || mAsyncProbe == 7)
+    {
+        if (!mpAsyncContext)
+        {
+            gfx::ICommandQueue::Desc desc = {gfx::ICommandQueue::QueueType::Graphics};
+            if (SLANG_FAILED(mpDevice->getGfxDevice()->createCommandQueue(desc, mpAsyncQueue.writeRef())))
+                FALCOR_THROW("asyncProbe: could not create a second command queue.");
+            for (auto& pHeap : mpAsyncHeaps)
+            {
+                gfx::ITransientResourceHeap::Desc heapDesc = {};
+                heapDesc.flags = gfx::ITransientResourceHeap::Flags::AllowResizing;
+                heapDesc.constantBufferSize = 1 << 20;
+                heapDesc.samplerDescriptorCount = 64;
+                heapDesc.uavDescriptorCount = 4096;
+                heapDesc.srvDescriptorCount = 4096;
+                heapDesc.constantBufferDescriptorCount = 4096;
+                if (SLANG_FAILED(mpDevice->getGfxDevice()->createTransientResourceHeap(heapDesc, pHeap.writeRef())))
+                    FALCOR_THROW("asyncProbe: could not create a transient heap.");
+            }
+            mpAsyncContext = std::make_unique<ComputeContext>(mpDevice.get(), mpAsyncQueue.get(), mpAsyncHeaps[0].get());
+            mpAsyncFence = mpDevice->createFence();
+            // Its command buffer stays closed between uses, so a heap is never reset under an open list.
+            mpAsyncContext->getLowLevelData()->closeCommandBuffer();
+            logInfo("HSTRCloud: asyncProbe second queue created.");
+        }
+        // 1: everything recorded before the query goes to the GPU now; the probe's queue starts when it has finished, as the query
+        // does (that split starves the main queue, see dispatchComputeQueueProbe). 7: at the frame's start, no split, no wait.
+        if (mAsyncProbe == 1)
+        {
+            pRenderContext->submit();
+            const uint64_t ready = pRenderContext->signal(mpAsyncFence.get());
+            mpAsyncContext->wait(mpAsyncFence.get(), ready);
+        }
+        // The next heap of the ring, as Device::endFrame rotates the main context's: reset once its last use has finished.
+        mAsyncHeap = (mAsyncHeap + 1) % uint32_t(mpAsyncHeaps.size());
+        gfx::ITransientResourceHeap* pHeap = mpAsyncHeaps[mAsyncHeap].get();
+        pHeap->synchronizeAndReset();
+        mpAsyncContext->getLowLevelData()->setTransientHeap(pHeap);
+        mpAsyncContext->getLowLevelData()->openCommandBuffer();
+        mpAsyncProbePass->execute(mpAsyncContext.get(), uint3(mAsyncProbeThreads, 1, 1));
+        mpAsyncContext->submit();
+        mpAsyncContext->getLowLevelData()->closeCommandBuffer();
+        pHeap->finish();
+        const uint64_t done = mpAsyncContext->signal(mpAsyncFence.get());
+        if (mAsyncProbe == 1)
+            mAsyncProbeDone = done;
+        return;
+    }
+    if (mAsyncProbe == 2)
+    {
+        const bool autoBarriers = pRenderContext->getAutoUavBarriers();
+        pRenderContext->setAutoUavBarriers(false);
+        mpAsyncProbePass->execute(pRenderContext, uint3(mAsyncProbeThreads, 1, 1));
+        pRenderContext->setAutoUavBarriers(autoBarriers);
+        return;
+    }
+    FALCOR_PROFILE(pRenderContext, "asyncProbe");
+    pRenderContext->uavBarrier(mpAsyncProbeOut.get());
+    mpAsyncProbePass->execute(pRenderContext, uint3(mAsyncProbeThreads, 1, 1));
+    pRenderContext->uavBarrier(mpAsyncProbeOut.get());
+}
+
+void HSTRCloud::finishAsyncProbe(RenderContext* pRenderContext)
+{
+    if (mAsyncProbeDone == 0)
+        return;
+    // The main queue's later work (the next frame's, the tone mapper, the transient heaps' reuse) waits for the probe.
+    pRenderContext->submit();
+    pRenderContext->wait(mpAsyncFence.get(), mAsyncProbeDone);
+    mAsyncProbeDone = 0;
+}
+
+void HSTRCloud::beginAsyncResidency(RenderContext* pRenderContext)
+{
+    // The last asyncResidency frame's tile columns: published now (the main queue waited for them at that frame's end).
+    mBeamInvalidations.insert(mBeamInvalidations.end(), mDeferredInvalidations.begin(), mDeferredInvalidations.end());
+    mDeferredInvalidations.clear();
+    // Serial on frames a blocking diagnostic reads the residency's results back (through the main context), with cloudSunBeside
+    // (its run is spread over the main queue's frame) and with the CPU sun scheduler.
+    const bool diagnostics = mCloudCommitCheck > 0 || mCloudSkirtCheck || mCloudSunResolveCheck > 0 || mCloudSunTouchCheck ||
+                             mCloudSunStampFineCheck != 0 || mSunBakeProbe || (mpCloudResidency && mpCloudResidency->scatterCheckPending());
+    mAsyncResidencyActive = mAsyncResidency && mpCloudResidency && mCloudGpuSun && !mCloudSunBeside && !diagnostics;
+    if (!mAsyncResidencyActive)
+    {
+        if (mpCloudResidency)
+            mpCloudResidency->setAsyncContext(nullptr);
+        mAsyncResidencyLastFrame = false;
+        return;
+    }
+    if (!mpResidencyContext)
+    {
+        gfx::ICommandQueue::Desc desc = {gfx::ICommandQueue::QueueType::Compute};
+        if (SLANG_FAILED(mpDevice->getGfxDevice()->createCommandQueue(desc, mpResidencyQueue.writeRef())))
+            FALCOR_THROW("asyncResidency: could not create a compute queue.");
+        for (auto& pHeap : mpResidencyHeaps)
+        {
+            gfx::ITransientResourceHeap::Desc heapDesc = {};
+            heapDesc.flags = gfx::ITransientResourceHeap::Flags::Enum(
+                gfx::ITransientResourceHeap::Flags::AllowResizing | gfx::ITransientResourceHeap::Flags::ComputeCommandLists
+            );
+            heapDesc.constantBufferSize = 4 << 20;
+            heapDesc.samplerDescriptorCount = 1024;
+            heapDesc.uavDescriptorCount = 65536;
+            heapDesc.srvDescriptorCount = 65536;
+            heapDesc.constantBufferDescriptorCount = 65536;
+            if (SLANG_FAILED(mpDevice->getGfxDevice()->createTransientResourceHeap(heapDesc, pHeap.writeRef())))
+                FALCOR_THROW("asyncResidency: could not create a transient heap.");
+        }
+        mpResidencyContext = std::make_unique<ComputeContext>(mpDevice.get(), mpResidencyQueue.get(), mpResidencyHeaps[0].get());
+        // Its command buffer stays closed between frames, so a heap is never reset under an open list.
+        mpResidencyContext->getLowLevelData()->closeCommandBuffer();
+        // Both contexts record the residency's buffers and atlases in one frame, interleaved: with Falcor's per-resource state
+        // tracking each list's barriers started from the other's last state (asyncdbg5: D3D12 527 on residency.SunResolved, a
+        // UNORDERED_ACCESS -> NON_PIXEL barrier in the main list while it was NON_PIXEL there), and the main list re-transitioned
+        // what only the compute queue had written.
+        mpResidencyContext->setOwnResourceStates(true);
+        // Named, so the debug layer's cross-queue messages say which queue holds the other's resource.
+        auto nameQueue = [](gfx::ICommandQueue* pQueue, const wchar_t* name)
+        {
+            gfx::InteropHandle handle = {};
+            if (SLANG_SUCCEEDED(pQueue->getNativeHandle(&handle)) && handle.handleValue != 0)
+                reinterpret_cast<ID3D12CommandQueue*>(handle.handleValue)->SetName(name);
+        };
+        nameQueue(mpResidencyQueue.get(), L"HSTR residency COMPUTE queue");
+        nameQueue(pRenderContext->getLowLevelData()->getGfxCommandQueue(), L"Falcor main DIRECT queue");
+        mpResidencyFence = mpDevice->createFence();
+        mpMainFence = mpDevice->createFence();
+        logInfo("HSTRCloud: asyncResidency compute queue created.");
+    }
+    // The next heap of the ring (as Device::endFrame rotates the main context's): reset once its last frame has finished.
+    mResidencyHeap = (mResidencyHeap + 1) % uint32_t(mpResidencyHeaps.size());
+    gfx::ITransientResourceHeap* pHeap = mpResidencyHeaps[mResidencyHeap].get();
+    pHeap->synchronizeAndReset();
+    mpResidencyContext->getLowLevelData()->setTransientHeap(pHeap);
+    mpResidencyContext->getLowLevelData()->openCommandBuffer();
+    // The main queue's last frame is the last that may map what this frame frees and rewrites (CloudResidency's quarantine).
+    // After a serial frame, whose residency work ran on the main queue and signalled nothing, its fence covers everything the
+    // main queue has been given (that frame ended with a submit). FOUND (asyncdbg6, debug layer): without it the first frame after
+    // a serial one waited only for the last async frame's value, and its decode wrote residency.Residuals while the serial frame's
+    // decode was still in flight on the main queue (D3D12 1047, frame 621).
+    if (!mAsyncResidencyLastFrame)
+        mMainFenceValue = pRenderContext->signal(mpMainFence.get());
+    mAsyncResidencyLastFrame = true;
+    mpResidencyContext->wait(mpMainFence.get(), mMainFenceValue);
+    mpCloudResidency->setAsyncContext(mpResidencyContext.get());
+}
+
+void HSTRCloud::submitAsyncResidency(RenderContext* pRenderContext)
+{
+    if (!mAsyncResidencyActive)
+        return;
+    // HSTRCloud's main-queue work first, so both queues start on it together (the frame is CPU-bound: recorded for ~10-40 ms and
+    // submitted at once; work submitted earlier runs on an idle GPU and overlaps nothing, qtrace_compute6).
+    pRenderContext->submit();
+    mMainFenceValue = pRenderContext->signal(mpMainFence.get());
+    mpResidencyContext->submit();
+    mpResidencyContext->getLowLevelData()->closeCommandBuffer();
+    mpResidencyHeaps[mResidencyHeap]->finish();
+    const uint64_t done = mpResidencyContext->signal(mpResidencyFence.get());
+    // Everything after - the frame's later passes, the next frame, the upload heap's and transient heaps' reuse - waits for it.
+    pRenderContext->wait(mpResidencyFence.get(), done);
+    mpCloudResidency->setAsyncContext(nullptr);
+    mAsyncResidencyActive = false;
+    ++mAsyncResidencyFrames;
 }
 
 void HSTRCloud::finishDeferredSun(RenderContext* pRenderContext)
@@ -4832,21 +5362,22 @@ void HSTRCloud::finishDeferredSun(RenderContext* pRenderContext)
         return;
     if (!mSunScheduled)
         ++mSunSerialRuns; // DIAGNOSTIC: no dirty query this frame to hide the stamps behind.
-    dispatchSunScheduling(pRenderContext, (mSunScheduled ? 0u : kSunStamp) | kSunSelect | kSunBake);
+    dispatchSunScheduling(pRenderContext, pRenderContext, (mSunScheduled ? 0u : kSunStamp) | kSunSelect | kSunBake);
     mpCloudResidency->gpuSunDispatched();
     mSunDeferred = false;
     mSunScheduled = false;
     mSunBaked = true;
 }
 
-void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext)
+void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext, ComputeContext* pContext)
 {
     auto& residency = *mpCloudResidency;
     const uint32_t bakeMax = mSunBakeMax;
-    FALCOR_PROFILE(pRenderContext, "scheduleSun");
+    RenderContext* pProfile = pContext == pRenderContext ? pRenderContext : nullptr;
+    OptionalProfile scheduleScope(pProfile, "scheduleSun");
     // The jobs assign wrote; entries without a slot return at once.
     {
-        FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
+        OptionalProfile scope(pProfile, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
         mParams.cloudCommitCount = bakeMax;
         if (mSunBakeProbe && !mpSunBakeProbe)
@@ -4874,7 +5405,7 @@ void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext)
             }
             mpBakeCloudSunPass->getRootVar()["gSunBakeProbe"] = mpSunBakeProbe;
         }
-        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * bakeMax));
+        mpBakeCloudSunPass->execute(pContext, uint3(10, 10, 10 * bakeMax));
         mParams.cloudCommitCount = 0;
         if (mpSunBakeProbe)
         {
@@ -4892,7 +5423,8 @@ void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext)
             mpSunReadback = mpDevice->createBuffer(sizeof(uint32_t), ResourceBindFlags::None, MemoryType::ReadBack);
             mpSunFence = mpDevice->createFence();
         }
-        pRenderContext->copyBufferRegion(mpSunReadback.get(), 0, residency.getGpuSunCounters().get(), 2 * sizeof(uint32_t), sizeof(uint32_t));
+        // Read at a later run's start through a fence the main queue signals: it waits for the compute queue at each frame's end.
+        pContext->copyBufferRegion(mpSunReadback.get(), 0, residency.getGpuSunCounters().get(), 2 * sizeof(uint32_t), sizeof(uint32_t));
         residency.gpuSunQueued();
         mSunReadbackRecorded = true;
     }
@@ -6818,10 +7350,57 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         logInfo("FRAMELOG begin {}", mExecuteFrames + 1);
         pRenderContext->setLogBarriers(true);
     }
+    if (mQueueOverlapTest)
+    {
+        pRenderContext->submit(true); // On an idle GPU.
+        {
+            // Every module in this process: a fresh device here serializes the queues too (qoverlap2), a standalone one does not.
+            HMODULE modules[1024];
+            DWORD bytes = 0;
+            if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+                for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024); ++i)
+                {
+                    char path[MAX_PATH] = "";
+                    GetModuleFileNameA(modules[i], path, MAX_PATH);
+                    logInfo("HSTRCloud: queueOverlapTest module {}", path);
+                }
+        }
+        ID3D12Device* pFalcorDevice = mpDevice->getNativeHandle().as<ID3D12Device*>();
+        runQueueOverlapTest(pFalcorDevice, "Falcor's device");
+        // Only the first DIRECT queue a process creates runs beside a COMPUTE queue (queue_overlap.cpp: one idle DIRECT queue
+        // created before the test's serializes it, created after does not). Is Falcor's main queue that one?
+        runQueueOverlapTest(
+            pFalcorDevice, "Falcor's main queue", pRenderContext->getLowLevelData()->getCommandQueueNativeHandle().as<ID3D12CommandQueue*>()
+        );
+        // And on a device of our own in this process, on the same adapter: tells Falcor's device setup from the process.
+        Slang::ComPtr<IDXGIFactory4> pFactory;
+        Slang::ComPtr<IDXGIAdapter1> pAdapter;
+        Slang::ComPtr<ID3D12Device> pFresh;
+        if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(pFactory.writeRef()))) &&
+            SUCCEEDED(pFactory->EnumAdapterByLuid(pFalcorDevice->GetAdapterLuid(), IID_PPV_ARGS(pAdapter.writeRef()))) &&
+            SUCCEEDED(D3D12CreateDevice(pAdapter.get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(pFresh.writeRef()))))
+            runQueueOverlapTest(pFresh.get(), "a fresh device");
+        else
+            logWarning("HSTRCloud: queueOverlapTest could not create a fresh device.");
+        mQueueOverlapTest = false;
+    }
+    beginAsyncResidency(pRenderContext);
     executeFrame(pRenderContext, renderData);
     // cloudSunBeside: the deferred run's rest, after everything that samples the sun atlas, whatever path the frame took.
     if (mpCloudResidency)
         finishDeferredSun(pRenderContext);
+    finishAsyncProbe(pRenderContext);
+    // Before the timer's end: with it the pass's GPU time spans both queues' work.
+    submitAsyncResidency(pRenderContext);
+    // asyncProbe 6 / 7: this frame's work goes to the GPU, then the probe to its queue, so both start together.
+    // MEASURED: at the frame's start instead (qtrace_compute6 / qtrace_direct7) the probe ran while the GPU waited for the frame's
+    // one submission (Device::endFrame, after ~10-40 ms of CPU recording) and overlapped nothing: async-queue cycles 0% in every
+    // HSTRCloud range, HSTRCloud as without it.
+    if (mAsyncProbe == 6 || mAsyncProbe == 7)
+    {
+        pRenderContext->submit();
+        dispatchAsyncProbe(pRenderContext);
+    }
     if (logFrame)
     {
         pRenderContext->setLogBarriers(false);
@@ -6834,6 +7413,43 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pTimer->resolve();
         ++mGpuTimerFrame;
     }
+    logD3D12Messages();
+}
+
+void HSTRCloud::logD3D12Messages()
+{
+    // DIAGNOSTIC (--enable-debug-layer): the D3D12 validation messages, which reach only the info queue and a debugger. Each message
+    // ID logged once with its text, then counted (cloudStats d3d12Messages; logged every 240 frames).
+    if (!mpDevice->getDesc().enableDebugLayer)
+        return;
+    Slang::ComPtr<ID3D12InfoQueue> pQueue;
+    if (FAILED(mpDevice->getNativeHandle().as<ID3D12Device*>()->QueryInterface(IID_PPV_ARGS(pQueue.writeRef()))))
+        return;
+    const UINT64 count = pQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i)
+    {
+        SIZE_T size = 0;
+        pQueue->GetMessage(i, nullptr, &size);
+        std::vector<uint8_t> bytes(size);
+        auto* pMessage = reinterpret_cast<D3D12_MESSAGE*>(bytes.data());
+        if (FAILED(pQueue->GetMessage(i, pMessage, &size)))
+            continue;
+        if (pMessage->Severity == D3D12_MESSAGE_SEVERITY_INFO || pMessage->Severity == D3D12_MESSAGE_SEVERITY_MESSAGE)
+            continue;
+        ++mD3D12Messages;
+        // Each distinct text once (they name the resource), the first 100; the messages present before asyncResidency (an
+        // uninitialized descriptor, simultaneous-access creation, a texture's state, a dispatch over 65535 groups) once per ID.
+        const uint32_t id = uint32_t(pMessage->ID);
+        const bool known = id == 646 || id == 1328 || id == 538 || id == 1296;
+        const bool newId = mD3D12MessageIds.insert(id).second;
+        std::string text(pMessage->pDescription, pMessage->DescriptionByteLength);
+        if (known ? newId : (mD3D12MessageTexts.size() < 100 && mD3D12MessageTexts.insert(text).second))
+            logWarning("HSTRCloud: D3D12 message {} (severity {}, frame {}): {}", uint32_t(pMessage->ID), uint32_t(pMessage->Severity),
+                       mExecuteFrames, text);
+    }
+    pQueue->ClearStoredMessages();
+    if (mExecuteFrames % 240 == 0 && mD3D12Messages > 0)
+        logWarning("HSTRCloud: {} D3D12 messages so far, {} distinct.", mD3D12Messages, mD3D12MessageIds.size());
 }
 
 void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& renderData)
@@ -8461,7 +9077,12 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         var["hstrBeamContinueList"] = mpBeamContinueList;
                                         var["hstrBeamContinueArgs"] = mpBeamContinueArgs;
                                     }
+                                    // asyncProbe 1 / 4 / 5 are submitted on their own queue before the query, 2 / 3 go behind it.
+                                    if (mAsyncProbe == 1 || mAsyncProbe == 4 || mAsyncProbe == 5)
+                                        dispatchAsyncProbe(pRenderContext);
                                     mpBeamDirtyQueryPass->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 0);
+                                    if (mAsyncProbe == 2 || mAsyncProbe == 3)
+                                        dispatchAsyncProbe(pRenderContext);
                                     if (compactQuery)
                                     {
                                         FALCOR_PROFILE(pRenderContext, "listed");
@@ -8547,7 +9168,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                             pRenderContext->setLogBarriers(true);
                                         }
                                         pRenderContext->setAutoUavBarriers(false);
-                                        dispatchSunScheduling(pRenderContext, kSunStamp);
+                                        dispatchSunScheduling(pRenderContext, pRenderContext, kSunStamp);
                                         pRenderContext->setAutoUavBarriers(true);
                                         mSunScheduled = true;
                                         ++mSunBesideRuns;

@@ -34,6 +34,7 @@
 #include "Core/Macros.h"
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if FALCOR_HAS_CUDA
@@ -73,8 +74,9 @@ public:
      * Throws an exception if creation failed.
      * @param[in] pDevice Graphics device.
      * @param[in] pQueue Command queue.
+     * @param[in] pTransientHeap Its own transient heap (LowLevelContextData); null: the device's current one.
      */
-    CopyContext(Device* pDevice, gfx::ICommandQueue* pQueue);
+    CopyContext(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap = nullptr);
     virtual ~CopyContext();
 
     ref<Device> getDevice() const;
@@ -156,6 +158,18 @@ public:
     /// DIAGNOSTIC: log every state transition and UAV barrier recorded while enabled (resource name, old and new state), to find
     /// what serialises two dispatches meant to overlap.
     void setLogBarriers(bool enabled) { mLogBarriers = enabled; }
+
+    /**
+     * Track buffers' and simultaneous-access textures' states in this context instead of in the resources, for a context recording
+     * into another queue in the same frames as the device's render context: each queue's command list then barriers from its own
+     * last state, not from whichever context recorded the resource last. These resources decay to the common state at the end of
+     * every submission, so this context's states start from common after each submit. Other textures keep the global tracking.
+     */
+    void setOwnResourceStates(bool own)
+    {
+        mOwnStates = own;
+        mStates.clear();
+    }
 
     /**
      * Copy an entire resource
@@ -281,10 +295,17 @@ protected:
         const uint3& size = uint3(-1)
     );
 
+    /// setOwnResourceStates: whether pResource's state is tracked in mStates; its tracked state.
+    bool ownsState(const Resource* pResource) const;
+    Resource::State getTrackedState(const Resource* pResource) const;
+    void setTrackedState(const Resource* pResource, Resource::State state);
+
     Device* mpDevice;
     std::unique_ptr<LowLevelContextData> mpLowLevelData;
     bool mCommandsPending = false;
     bool mAutoUavBarriers = true;
     bool mLogBarriers = false;
+    bool mOwnStates = false;
+    std::unordered_map<const Resource*, Resource::State> mStates;
 };
 } // namespace Falcor

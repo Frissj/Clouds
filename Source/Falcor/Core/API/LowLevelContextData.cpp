@@ -38,7 +38,8 @@
 
 namespace Falcor
 {
-LowLevelContextData::LowLevelContextData(Device* pDevice, gfx::ICommandQueue* pQueue) : mpDevice(pDevice), mpGfxCommandQueue(pQueue)
+LowLevelContextData::LowLevelContextData(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap)
+    : mpDevice(pDevice), mpGfxCommandQueue(pQueue), mpTransientHeap(pTransientHeap)
 {
     mpFence = mpDevice->createFence();
     mpFence->breakStrongReferenceToDevice();
@@ -105,7 +106,8 @@ void LowLevelContextData::closeCommandBuffer()
 void LowLevelContextData::openCommandBuffer()
 {
     mIsCommandBufferOpen = true;
-    FALCOR_GFX_CALL(mpDevice->getCurrentTransientResourceHeap()->createCommandBuffer(mGfxCommandBuffer.writeRef()));
+    gfx::ITransientResourceHeap* pHeap = mpTransientHeap ? mpTransientHeap : mpDevice->getCurrentTransientResourceHeap();
+    FALCOR_GFX_CALL(pHeap->createCommandBuffer(mGfxCommandBuffer.writeRef()));
     mpCommandBuffer = mGfxCommandBuffer.get();
 }
 

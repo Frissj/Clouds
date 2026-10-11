@@ -52,11 +52,12 @@ averaged (~1 ms on every 4th frame) | dirtyTiles 0.08 | worldCacheView 0.055 | w
 
 ## Big structural (multi-hour, ask first)
 
-- [ ] **Async residency + sun pipeline on a second queue**, inside the dirty query's ~0.9 ms of idle GPU. Hides cloudSea
-      (0.17-0.55) and the sun scheduler (~0.2 avg, removes the every-4th-frame ~1 ms spike). Ceiling ~0.4-0.6 ms a frame.
-      Needs: a second gfx queue + ComputeContext (slang-gfx has only the Graphics queue type; a second one is possible), fences,
-      simultaneous-access density / sun atlases (both queues touch them), one-frame-late publishing of pages and resolved sun
-      slots so the query never reads a slot being written.
+- [ ] **Async residency + sun pipeline on a second queue** - root cause of "no overlap" found (HSTRCloud.h asyncProbe note,
+      scripts/HSTR/bench/queue_overlap.cpp): only the FIRST DIRECT queue alive in a process overlaps a COMPUTE queue, and
+      slang-gfx creates an internal DIRECT queue before Falcor's main one. HAGS is not it. Needs: slang-gfx 2024.1.34 patched
+      (main queue first - e.g. lazy m_resourceCommandQueue - and a Compute queue type with COMPUTE command lists in the transient
+      heap), rebuilt from source; then Falcor's async context on that queue, one-frame-late publishing of residency / sun results.
+      Standalone ceiling: ~74% of side work hidden (1.50 ms for 2 x 1.19).
 
 ## Known limits found (not costs, but real)
 

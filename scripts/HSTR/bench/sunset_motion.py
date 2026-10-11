@@ -32,7 +32,7 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
             "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
             "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames", "uploadRuns", "uploadBytes", "scatterJobs", "scatterChecks", "scatterMismatches", "commitChecks", "commitMismatches", "sunResolveListFrames", "sunResolveListBricks", "sunResolveListChecks",
-            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns",
+            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames",
             "beamHistoryProbeUnits", "beamHistoryProbe02", "beamHistoryProbe10",
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft") + tuple(
             f"cutEnteredL{k}" for k in range(8))
@@ -289,12 +289,12 @@ def profile(tag, frames, speed):
         # Any scope, not only leaves: the profiler keeps every event it has seen, so a scope whose children stopped running in
         # this arm (march with seaFarOverlapScopes off) is never a leaf.
         match = os.environ.get("HSTR_MOTION_PROFILE_MATCH")
-        if match and kind == "gpu_time":
+        if match:
             for n, l in lanes.items():
                 if re.search(match, n):
                     # Falcor records 0 for an event on a frame it did not run: count the frames it ran by their non-zero records.
                     ran = [r for r in l["records"] if r > 0.0]
-                    print(f"MOTION {tag}   match {sum(ran) / frames:6.3f} ms a frame ({len(ran)} of {frames} frames, "
+                    print(f"MOTION {tag}   match {kind[:3]} {sum(ran) / frames:6.3f} ms a frame ({len(ran)} of {frames} frames, "
                           f"{sum(ran) / max(len(ran), 1):.3f} when run)  {n.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}",
                           flush=True)
 

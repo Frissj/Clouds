@@ -5304,23 +5304,25 @@ struct HSTRCloudRenderer
 
     void pushSunSlot(uint slot)
     {
+        const HSTRCloudSunFrame frame = sunFrame();
         uint top;
-        InterlockedAdd(hstrCloudSunFreeTop[0], 1u, top);
-        hstrCloudSunFree[top] = slot;
+        InterlockedAdd(hstrCloudSunFreeTop[frame.freePush], 1u, top);
+        hstrCloudSunFree[frame.freePush * frame.sunSlots + top] = slot;
     }
 
     /// A free sun slot, or kCloudRefNone when there is none (pushes only happen in earlier dispatches).
     uint popSunSlot()
     {
+        const HSTRCloudSunFrame frame = sunFrame();
         uint previous;
-        InterlockedAdd(hstrCloudSunFreeTop[0], 0xFFFFFFFFu, previous);
-        if (previous == 0u || previous > sunFrame().sunSlots)
+        InterlockedAdd(hstrCloudSunFreeTop[frame.freePop], 0xFFFFFFFFu, previous);
+        if (previous == 0u || previous > frame.sunSlots)
         {
             uint unused;
-            InterlockedAdd(hstrCloudSunFreeTop[0], 1u, unused);
+            InterlockedAdd(hstrCloudSunFreeTop[frame.freePop], 1u, unused);
             return kCloudRefNone;
         }
-        return hstrCloudSunFree[previous - 1u];
+        return hstrCloudSunFree[frame.freePop * frame.sunSlots + previous - 1u];
     }
 
     uint2 sunFieldTexel(uint entry) { return uint2(entry & (kCloudSunFieldWidth - 1u), entry / kCloudSunFieldWidth); }
@@ -5805,7 +5807,7 @@ struct HSTRCloudRenderer
             candidateTake = min(count, capacity - total);
             total += candidateTake;
         }
-        const uint freeSlots = hstrCloudSunFreeTop[0];
+        const uint freeSlots = hstrCloudSunFreeTop[sunFrame().freePop];
         const uint needed = total > freeSlots ? total - freeSlots : 0u;
         const uint limit = top >= 0 ? min(uint(top) + 2u, kCloudSunBins) : 0u;
         uint holders = 0;
@@ -17869,16 +17871,17 @@ void clearDirtyCloudPages(uint3 id: SV_DispatchThreadID)
 void markDirtyCloudPages(uint3 id: SV_DispatchThreadID)
 {
     const uint count = gHSTRCloud.params.cloudPageRegionCount;
-    if (count == 0 || id.x >= gHSTRCloud.hstrCloudDirtyRegions[count - 1u].workEnd) return;
+    const uint work = id.x + id.y * kCloudDirtyPageRowThreads;
+    if (count == 0 || work >= gHSTRCloud.hstrCloudDirtyRegions[count - 1u].workEnd) return;
     uint lo = 0, hi = count;
     while (lo < hi)
     {
         const uint mid = (lo + hi) >> 1u;
-        if (id.x < gHSTRCloud.hstrCloudDirtyRegions[mid].workEnd) hi = mid; else lo = mid + 1u;
+        if (work < gHSTRCloud.hstrCloudDirtyRegions[mid].workEnd) hi = mid; else lo = mid + 1u;
     }
     const HSTRCloudDirtyPageRegion region = gHSTRCloud.hstrCloudDirtyRegions[lo];
     const uint begin = lo == 0 ? 0u : gHSTRCloud.hstrCloudDirtyRegions[lo - 1u].workEnd;
-    const uint local = id.x - begin;
+    const uint local = work - begin;
     const uint3 p = uint3(local % region.extent.x, (local / region.extent.x) % region.extent.y,
                           local / (region.extent.x * region.extent.y)) + region.origin;
     const HSTRCloudAsset asset = gHSTRCloud.hstrCloudAssets[region.asset];

@@ -48,8 +48,9 @@ public:
      * Throws an exception if creation failed.
      * @param[in] pDevice Graphics device.
      * @param[in] pQueue Command queue.
+     * @param[in] pTransientHeap Its own transient heap (LowLevelContextData); null: the device's current one.
      */
-    ComputeContext(Device* pDevice, gfx::ICommandQueue* pQueue);
+    ComputeContext(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap = nullptr);
     ~ComputeContext();
 
     /**

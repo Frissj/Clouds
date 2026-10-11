@@ -136,7 +136,7 @@ Texture::Texture(
     mState.perSubresource.resize(mMipLevels * mArraySize, mState.global);
 
     ResourceBindFlags supported = mpDevice->getFormatBindFlags(mFormat);
-    supported |= ResourceBindFlags::Shared;
+    supported |= ResourceBindFlags::Shared | ResourceBindFlags::SimultaneousAccess;
     if ((mBindFlags & supported) != mBindFlags)
     {
         FALCOR_THROW(
@@ -189,6 +189,7 @@ Texture::Texture(
     {
         desc.isShared = true;
     }
+    desc.allowSimultaneousAccess = is_set(mBindFlags, ResourceBindFlags::SimultaneousAccess);
 
     // Validate description.
     FALCOR_ASSERT(desc.size.width > 0 && desc.size.height > 0);

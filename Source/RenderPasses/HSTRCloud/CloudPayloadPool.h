@@ -53,7 +53,8 @@ public:
     int pollLoad(uint32_t ticket);
 
     /// Without DirectStorage: uploads decompressed bytes into the range from word. Main thread.
-    void upload(uint32_t word, const std::vector<uint8_t>& bytes);
+    /// Recorded into pContext (the residency's context: the compute queue's under asyncResidency, where the decode reads it).
+    void upload(Falcor::CopyContext* pContext, uint32_t word, const std::vector<uint8_t>& bytes);
 
 private:
     ref<Device> mpDevice;

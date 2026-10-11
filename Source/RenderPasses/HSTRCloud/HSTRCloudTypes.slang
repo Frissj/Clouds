@@ -285,6 +285,9 @@ static const uint kCloudBrickEdge = 10;        ///< Stored edge of a sun atlas s
 /// 3.288 before (compactship2): inside the cross-run spread. The saved-reference gate (hillcore1 / 2) could not judge it: its
 /// first sanity arm never reached the image, and its anchor did not repeat after the second's residency rebuild.
 static const uint kCloudDensityEdge = 8;
+/// markDirtyCloudPages' threads a dispatch row (32768 groups of 256): its work runs in rows, as D3D12 drops a dispatch past 65535
+/// groups in a dimension (asyncdbg5: the first frame's 226530 groups, D3D12 1296).
+static const uint kCloudDirtyPageRowThreads = 1u << 23;
 static const uint kCloudChunkLevel = 4;        ///< Directory cells are level-4 bricks (128 source voxels).
 static const uint kCloudRefNone = 0xFFFFFFFF;  ///< Directory/node entry: nothing mapped (the domain proxy applies).
 /// Changed-content spheres markBeamChanges and compactBeamChanges may list for one build of the beam image; past it every guard
@@ -492,6 +495,11 @@ struct HSTRCloudSunFrame
     uint stampFine;
     uint fineCells;
     uint stampCheck; ///< DIAGNOSTIC (cloudSunStampFineCheck): this stamp pass counts into hstrCloudSunCounters 10 / 11.
+    /// The free sun slot stacks (hstrCloudSunFree holds two of sunSlots entries, hstrCloudSunFreeTop their sizes): assignSunBake pops
+    /// from freePop, releases and evictions push onto freePush. asyncResidency alternates them by run, so a slot freed in one run is
+    /// not baked over before the next: the frame beside the run may still resolve to it. Equal: one stack, as before.
+    uint freePop;
+    uint freePush;
 };
 
 /// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed

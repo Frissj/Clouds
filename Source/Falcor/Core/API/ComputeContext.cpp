@@ -32,7 +32,8 @@
 
 namespace Falcor
 {
-ComputeContext::ComputeContext(Device* pDevice, gfx::ICommandQueue* pQueue) : CopyContext(pDevice, pQueue)
+ComputeContext::ComputeContext(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap)
+    : CopyContext(pDevice, pQueue, pTransientHeap)
 {
     bindDescriptorHeaps(); // TODO: Should this be done here?
 }

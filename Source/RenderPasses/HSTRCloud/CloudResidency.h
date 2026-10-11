@@ -291,6 +291,17 @@ public:
     void setSunStampFine(bool fine) { mSunStampFine = fine; }
     void setSunFineUploadAll(bool all) { mSunFineUploadAll = all; }
     void setSunEvery(uint32_t every) { mSunEvery = std::max(every, 1u); }
+    /// asyncResidency: the context this frame's uploads and scatters record into (the compute queue's), or nullptr for the device's
+    /// render context. On, freed atlas slots, GPU brick indices and sun slots are quarantined: none is written for a new brick or
+    /// bake before a later frame, so the main queue's frame running beside this one never reads another brick's data through a
+    /// mapping it still holds.
+    void setAsyncContext(ComputeContext* pContext)
+    {
+        mpAsyncContext = pContext;
+        mSunSlotQuarantine = pContext != nullptr;
+    }
+    /// The context residency work records into this frame.
+    ComputeContext* getContext() const;
     void setLoadsBesideCut(bool on) { mLoadsBesideCut = on; }
     /// Bricks committed a frame, at most desc.loadsPerFrame (the staging capacity); a runtime cap, so it changes without a rebuild.
     void setLoadCap(uint32_t cap) { mLoadCap = std::clamp(cap, 1u, mDesc.loadsPerFrame); }
@@ -299,6 +310,7 @@ public:
     /// to an eighth of it.
     void setScatterDense(bool on) { mScatterDense = on; }
     void addScatterChecks(uint32_t frames) { mScatterCheck += frames; }
+    bool scatterCheckPending() const { return mScatterCheck > 0; } ///< Its blocking readbacks need the residency's work serial.
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
     const ref<Buffer>& getBricks() const { return mpBricks; }
     const ref<Buffer>& getPages() const { return mpPages; }
@@ -360,6 +372,8 @@ public:
     void bindGpuSun(const ShaderVar& var) const;
     /// The scheduler's buffers to clear before its scan.
     ref<Buffer> getGpuSunCounters() const { return mpSunCounters; }
+    /// The bake jobs (hstrCloudSunBakes): CPU-staged, or written by assignSunBakes.
+    const ref<Buffer>& getSunBakes() const { return mpSunBakes; }
     ref<Buffer> getGpuSunHistogram() const { return mpSunHistogram; }
     /// Reads the scheduler's counts of the last frame into the stats (a GPU readback: for scripts, not the frame).
     void readGpuSunStats();
@@ -595,6 +609,12 @@ private:
     std::vector<HSTRCloudBrick> mBricks;
     std::vector<uint32_t> mFreeBricks;
     std::vector<uint32_t> mFreeSlots;
+    /// Freed this frame under asyncResidency (setAsyncContext): free again at the next update.
+    std::vector<uint32_t> mRetiredBricks;
+    std::vector<uint32_t> mRetiredSlots;
+    ComputeContext* mpAsyncContext = nullptr;
+    /// A DeviceLocal buffer's update through getContext() (Buffer::setBlob records into the device's render context).
+    void uploadBlob(Buffer* pBuffer, const void* pData, size_t offset, size_t size);
     std::vector<uint64_t> mBrickOwner;
     std::vector<HSTRCloudStaging> mStagingInfo;
     std::vector<uint64_t> mStaged; ///< Handles staged this frame, in staging order before grouping.
@@ -689,6 +709,8 @@ private:
     ref<Buffer> mpSunFineCells;
     uint32_t mSunFineCellCapacity = 0;
     uint32_t mSunEvery = 1;
+    uint32_t mSunFreeStack = 0;      ///< The free sun slot stack the next scheduling run pops (HSTRCloudSunFrame::freePop).
+    bool mSunSlotQuarantine = false; ///< setAsyncContext: a run's freed sun slots go onto the other stack.
     bool mLoadsBesideCut = true; ///< Loads run on the frames a walk is on the worker (free slots only).
     uint32_t mLoadCap = 1024;    ///< setLoadCap.
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.

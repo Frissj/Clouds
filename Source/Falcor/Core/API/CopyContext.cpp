@@ -48,11 +48,11 @@
 
 namespace Falcor
 {
-CopyContext::CopyContext(Device* pDevice, gfx::ICommandQueue* pQueue) : mpDevice(pDevice)
+CopyContext::CopyContext(Device* pDevice, gfx::ICommandQueue* pQueue, gfx::ITransientResourceHeap* pTransientHeap) : mpDevice(pDevice)
 {
     FALCOR_ASSERT(mpDevice);
     FALCOR_ASSERT(pQueue);
-    mpLowLevelData = std::make_unique<LowLevelContextData>(mpDevice, pQueue);
+    mpLowLevelData = std::make_unique<LowLevelContextData>(mpDevice, pQueue, pTransientHeap);
 }
 
 CopyContext::~CopyContext() = default;
@@ -80,6 +80,8 @@ void CopyContext::submit(bool wait)
         // last flush(), and unless we signal they will not be released
         signal(mpLowLevelData->getFence().get());
     }
+    // The resources whose states this context tracks decay to common at the end of the submission.
+    mStates.clear();
 
     bindDescriptorHeaps();
 
@@ -162,7 +164,7 @@ bool CopyContext::resourceBarrier(const Resource* pResource, Resource::State new
             globalBarrier = globalBarrier && pViewInfo->arraySize == pTexture->getArraySize();
         }
 
-        if (globalBarrier)
+        if (globalBarrier || ownsState(pTexture))
         {
             return textureBarrier(pTexture, newState);
         }
@@ -407,25 +409,47 @@ std::vector<uint8_t> CopyContext::ReadTextureTask::getData() const
     return result;
 }
 
+bool CopyContext::ownsState(const Resource* pResource) const
+{
+    if (!mOwnStates)
+        return false;
+    return pResource->getType() == Resource::Type::Buffer || is_set(pResource->getBindFlags(), ResourceBindFlags::SimultaneousAccess);
+}
+
+Resource::State CopyContext::getTrackedState(const Resource* pResource) const
+{
+    if (!ownsState(pResource))
+        return pResource->getGlobalState();
+    auto it = mStates.find(pResource);
+    return it == mStates.end() ? Resource::State::Common : it->second;
+}
+
+void CopyContext::setTrackedState(const Resource* pResource, Resource::State state)
+{
+    if (ownsState(pResource))
+        mStates[pResource] = state;
+    else
+        pResource->setGlobalState(state);
+}
+
 bool CopyContext::textureBarrier(const Texture* pTexture, Resource::State newState)
 {
     auto resourceEncoder = getLowLevelData()->getResourceCommandEncoder();
     bool recorded = false;
-    if (pTexture->getGlobalState() != newState)
+    const Resource::State oldState = getTrackedState(pTexture);
+    if (oldState != newState)
     {
         gfx::ITextureResource* textureResource = pTexture->getGfxTextureResource();
-        resourceEncoder->textureBarrier(
-            1, &textureResource, getGFXResourceState(pTexture->getGlobalState()), getGFXResourceState(newState)
-        );
+        resourceEncoder->textureBarrier(1, &textureResource, getGFXResourceState(oldState), getGFXResourceState(newState));
         if (mLogBarriers)
             logInfo(
                 "BARRIER texture '{}' {} {}x{}x{} format {} {} -> {}", pTexture->getName(), fmt::ptr(pTexture), pTexture->getWidth(), pTexture->getHeight(),
-                pTexture->getDepth(), int(pTexture->getFormat()), int(pTexture->getGlobalState()), int(newState)
+                pTexture->getDepth(), int(pTexture->getFormat()), int(oldState), int(newState)
             );
         mCommandsPending = true;
         recorded = true;
     }
-    pTexture->setGlobalState(newState);
+    setTrackedState(pTexture, newState);
     return recorded;
 }
 
@@ -435,14 +459,15 @@ bool CopyContext::bufferBarrier(const Buffer* pBuffer, Resource::State newState)
     if (pBuffer->getMemoryType() != MemoryType::DeviceLocal)
         return false;
     bool recorded = false;
-    if (pBuffer->getGlobalState() != newState)
+    const Resource::State oldState = getTrackedState(pBuffer);
+    if (oldState != newState)
     {
         auto resourceEncoder = getLowLevelData()->getResourceCommandEncoder();
         gfx::IBufferResource* bufferResource = pBuffer->getGfxBufferResource();
-        resourceEncoder->bufferBarrier(1, &bufferResource, getGFXResourceState(pBuffer->getGlobalState()), getGFXResourceState(newState));
+        resourceEncoder->bufferBarrier(1, &bufferResource, getGFXResourceState(oldState), getGFXResourceState(newState));
         if (mLogBarriers)
-            logInfo("BARRIER buffer '{}' ({} B) {} -> {}", pBuffer->getName(), pBuffer->getSize(), int(pBuffer->getGlobalState()), int(newState));
-        pBuffer->setGlobalState(newState);
+            logInfo("BARRIER buffer '{}' ({} B) {} -> {}", pBuffer->getName(), pBuffer->getSize(), int(oldState), int(newState));
+        setTrackedState(pBuffer, newState);
         mCommandsPending = true;
         recorded = true;
     }
