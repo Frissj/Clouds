@@ -1659,6 +1659,8 @@ struct HSTRCloudParams
     /// A far-sea run recomputes 1 / seaFarRefresh of the texels (seaFarRefresh), reprojecting the rest.
     /// MEASURED (far1, 4K sunset walk, arms base / refresh 16 / scale 4 / base): farSea 0.97 / 0.81 / 0.67 / 0.80 ms, over 0.02
     /// in motion 2.23 / 2.82 / 2.46 / 2.31% - ~0.1 ms for a visible error rise each; kept at 8 and scale 2.
+    /// Again on today's frame (farref1, ship / 16 / ship; clocks drifted ~45% between the anchors, so far sea over query): 0.188 /
+    /// 0.165 / 0.184 - refresh 16 saves ~0.02-0.03 ms now (the footprint step and far sky cut the march since far1); kept at 8.
     uint seaFarRefresh = 8;
     uint seaFarPhase = 0;      ///< Which of them (set per run).
     uint seaFarRefreshAll = 1; ///< This run recomputes every texel (set per run).

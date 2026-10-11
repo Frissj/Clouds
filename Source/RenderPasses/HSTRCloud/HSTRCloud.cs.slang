@@ -17104,6 +17104,7 @@ void resolveBeam(uint3 dispatchThreadId: SV_DispatchThreadID, uint3 groupId: SV_
 }
 
 groupshared uint gHalfMask[4]; ///< beamHalfResolve: the residual masks of the group's two 8 x 8 screen groups.
+groupshared uint gHalfExact[2]; ///< beamHalfResolve: the fill group's lanes it could not fill.
 
 /// beamHalfResolve: an 8 x 8 group covers 16 x 8 pixels, one of each row's two checkerboard parities (phase 0 the shaded half,
 /// 1 the filled half), i.e. the 8 x 8 screen groups 2 group.x and 2 group.x + 1 of row group.y. The shaded half queues those with
@@ -17164,17 +17165,143 @@ void resolveBeamHalfGroup(uint2 groupThread, uint2 group, uint groupIndex, uint 
         gHSTRCloud.hstrBeamResidualEntry[slot] = entry;
 }
 
+#ifndef HSTR_HALF_FUSED
+#define HSTR_HALF_FUSED 0
+#endif
+#if HSTR_HALF_FUSED
+/// beamHalfFused: the shaded parity of the group's 16 x 8 pixels and the halo of shaded pixels its filled parity reads (a row above
+/// and below, a column left and right: 24, the neighbouring groups' own pixels resolved again - the same value written twice), as
+/// (colour, from a basis) in local coordinates offset by one.
+groupshared float4 gHalfShaded[10][18];
+#endif
+
 [numthreads(8, 8, 1)]
 void resolveBeamHalf(uint3 groupThreadId: SV_GroupThreadID, uint3 groupId: SV_GroupID, uint groupIndex: SV_GroupIndex)
 {
+#if HSTR_HALF_FUSED
+    // beamHalfFused: the fill in the same group as the shade, from groupshared instead of a second dispatch. The fill's own dispatch
+    // needs a UAV barrier, which on this driver waits for every earlier dispatch - the unit march this pass overlaps (beamOverlapResolve)
+    // - so the separate fill and exact passes ran serially after it. Here only the exact pass does.
+    const uint2 tile = uint2(groupId.x * 16u, groupId.y * 8u);
+    {
+        const uint ly = groupThreadId.y;
+        const uint lx = 2u * groupThreadId.x + (ly & 1u);
+        gResolvedByBasis = false;
+        gBasisColor = 0.f;
+        // resolveBeamHalfGroup's shaded half, inline: the residual queue below needs the group's masks.
+        const uint2 pixel = tile + uint2(lx, ly);
+        if (groupIndex < 4)
+            gHalfMask[groupIndex] = 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (gHSTRCloud.resolveBeamHalfShade(pixel))
+        {
+            const uint bit = (pixel.y & 7u) * 8u + (pixel.x & 7u);
+            InterlockedOr(gHalfMask[((pixel.x >> 3) & 1u) * 2u + (bit >> 5)], 1u << (bit & 31u));
+        }
+        gHalfShaded[ly + 1u][lx + 1u] = float4(gBasisColor, gResolvedByBasis ? 1.f : 0.f);
+    }
+    if (groupIndex < 24u)
+    {
+        // The halo: row -1 at odd columns, row 8 at even ones, column -1 at odd rows, column 16 at even rows (the shaded parity).
+        int2 local;
+        if (groupIndex < 8u)
+            local = int2(2 * int(groupIndex) + 1, -1);
+        else if (groupIndex < 16u)
+            local = int2(2 * int(groupIndex - 8u), 8);
+        else if (groupIndex < 20u)
+            local = int2(-1, 2 * int(groupIndex - 16u) + 1);
+        else
+            local = int2(16, 2 * int(groupIndex - 20u));
+        const int2 global = int2(tile) + local;
+        float4 value = 0.f;
+        if (all(global >= 0) && all(global < int2(gHSTRCloud.params.frameDim)))
+        {
+            gResolvedByBasis = false;
+            gBasisColor = 0.f;
+            gHSTRCloud.resolveBeamPixel(uint2(global)); // Its residual verdict is the owning group's to queue.
+            value = float4(gBasisColor, gResolvedByBasis ? 1.f : 0.f);
+        }
+        gHalfShaded[local.y + 1][local.x + 1] = value;
+    }
+    if (groupIndex < 2)
+        gHalfExact[groupIndex] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // The shaded half's residual queue, as resolveBeamHalfGroup phase 0.
+    if (groupIndex < 2u)
+    {
+        const uint2 screenGroups = (gHSTRCloud.params.frameDim + 7u) / 8u;
+        const uint2 screenGroup = uint2(groupId.x * 2u + groupIndex, groupId.y);
+        if (all(screenGroup < screenGroups))
+        {
+            const uint slot = screenGroup.y * screenGroups.x + screenGroup.x;
+            const uint m0 = gHalfMask[groupIndex * 2u], m1 = gHalfMask[groupIndex * 2u + 1u];
+            uint entry = 0xFFFFFFFFu;
+            if ((m0 | m1) != 0u)
+            {
+                uint queuedEntry;
+                InterlockedAdd(gHSTRCloud.hstrBeamResidualArgs[0], 1u, queuedEntry);
+                if (queuedEntry < gHSTRCloud.beamResidualGroups())
+                {
+                    gHSTRCloud.hstrBeamResidualList[3 * queuedEntry] = screenGroup.x | (screenGroup.y << 16);
+                    gHSTRCloud.hstrBeamResidualList[3 * queuedEntry + 1] = m0;
+                    gHSTRCloud.hstrBeamResidualList[3 * queuedEntry + 2] = m1;
+                    entry = queuedEntry;
+                }
+            }
+            gHSTRCloud.hstrBeamResidualEntry[slot] = entry;
+        }
+    }
+    // The filled parity: fillBeamHalfPixel's rule, its four neighbours from groupshared (at the frame's edge the opposite one).
+    {
+        const uint ly = groupThreadId.y;
+        const uint lx = 2u * groupThreadId.x + ((ly + 1u) & 1u);
+        const uint2 pixel = tile + uint2(lx, ly);
+        bool fill = true;
+        if (all(pixel < gHSTRCloud.params.frameDim))
+        {
+            const int2 p = int2(pixel);
+            const int2 last = int2(gHSTRCloud.params.frameDim) - 1;
+            const int2 n[4] = { int2(p.x > 0 ? -1 : 1, 0), int2(p.x < last.x ? 1 : -1, 0), int2(0, p.y > 0 ? -1 : 1),
+                                int2(0, p.y < last.y ? 1 : -1) };
+            bool basis = true;
+            float3 sum = 0.f, lo = 3.4e38f, hi = -3.4e38f;
+            [unroll]
+            for (uint k = 0; k < 4; ++k)
+            {
+                const float4 v = gHalfShaded[int(ly) + n[k].y + 1][int(lx) + n[k].x + 1];
+                basis = basis && v.w > 0.5f;
+                sum += v.rgb;
+                const float3 l = log(1.f + max(v.rgb, 0.f));
+                lo = min(lo, l);
+                hi = max(hi, l);
+            }
+            fill = basis && all(hi - lo <= gHSTRCloud.params.beamHalfContrast);
+            if (fill)
+                gHSTRCloud.color[pixel] = float4(0.25f * sum, 1.f);
+        }
+        if (!fill)
+            InterlockedOr(gHalfExact[groupIndex >> 5], 1u << (groupIndex & 31u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex != 0 || (gHalfExact[0] | gHalfExact[1]) == 0u)
+        return;
+    uint entry;
+    InterlockedAdd(gHSTRCloud.hstrBeamHalfExactArgs[0], 1u, entry);
+    if (entry < gHSTRCloud.beamHalfGroups())
+    {
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry] = groupId.x | (groupId.y << 16);
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry + 1] = gHalfExact[0];
+        gHSTRCloud.hstrBeamHalfExactList[3 * entry + 2] = gHalfExact[1];
+    }
+#else
     resolveBeamHalfGroup(groupThreadId.xy, groupId.xy, groupIndex, 0u);
+#endif
 }
 
 /// One group per queued resolve group, laid out in rows of kResidualRow groups because a dispatch dimension stops at 65,535 and
 /// a 4K frame has 129,600 resolve groups.
 static const uint kResidualRow = 32768;
 
-groupshared uint gHalfExact[2]; ///< beamHalfResolve: the fill group's lanes it could not fill.
 
 /// beamHalfResolve, the filled parity: each pixel the mean of its neighbours where it can be (fillBeamHalfPixel); the group's other
 /// lanes are listed, one entry per group with their mask, for exactBeamHalf.

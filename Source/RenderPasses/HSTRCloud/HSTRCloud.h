@@ -421,6 +421,13 @@ private:
     /// nothing: one UAV -> SRV transition was left (hstrBeamPixelPrev, the beam pixels again in the reference frame), found in ngfx9.
     /// With it on, the units scope's time includes the pixel pass running inside it: compare HSTRCloud totals, not these two scopes.
     bool mBeamOverlapResolve = true;
+    /// beamHalfFused: beamHalfResolve's fill inside the shade's groups (HSTR_HALF_FUSED, resolveBeamHalf) with a shaded halo, instead
+    /// of its own dispatch, whose UAV barrier waited for the unit march the shade overlaps; only the exact pass stays behind it.
+    /// MEASURED, off (4K sunset walk, GPU traces frames 60-63, nowtrace2 ship vs fusedtrace1): the resolve after the march 0.41-0.56
+    /// -> 0.24-0.29 ms, but the march range 0.90-1.11 -> 1.24-1.36; march + resolve 1.48 / 1.52 / 1.48 / 1.46 -> 1.55 / 1.53 / 1.60 /
+    /// 1.53. The shade + fill (+ its 37% halo) lengthen the unit march by about their own cost: beside the march they do not hide.
+    /// Quality equal within the anchors (halffused1: 5.7 / 5.8 / 6.0% over 0.02 vs 3.8 / 2.1 / 5.7 and 5.2 / 5.0 / 5.5).
+    bool mBeamHalfFused = false;
     LazyComputePass mpBeamWarpFieldPass; ///< beamWarp: the warp offset per on-screen lattice point (buildBeamWarpField).
     LazyComputePass mpBeamWarpEdgePass;  ///< beamWarpEdge: held blocks' disoccluded edge tiles re-marched (repairBeamWarpEdge).
     LazyComputePass mpBeamWarpGapPass;   ///< beamWarpGap: held blocks' opened gap strips listed for repair (repairBeamWarpGap).
@@ -964,7 +971,11 @@ private:
     uint32_t mCloudSunBakesPerFrame = 256; ///< Bricks whose sun depth is baked per frame (CloudResidencyDesc::sunBakesPerFrame).
     uint32_t mCloudSunPoolScale = 1;       ///< Sun atlas slots per density slot (CloudResidencyDesc::sunPoolScale).
     uint32_t mCloudSunPacked = 0;          ///< cloudSunPacked: CloudResidencyDesc::sunPacked (0 none, 1 RG8, 2 RG16F).
-    bool mCloudSunPackedRead = false;      ///< cloudSunPackedRead: the beam marches read density + bake from it (HSTR_SUN_PACKED).
+    /// cloudSunPackedRead: the beam marches read density + bake from it (HSTR_SUN_PACKED).
+    /// MEASURED again with residency mapped (packread1, 4K sunset walk, cloudSunPacked 1 before the settle; motpack1 had held
+    /// 102-136k of 243k bricks): query / units ms off 0.83 / 0.79, on 0.81 / 0.77, off 0.82 / 0.78, on 0.85 / 0.86; motion score
+    /// 3.8 / 2.5 / 5.5 / 5.1% over 0.02. No gain: off.
+    bool mCloudSunPackedRead = false;
     bool mBeamListsFull = false;           ///< beamListsFull (DIAGNOSTIC): the beam lists at four levels' 85 per tile, the old size.
     LazyComputePass mpBakeCloudSunPass;
     // GPU sun bake scheduling (cloudGpuSun, CloudResidencyDesc::gpuSun).

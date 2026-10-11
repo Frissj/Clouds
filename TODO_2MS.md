@@ -43,6 +43,9 @@ averaged (~1 ms on every 4th frame) | dirtyTiles 0.08 | worldCacheView 0.055 | w
       Build and trace it. Blocker found: the halo (24 shaded pixels of the neighbouring groups per 16 x 8 tile: a row above and
       below, 4 left, 4 right) needs a side-effect-free shade - resolveBeamHalfShade writes color and the basis flag and queues
       residual groups, which the halo must not duplicate. Estimated net 0.07-0.1 ms (fill 0.165 minus ~0.03-0.05 halo shading).
+      BUILT and MEASURED out (beamHalfFused, off): the halo is resolveBeamPixel again (same value written twice, verdict ignored).
+      Traces: resolve after the march 0.41-0.56 -> 0.24-0.29 ms but the march range +0.3; march + resolve ~1.48 -> ~1.55 ms. Work
+      beside the unit march does not hide (it is not idle enough), so the review's "resolve beside the query" has no headroom either.
 - [ ] **Dense fill: why slower** (0.151 -> 0.279 ms): unknown without a trace (Shader Pipelines of fillBeamHalf, dense arm).
 - [ ] **Sun bake order by sampling** (most-sampled bricks first) to cut the 60-85% ancestor-lit samples while walking.
 - [ ] **Bake step 3**: never measured (residency frozen under PT arms stops bake scheduling); needs the arms thawed.

@@ -143,6 +143,14 @@ g.addPass(createPass("HSTRCloud", {
     # 0.72%, p99.9 9/255, max 23/255; sanity (constant brick density in the bake) 2.6%, p99.9 40/255, max 79/255. The squared-excess
     # gate barely sees bakes (0.020159 anchor, 0.020152 step 2, 0.019845 sanity), so the image comparison decides.
     "cloudSunBakeStep": 2.0,
+    # Camera marches skip brick cells whose density bound gives at most 0.05 optical depth across, and end a ray at transmittance
+    # 0.02 (was 1e-3). The second is an explicit approximation. Path trace (hillthin1, sunset_hill 960x540, 326 spp, squared excess
+    # with the noise subtracted): ship 0.020607, thin 0.05 0.020607 (identical), + min transmittance 0.02 0.021053 (+2.2%; p99 /
+    # p99.9 unchanged 0.487 / 0.689, max 0.720 -> 0.722), sanity thin 1.0 0.024740 (+20%, max 0.948), ship again 0.020607.
+    # Time (thintime2, 4K sunset walk, query + units ms): ship 1.631 / again 1.686, thin 1.585, thin + 0.02 1.484 (-0.17 against
+    # the anchors' mean); motion score 6.4 / 6.1% anchors, 5.8% / 2.4%.
+    "cloudThinDepth": 0.05,
+    "cloudMinTransmittance": 0.02,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).
     "cloudGpuSun": os.environ.get("HSTR_GPU_SUN", "1") != "0",
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K

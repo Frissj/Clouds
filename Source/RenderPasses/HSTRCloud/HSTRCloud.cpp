@@ -1108,6 +1108,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.beamHalfFillSkip = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "beamHalfFused")
+        {
+            mBeamHalfFused = bool(value);
+            continue;
+        }
         if (key == "beamQueryStepCap")
         {
             mParams.beamQueryStepCap = uint32_t(value);
@@ -8683,6 +8688,12 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             const bool half = mParams.beamHalfResolve != 0 && !mBeamSparseBuilt;
             const ref<ComputePass>& pResolve = mBeamSparseBuilt ? mpBeamSparseResolvePass : half ? mpBeamHalfShadePass : mpBeamResolvePass;
             const ref<ComputePass>& pResolveWarp = half ? mpBeamHalfShadeWarpPass : mpBeamResolveWarpPass;
+            // beamHalfFused: the fill inside the shade's groups (resolveBeamHalf), so no barrier ties it to the unit march.
+            if (half)
+            {
+                pResolve->getProgram()->addDefine("HSTR_HALF_FUSED", mBeamHalfFused ? "1" : "0");
+                pResolveWarp->getProgram()->addDefine("HSTR_HALF_FUSED", mBeamHalfFused ? "1" : "0");
+            }
             // A define, not a branch on a parameter: compiled in, the warp cost the resolve 0.45 -> 0.74 ms at 4K whether it was
             // on or off (budgetwarp2) - registers, as with the residual below.
             const bool warp = mBeamWarp && mParams.beamRefFrame != 0 && mBeamOct;
@@ -8947,7 +8958,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     dispatch(pResolve, pResolveWarp);
                 }
                 const bool fill = half && mParams.beamHalfFillSkip == 0; // beamHalfFillSkip: the oracle drops the fill and exact passes.
-                if (fill)
+                if (fill && !mBeamHalfFused)
                 {
                     std::optional<ScopedProfilerEvent> fillScope;
                     if (pixelsScope)
