@@ -691,6 +691,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mParams.worldCacheView = bool(value) ? 1u : 0u;
             continue;
         }
+        if (key == "worldCacheViewEvery")
+        {
+            mWorldCacheViewEvery = std::max(1u, uint32_t(value));
+            continue;
+        }
         if (key == "beamSunKnock")
         {
             mBeamSunKnock = uint32_t(value);
@@ -1141,6 +1146,51 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "cloudSunStampRows")
         {
             mCloudSunStampRows = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == "cloudSunStampFine")
+        {
+            mCloudSunStampFine = bool(value);
+            continue;
+        }
+        if (key == "cloudSunStampFineCheck")
+        {
+            mCloudSunStampFineCheck = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudSunBeside")
+        {
+            mCloudSunBeside = bool(value);
+            continue;
+        }
+        if (key == "beamHistoryBlendOracle")
+        {
+            mBeamHistoryBlendOracle = std::clamp(float(value), 0.f, 1.f);
+            continue;
+        }
+        if (key == "cloudSunFineUploadAll")
+        {
+            mCloudSunFineUploadAll = bool(value);
+            continue;
+        }
+        if (key == "beamMarkBakes")
+        {
+            mBeamMarkBakes = bool(value);
+            continue;
+        }
+        if (key == "cloudSunBesideLog")
+        {
+            mCloudSunBesideLog = uint32_t(value);
+            continue;
+        }
+        if (key == "beamChangeAssetSlots")
+        {
+            mBeamChangeAssetSlotsOn = bool(value);
+            continue;
+        }
+        if (key == "cloudSunStampSkipSame")
+        {
+            mCloudSunStampSkipSame = bool(value);
             continue;
         }
         if (key == "beamUnitRefill")
@@ -1807,6 +1857,7 @@ Properties HSTRCloud::getProperties() const
         props["cutLevels"] = mpCloudResidency->cutLevels(); // DIAGNOSTIC
     props["cacheOracle"] = mParams.cacheOracle;
     props["worldCacheRingModulation"] = mWorldCacheRingModulation;
+    props["worldCacheViewEvery"] = mWorldCacheViewEvery;
     props["worldCacheRingDepth"] = mParams.worldCacheRingDepth;
     props["seaFarField"] = mSeaFarField;
     props["seaFarDistance"] = mParams.seaFarDistance;
@@ -2082,6 +2133,7 @@ Properties HSTRCloud::getProperties() const
     props["cloudSunBakesCap"] = mCloudSunBakesCap;
     props["cloudSunBakesMoving"] = mCloudSunBakesMoving;
     props["cloudSunLevelStamps"] = mCloudSunLevelStamps;
+    props["cloudSunBeside"] = mCloudSunBeside;
     props[kCloudCameraKernel] = mCloudCameraKernel;
     props[kCloudMinTransmittance] = mParams.cloudMinTransmittance;
     props[kCloudGpuSun] = mCloudGpuSun;
@@ -2131,6 +2183,25 @@ Properties HSTRCloud::getProperties() const
         cloud["sunStampRuns"] = stats.sunStampRuns;
         cloud["sunStampRaw"] = stats.sunStampRaw;
         cloud["sunStampChanges"] = stats.sunStampChanges;
+        cloud["sunStampStores"] = stats.sunStampStores;
+        cloud["sunStampFresh"] = stats.sunStampFresh;
+        cloud["sunStampCheckStores"] = stats.sunStampCheckStores;
+        cloud["sunStampCheckFresh"] = stats.sunStampCheckFresh;
+        cloud["sunStampCheckTotal"] = mSunStampCheckTotal;
+        cloud["sunStampCheckRuns"] = mSunStampCheckRuns;
+        cloud["beamHistoryProbeUnits"] = mBeamHistoryProbeTotals[0];
+        cloud["beamHistoryProbe02"] = mBeamHistoryProbeTotals[1];
+        cloud["beamHistoryProbe10"] = mBeamHistoryProbeTotals[2];
+        cloud["sunBesideRuns"] = mSunBesideRuns;
+        cloud["sunSerialRuns"] = mSunSerialRuns;
+        cloud["sunFineRuns"] = stats.sunFineRuns;
+        cloud["sunFineFallbacks"] = stats.sunFineFallbacks;
+        cloud["sunFineCells"] = stats.sunFineCells;
+        cloud["sunFineCellsPeak"] = stats.sunFineCellsPeak;
+        cloud["sunFineUploadBytes"] = stats.sunFineUploadBytes;
+        cloud["sunFineWaves"] = stats.sunFineWaves;
+        cloud["sunFinePassed"] = stats.sunFinePassed;
+        cloud["sunFineTested"] = stats.sunFineTested;
         cloud["sunResolveListFrames"] = mSunResolveListFrames;
         cloud["sunResolveListBricks"] = mSunResolveListBricks;
         cloud["sunResolveListChecks"] = mSunResolveListChecks;
@@ -2958,6 +3029,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamGuardPyramidTopPass = createPass("buildBeamGuardPyramidTop");
     mpBeamInvalidatePass = createPass("invalidateBeamGuardBlocks");
     mpBeamMarkChangesPass = createPass("markBeamChanges");
+    mpBeamMarkChangesListedPass = createPass("markBeamChangesListed");
     mpBeamCompactChangesPass = createPass("compactBeamChanges");
     mpBeamQueueArgsPass = createPass("writeBeamQueueArgs");
     mpBeamQueueTilePass = createPass("queueBeamTiles");
@@ -2992,6 +3064,7 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpDomainLayerDistancePass[2] = createPass("domainLayerDistanceZ");
     mpDomainOccupancyPass = createPass("domainOccupancy");
     mpStampSunPass = createPass("stampSunChanges");
+    mpStampSunFinePass = createPass("stampSunFine");
     mpResetSunBlocksPass = createPass("resetSunBlocks");
     mpResetSunNodesPass = createPass("resetSunNodes");
     mpAgeSunPass = createPass("ageSunField");
@@ -3724,7 +3797,44 @@ void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, uint32_t bakes)
         var["hstrBeamChangeSpheresOutput"] = mpBeamChangeSpheres;
         var["hstrBeamChangeCountOutput"] = mpBeamChangeCount;
     };
-    if (mParams.beamChangeInputs + bakes > 0)
+    if (mParams.beamChangeInputs + bakes > 0 && mBeamChangeAssetSlotsOn)
+    {
+        // beamChangeAssetSlots: a change can only mark the instances of its own asset (markBeamChangeLayer returns at once on any
+        // other), so each change gets a thread per (slot, layer) of its asset instead of one per slot looping the layers.
+        const auto& instances = mpCloudResidency->getInstanceRecords();
+        uint32_t assets = 0;
+        for (const auto& instance : instances)
+            if (instance.scale > 0.f)
+                assets = std::max(assets, instance.asset + 1u);
+        std::vector<std::vector<uint32_t>> lists(assets);
+        for (uint32_t i = 0; i < uint32_t(instances.size()); ++i)
+            if (instances[i].scale > 0.f)
+                lists[instances[i].asset].push_back((i % slots) | ((i / slots) << 16));
+        std::vector<uint32_t> packed(2u * assets);
+        uint32_t most = 0;
+        for (uint32_t a = 0; a < assets; ++a)
+        {
+            packed[2u * a] = uint32_t(packed.size());
+            packed[2u * a + 1u] = uint32_t(lists[a].size());
+            packed.insert(packed.end(), lists[a].begin(), lists[a].end());
+            most = std::max(most, uint32_t(lists[a].size()));
+        }
+        if (packed != mBeamChangeAssetSlots)
+        {
+            if (!mpBeamChangeAssetSlots || mpBeamChangeAssetSlots->getElementCount() < packed.size())
+                mpBeamChangeAssetSlots = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), uint32_t(packed.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nullptr, false
+                );
+            mpBeamChangeAssetSlots->setBlob(packed.data(), 0, packed.size() * sizeof(uint32_t));
+            mBeamChangeAssetSlots = packed;
+            mBeamChangeAssetSlotsMax = most;
+        }
+        bind(mpBeamMarkChangesListedPass);
+        mpBeamMarkChangesListedPass->getRootVar()["CB"]["gHSTRCloud"]["hstrBeamChangeAssetSlots"] = mpBeamChangeAssetSlots;
+        mpBeamMarkChangesListedPass->execute(pRenderContext, uint3(mParams.beamChangeInputs + bakes, mBeamChangeAssetSlotsMax, 1));
+        mBeamChangeCellsMarked = true;
+    }
+    else if (mParams.beamChangeInputs + bakes > 0)
     {
         bind(mpBeamMarkChangesPass);
         mpBeamMarkChangesPass->execute(pRenderContext, uint3(mParams.beamChangeInputs + bakes, slots, 1));
@@ -4118,6 +4228,9 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setSunScanWave(mCloudSunScanWave);
     mpCloudResidency->setSunStampSplit(mCloudSunStampSplit);
     mpCloudResidency->setSunStampRows(mCloudSunStampRows);
+    mpCloudResidency->setSunStampSkipSame(mCloudSunStampSkipSame);
+    mpCloudResidency->setSunStampFine(mCloudSunStampFine);
+    mpCloudResidency->setSunFineUploadAll(mCloudSunFineUploadAll);
     mpCloudResidency->setSunEvery(mCloudSunEvery);
     mpCloudResidency->setLoadsBesideCut(mCloudLoadsBesideCut);
     mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame);
@@ -4315,9 +4428,23 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     bool sunRan = false; // A scheduling run (not cloudSunEvery's release-only frames).
     if (mCloudGpuSun)
     {
-        sunRan = mpCloudResidency->getGpuSunFrame().run;
-        sunSlotsChanged = dispatchSunScheduling(pRenderContext);
-        mpCloudResidency->gpuSunDispatched();
+        if (mCloudSunBeside && mpCloudResidency->getGpuSunFrame().run)
+        {
+            // This frame's run: its first part here, its stamps behind the dirty query, the rest at the frame's end (finishDeferredSun).
+            // Last frame's, if any, lands now.
+            dispatchSunScheduling(pRenderContext, kSunPre);
+            mSunDeferred = true;
+            mSunScheduled = false;
+            sunRan = mSunBaked;
+            sunSlotsChanged = mSunBaked;
+        }
+        else
+        {
+            sunRan = mpCloudResidency->getGpuSunFrame().run || mSunBaked;
+            sunSlotsChanged = dispatchSunScheduling(pRenderContext) || mSunBaked;
+            mpCloudResidency->gpuSunDispatched();
+        }
+        mSunBaked = false;
     }
     else if (const uint32_t bakes = mpCloudResidency->getSunBakeCount(); bakes > 0)
     {
@@ -4335,7 +4462,9 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     // What the frame settled and baked, for the beam image to re-verify (the bake jobs are still in hstrCloudSunBakes).
     markBeamChanges(
         pRenderContext,
-        mCloudGpuSun ? (sunSlotsChanged ? mpCloudResidency->getGpuSunFrame().info.bakeMax : 0u) : mpCloudResidency->getSunBakeCount()
+        // FOUND (cloudSunBeside work): with the GPU scheduler this always passed 0 bakes - it read the frame's bakeMax after
+        // gpuSunDispatched cleared it - so bakes never marked the beam. beamMarkBakes passes the run's bake jobs (mSunBakeMax).
+        mCloudGpuSun ? (mBeamMarkBakes && sunRan ? mSunBakeMax : 0u) : mpCloudResidency->getSunBakeCount()
     );
     // After every slot change and bake of the frame: the sun bake each brick's samples read, per orientation class. Only when
     // something it reads changed - the sun slot table (a scheduling run's evictions and assignments, or CPU bakes), the brick table
@@ -4566,17 +4695,17 @@ bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<Compu
     return first;
 }
 
-bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
+bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, uint32_t phases)
 {
     auto& residency = *mpCloudResidency;
     // The bake count of an earlier run, read back without waiting: a run that staged nothing lets the scheduler idle. The copy was
     // recorded in an earlier frame, whose end submitted it, so the fence is signalled now rather than by flushing then.
-    if (mSunReadbackRecorded)
+    if ((phases & kSunPre) && mSunReadbackRecorded)
     {
         mSunReadbackPending = pRenderContext->signal(mpSunFence.get());
         mSunReadbackRecorded = false;
     }
-    if (mSunReadbackPending != 0 && mpSunFence->getCurrentValue() >= mSunReadbackPending)
+    if ((phases & kSunPre) && mSunReadbackPending != 0 && mpSunFence->getCurrentValue() >= mSunReadbackPending)
     {
         const uint32_t bakes = *static_cast<const uint32_t*>(mpSunReadback->map());
         mpSunReadback->unmap();
@@ -4597,42 +4726,124 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
             ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
             residency.bind(var);
             residency.bindGpuSun(var);
+            // The resets and stamps write only the field. Bound, the slot table's and bake list's writable views would transition
+            // them out of the read state the query's bindings left them in, and that transition waits for the query (sunbeside1's
+            // cloudSunBesideLog: 17301504 B and 49152 B, ShaderResource -> UnorderedAccess, on every run beside it).
+            const ComputePass* p = pPass.get();
+            if (p == mpResetSunBlocksPass.get() || p == mpResetSunNodesPass.get() || p == mpStampSunPass.get() || p == mpStampSunFinePass.get())
+            {
+                var["hstrCloudSunSlotsOutput"] = ref<Buffer>();
+                var["hstrCloudSunBakesOutput"] = ref<Buffer>();
+            }
             mResidencyPassesBound.push_back(pPass.get());
         }
         pPass->execute(pRenderContext, threads);
     };
     // The invalidation field ages every frame, idle or not.
-    if (info.ageRows > 0)
+    if ((phases & kSunPre) && info.ageRows > 0)
         run("age", mpAgeSunPass, uint3(kCloudSunFieldWidth, info.ageRows, 1));
     if (!sun.run)
     {
         // cloudSunEvery's frames between runs: the releases alone (their slots go back, their pairs clear).
-        if (!sun.releaseOnly || info.releaseCount == 0)
+        if (!(phases & kSunPre) || !sun.releaseOnly || info.releaseCount == 0)
             return false; // The counters keep the last run's (the stats read them).
         run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
         return true;
     }
-    pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
-    pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
-    if (info.releaseCount > 0)
-        run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
-    // New blocks and nodes restart before this frame's changes stamp over them.
-    if (info.blockResets > 0)
-        run("resetBlocks", mpResetSunBlocksPass, uint3(info.blockLength, info.blockResets, 1));
-    if (info.nodeResets > 0)
-        run("resetNodes", mpResetSunNodesPass, uint3(kCloudSunFineEntries, info.nodeResets, 1));
-    if (info.changeCount > 0)
-        run("stamp", mpStampSunPass, uint3(info.changeCount, info.stampSplit != 0 ? info.classCount : 1u, std::max(info.stampRows, 1u)));
-    run("scan", mpScanSunPass, uint3(info.capacity, 1, 1));
-    run("select", mpSelectSunPass, uint3(1));
-    run("emit", mpEmitSunPass, uint3(info.capacity, 1, 1));
-    run("evict", mpEvictSunPass, uint3(info.bakeMax, 1, 1));
-    run("assign", mpAssignSunPass, uint3(info.bakeMax, 1, 1));
+    if (phases & kSunPre)
+    {
+        pRenderContext->clearUAV(residency.getGpuSunCounters()->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(residency.getGpuSunHistogram()->getUAV().get(), uint4(0));
+        if (info.releaseCount > 0)
+            run("release", mpReleaseSunPass, uint3(info.releaseCount, 1, 1));
+    }
+    // kSunStamp: the resets and stamps store the run's epoch into the field, so their order among themselves does not matter
+    // (cloudSunBeside dispatches them with no barrier between). New blocks and nodes restart before the changes stamp over them.
+    if (phases & kSunStamp)
+    {
+        if (info.blockResets > 0)
+            run("resetBlocks", mpResetSunBlocksPass, uint3(info.blockLength, info.blockResets, 1));
+        if (info.nodeResets > 0)
+            run("resetNodes", mpResetSunNodesPass, uint3(kCloudSunFineEntries, info.nodeResets, 1));
+        const uint3 stampThreads(info.changeCount, info.stampSplit != 0 ? info.classCount : 1u, std::max(info.stampRows, 1u));
+        // stampSunFine: a thread per (candidate cell, class), 1024 a row.
+        const uint32_t finePairs = info.fineCells * std::min(info.classCount, kCloudSunClasses);
+        const uint3 fineThreads(std::min(finePairs, 1024u), (finePairs + 1023u) / 1024u, 1u);
+        // DIAGNOSTIC cloudSunStampFineCheck (stampFine runs only): 1 the full stamp after the fine one, storing only into entries that
+        // lack the epoch - each such entry is one the fine stamp missed; 2 the full stamp first, then the fine one the same way - each
+        // entry it changes is one it stamped beyond the full stamp. Counted in hstrCloudSunCounters 10 / 11 (sunStampCheckFresh, must
+        // be 0).
+        const uint32_t check = info.changeCount > 0 && info.stampFine != 0 ? mCloudSunStampFineCheck : 0u;
+        auto withInfo = [&](auto change)
+        {
+            HSTRCloudSunFrame copy = info;
+            change(copy);
+            residency.setGpuSunFrameInfo(copy);
+        };
+        if (check == 2)
+        {
+            withInfo([](HSTRCloudSunFrame& f) { f.stampFine = 0; });
+            run("stamp", mpStampSunPass, stampThreads);
+            withInfo([](HSTRCloudSunFrame& f) { f.stampSkipSame = 1; f.stampCheck = 1; });
+            run("stampFine", mpStampSunFinePass, fineThreads);
+            residency.setGpuSunFrameInfo(info);
+        }
+        else if (info.changeCount > 0)
+        {
+            // DIAGNOSTIC: its own scope beside the fine stamp (pair blocks only), so the profile splits the two kinds of run.
+            run(info.stampFine != 0 ? "stampCoarse" : "stamp", mpStampSunPass, stampThreads);
+            if (info.stampFine != 0)
+                run("stampFine", mpStampSunFinePass, fineThreads);
+            if (check == 1)
+            {
+                withInfo([](HSTRCloudSunFrame& f) { f.stampFine = 0; f.stampSkipSame = 1; f.stampCheck = 1; });
+                run("stampCheck", mpStampSunPass, stampThreads);
+                residency.setGpuSunFrameInfo(info);
+            }
+        }
+        if (check != 0)
+        {
+            mSunStampCheckTotal += residency.getGpuSunCounters()->getElement<uint32_t>(11); // DIAGNOSTIC (blocking)
+            ++mSunStampCheckRuns;
+        }
+    }
+    if (phases & kSunSelect)
+    {
+        run("scan", mpScanSunPass, uint3(info.capacity, 1, 1));
+        run("select", mpSelectSunPass, uint3(1));
+        run("emit", mpEmitSunPass, uint3(info.capacity, 1, 1));
+        run("evict", mpEvictSunPass, uint3(info.bakeMax, 1, 1));
+        run("assign", mpAssignSunPass, uint3(info.bakeMax, 1, 1));
+        mSunBakeMax = info.bakeMax; // gpuSunDispatched clears the frame before a deferred run bakes.
+    }
+    if (phases & kSunBake)
+        bakeScheduledSun(pRenderContext);
+    return true;
+}
+
+void HSTRCloud::finishDeferredSun(RenderContext* pRenderContext)
+{
+    if (!mSunDeferred)
+        return;
+    if (!mSunScheduled)
+        ++mSunSerialRuns; // DIAGNOSTIC: no dirty query this frame to hide the stamps behind.
+    dispatchSunScheduling(pRenderContext, (mSunScheduled ? 0u : kSunStamp) | kSunSelect | kSunBake);
+    mpCloudResidency->gpuSunDispatched();
+    mSunDeferred = false;
+    mSunScheduled = false;
+    mSunBaked = true;
+}
+
+void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext)
+{
+    auto& residency = *mpCloudResidency;
+    const uint32_t bakeMax = mSunBakeMax;
+    FALCOR_PROFILE(pRenderContext, "scheduleSun");
     // The jobs assign wrote; entries without a slot return at once.
     {
         FALCOR_PROFILE(pRenderContext, "bakeCloudSun");
         mParams.cloudCommitOffset = 0;
-        mParams.cloudCommitCount = info.bakeMax;
+        mParams.cloudCommitCount = bakeMax;
         if (mSunBakeProbe && !mpSunBakeProbe)
         {
             // Once, before the probe buffer is first bound: new vars for the probe's program, so the residency bindings are redone.
@@ -4658,7 +4869,7 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
             }
             mpBakeCloudSunPass->getRootVar()["gSunBakeProbe"] = mpSunBakeProbe;
         }
-        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * info.bakeMax));
+        mpBakeCloudSunPass->execute(pRenderContext, uint3(10, 10, 10 * bakeMax));
         mParams.cloudCommitCount = 0;
         if (mpSunBakeProbe)
         {
@@ -4680,7 +4891,6 @@ bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext)
         residency.gpuSunQueued();
         mSunReadbackRecorded = true;
     }
-    return true;
 }
 
 void HSTRCloud::uploadHierarchy()
@@ -6146,6 +6356,11 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_FORM_B", formB ? std::to_string(mFormB) : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_ORACLE", std::to_string(mParams.cloudLayerOracle));
     pPass->getProgram()->addDefine("HSTR_FORM_R", mHullTlas && mHullTlasFrame == mExecuteFrames ? std::to_string(mFormR) : "0");
+    // ORACLE beamHistoryBlendOracle: compiled in only while asked for (beamUnitWrite).
+    if (mBeamHistoryBlendOracle > 0.f)
+        pPass->getProgram()->addDefine("HSTR_HISTORY_BLEND", fmt::format("{:.4f}f", mBeamHistoryBlendOracle));
+    else
+        pPass->getProgram()->removeDefine("HSTR_HISTORY_BLEND");
 }
 
 void HSTRCloud::ensureCellViews(RenderContext* pRenderContext)
@@ -6599,6 +6814,9 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         pRenderContext->setLogBarriers(true);
     }
     executeFrame(pRenderContext, renderData);
+    // cloudSunBeside: the deferred run's rest, after everything that samples the sun atlas, whatever path the frame took.
+    if (mpCloudResidency)
+        finishDeferredSun(pRenderContext);
     if (logFrame)
     {
         pRenderContext->setLogBarriers(false);
@@ -7040,12 +7258,22 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             mWorldCacheBakeDirty = false;
             ++mWorldCacheBakes;
         }
-        // worldCacheView: every frame, after the cache textures, before any camera march.
-        if (mParams.worldCacheView != 0 && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && mpWorldCacheTextures[0])
+        // worldCacheView: after the cache textures, before any camera march. It depends on the cache and the camera position only:
+        // a parked camera keeps it; a moving one rebakes every worldCacheViewEvery frames.
+        const float3 viewCamera = mpScene->getCamera()->getPosition();
+        const bool viewMissing = !mpWorldCacheView || mpWorldCacheView->getWidth() != dims.x || mpWorldCacheView->getHeight() != dims.y ||
+                                 mpWorldCacheView->getDepth() != dims.z;
+        ++mWorldCacheViewAge;
+        const bool viewDue = viewMissing || mWorldCacheViewBakes != mWorldCacheBakes ||
+                             (any(viewCamera != mWorldCacheViewCamera) && mWorldCacheViewAge >= mWorldCacheViewEvery);
+        if (mParams.worldCacheView != 0 && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && mpWorldCacheTextures[0] &&
+            viewDue)
         {
             FALCOR_PROFILE(pRenderContext, "worldCacheView");
-            if (!mpWorldCacheView || mpWorldCacheView->getWidth() != dims.x || mpWorldCacheView->getHeight() != dims.y ||
-                mpWorldCacheView->getDepth() != dims.z)
+            mWorldCacheViewAge = 0;
+            mWorldCacheViewBakes = mWorldCacheBakes;
+            mWorldCacheViewCamera = viewCamera;
+            if (viewMissing)
                 mpWorldCacheView = mpDevice->createTexture3D(
                     dims.x, dims.y, dims.z, ResourceFormat::RGBA16Float, 1, nullptr,
                     ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
@@ -8303,6 +8531,28 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                             --mSeaFarOverlapLog;
                                         }
                                     }
+                                    // cloudSunBeside: the deferred run's field resets and stamps in the query's shadow too. They write
+                                    // only the sun field, which neither the query nor the march reads; any barrier recorded here would
+                                    // wait for the query (DIAGNOSTIC cloudSunBesideLog lists them).
+                                    if (mSunDeferred && !mSunScheduled)
+                                    {
+                                        if (mCloudSunBesideLog > 0)
+                                        {
+                                            logInfo("BARRIER --- sun stamps beside the query (frame {})", mExecuteFrames);
+                                            pRenderContext->setLogBarriers(true);
+                                        }
+                                        pRenderContext->setAutoUavBarriers(false);
+                                        dispatchSunScheduling(pRenderContext, kSunStamp);
+                                        pRenderContext->setAutoUavBarriers(true);
+                                        mSunScheduled = true;
+                                        ++mSunBesideRuns;
+                                        if (mCloudSunBesideLog > 0)
+                                        {
+                                            pRenderContext->setLogBarriers(false);
+                                            logInfo("BARRIER --- end");
+                                            --mCloudSunBesideLog;
+                                        }
+                                    }
                                 }
                                 if (!mBeamFusedBuild)
                                 {
@@ -9100,6 +9350,12 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                         else
                             pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
+                        if (mBeamHistoryBlendOracle > 0.f)
+                        {
+                            // DIAGNOSTIC (blocking, oracle only): kBeamHistoryProbe's three counts into running totals.
+                            for (uint32_t k = 0; k < 3; ++k)
+                                mBeamHistoryProbeTotals[k] += mpBeamCounts[mBeamParity]->getElement<uint32_t>(kBeamHistoryProbe + k);
+                        }
                         if (farBeside && mSeaFarOverlapLog > 0)
                         {
                             pRenderContext->setLogBarriers(false);

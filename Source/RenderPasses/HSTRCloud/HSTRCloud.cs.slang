@@ -611,6 +611,8 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint> hstrCloudSunRelease;             ///< Bricks whose bakes are freed this frame (unloaded).
     StructuredBuffer<float4> hstrCloudSunDirections;        ///< Per orientation class: sun direction in its source voxels.
     RWTexture2D<uint> hstrCloudSunField;                    ///< Sun bake invalidation epochs (R16), kCloudSunFieldWidth a row.
+    StructuredBuffer<uint> hstrCloudSunChangeSat;           ///< stampFine: per asset (grid offsets, cells), then changed-cell prefix sums.
+    StructuredBuffer<uint2> hstrCloudSunFineCells;          ///< stampFine: candidate cells (asset, x | y << 10 | z << 20).
     StructuredBuffer<uint> hstrCloudSunFieldBlocks;         ///< Per asset, kCloudSunClasses entries: its level >= 2 block's first entry, or kCloudRefNone.
     StructuredBuffer<uint> hstrCloudSunFieldLevels;         ///< Per asset, kCloudSunFieldLevels entries: a level's offset in a block.
     StructuredBuffer<HSTRCloudSunChange> hstrCloudSunChanges; ///< This frame's residency changes (stampSunChanges).
@@ -709,6 +711,7 @@ struct HSTRCloudRenderer
     RWStructuredBuffer<float4> hstrBeamChangeSpheresOutput;
     RWStructuredBuffer<uint> hstrBeamChangeCountOutput;
     StructuredBuffer<uint4> hstrBeamChangeInput;         ///< Residency changes: asset, level, packed brick coordinates.
+    StructuredBuffer<uint> hstrBeamChangeAssetSlots;     ///< beamChangeAssetSlots: per asset (offset, count), then slot | layer << 16.
     RWStructuredBuffer<uint> hstrBeamChangeCellsOutput;  ///< Per slot, a bit per change cell (compactBeamChanges clears them).
     /// beamRepairProbe: the residual units and the lattice as they stood before this build re-marched them.
     Texture2D<float4> hstrBeamPixelsSnapshot;
@@ -5372,6 +5375,17 @@ struct HSTRCloudRenderer
         last = min(int3(ceil((hi - a) / (8.f * s) + 1e-4f)) - 1, dims - 1);
     }
 
+    /// One stamp store (stampSkipSame: only where the entry does not hold the run's epoch yet; fresh counts those stored then).
+    void stampSunEntry(uint entry, uint epoch, bool skipSame, inout uint stores, inout uint fresh)
+    {
+        const uint2 texel = sunFieldTexel(entry);
+        ++stores;
+        if (skipSame && hstrCloudSunField[texel] == epoch)
+            return;
+        hstrCloudSunField[texel] = epoch;
+        fresh += skipSame ? 1u : 0u;
+    }
+
     /// Stamp: this frame into every entry, of every class, whose bakes read the change's cells.
     void stampSunChange(uint entry, uint thread, uint rowThread)
     {
@@ -5401,7 +5415,9 @@ struct HSTRCloudRenderer
         // MEASURED (sunset_motion9, 4K sunset sea, arms alternating on one path) outdated bakes at walk's chunk ends 96k -> 82k,
         // walk 9.14 -> 9.89 ms and sprint 13.93 -> 11.99 (within the arms' spread). Most of a flight's outdating is real: bricks
         // of the bake's own level and coarser mapping and unmapping while the cut sits at the atlas cap.
-        const uint levels = min(min(asset.topLevel, frame.levelStamps != 0 ? change.level : 0xFFFFu) + 1u, kCloudSunFieldLevels);
+        uint levels = min(min(asset.topLevel, frame.levelStamps != 0 ? change.level : 0xFFFFu) + 1u, kCloudSunFieldLevels);
+        const bool skipSame = frame.stampSkipSame != 0;
+        uint stores = 0, fresh = 0;
         // Levels >= 2: the blocks of the asset's pairs.
         for (uint c = classFirst; c < classEnd; ++c)
         {
@@ -5421,11 +5437,14 @@ struct HSTRCloudRenderer
                         if (row % rows != rowThread)
                             continue;
                         for (int x = first.x; x <= last.x; ++x)
-                            hstrCloudSunField[sunFieldTexel(offset + uint(x + dims.x * (y + dims.y * z)))] = epoch;
+                            stampSunEntry(offset + uint(x + dims.x * (y + dims.y * z)), epoch, skipSame, stores, fresh);
                     }
             }
         }
-        // Levels 0-1: the positions of every class, in the nodes of the 32-voxel cells they lie in.
+        // Levels 0-1: the positions of every class, in the nodes of the 32-voxel cells they lie in (stampFine: stampSunFine's).
+        // cloudSunStampFineCheck 2 runs this pass in full with stampFine cleared in its record, so no level is lost there.
+        if (frame.stampFine != 0)
+            levels = 0u; // Every fine range empty below.
         int3 firsts[2 * kCloudSunClasses];
         int3 lasts[2 * kCloudSunClasses];
         int3 cellFirst = int3(0x3FFFFFFF);
@@ -5470,9 +5489,124 @@ struct HSTRCloudRenderer
                             for (int z = first.z; z <= last.z; ++z)
                                 for (int y = first.y; y <= last.y; ++y)
                                     for (int x = first.x; x <= last.x; ++x)
-                                        hstrCloudSunField[sunFieldTexel(sunFineEntry(node, c, level, uint3(x, y, z)))] = epoch;
+                                        stampSunEntry(sunFineEntry(node, c, level, uint3(x, y, z)), epoch, skipSame, stores, fresh);
                         }
                 }
+        // The run's store counts (hstrCloudSunCounters 8, 9), one atomic a wave.
+        const uint waveStores = WaveActiveSum(stores), waveFresh = WaveActiveSum(fresh);
+        if (WaveIsFirstLane())
+        {
+            const uint counter = frame.stampCheck != 0 ? 10u : 8u;
+            InterlockedAdd(hstrCloudSunCounters[counter], waveStores);
+            InterlockedAdd(hstrCloudSunCounters[counter + 1u], waveFresh);
+        }
+    }
+
+    /// The changed cells (grid: a stampFine prefix-sum grid of a g-cell asset) in the support box [lo, hi] (voxels, cell = 32).
+    int sunChangedCells(uint grid, int3 g, float3 lo, float3 hi)
+    {
+        const int3 k0 = max(int3(floor(lo / 32.f)), 0);
+        const int3 k1 = min(int3(floor(hi / 32.f)), g - 1);
+        if (any(k0 > k1))
+            return 0;
+        // The inclusive prefix sums (cell k at k + 1) over the box's eight corners.
+        const uint2 G = uint2(g.xy + 1);
+        const int3 h = k1 + 1;
+        int count = 0;
+        [unroll]
+        for (uint corner = 0; corner < 8u; ++corner)
+        {
+            const int3 q = int3((corner & 1u) ? h.x : k0.x, (corner & 2u) ? h.y : k0.y, (corner & 4u) ? h.z : k0.z);
+            // (-1) to the number of lo coordinates (3 - the hi bits).
+            const int sign = (countbits(corner) & 1u) != 0u ? 1 : -1;
+            count += sign * int(hstrCloudSunChangeSat[grid + uint(q.x) + G.x * (uint(q.y) + G.y * uint(q.z))]);
+        }
+        return count;
+    }
+
+    /// stampFine: the level 0-1 entries (sunFineEntry indices: 72 a class) of the candidate cells' nodes, each stamped iff its support
+    /// box - sunStampRange's, as a cell range - holds a changed cell of the run (the prefix sums: level-0 entries every change, level-1
+    /// entries the changes stampSunChange would stamp level 1 for). The entries stampSunChange's fine part stamps, each stored once.
+    /// One lane per (candidate cell, class) first tests the union of that pair's 72 boxes against every change (level 0 at 32 cell +
+    /// {0, 8, 16, 24} reaches [-3, 34] past it, level 1 at 32 cell + {0, 16} [-5.5, 36.5]); most pairs of the dilated candidate list
+    /// hold none. The wave then takes its passing pairs one at a time, its lanes over the pair's 72 entries. MEASURED (markbakes1,
+    /// 4K sunset walk, one run): 756k pairs, 165k passing, 3.1M entries tested, 2.0M stored. One wave per pair, each lane repeating
+    /// the pair's test, cost 1.7-2.1 ms a run, instruction-bound (besidetrace2: 58% issue, ALU 40%, L1 hit 86%); this way 0.20-0.23
+    /// ms a run (stampfine5), exact (cloudSunStampFineCheck 1 and 2: 0 over 103 checked runs).
+    void stampSunFine(uint pair)
+    {
+        const HSTRCloudSunFrame frame = sunFrame();
+        const uint classes = min(frame.classCount, kCloudSunClasses);
+        const uint candidate = pair / max(classes, 1u);
+        const uint c = pair % max(classes, 1u);
+        const uint lane = WaveGetLaneIndex();
+        uint stores = 0, fresh = 0;
+        uint waves = 0, passed = 0, tested = 0; // DIAGNOSTIC (counters 12-14; "waves" counts pairs)
+        bool pass = false;
+        uint asset = 0;
+        uint3 cell = 0;
+        if (candidate < frame.fineCells)
+        {
+            waves = 1u;
+            const uint2 fine = hstrCloudSunFineCells[candidate];
+            asset = fine.x;
+            cell = uint3(fine.y & 1023u, (fine.y >> 10) & 1023u, fine.y >> 20);
+            const uint packed = hstrCloudSunChangeSat[4u * asset + 2u];
+            const int3 g = int3(packed & 1023u, (packed >> 10) & 1023u, packed >> 20);
+            const float3 sweep = sunReach(asset) * hstrCloudSunDirections[c].xyz;
+            const float3 base = float3(cell) * 32.f;
+            const float wide = 16.f * 1e-4f;
+            pass = sunChangedCells(hstrCloudSunChangeSat[4u * asset], g, base - 5.5f + min(sweep, 0.f) - wide,
+                                   base + 36.5f + max(sweep, 0.f) + wide) != 0;
+            passed = pass ? 1u : 0u;
+        }
+        uint4 ballot = WaveActiveBallot(pass);
+        for (uint word = 0; word < 4u; ++word)
+        {
+            while (ballot[word] != 0u)
+            {
+                const uint owner = 32u * word + firstbitlow(ballot[word]);
+                ballot[word] &= ballot[word] - 1u;
+                const uint pAsset = WaveReadLaneAt(asset, owner);
+                const uint3 pCell = WaveReadLaneAt(cell, owner);
+                const uint pClass = WaveReadLaneAt(c, owner);
+                const uint packed = hstrCloudSunChangeSat[4u * pAsset + 2u];
+                const int3 g = int3(packed & 1023u, (packed >> 10) & 1023u, packed >> 20);
+                const float3 sweep = sunReach(pAsset) * hstrCloudSunDirections[pClass].xyz;
+                const uint node = sunFineNode(pAsset, pCell);
+                for (uint e = lane; e < 72u && node != kCloudRefNone; e += WaveGetLaneCount())
+                {
+                    const uint level = e < 8u ? 1u : 0u;
+                    const uint j = e - 8u;
+                    const uint3 local = level == 1u ? uint3(e & 1u, (e >> 1) & 1u, e >> 2) : uint3(j & 3u, (j >> 2) & 3u, j >> 4);
+                    const uint3 position = (pCell << (2u - level)) + local;
+                    if (!all(position < sunLevelDims(pAsset, level)))
+                        continue;
+                    ++tested;
+                    const float s = float(1u << level);
+                    const float eps = 8.f * s * 1e-4f;
+                    const float3 p = float3(position) * (8.f * s);
+                    const float3 lo = p - 2.5f * s - 0.5f + min(sweep, 0.f) - eps;
+                    const float3 hi = p + 10.5f * s - 0.5f + max(sweep, 0.f) + eps;
+                    if (sunChangedCells(hstrCloudSunChangeSat[4u * pAsset + level], g, lo, hi) != 0)
+                        stampSunEntry(sunFineEntry(node, pClass, level, position), frame.frame & 0xFFFFu, frame.stampSkipSame != 0, stores, fresh);
+                }
+            }
+        }
+        const uint waveStores = WaveActiveSum(stores), waveFresh = WaveActiveSum(fresh);
+        const uint waveWaves = WaveActiveSum(waves), wavePassed = WaveActiveSum(passed), waveTested = WaveActiveSum(tested);
+        if (WaveIsFirstLane())
+        {
+            const uint counter = frame.stampCheck != 0 ? 10u : 8u;
+            InterlockedAdd(hstrCloudSunCounters[counter], waveStores);
+            InterlockedAdd(hstrCloudSunCounters[counter + 1u], waveFresh);
+            if (frame.stampCheck == 0)
+            {
+                InterlockedAdd(hstrCloudSunCounters[12], waveWaves);
+                InterlockedAdd(hstrCloudSunCounters[13], wavePassed);
+                InterlockedAdd(hstrCloudSunCounters[14], waveTested);
+            }
+        }
     }
 
     /// Reset: restarts field ranges (new pair blocks, new directory nodes) at this frame, which drops every bake they cover.
@@ -13524,7 +13658,7 @@ struct HSTRCloudRenderer
             hstrBeamRepair[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo), exact.distance);
             return;
         }
-        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false), exact.distance);
+        hstrBeamPixelOutput[unit] = float4(beamHistoryBlend(unit, hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false)), exact.distance);
         hstrBeamUnitTransmittanceOutput[unit] = exp(-exact.depth);
 #if HSTR_BEAM_REPAIR_PROBE
         beamProbeUnit(unit, w, hstrBeamPixelOutput[unit].rgb, exact.steps);
@@ -14411,11 +14545,33 @@ struct HSTRCloudRenderer
         }
     }
 
+    /// ORACLE beamHistoryBlendOracle (wrong image, HSTR_HISTORY_BLEND): a marched unit's fresh radiance blended with the value the
+    /// unit held before it - the temporal accumulation a jittered long-step march would need - counting how far that history is from
+    /// the fresh march (kBeamHistoryProbe). Without the define, the radiance as given.
+    float3 beamHistoryBlend(uint2 unit, float3 radiance)
+    {
+#if defined(HSTR_HISTORY_BLEND)
+        const float4 history = hstrBeamPixelOutput[unit];
+        if (!gUnitRepair && history.a >= 0.f && all(isfinite(history.rgb)))
+        {
+            const float error = dot(abs(log(1.f + max(history.rgb, 0.f)) - log(1.f + max(radiance, 0.f))), 1.f / 3.f);
+            InterlockedAdd(hstrBeamCounts[kBeamHistoryProbe], 1u);
+            if (error > 0.02f)
+                InterlockedAdd(hstrBeamCounts[kBeamHistoryProbe + 1], 1u);
+            if (error > 0.1f)
+                InterlockedAdd(hstrBeamCounts[kBeamHistoryProbe + 2], 1u);
+            return lerp(radiance, history.rgb, HSTR_HISTORY_BLEND);
+        }
+#endif
+        return radiance;
+    }
+
     /// marchBeamUnitExact's writes for a marched unit.
     void beamUnitWrite(uint2 unit, float3 w, BeamSample exact)
     {
         const float3 albedo = gScene.getGridVolume(0).data.albedo;
-        hstrBeamPixelOutput[unit] = float4(hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false), exact.distance);
+        const float3 radiance = beamHistoryBlend(unit, hazedBeamRadiance(exact.cache, exact.single, exact.depth, exact.distance, w, albedo, false));
+        hstrBeamPixelOutput[unit] = float4(radiance, exact.distance);
         hstrBeamUnitTransmittanceOutput[unit] = exp(-exact.depth);
         if (params.beamGuard != 0 && params.beamRefFrame != 0)
         {
@@ -15596,6 +15752,33 @@ void invalidateBeamGuardBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
 void markBeamChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.markBeamChange(dispatchThreadId.x, dispatchThreadId.y);
+}
+
+/// beamChangeAssetSlots: thread (change, k) marks the k-th (slot, layer) holding the change's asset (hstrBeamChangeAssetSlots: per
+/// asset its offset and count, then the packed slot | layer << 16 entries), instead of every slot and layer.
+[numthreads(64, 1, 1)]
+void markBeamChangesListed(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint change = dispatchThreadId.x;
+    const HSTRCloudParams params = gHSTRCloud.params;
+    if (change >= params.beamChangeInputs + params.beamChangeBakes)
+        return;
+    uint asset;
+    if (change < params.beamChangeInputs)
+        asset = gHSTRCloud.hstrBeamChangeInput[change].x;
+    else
+    {
+        const HSTRCloudSunBake job = gHSTRCloud.hstrCloudSunBakes[change - params.beamChangeInputs];
+        if (job.slot == kCloudRefNone)
+            return;
+        asset = job.asset;
+    }
+    const uint offset = gHSTRCloud.hstrBeamChangeAssetSlots[2u * asset];
+    const uint count = gHSTRCloud.hstrBeamChangeAssetSlots[2u * asset + 1u];
+    if (dispatchThreadId.y >= count)
+        return;
+    const uint entry = gHSTRCloud.hstrBeamChangeAssetSlots[offset + dispatchThreadId.y];
+    gHSTRCloud.markBeamChangeLayer(change, entry & 0xFFFFu, entry >> 16);
 }
 
 [numthreads(64, 1, 1)]
@@ -18419,6 +18602,13 @@ void ageSunField(uint3 dispatchThreadId: SV_DispatchThreadID)
 void stampSunChanges(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.stampSunChange(dispatchThreadId.x, dispatchThreadId.y, dispatchThreadId.z);
+}
+
+/// stampFine: x the (class, entry) slot (72 a class), y + 1024 z the candidate cell.
+[numthreads(64, 1, 1)]
+void stampSunFine(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.stampSunFine(dispatchThreadId.x + 1024u * dispatchThreadId.y);
 }
 
 [numthreads(256, 1, 1)]

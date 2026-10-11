@@ -32,12 +32,15 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
             "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
             "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames", "uploadRuns", "uploadBytes", "scatterJobs", "scatterChecks", "scatterMismatches", "commitChecks", "commitMismatches", "sunResolveListFrames", "sunResolveListBricks", "sunResolveListChecks",
-            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "cutOrderedCount", "cutEntered", "cutLeft") + tuple(
+            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns",
+            "beamHistoryProbeUnits", "beamHistoryProbe02", "beamHistoryProbe10",
+            "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft") + tuple(
             f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
           "beamMarchTiles", "bindCpuMs", "loaded", "slotsUsed", "freeSlots", "freeBricks", "committed", "commitFails",
           "evictCalls", "evictFreed", "evictCandidates", "loadHeld", "loadScanned", "undesiredFadingOut", "undesiredHeld",
-          "undesiredIdle", "activeFades", "cuts", "cutEntered") + tuple(  # rtSpanProbe's last frame (present only while it is on).
+          "undesiredIdle", "activeFades", "cuts", "cutEntered", "sunStampStores", "sunStampFresh", "sunStampCheckStores",
+          "sunStampCheckFresh", "sunFineCellsPeak", "sunFineWaves", "sunFinePassed", "sunFineTested") + tuple(  # rtSpanProbe's last frame (present only while it is on).
           f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
           f"rtProbeBin{b}" for b in range(8)) + tuple(  # rasterProbe's last frame (present only while it is on).
           f"raster{n}" for n in ("Boxes", "Items", "Fragments", "Culled", "Empty", "Unbaked", "Subdivided", "NoSlice", "QueueOverflow",
@@ -408,7 +411,10 @@ for speed in speeds:
         print(f"MOTION {tag} arm {name}: {summary(arm_walls[name])} counters {arm_counts[name]}", flush=True)
         ends = arm_levels[name]
         print(f"MOTION {tag} arm {name} chunk ends: " + str({k: round(sum(float(e.get(k) or 0) for e in ends) / len(ends))
-                                                             for k in ("sunWaiting", "sunStale", "desired", "mapped")}), flush=True)
+                                                             for k in ("sunWaiting", "sunStale", "desired", "mapped", "sunStampStores",
+                                                                       "sunStampFresh", "sunStampCheckStores",
+                                                                       "sunStampCheckFresh", "sunFineWaves", "sunFinePassed",
+                                                                       "sunFineTested")}), flush=True)
         if arm_dirty[name]:
             d = arm_dirty[name]
             means = {k: round(sum(float(x.get(k) or 0) for x in d) / len(d), 1) for k in d[0]}

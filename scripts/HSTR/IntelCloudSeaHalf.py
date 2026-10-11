@@ -113,6 +113,29 @@ g.addPass(createPass("HSTRCloud", {
     # 60-85% of lit samples light from an ancestor's bake ~1.5 levels coarser (300-400k bakes waiting); the path-trace gate, run
     # parked and fully baked, never sees it.
     "cloudSunBakesMoving": 64,
+    # Sun stamp, levels 0-1 by changed-cell prefix sums (stampSunFine) instead of every change's sweep box (stampSunChange). The full
+    # stamp stored 9-34M times a run, 88-93% into entries already holding the run's epoch (stampskip2: overlapping sweeps); reading
+    # first (cloudSunStampSkipSame) was no faster. stampfine4 (4K sunset walk, 96 profiled frames, scheduleSun every 4th): stamp
+    # ship 1.379 / ship again 1.586 ms a run (0.316 / 0.380 a frame) -> coarse 0.049 + fine 0.643 (0.086 a frame; with the listed
+    # beam marks 0.044 + 0.723, 0.160 a frame, over 1.3x the changes). Exact: cloudSunStampFineCheck 1 (full stamp after, counting
+    # entries the fine stamp missed) and 2 (full stamp first, counting entries it stamped beyond) 0 over 101 checked runs, no
+    # list fallbacks (capacity 262144, peak 174911 candidates). One stamp a cell per class (stampfine3) cost 1.76 ms a run: 97%
+    # of its threads stored nothing; the wave per (class, cell) tests the union box first. stampfine5: a lane per (cell, class) for
+    # that test, the wave then over the passing pairs' entries - stampFine 1.7-2.1 -> 0.20-0.23 ms a run, coarse 0.07; full stamp
+    # 1.23 / 1.72 ms a run in the same launch; per frame ~0.065 vs 0.17-0.41 ms. Checks 1 / 2: 0 over 103 runs.
+    "cloudSunStampFine": True,
+    # markBeamChanges: one thread per (change, instance of its asset) instead of per sea slot. stampfine2 / 4: 0.029 / 0.038 ms a
+    # run against ship 0.052 / 0.054 and 0.047 / 0.049.
+    "beamChangeAssetSlots": True,
+    # GPU sun bakes mark the beam blocks that read them (markBeamChanges). Never happened before: the bake count was read after
+    # gpuSunDispatched cleared it. markbakes1 (4K sunset walk, motion score 2): ship 8.00% / on 5.24% / ship again 5.13% over 0.02,
+    # markBeamChanges 0.031 / 0.027 / 0.033 ms, units 0.73 / 0.82 / 0.95 - no measurable cost or quality change; on as correct.
+    "beamMarkBakes": True,
+    # worldCacheView rebaked every 4th frame while the camera moves (never while parked and unchanged). cacheview1 (4K sunset walk,
+    # motion score 2, share over 0.02 / p99.9): every 1 0.065 ms a frame 4.84% / 0.97, every 2 0.028 5.66% / 0.49, every 4 0.015
+    # 5.12% / 0.41, sanity view off 7.25% / 0.58, every 1 again 0.055 6.40% / 0.41 - 2 and 4 inside the anchors' spread, the
+    # sanity arm above it. The first anchor ran under-mapped (213880 of 243302), the rest mapped in full.
+    "worldCacheViewEvery": 4,
     # Sun bake step, level voxels (default 0.5). An explicit approximation. The bake's cost is its density steps: ~92 a texel, 98.5%
     # of texels marching to the full reach (bake probe, HSTR_SUN_BAKE_PROBE). bakestep4 (4K sunset walk, bakes kept across arms):
     # bakeCloudSun 0.5 0.557 / 0.412 ms, 1 0.229, 2 0.123. Quality (sunset_hill_bakestep5, every arm fully rebaked, 960 x 540 exact

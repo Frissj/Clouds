@@ -357,6 +357,11 @@ private:
     bool mBeamChangeCellsMarked = false; ///< Cells marked since the last listing.
     uint32_t mBeamChangeApplying = 0;    ///< Slices of the current list still to apply.
     LazyComputePass mpBeamMarkChangesPass;
+    LazyComputePass mpBeamMarkChangesListedPass;   ///< beamChangeAssetSlots: markBeamChangesListed.
+    ref<Buffer> mpBeamChangeAssetSlots;            ///< hstrBeamChangeAssetSlots.
+    std::vector<uint32_t> mBeamChangeAssetSlots;   ///< Its contents as last uploaded.
+    uint32_t mBeamChangeAssetSlotsMax = 0;         ///< The most (slot, layer) entries any asset has (the dispatch's y).
+    bool mBeamChangeAssetSlotsOn = false;          ///< beamChangeAssetSlots.
     LazyComputePass mpBeamCompactChangesPass;
     ref<Buffer> mpBeamChangeInput;
     ref<Buffer> mpBeamChangeCells;
@@ -797,6 +802,10 @@ private:
     bool mBeamHistoryValid = false;            ///< Last frame's beam lists belong to the current tile layout.
     bool mBeamReusable = false;                ///< The beam queries and tile levels of the last frame are still exact.
     uint32_t mWorldCacheBakes = 0;             ///< Bakes of the world cache textures, to detect lighting changes.
+    uint32_t mWorldCacheViewEvery = 1;         ///< worldCacheViewEvery: frames between view bakes while the camera moves.
+    uint32_t mWorldCacheViewAge = 0;           ///< Frames since the last view bake.
+    uint32_t mWorldCacheViewBakes = ~0u;       ///< mWorldCacheBakes at the last view bake.
+    float3 mWorldCacheViewCamera = float3(0.f); ///< The camera position at the last view bake.
     uint32_t mBeamBakes = 0;                   ///< mWorldCacheBakes when the beam queries were last built.
     uint4 mBeamLayout = uint4(0);              ///< Frame size, tile size and levels the beam lists were built for.
     float3 mBeamCameraPosition = float3(0.f);
@@ -963,6 +972,7 @@ private:
     LazyComputePass mpReleaseSunPass;
     LazyComputePass mpScanSunPass;
     LazyComputePass mpStampSunPass;
+    LazyComputePass mpStampSunFinePass; ///< cloudSunStampFine: stampSunFine.
     LazyComputePass mpResetSunBlocksPass;
     LazyComputePass mpResetSunNodesPass;
     LazyComputePass mpAgeSunPass;
@@ -990,7 +1000,14 @@ private:
     uint64_t mSunReadbackPending = 0;
     bool mSunReadbackRecorded = false; ///< The copy is in the command list; its fence is signalled next frame.
     /// Returns whether a scheduling run was dispatched (it can evict and assign sun slots).
-    bool dispatchSunScheduling(RenderContext* pRenderContext);
+    /// dispatchSunScheduling's parts, in order: the readback, age, counter clears and releases; the field resets and stamps; scan
+    /// to assign; the bakes.
+    static constexpr uint32_t kSunPre = 1, kSunStamp = 2, kSunSelect = 4, kSunBake = 8, kSunAll = 15;
+    bool dispatchSunScheduling(RenderContext* pRenderContext, uint32_t phases = kSunAll);
+    /// The bakes of the scheduling run dispatched last (dispatchSunScheduling's last part).
+    void bakeScheduledSun(RenderContext* pRenderContext);
+    /// cloudSunBeside's deferred run: its stamps (unless they ran beside the dirty query), scan to assign and bakes, at the frame's end.
+    void finishDeferredSun(RenderContext* pRenderContext);
     bool mSunResolveAlways = false; ///< cloudSunResolveAlways: resolve every frame (the A/B anchor for the dirty test).
     bool mSunResolveValid = false; ///< hstrCloudSunResolved holds the resolve of mSunResolveInputs and the current slot and brick tables.
     uint4 mSunResolveInputs = uint4(0); ///< Sun generation, oldest generation, ancestor reach, resolved buffer it was written to.
@@ -1011,6 +1028,38 @@ private:
     /// MEASURED, left at 1 (stamprows1, same walk, arms alternating in one launch, profiled): stamp 0.231 / 0.172 / 0.243 / 0.547 ms
     /// a frame at 1 / 4 / 16 / 64 - not short of threads: each split repeats the ranges' setup, and the stores are the cost.
     uint32_t mCloudSunStampRows = 1;
+    bool mCloudSunStampSkipSame = false; ///< cloudSunStampSkipSame: stampSunEntry stores only where the entry lacks the run's epoch.
+    bool mCloudSunStampFine = false;     ///< cloudSunStampFine: levels 0-1 stamped once per entry by stampSunFine.
+    uint32_t mCloudSunStampFineCheck = 0; ///< DIAGNOSTIC cloudSunStampFineCheck: 1 misses, 2 extras of the fine stamp (dispatchSunScheduling).
+    uint32_t mSunStampCheckTotal = 0;     ///< DIAGNOSTIC: those over every checked run (a blocking read per run; must stay 0).
+    uint32_t mSunStampCheckRuns = 0;      ///< DIAGNOSTIC: the checked runs.
+    /// cloudSunBeside: a scheduling run moves from the cloud sea's place to right behind the dirty query, with no barrier between
+    /// them (the query and march read only the resolved table and the sun atlas, which scheduling does not write), and its bakes to
+    /// the frame's end (they write the atlas the march samples). The next frame's beam marks and resolve take its changes.
+    /// MEASURED, off: sunbeside2 shows no barrier at the stamps once the slot table / bake list views are unbound, and every run went
+    /// beside the query (sunBesideRuns 60). GPU traces (4K sunset walk, frames 60-64, the sun run frame): ship besidetrace2 query
+    /// 0.86 + stamps 1.34 serial, HSTRCloud 5.21; beside besidetrace1 query range with the stamps inside 1.94 (= 0.86 + 1.12),
+    /// HSTRCloud 4.52 (cloudSea residency differed). stampFine runs at 58% sm__throughput against the query's 11%, so nothing hides:
+    /// the stamp's cost is its own work, not idle time.
+    bool mCloudSunBeside = false;
+    bool mSunDeferred = false;  ///< A scheduling run is waiting for this frame's query.
+    bool mSunScheduled = false; ///< ... and has been dispatched (its bakes follow at the frame's end).
+    bool mSunBaked = false;     ///< Last frame's end baked a deferred run: this frame's marks and resolve take it.
+    uint32_t mSunBakeMax = 0;   ///< The bake jobs of the last scheduling run (its HSTRCloudSunFrame::bakeMax).
+    /// ORACLE beamHistoryBlendOracle (wrong image): a dirty unit's fresh march blended with its previous value at this weight - the
+    /// history a temporal (jittered, accumulated) march would lean on. 0 compiles it out.
+    /// MEASURED, closes the temporal stochastic march (histblend4, 4K sunset walk, motion score 2, 3 interleaved cycles; share over
+    /// 0.02): ship 6.4 / 6.0 / 5.3%, blend 0.5 10.4 / 10.2 / 6.8%, sanity 0.95 15.8 / 16.5 / 17.9%. kBeamHistoryProbe (blend 0.5
+    /// arm): ~32k dirty units a frame hold a history, 60% of them over 0.02 from the fresh march and 28% over 0.1 - the guard
+    /// re-marches exactly the units whose history is wrong, so there is nothing to accumulate. (histblend1-3 never blended: the
+    /// shipped unit write bypassed beamUnitWrite until beamHistoryBlend served both.)
+    float mBeamHistoryBlendOracle = 0.f;
+    std::array<uint64_t, 3> mBeamHistoryProbeTotals{}; ///< DIAGNOSTIC: kBeamHistoryProbe summed over the dirty marches (cumulative).
+    bool mCloudSunFineUploadAll = false; ///< DIAGNOSTIC cloudSunFineUploadAll (CloudResidency::mSunFineUploadAll).
+    bool mBeamMarkBakes = false; ///< beamMarkBakes: a GPU scheduling run's bakes mark the beam (markBeamChanges); before, none did.
+    uint32_t mCloudSunBesideLog = 0; ///< DIAGNOSTIC cloudSunBesideLog: runs whose stamps log the barriers recorded beside the query.
+    uint32_t mSunBesideRuns = 0;   ///< DIAGNOSTIC: deferred runs scheduled beside the query (cumulative).
+    uint32_t mSunSerialRuns = 0;   ///< DIAGNOSTIC: deferred runs with no query to hide behind, scheduled at the frame's end.
     float mCloudSunBakeAngle = 0.25f;         ///< Degrees the sun moves from the current generation's bake direction before the next.
     bool mCloudSunLiveMarch = true;           ///< Whether the camera program keeps sunDepthAt's live near march (HSTR_SUN_LIVE).
     /// cloudSunLiveDirty: whether the dirty query and unit march keep it too. Off: compiled out of those two passes only.

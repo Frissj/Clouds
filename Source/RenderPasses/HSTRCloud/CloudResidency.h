@@ -167,6 +167,18 @@ public:
         uint32_t sunStampRuns = 0;    ///< DIAGNOSTIC: change uploads for stampSunChanges (cumulative).
         uint32_t sunStampRaw = 0;     ///< DIAGNOSTIC: changes before the dedupe (cumulative).
         uint32_t sunStampChanges = 0; ///< DIAGNOSTIC: changes stamped (cumulative).
+        uint32_t sunStampStores = 0;  ///< DIAGNOSTIC: the last scheduling run's stamp stores (hstrCloudSunCounters 8).
+        uint32_t sunStampFresh = 0;   ///< ... of those, under stampSkipSame, the ones that changed the entry (9).
+        uint32_t sunStampCheckStores = 0; ///< DIAGNOSTIC (cloudSunStampFineCheck): the check pass's stores (10)
+        uint32_t sunStampCheckFresh = 0;  ///< ... and the entries it changed: the fine stamp's misses (1) or extras (2); must be 0.
+        uint32_t sunFineRuns = 0;      ///< DIAGNOSTIC (cloudSunStampFine): runs stamped by stampSunFine (cumulative).
+        uint32_t sunFineFallbacks = 0; ///< DIAGNOSTIC: runs over the candidate list's capacity, stamped in full instead (cumulative).
+        uint32_t sunFineCells = 0;     ///< DIAGNOSTIC: candidate cells over all runs, fallbacks included (cumulative).
+        uint32_t sunFineCellsPeak = 0; ///< DIAGNOSTIC: the most candidate cells in one run.
+        uint32_t sunFineUploadBytes = 0; ///< DIAGNOSTIC: bytes stampSunFine's inputs uploaded (cumulative).
+        uint32_t sunFineWaves = 0;     ///< DIAGNOSTIC: the last run's stampSunFine (class, cell) waves (hstrCloudSunCounters 12),
+        uint32_t sunFinePassed = 0;    ///< ... those whose union box held a change (13),
+        uint32_t sunFineTested = 0;    ///< ... and the entries they tested (14).
         uint32_t scatterMismatches = 0; ///< DIAGNOSTIC: entries that differed (cumulative).
         uint32_t slotsUsed = 0;
         uint32_t nodesUsed = 0;
@@ -275,6 +287,9 @@ public:
     /// Whether stampSunChanges runs a thread per change and class (HSTRCloudSunFrame::stampSplit).
     void setSunStampSplit(bool stampSplit) { mSunStampSplit = stampSplit; }
     void setSunStampRows(uint32_t rows) { mSunStampRows = std::max(rows, 1u); }
+    void setSunStampSkipSame(bool skip) { mSunStampSkipSame = skip; }
+    void setSunStampFine(bool fine) { mSunStampFine = fine; }
+    void setSunFineUploadAll(bool all) { mSunFineUploadAll = all; }
     void setSunEvery(uint32_t every) { mSunEvery = std::max(every, 1u); }
     void setLoadsBesideCut(bool on) { mLoadsBesideCut = on; }
     /// Bricks committed a frame, at most desc.loadsPerFrame (the staging capacity); a runtime cap, so it changes without a rebuild.
@@ -337,6 +352,8 @@ public:
         HSTRCloudSunFrame info = {}; ///< Uploaded to hstrCloudSunFrameInfo.
     };
     const GpuSunFrame& getGpuSunFrame() const { return mGpuSunFrame; }
+    /// DIAGNOSTIC (cloudSunStampFineCheck): the scheduler's frame record, rewritten between check passes.
+    void setGpuSunFrameInfo(const HSTRCloudSunFrame& info) const { mpSunFrameInfo->setBlob(&info, 0, sizeof(HSTRCloudSunFrame)); }
     /// HSTRCloud dispatched the frame: a frame without a residency update (frozen) must not replay its releases, resets and changes.
     void gpuSunDispatched() { mGpuSunFrame = {}; }
     /// Binds the scheduler's buffers for writing (and unbinds the camera's views of the same buffers).
@@ -659,6 +676,18 @@ private:
     bool mSunScanWave = false;
     bool mSunStampSplit = false;
     uint32_t mSunStampRows = 1;
+    bool mSunStampSkipSame = false;
+    /// cloudSunStampFine: levels 0-1 stamped by stampSunFine, one thread per (candidate cell's node, class, entry) testing its support
+    /// box against per-asset prefix sums of the run's changed cells, instead of per change over overlapping sweeps.
+    bool mSunStampFine = false;
+    std::vector<HSTRCloudAsset> mGpuAssetRecords; ///< The assets as uploaded (dims, top level, voxel size for the stamp grids).
+    std::vector<uint32_t> mSunChangeSat;          ///< Per asset (offset, grid) headers, then the two prefix-sum grids per asset.
+    std::vector<uint2> mSunFineCells;             ///< This run's candidate cells: (asset, x | y << 10 | z << 20).
+    ref<Buffer> mpSunChangeSat;
+    bool mSunChangeSatUploaded = false; ///< Its header (per-asset offsets and dimensions) is on the GPU.
+    bool mSunFineUploadAll = false;     ///< DIAGNOSTIC cloudSunFineUploadAll: every asset's grids each run (the A/B anchor).
+    ref<Buffer> mpSunFineCells;
+    uint32_t mSunFineCellCapacity = 0;
     uint32_t mSunEvery = 1;
     bool mLoadsBesideCut = true; ///< Loads run on the frames a walk is on the worker (free slots only).
     uint32_t mLoadCap = 1024;    ///< setLoadCap.
@@ -689,6 +718,7 @@ private:
     void releaseSunField(uint32_t slot);
     /// Uploads the field's block table, the ranges to reset and the changes to stamp into mGpuSunFrame.
     void uploadSunChanges();
+    void buildSunFineStamp(); ///< cloudSunStampFine: this run's changed-cell prefix sums and candidate cells.
     GpuSunFrame mGpuSunFrame;
     bool mGpuSunRan = false; ///< Whether the last residency update ran the scheduler (the stats' bake count is its).
     SunScheduleInputs mGpuSunInputs;       ///< This frame's.

@@ -156,6 +156,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
 #if !HSTR_CLOUD_STREAMING
     createLibraryStores(library);
 #endif
+    mGpuAssetRecords = gpuAssets;
     mInstances.resize(sea.getInstanceTiles().size());
     mTileForward.resize(sea.getInstanceTiles().size(), float3x3::identity());
 
@@ -339,6 +340,21 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mSunFieldRows = uint32_t((entries + kCloudSunFieldWidth - 1) / kCloudSunFieldWidth);
         mpSunField = mpDevice->createTexture2D(kCloudSunFieldWidth, mSunFieldRows, ResourceFormat::R16Uint, 1, 1, nullptr, readWrite);
         mpSunResets = create(sizeof(uint32_t), blocks + nodeCapacity, nullptr);
+        // cloudSunStampFine: per asset a header (two grid offsets, the cell grid packed), then two prefix-sum grids of 32-voxel cells
+        // ((g + 1)^3 each: all changes, and those of level >= 1); and the candidate cell list.
+        {
+            uint32_t words = 4u * uint32_t(mGpuAssetRecords.size());
+            for (const HSTRCloudAsset& asset : mGpuAssetRecords)
+            {
+                const uint3 g = (asset.dims + 31u) / 32u + 1u;
+                words += 2u * g.x * g.y * g.z;
+            }
+            mSunChangeSat.assign(words, 0u);
+            mpSunChangeSat = create(sizeof(uint32_t), words, nullptr);
+            // MEASURED (stampfine2, sunset walk speed 2): 65536 sent 27 of 43 runs back to the full stamp (peak 174911 candidates).
+            mSunFineCellCapacity = 262144;
+            mpSunFineCells = create(sizeof(uint2), mSunFineCellCapacity, nullptr);
+        }
         mpSunFrameInfo = create(sizeof(HSTRCloudSunFrame), 1, nullptr);
         mpSunFieldBlocks = create(sizeof(uint32_t), uint32_t(mSunFieldBlocks.size()), mSunFieldBlocks.data());
         mpSunFieldLevels = create(sizeof(uint32_t), uint32_t(mSunFieldLevels.size()), mSunFieldLevels.data());
@@ -2695,6 +2711,137 @@ void CloudResidency::releaseSunField(uint32_t slot)
     --mSunFieldUsers[pair];
 }
 
+void CloudResidency::buildSunFineStamp()
+{
+    // stampSunFine's inputs for this run's (deduplicated) changes. A level-L entry at brick position p of class c is stamped by a
+    // change iff its support box [8 s p + a, 8 s p + b] (sunStampRange's a and b) meets the change's cells, so per asset: the
+    // changed 32-voxel cells as prefix sums (level-0 entries: every change; level-1 entries: changes level-1 bakes can read, as
+    // stampSunChange's levels), and the cells whose entries can reach a changed cell (the candidates).
+    const uint32_t assets = uint32_t(mGpuAssetRecords.size());
+    const uint32_t classes = std::min(uint32_t(mSunClasses.size()), kCloudSunClasses);
+    std::fill(mSunChangeSat.begin(), mSunChangeSat.end(), 0u);
+    std::vector<uint3> grids(assets);
+    uint32_t offset = 4u * assets;
+    for (uint32_t a = 0; a < assets; ++a)
+    {
+        const uint3 g = (mGpuAssetRecords[a].dims + 31u) / 32u;
+        const uint3 G = g + 1u;
+        grids[a] = g;
+        mSunChangeSat[4u * a] = offset;
+        mSunChangeSat[4u * a + 1u] = offset + G.x * G.y * G.z;
+        mSunChangeSat[4u * a + 2u] = g.x | (g.y << 10) | (g.z << 20);
+        offset += 2u * G.x * G.y * G.z;
+    }
+    auto at = [&](uint32_t a, uint32_t grid, uint32_t x, uint32_t y, uint32_t z) -> uint32_t&
+    {
+        const uint3 G = grids[a] + 1u;
+        return mSunChangeSat[mSunChangeSat[4u * a + grid] + x + G.x * (y + G.y * z)];
+    };
+    // The changed cells (prefix-sum layout: cell k at k + 1).
+    std::vector<uint8_t> touched(assets, 0);
+    for (const HSTRCloudSunChange& change : mSunChanges)
+    {
+        const uint32_t a = change.asset;
+        const uint3 first(change.first & 1023u, (change.first >> 10) & 1023u, change.first >> 20);
+        const uint3 last = min(uint3(change.last & 1023u, (change.last >> 10) & 1023u, change.last >> 20), grids[a] - 1u);
+        const bool fine1 = mGpuAssetRecords[a].topLevel >= 1 && (!mSunLevelStamps || change.level >= 1);
+        touched[a] = 1;
+        for (uint32_t z = first.z; z <= last.z; ++z)
+            for (uint32_t y = first.y; y <= last.y; ++y)
+                for (uint32_t x = first.x; x <= last.x; ++x)
+                {
+                    at(a, 0, x + 1, y + 1, z + 1) = 1u;
+                    if (fine1)
+                        at(a, 1, x + 1, y + 1, z + 1) = 1u;
+                }
+    }
+    mSunFineCells.clear();
+    for (uint32_t a = 0; a < assets; ++a)
+    {
+        if (!touched[a])
+            continue;
+        const uint3 g = grids[a];
+        // Candidates: a cell holds level-0 positions up to 24 voxels in and level-1 ones up to 16, whose supports reach at most
+        // 20.5 + the sweep's positive part past their position and 5.5 + its negative part before it (s <= 2); one cell more
+        // either side for rounding.
+        const float reach = mGpuSunFrame.info.reachScale / mGpuAssetRecords[a].sourceVoxelWorld;
+        float3 up(0.f), down(0.f);
+        for (uint32_t c = 0; c < classes; ++c)
+        {
+            const float3 sweep = reach * mSunDirections[c].xyz();
+            up = max(up, max(sweep, float3(0.f)));
+            down = max(down, max(-sweep, float3(0.f)));
+        }
+        const int3 below = int3(ceil((44.5f + up) / 32.f)) + 1;
+        const int3 above = int3(ceil((37.5f + down) / 32.f)) + 1;
+        std::vector<uint8_t> candidate(size_t(g.x) * g.y * g.z, 0);
+        for (uint32_t z = 0; z < g.z; ++z)
+            for (uint32_t y = 0; y < g.y; ++y)
+                for (uint32_t x = 0; x < g.x; ++x)
+                {
+                    if (at(a, 0, x + 1, y + 1, z + 1) == 0u)
+                        continue;
+                    const int3 lo = max(int3(x, y, z) - below, int3(0));
+                    const int3 hi = min(int3(x, y, z) + above, int3(g) - 1);
+                    for (int cz = lo.z; cz <= hi.z; ++cz)
+                        for (int cy = lo.y; cy <= hi.y; ++cy)
+                            for (int cx = lo.x; cx <= hi.x; ++cx)
+                                candidate[cx + g.x * (cy + g.y * cz)] = 1;
+                }
+        for (uint32_t z = 0; z < g.z; ++z)
+            for (uint32_t y = 0; y < g.y; ++y)
+                for (uint32_t x = 0; x < g.x; ++x)
+                    if (candidate[x + g.x * (y + g.y * z)])
+                        mSunFineCells.push_back(uint2(a, x | (y << 10) | (z << 20)));
+        // Inclusive prefix sums of both grids, in place (index 0 along each axis stays 0).
+        for (uint32_t grid = 0; grid < 2; ++grid)
+        {
+            for (uint32_t z = 1; z <= g.z; ++z)
+                for (uint32_t y = 1; y <= g.y; ++y)
+                    for (uint32_t x = 1; x <= g.x; ++x)
+                        at(a, grid, x, y, z) += at(a, grid, x - 1, y, z);
+            for (uint32_t z = 1; z <= g.z; ++z)
+                for (uint32_t y = 1; y <= g.y; ++y)
+                    for (uint32_t x = 1; x <= g.x; ++x)
+                        at(a, grid, x, y, z) += at(a, grid, x, y - 1, z);
+            for (uint32_t z = 1; z <= g.z; ++z)
+                for (uint32_t y = 1; y <= g.y; ++y)
+                    for (uint32_t x = 1; x <= g.x; ++x)
+                        at(a, grid, x, y, z) += at(a, grid, x, y, z - 1);
+        }
+    }
+    mStats.sunFineCells += uint32_t(mSunFineCells.size());                                            // DIAGNOSTIC
+    mStats.sunFineCellsPeak = std::max(mStats.sunFineCellsPeak, uint32_t(mSunFineCells.size())); // DIAGNOSTIC
+    if (mSunFineCells.size() > mSunFineCellCapacity)
+        ++mStats.sunFineFallbacks; // DIAGNOSTIC
+    if (mSunFineCells.empty() || mSunFineCells.size() > mSunFineCellCapacity)
+        return; // Over the list's capacity: stampSunChange stamps every level this run.
+    ++mStats.sunFineRuns; // DIAGNOSTIC
+    // Only the touched assets' grids: stampSunFine reads no other asset's (its candidates come from the touched ones). The header
+    // (offsets and dimensions) never changes after the first upload. MEASURED (satupload1, 4K sunset walk): 2.66 -> 2.37 MB a run
+    // (nearly every asset is touched), sunBakes scope 0.05-0.09 ms a run either way; exact (check 1: 0 over 56 runs). Kept: free.
+    if (!mSunChangeSatUploaded)
+    {
+        mpSunChangeSat->setBlob(mSunChangeSat.data(), 0, 4u * assets * sizeof(uint32_t));
+        mSunChangeSatUploaded = true;
+        mStats.sunFineUploadBytes += 4u * assets * sizeof(uint32_t); // DIAGNOSTIC
+    }
+    for (uint32_t a = 0; a < assets; ++a)
+    {
+        if (!touched[a] && !mSunFineUploadAll)
+            continue;
+        const uint32_t first = mSunChangeSat[4u * a];
+        const uint3 G = grids[a] + 1u;
+        const uint32_t words = 2u * G.x * G.y * G.z;
+        mpSunChangeSat->setBlob(mSunChangeSat.data() + first, first * sizeof(uint32_t), words * sizeof(uint32_t));
+        mStats.sunFineUploadBytes += words * sizeof(uint32_t); // DIAGNOSTIC
+    }
+    mpSunFineCells->setBlob(mSunFineCells.data(), 0, mSunFineCells.size() * sizeof(uint2));
+    mStats.sunFineUploadBytes += uint32_t(mSunFineCells.size() * sizeof(uint2)); // DIAGNOSTIC
+    mGpuSunFrame.info.stampFine = 1;
+    mGpuSunFrame.info.fineCells = uint32_t(mSunFineCells.size());
+}
+
 void CloudResidency::uploadSunChanges()
 {
     // Changes over the same cells stamp the same entries: most are fine bricks sharing a cell. Duplicates keep the coarsest level
@@ -2763,6 +2910,10 @@ void CloudResidency::uploadSunChanges()
     mGpuSunFrame.info.fineBase = mSunFineBase;
     mSunBlockResets.clear();
     mSunNodeResets.clear();
+    mGpuSunFrame.info.stampFine = 0;
+    mGpuSunFrame.info.fineCells = 0;
+    if (mSunStampFine && !mSunChanges.empty() && mpSunChangeSat)
+        buildSunFineStamp();
     mGpuSunFrame.info.changeCount = uint32_t(mSunChanges.size());
     mStats.sunStampChanges += uint32_t(mSunChanges.size()); // DIAGNOSTIC
     ++mStats.sunStampRuns;
@@ -2881,6 +3032,7 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunFrame.info.scanWave = mSunScanWave ? 1u : 0u;
         mGpuSunFrame.info.stampSplit = mSunStampSplit ? 1u : 0u;
         mGpuSunFrame.info.stampRows = mSunStampRows;
+        mGpuSunFrame.info.stampSkipSame = mSunStampSkipSame ? 1u : 0u;
         uploadSunChanges();
         return;
     }
@@ -3197,6 +3349,8 @@ void CloudResidency::bindGpuSun(const ShaderVar& var) const
     var["hstrCloudSunChanges"] = mpSunChanges;
     var["hstrCloudSunResets"] = mpSunResets;
     var["hstrCloudSunFrameInfo"] = mpSunFrameInfo;
+    var["hstrCloudSunChangeSat"] = mpSunChangeSat;
+    var["hstrCloudSunFineCells"] = mpSunFineCells;
 }
 
 void CloudResidency::readGpuSunStats()
@@ -3208,6 +3362,13 @@ void CloudResidency::readGpuSunStats()
     mStats.sunBaked = mpSunCounters->getElement<uint32_t>(3);
     mStats.sunWaiting = mpSunCounters->getElement<uint32_t>(4);
     mStats.sunStale = mpSunCounters->getElement<uint32_t>(5);
+    mStats.sunStampStores = mpSunCounters->getElement<uint32_t>(8);
+    mStats.sunStampFresh = mpSunCounters->getElement<uint32_t>(9);
+    mStats.sunStampCheckStores = mpSunCounters->getElement<uint32_t>(10);
+    mStats.sunStampCheckFresh = mpSunCounters->getElement<uint32_t>(11);
+    mStats.sunFineWaves = mpSunCounters->getElement<uint32_t>(12);
+    mStats.sunFinePassed = mpSunCounters->getElement<uint32_t>(13);
+    mStats.sunFineTested = mpSunCounters->getElement<uint32_t>(14);
     mStats.sunSlotsFree = mpSunFreeTop->getElement<uint32_t>(0);
 }
 } // namespace hstrcloud

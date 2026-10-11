@@ -53,7 +53,7 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 499;
+static const uint kBeamCountSlots = 502;
 /// beamHalfResolve counters (always on with it): filled pixels, and the exact ones because a neighbour was not from a basis, or
 /// because the neighbours disagreed past beamHalfContrast; then the shaded half's basis pixels; the fill's waves, and those with
 /// any lane resolved exactly (which pays the whole resolve for the wave). Counted only under beamHalfProbe.
@@ -197,6 +197,9 @@ static const uint kBeamSunProbe = 464;
 /// beamLayerProbe: of the resolved sun answers (kBeamSunProbe + 0), those whose bake is an ancestor's (coarser than the sampled
 /// brick: its own bake has not landed), and the levels they climbed in total - what a lower moving bake rate costs the image.
 static const uint kBeamSunAncestor = 497;
+/// beamHistoryBlendOracle: dirty units marched with a history (a stored value), and of those the ones whose history differs from the
+/// fresh march by over 0.02 and over 0.1 in mean log radiance - the error a temporal blend would carry in.
+static const uint kBeamHistoryProbe = 499;
 static const uint kBeamProbeDistance = 385;
 /// formR 2 (HSTR_FORM_R 2, counting probe: no jump): over the lean marches, hull queries, march steps taken while outside every
 /// hull (what formR 1 jumps over), brick density samples outside every hull (must be 0: else the hulls drop cloud), proxy density
@@ -408,7 +411,9 @@ static const uint kCloudSunBins = 256;       ///< Priority histogram bins of the
 static const uint kCloudSunBinShift = 24;    ///< State: the last cut's priority bin (floor(priority * 16), clamped to the bins).
 /// hstrCloudSunCounters entries (cleared every frame): candidates emitted, holders emitted, bakes staged, bricks baked, bricks
 /// waiting, stale bakes invalidated, then the partial-bin reservations of candidates and holders.
-static const uint kCloudSunCounters = 8;
+/// ... [8] / [9]: the last run's stamp stores, and those that changed the entry; [10] / [11] the same for a stampCheck pass.
+/// ... [12] / [13] / [14]: stampSunFine's (class, cell) waves, those whose union box held a change, and the entries they tested.
+static const uint kCloudSunCounters = 15;
 struct HSTRCloudSunSched
 {
     uint coord;     ///< BrickHeader::coord: level-local brick coordinates, 10 bits per axis.
@@ -479,6 +484,14 @@ struct HSTRCloudSunFrame
     /// stampSunChanges' threads per change and class (dispatch z): thread r stamps every stampRows-th row of the change's ranges
     /// (z rows of the pair-block levels, then cell rows of levels 0-1). 1: one thread stamps every row.
     uint stampRows;
+    /// 1: a stamp reads the entry first and stores only where it does not hold the run's epoch yet - overlapping sweeps of neighbouring
+    /// changes and entries stamped earlier in the run store once (exact: the same values).
+    uint stampSkipSame;
+    /// 1: stampSunChanges stamps levels >= 2 only; stampSunFine stamps levels 0-1 over fineCells candidate cells
+    /// (hstrCloudSunFineCells) against the run's changed-cell prefix sums (hstrCloudSunChangeSat). The same entries, each stored once.
+    uint stampFine;
+    uint fineCells;
+    uint stampCheck; ///< DIAGNOSTIC (cloudSunStampFineCheck): this stamp pass counts into hstrCloudSunCounters 10 / 11.
 };
 
 /// The cloud sea's domain proxy is built on the GPU from the tiles' float16 volumes (HSTRCloud::uploadDomainExtinction): per changed
