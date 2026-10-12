@@ -378,6 +378,8 @@ private:
     /// Under asyncResidency, a frame's changes are marked by the next frame (markResidencyChanges): this frame's march may read them
     /// half-published, and their re-march must read them whole.
     void markResidencyChanges(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t bakes);
+    /// The beam marks the last asyncResidency frame deferred, before this frame's beam builds.
+    void publishBeamChanges(RenderContext* pRenderContext);
     /// Marks changes (the first bakes jobs of pBakes after them) into the change cells; then markBeamChangeCycle once a frame.
     void markBeamChanges(RenderContext* pRenderContext, std::vector<uint4>& changes, uint32_t bakes, const ref<Buffer>& pBakes);
     /// The change cells' listing every beamChangeInterval frames and the slice the frame's build applies.
@@ -953,7 +955,19 @@ private:
     /// cloudCutMargin 8 / 4 / 2 (cutmargin1) leaves 2-4 cuts a 120 frames in every arm: the remaining lag is the walk itself, ~630 ms
     /// of worker time a cut (cutcadence1: 1269 ms over 2 cuts, 1896 over 3, worker busy on 117-118 of 120 frames).
     uint32_t mCloudBrickLoadsPerFrame = 4096;
-    static constexpr uint32_t kCloudLoadCapacity = 4096; ///< The residency's staging capacity (8 MB of residuals).
+    /// The residency's staging capacity (2 KB of residuals a brick, 32 MB): cloudResidencySkipBusy updates cover several frames and
+    /// commit the cap of each (mResidencyFramesCovered). skipbusy2 (4K sunset walk, cap per update): 18 of 29 skip updates at 4096,
+    /// chunk-end backlogs 50k / 0 / 30k / 37k against 0 / 0 / 12k / 18k waiting for every update.
+    static constexpr uint32_t kCloudLoadCapacity = 16384;
+    /// cloudResidencySkipBusy: frames since the last launch; the next update's load cap is cloudBrickLoadsPerFrame times this (the
+    /// frames the update just taken covered, which the next one's likely covers too).
+    uint32_t mResidencyFramesCovered = 0;
+    /// cloudResidencySkipBusy: the frame clock the residency runs on (CloudResidency::setFrameClock), and whether the last update
+    /// taken left fades running: the frames without an update advance them on the GPU themselves, so a fade lasts cloudFadeFrames
+    /// frames, not updates. skipbusy3 (updates clocked per update, ~3 frames each): fade ends 29.6k against 284k waiting for every
+    /// update, the atlas full of bricks fading out (mapped 270336 at a chunk's end).
+    uint32_t mResidencyFrame = 0;
+    bool mResidencyFadesRunning = false;
     uint32_t mCloudSeaTiles = 8;
     uint32_t mCloudSeaSeed = 1;
     float mCloudSeaCoverage = 0.85f;
@@ -1326,6 +1340,32 @@ private:
     float mCloudCutStick = 0.f;                 ///< cloudCutStick: CloudView::cutStick (levels of priority).
     bool mCloudCutThreshold = true;             ///< cloudCutThreshold: CloudView::cutThreshold (MEASURED there).
     bool mCloudCutThresholdCheck = false;       ///< cloudCutThresholdCheck: CloudView::cutThresholdCheck (DIAGNOSTIC).
+    uint32_t mCloudFadeEndOrder = 0;            ///< cloudFadeEndOrder: CloudView::fadeEndOrder (DIAGNOSTIC).
+    /// cloudResidencyWorker (asyncResidency frames): the residency's CPU update runs on its own thread from the end of the frame's
+    /// residency recording to the next frame's (CloudResidency::launchUpdate), which records what it queued. The residency then acts
+    /// a frame later on the GPU, as if its camera were a frame older. MEASURED (worker4, 4K sunset walk): 3.03 of 8.36 ms of update a
+    /// frame run beside the frame; motion score unchanged (worker3). On in IntelCloudSeaHalf.py.
+    bool mCloudResidencyWorker = false;
+    /// cloudResidencySkipBusy (cloudResidencyWorker frames): a frame whose update is still running does not wait for it. It renders
+    /// with the residency it has and launches nothing; the update is taken by the first frame that finds it done. The residency then
+    /// advances at its own rate (its fades and cut count updates, not frames). submit1 (4K sunset walk, worker on): the update took
+    /// 5.5 ms a frame and the frame waited 2.96 ms of it (takeWaitUs).
+    bool mCloudResidencySkipBusy = false;
+    bool mCloudDeferArena = true; ///< DIAGNOSTIC cloudDeferArena: CloudResidency::setDeferArena.
+    bool mCloudStepTiming = false; ///< DIAGNOSTIC cloudStepTiming: CloudResidency::setStepTiming.
+    bool mCloudMapEvents = true;   ///< cloudMapEvents: CloudResidency::setMapEvents (false: the whole map list scanned, the anchor).
+    bool mCloudParallelFades = true; ///< cloudParallelFades: CloudResidency::setParallelFades (false: one thread, the anchor).
+    /// cloudParallelMaps: CloudResidency::setParallelMaps. Off until measured (built, not yet run).
+    bool mCloudParallelMaps = false;
+    uint64_t mResidencySkips = 0; ///< Frames that found the update running and skipped the residency (cloudStats residencySkips).
+    /// cloudResidencyWorker frames: updateCloudDomain runs at the frame's end, just before the compute queue's submission, so the
+    /// update it launches has the next frame's recording to run beside too; the frame's start only publishes the last frame's beam
+    /// marks. mDomainDue: the frame's start reached the place updateCloudDomain had.
+    bool mLateDomain = false;
+    bool mDomainDue = false;
+    uint64_t mSubmitMainUs = 0;      ///< DIAGNOSTIC: CPU time of submitAsyncResidency's main-queue submission and signal, cumulative.
+    uint64_t mSubmitResidencyUs = 0; ///< DIAGNOSTIC: ... and of the residency compute queue's submission.
+    std::vector<uint32_t> mResidencyPendingSlots; ///< Instance slots the sea changed that no residency update has taken yet.
     bool mCloudScatterUploads = true;           ///< cloudScatterUploads: CloudResidency uploads changed table elements by scatter.
     /// cloudScatterDense: CloudResidency::setScatterDense. MEASURED (scatterdense2, 4K sunset walk 2, warm, arms interleaved,
     /// 120 frames): upload MB per 1k committed bricks sparse 0.54 / 0.57 -> dense 0.28 / 0.33; residency/upload 0.122 / 0.100 ->

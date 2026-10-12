@@ -9,6 +9,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <future>
 #include <memory>
 #include <set>
@@ -87,7 +89,11 @@ struct CloudView
     /// payload fills. 20 units a frame: 43 -> 37 ms. HSTRCloud defaults to 8.
     float cutMargin = 0.f;
     float cutTurn = 3.f;
-    /// Budget-bound (ordered) cut only: a brick the last cut refined is refined ahead of others by this many levels of priority, so
+    /// Threshold cut (cutThreshold): a brick the last cut held is admitted as if its parent ranked this many levels higher.
+    /// MEASURED (stick1, 4K sunset walk at 2 units a frame, 60-frame arms x2 in one launch): bricks entering 226k / 268k / 87k / 268k
+    /// / 285k at stick 0 / 0.5 / 1 / 2 / 0 again - noise, the sanity arm 2 no lower; of the entering bricks only 9-11% had left within
+    /// the last ~4 cuts (cutReentered) at stick 0, so hysteresis can remove ~10% of the churn at most: it is new bricks coming into view.
+    /// Budget-bound (ordered) cut: a brick the last cut refined is refined ahead of others by this many levels of priority, so
     /// the cut does not trade the refinements it holds for ones barely ahead of them (stall1: ~140k of 243k desired bricks replaced
     /// within ~100 walk frames; stick1: 50-107k a cut, and still ~100k a cut once parked - the mapped-children hysteresis feeds the
     /// half-loaded mapped set back into the cut). Keyed on the cut's own last answer, not on what is mapped. 0: off.
@@ -112,6 +118,12 @@ struct CloudView
     bool cutThreshold = true;
     /// DIAGNOSTIC: unpruned threshold cut beside the heap cut (which is taken on); counts the bricks the two sets differ in.
     bool cutThresholdCheck = false;
+    /// DIAGNOSTIC: fade ends a frame handles in their bucket's order (0), sorted by handle so siblings, their parent and their
+    /// pages come together (1), or sorted with the next ends' bricks prefetched (2). MEASURED (cpuprof9, 4K sunset walk at 2 units a
+    /// frame, arms alternating every 20 frames, one launch): CPU per fade-out end 737 / 780 / 847 ns for 0 / 1 / 2 and 952 for the
+    /// anchor 0 repeated last - no gain beyond the drift; fades in ~150-230 ns. The fade-out end (unmap) is not limited by the order
+    /// its bricks are visited in.
+    uint32_t fadeEndOrder = 0;
 };
 
 /// Virtual memory for cloud density. The cut through every nearby instance's brick pyramid is chosen by importance each frame:
@@ -156,6 +168,25 @@ public:
         uint32_t evictCalls = 0;      ///< Evictions run.
         uint32_t evictFreed = 0;      ///< Bricks they unloaded.
         uint32_t evictCandidates = 0; ///< Last eviction: loaded, unmapped, undesired leaves found.
+        uint32_t evictScans = 0;        ///< DIAGNOSTIC: scans of the loaded list for eviction candidates, cumulative.
+        uint64_t updateUs = 0;          ///< DIAGNOSTIC: CPU time of update() wherever it ran, cumulative (microseconds) ...
+        uint64_t workerUpdateUs = 0;    ///< ... of which on the residency's own thread (launchUpdate) ...
+        uint64_t takeWaitUs = 0;        ///< ... and the frame's wait for those at takeUpdate: the rest ran beside the frame.
+        /// DIAGNOSTIC: the update thread's cycles while running (QueryThreadCycleTime) against the TSC over its updates: their
+        /// ratio is the share of the update's wall time the thread was on a core.
+        uint64_t workerRunCycles = 0;
+        uint64_t workerWallCycles = 0;
+        uint64_t workerKernelUs = 0; ///< DIAGNOSTIC: the update thread's kernel-mode time over its updates (GetThreadTimes, ticks).
+        uint64_t workerUserUs = 0;   ///< ... and user-mode time.
+        uint64_t replayUs = 0;         ///< ... and takeUpdate's recording of what the update queued (the frame thread's).
+        uint32_t workerUpdates = 0;     ///< DIAGNOSTIC: updates launched on the residency's own thread, cumulative.
+        /// DIAGNOSTIC: update()'s phases, CPU microseconds, cumulative (the profiler's scopes see only sampled frames on the frame's
+        /// thread): merge (taking a cut on), loads (evict included), evict, maps, stage, fades, sun scheduling, upload, cut launch.
+        std::array<uint64_t, 9> phaseUs{};
+        /// DIAGNOSTIC (setStepTiming): TSC cycles of the steps of unmap, map and the fade ends (CloudResidency::Step).
+        std::array<uint64_t, 16> stepCycles{};
+        uint64_t walkTouchedCalls = 0;  ///< DIAGNOSTIC: bricks noted as changed beside a walk, cumulative (repeats included).
+        uint64_t walkTouchedListed = 0; ///< DIAGNOSTIC: of those, listed for the merge (once a brick a walk).
         uint32_t loadHeld = 0;        ///< Last frame: desired bricks skipped because their parent was not loaded.
         uint32_t loadScanned = 0;     ///< Last frame: load-list entries visited.
         uint32_t freeSlots = 0;       ///< Last frame: free atlas slots.
@@ -199,6 +230,7 @@ public:
         uint32_t cutOrderedCount = 0; ///< DIAGNOSTIC: cuts taken on that were ordered (cumulative).
         uint32_t cutEntered = 0;      ///< DIAGNOSTIC: bricks entering the desired set over all cuts taken on (cumulative).
         uint32_t cutLeft = 0;         ///< DIAGNOSTIC: bricks leaving it (cumulative).
+        uint32_t cutReentered = 0;    ///< DIAGNOSTIC: of cutEntered, bricks that had left within the last ~4 cuts (cumulative).
         std::array<uint32_t, 8> cutEnteredLevel{}; ///< DIAGNOSTIC: cutEntered by level (cumulative).
         double cutTotalMs = 0.0;
         float cutMargin = 0.f; ///< The motion envelope of the last cut, in voxels.
@@ -211,6 +243,12 @@ public:
         uint32_t fadeStarts = 0;   ///< Fades started or turned so far.
         uint32_t fadeEnds = 0;     ///< Fade ends handled so far.
         uint32_t fadeVoid = 0;     ///< End entries whose fade had already been replaced.
+        /// DIAGNOSTIC: of fadeEnds, fades in (settled); the rest unmap. MEASURED with per-end timers (cpuprof8, 4K sunset walk at 2
+        /// units a frame, 120 frames, 565k ends): ~200 ns a fade-in end, ~860 a fade-out end, of which replace ~285 and writeSunSched
+        /// ~95; the timers themselves cost ~0.3 ms a walk frame and were taken out.
+        uint32_t fadeEndIns = 0;
+        uint32_t fadeParallelBuckets = 0; ///< DIAGNOSTIC: fade end buckets swept by several threads (setParallelFades).
+        uint32_t mapParallelRuns = 0;     ///< DIAGNOSTIC: map queues mapped by several threads (setParallelMaps).
     };
     /// Mapped bricks the cut does not want, by why they are still mapped (auditMapped walks every mapped brick: diagnostics only).
     struct MappedAudit
@@ -295,13 +333,33 @@ public:
     /// render context. On, freed atlas slots, GPU brick indices and sun slots are quarantined: none is written for a new brick or
     /// bake before a later frame, so the main queue's frame running beside this one never reads another brick's data through a
     /// mapping it still holds.
-    void setAsyncContext(ComputeContext* pContext)
-    {
-        mpAsyncContext = pContext;
-        mSunSlotQuarantine = pContext != nullptr;
-    }
+    void setAsyncContext(ComputeContext* pContext) { mpAsyncContext = pContext; }
     /// The context residency work records into this frame.
     ComputeContext* getContext() const;
+    /// update() on the residency's own thread while the frame records the rest: its uploads and dispatches are queued rather than
+    /// recorded, and its profiler scopes are off (Falcor's profiler is the frame thread's). The update keeps the asyncResidency
+    /// state of the frame that launched it. Nothing else may touch the residency until takeUpdate (or waitUpdate, to read it).
+    void launchUpdate(const CloudSea& sea, const CloudView& view, std::vector<uint32_t> changedSlots);
+    /// Whether a launched update has not been taken yet.
+    bool updatePending() const { return mUpdateJob.valid(); }
+    /// The next update's frame number, when updates do not come every frame (HSTRCloud cloudResidencySkipBusy): fades, sun cadence
+    /// and the other frame counts then run in frames, not updates. Called before launchUpdate.
+    void setFrameClock(uint32_t frame) { mNextFrame = frame; }
+    /// DIAGNOSTIC: false copies each deferred upload into a vector of its own (the arena's A/B anchor).
+    void setDeferArena(bool on) { mDeferArena = on; }
+    uint32_t getFrame() const { return mFrame; }
+    /// The fade frame the GPU's advanceCloudFades reads, at a given frame (HSTRCloud writes it on frames without an update).
+    HSTRCloudFadeFrame fadeFrameAt(uint32_t frame) const { return {frame & kCloudFadeFrameMask, uint32_t(mBricks.size()), mFadeStep, 0}; }
+    /// Whether a launched update has finished (takeUpdate would not wait).
+    bool updateReady() const { return mUpdateJob.valid() && mUpdateJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }
+    /// Waits for a launched update without taking it; the residency may then be read.
+    void waitUpdate() const
+    {
+        if (mUpdateJob.valid())
+            mUpdateJob.wait();
+    }
+    /// Waits for a launched update, records what it queued into getContext() in its order, and returns what update() returned.
+    bool takeUpdate();
     void setLoadsBesideCut(bool on) { mLoadsBesideCut = on; }
     /// Bricks committed a frame, at most desc.loadsPerFrame (the staging capacity); a runtime cap, so it changes without a rebuild.
     void setLoadCap(uint32_t cap) { mLoadCap = std::clamp(cap, 1u, mDesc.loadsPerFrame); }
@@ -309,6 +367,38 @@ public:
     /// A table scatters whenever its changed elements cost fewer bytes than its dirty blocks (up to half the table), not only up
     /// to an eighth of it.
     void setScatterDense(bool on) { mScatterDense = on; }
+    /// DIAGNOSTIC: times the steps of unmap, map and the fade ends into Stats::stepCycles (an rdtsc pair a step).
+    void setStepTiming(bool on) { mStepTiming = on; }
+    /// Fade ends swept by several threads (mParallelFades); false: one (the A/B anchor).
+    void setParallelFades(bool on) { mParallelFades = on; }
+    /// Maps by several threads (mParallelMaps); false: one (the A/B anchor).
+    void setParallelMaps(bool on) { mParallelMaps = on; }
+    /// mapReady by events (mMapEvents); false scans the whole map list every update (the A/B anchor).
+    void setMapEvents(bool on)
+    {
+        mMapReseed |= on && !mMapEvents;
+        mMapEvents = on;
+    }
+    /// Stats::stepCycles entries.
+    enum Step : uint32_t
+    {
+        kStepReplace,     ///< unmap: the page table (its dirtyPages too).
+        kStepDirtyPages,  ///< paint / replace: dirtyPages alone.
+        kStepUnmapMark,   ///< unmap: markChanged and the beam change.
+        kStepUnmapNotes,  ///< unmap: its own fade, flags, noteMapped, noteEvictCandidate.
+        kStepUnmapParent, ///< unmap: the parent's count, noteMapped, updateFade.
+        kStepUnmapSun,    ///< unmap: writeSunSched.
+        kStepEndValid,    ///< fade ends: the entry's check.
+        kStepEndSetFade,  ///< fade ends out: setFade(0) before the unmap.
+        kStepEndUnlist,   ///< fade ends out: unlistMapped.
+        kStepEndIn,       ///< fade ends in: all of it.
+        kStepPaint,       ///< map: the page table (its dirtyPages too).
+        kStepMapMark,     ///< map: markChanged.
+        kStepMapNotes,    ///< map: noteMapped, the parent's count, noteMapped and updateFade, the list.
+        kStepMapFade,     ///< map: its own updateFade.
+        kStepMapSun,      ///< map: writeSunSched.
+        kStepCount
+    };
     void addScatterChecks(uint32_t frames) { mScatterCheck += frames; }
     bool scatterCheckPending() const { return mScatterCheck > 0; } ///< Its blocking readbacks need the residency's work serial.
     uint32_t getBrickCapacity() const { return uint32_t(mBricks.size()); }
@@ -429,6 +519,8 @@ private:
         uint8_t childCount = 0;
         uint8_t loadedChildren = 0;
         uint8_t mappedChildren = 0;
+        uint32_t walkTouched = 0; ///< mWalkTouchedEpoch when last listed in mWalkTouched (listed once a walk).
+        uint32_t leftCut = 0;     ///< DIAGNOSTIC: the cut taken on when it last left the desired set (0: never).
     };
 
     struct Store
@@ -550,6 +642,16 @@ private:
     // The apply step touches only what can change (the cut merge rebuilds these; the rest is events):
     size_t mToLoadNext = 0;          ///< mToLoad before it is loaded.
     std::vector<uint64_t> mToMap;    ///< Desired bricks not yet mapped, parents first (kToMap).
+    /// setMapEvents: mapReady takes only the bricks whose readiness may have changed - the cut's list once (mMapReseed), then each
+    /// brick committed while desired, and the bricks waiting on a parent once it maps - instead of the whole of mToMap every update.
+    /// stepsplit1 (4K sunset walk, worker on, step timers): the maps phase 101 ms over 80 frames, map() itself 50.5 of it; the rest
+    /// was the scan of mToMap, 10-70k bricks waiting on their loads, each a random brick read. MEASURED (mapevents1, same walk,
+    /// arms alternating): the phase less map() 28 / 39 ms (events) against 68 (scan) over 80 frames, 0.66 / 0.60 against 0.91 us a
+    /// mapped brick; chunk-end mapped counts in the scan arm's range.
+    bool mMapEvents = true;
+    bool mMapReseed = true;
+    std::vector<uint64_t> mMapQueue;
+    std::unordered_multimap<uint64_t, uint64_t> mMapWaitParent; ///< Parent -> loaded desired child waiting for it to map.
     uint32_t mMergeFrame = 0;        ///< Frame of the last cut merge (every desired brick's store was used then).
     uint32_t mPageStores = 0;        ///< Non-empty chunk and page stores.
     // Fades: mapped bricks fade in while desired, and out once undesired with no mapped children (then unmap). A fade runs on the
@@ -578,6 +680,7 @@ private:
         return (gpu.fadeStart & kCloudFadeIn) ? 1 : (gpu.fadeStart & kCloudFadeOut) ? -1 : 0;
     }
     void processFadeEnds(bool& changed);
+    uint32_t mFadeEndOrder = 0; ///< CloudView::fadeEndOrder of the frame.
     // Maps, unmaps and fades run beside a cut's walk (it takes about three frames on the sea; they waited for it, so each frame
     // between walks did three frames of them). The walk reads what they change from a snapshot taken when it starts, per GPU
     // brick; the merge revisits the bricks they touched meanwhile.
@@ -588,12 +691,89 @@ private:
     static constexpr uint8_t kSnapFull = 16;    ///< Held at a fade of 1.
     std::vector<uint8_t> mMappedState;          ///< Current, per GPU brick.
     std::vector<uint8_t> mMappedSnapshot;       ///< The running walk's copy.
-    std::vector<uint64_t> mWalkTouched;         ///< Bricks changed while the walk ran.
+    std::vector<uint64_t> mWalkTouched;         ///< Bricks changed while the walk ran, each once (noteWalkTouched).
+    uint32_t mWalkTouchedEpoch = 1;             ///< Bumped whenever mWalkTouched is cleared.
+    /// evict's candidates, least recently desired first: built by one scan of the loaded list and taken in order (each checked again
+    /// as it is taken) until a store is released or it runs out. Bricks that become candidates meanwhile - an unmap, a parent's last
+    /// loaded child unloaded, a cut that no longer desires them, a walk's snapshot gone - go on mEvictLate, merged in by key.
+    std::vector<std::pair<uint32_t, uint64_t>> mEvictOrder;
+    size_t mEvictNext = 0;
+    bool mEvictValid = false;
+    std::vector<std::pair<uint32_t, uint64_t>> mEvictLate;
+    bool evictCandidate(const Brick& b) const;
+    void noteEvictCandidate(uint64_t handle);
+    void scanEvictCandidates();
+    /// Lists a brick changed beside the walk, once a walk. Every map, unmap, fade and sun state write listed it again: the merge
+    /// redid each brick per listing and re-queued it to load and map as often. MEASURED (4K sunset walk, 2 units a frame): 2.20M
+    /// listings -> 0.69M bricks; merge/touched 0.84 -> 0.30 ms a walk frame (cpuprof2 -> cpuprof3).
+    void noteWalkTouched(uint64_t handle);
     /// Refreshes a brick's mMappedState entry (and records it while a walk runs).
     void noteMapped(uint64_t handle);
     /// Maps what the cut wants and its parents hold.
     void mapReady(bool& changed);
     void unlistMapped(uint64_t handle);
+    /// setParallelFades: a bucket's fade ends swept by several threads, one chunk's bricks per thread. A chunk's page and chunk
+    /// stores (levels 0-3) and its level-4 brick are touched by its own fades only, page table included; the coarse stores' ends
+    /// (levels 4+, whose parents span chunks) run serially after. While a thread sweeps, everything shared it would write goes to its
+    /// ResidencySink (tSink), merged in afterwards. stepsplit1 (4K sunset walk): the fades phase 160 ms over 80 frames, the largest of
+    /// the update, ~660 ns a fade-out end and ~214 ns a fade-in end, one thread. MEASURED (parfades1, same walk, arms alternating, up
+    /// to 16 threads): fades 45 / 62 ms for 236k / 334k ends (~190 ns an end) against 177 ms for 306k (579 ns), walk mean 6.20 / 7.45
+    /// against 8.03 ms, p95 12.6 / 19.5 against 23.5. Exact where it can be checked (parfades2): 0 scatter mismatches and 0 stale
+    /// skirt masks over 60 checked frames an arm. Motion score (parfades3, HSTR_MOTION_SCORE 2, arms reordered so neither config
+    /// holds the first position): > 0.02 at 5.48 / 5.63% parallel against 5.36 / 5.55% serial.
+    struct ResidencySink
+    {
+        std::vector<FadeEnd>* pCurrent = nullptr; ///< The partition being swept (ends due in the bucket append to it)...
+        uint32_t currentBucket = 0;               ///< ... the bucket's ring index.
+        std::vector<FadeEnd> serial;              ///< Ends due in the bucket of coarse-store bricks.
+        std::vector<std::pair<uint32_t, FadeEnd>> laterEnds; ///< Ends due in other buckets.
+        std::vector<uint4> beamChanges;
+        std::vector<HSTRCloudDirtyPageRegion> dirtyRegions; ///< Without work counts (the merge counts them on).
+        std::vector<HSTRCloudDirtyPageRegion> skirtRegions;
+        std::vector<HSTRCloudSunChange> sunChanges;
+        std::vector<uint32_t> changedAssets;
+        std::vector<uint32_t> bricks, nodes, scheds, states; ///< Scatter elements newly marked (their flags are set in place).
+        size_t directoryLo = SIZE_MAX, directoryHi = 0;
+        std::vector<uint32_t> freeNodes;
+        std::vector<uint64_t> walkTouched;
+        std::vector<std::pair<uint32_t, uint64_t>> evictLate;
+        std::vector<uint64_t> unlist;
+        int64_t activeFades = 0;
+        uint32_t unmaps = 0, fadeEnds = 0, fadeVoid = 0, fadeEndIns = 0, fadeStarts = 0; ///< As in Stats.
+        uint64_t walkTouchedCalls = 0, walkTouchedListed = 0;
+        bool changed = false;
+        // Maps (setParallelMaps):
+        std::vector<uint32_t> nodePool; ///< Free page nodes set aside for this thread's maps (ensureNode).
+        std::vector<uint32_t> sunNodeResets;
+        std::vector<uint64_t> mapped;                     ///< Into mMappedList in the merge.
+        std::unordered_multimap<uint64_t, uint64_t> wait; ///< Parent -> child waiting for it, both of this thread's chunks.
+        std::vector<std::pair<uint64_t, uint64_t>> waitShared; ///< Parent (a coarse store's) -> child: mMapWaitParent in the merge.
+        std::vector<uint64_t> released; ///< Bricks it mapped whose mMapWaitParent children it took (the merge erases them).
+        std::vector<uint64_t> retry;    ///< Bricks it could not map (its nodes ran out): the serial pass.
+        uint32_t maps = 0;
+    };
+    bool mParallelFades = true;
+    /// setParallelMaps: mapReady's queue mapped by several threads, one chunk's bricks per thread as for the fade ends (the coarse
+    /// stores' first, serially: parents map first). stepsplit1 / mapevents1 (4K sunset walk): map() ~430-660 ns a brick, the maps
+    /// phase 75-122 ms over 80 frames, one thread.
+    bool mParallelMaps = true;
+    std::vector<std::vector<uint64_t>> mMapParts; ///< The queue's fine bricks per thread.
+    /// Maps one thread's partition into its sink (children released by its maps join entries).
+    void mapPartition(std::vector<uint64_t>& entries, ResidencySink& sink);
+    void mergeMapSink(ResidencySink& sink);
+    /// The chunk-store index a brick's fade end or map is partitioned by (a page store's chunk store); kNone: a coarse store's.
+    uint32_t partitionOf(uint64_t handle) const;
+    std::vector<ResidencySink> mSinks;
+    std::vector<std::vector<FadeEnd>> mFadeParts; ///< A bucket's ends per thread.
+    bool fadeEndValid(const FadeEnd& end) const;
+    /// One fade end: a fade in settles at 1, a fade out unmaps.
+    void endFade(const FadeEnd& end, bool& changed);
+    static thread_local ResidencySink* tSink; ///< This thread's sink while it sweeps a partition (else null: the members).
+    /// The serial sweep of a bucket (ends appended meanwhile are swept too).
+    void sweepFadeEnds(std::vector<FadeEnd>& bucket, bool& changed);
+    /// One thread's partition, into its sink.
+    void sweepFadePartition(std::vector<FadeEnd>& entries, ResidencySink& sink);
+    void mergeResidencySink(ResidencySink& sink, uint32_t bucket);
     std::vector<float3x3> mTileForward; ///< Per slot: asset source voxel to tile-local domain voxel (linear part).
 
     // GPU mirrors.
@@ -613,7 +793,24 @@ private:
     std::vector<uint32_t> mRetiredBricks;
     std::vector<uint32_t> mRetiredSlots;
     ComputeContext* mpAsyncContext = nullptr;
-    /// A DeviceLocal buffer's update through getContext() (Buffer::setBlob records into the device's render context).
+    /// The running update's asyncResidency state (mpAsyncContext changes at the frame's ends, which a launched update spans).
+    bool mUpdateAsync = false;
+    /// launchUpdate: device work is queued (mDeferred) rather than recorded, and there are no profiler scopes (mpProfileContext null).
+    bool mDeferDevice = false;
+    RenderContext* mpProfileContext = nullptr;
+    std::vector<std::function<void(ComputeContext*)>> mDeferred;
+    std::vector<uint8_t> mDeferredBytes; ///< The deferred uploads' data (uploadBlob), until takeUpdate replays them.
+    bool mDeferArena = true;             ///< setDeferArena.
+    std::future<bool> mUpdateJob;
+    std::thread mUpdateThread;
+    std::mutex mUpdateMutex;
+    std::condition_variable mUpdateWake;
+    std::packaged_task<bool()> mUpdateTask; ///< Guarded by mUpdateMutex.
+    bool mUpdateQueued = false;
+    bool mUpdateStop = false;
+    void updateWorker();
+    /// A DeviceLocal buffer's update through getContext() (Buffer::setBlob records into the device's render context); queued with a
+    /// copy of the bytes under launchUpdate.
     void uploadBlob(Buffer* pBuffer, const void* pData, size_t offset, size_t size);
     std::vector<uint64_t> mBrickOwner;
     std::vector<HSTRCloudStaging> mStagingInfo;
@@ -641,6 +838,15 @@ private:
                 list.push_back(element);
             }
         }
+        /// Marks it into another list (a ResidencySink's; distinct elements only from distinct threads).
+        void mark(uint32_t element, std::vector<uint32_t>& into)
+        {
+            if (element < flag.size() && !flag[element])
+            {
+                flag[element] = 1;
+                into.push_back(element);
+            }
+        }
         void clear()
         {
             for (uint32_t element : list)
@@ -654,6 +860,7 @@ private:
     ScatterSet mStateScatter; ///< Live sun scheduler states (gpuSun).
     bool mScatterUploads = true;
     bool mScatterDense = false; ///< setScatterDense.
+    bool mStepTiming = false;   ///< setStepTiming.
     uint32_t mScatterCheck = 0; ///< DIAGNOSTIC: frames left to compare the GPU tables with the CPU's.
     std::vector<uint32_t> mScatterIndex;
     std::vector<uint32_t> mScatterData;
@@ -709,6 +916,7 @@ private:
     ref<Buffer> mpSunFineCells;
     uint32_t mSunFineCellCapacity = 0;
     uint32_t mSunEvery = 1;
+    uint32_t mSunRunFrame = 0; ///< mFrame of the last scheduling run (cloudSunEvery counts frames from it).
     uint32_t mSunFreeStack = 0;      ///< The free sun slot stack the next scheduling run pops (HSTRCloudSunFrame::freePop).
     bool mSunSlotQuarantine = false; ///< setAsyncContext: a run's freed sun slots go onto the other stack.
     bool mLoadsBesideCut = true; ///< Loads run on the frames a walk is on the worker (free slots only).
@@ -819,7 +1027,8 @@ private:
     std::vector<const CloudAsset*> mAssetRecords;
 
     uint32_t mFrame = 1;
-    uint32_t mCutFrame = 0;         ///< Frame of the last cut.
+    uint32_t mNextFrame = 0; ///< setFrameClock: the next update's mFrame (0: the last one's + 1).
+    uint32_t mCutFrame = 0;        ///< Frame of the last cut.
     uint32_t mCutId = 0;            ///< Increases with every cut; cut[mCutSlot].id == mCutId marks its bricks.
     uint32_t mCutSlot = 0;
     const CutState& cutOf(const Brick& b) const { return b.cut[mCutSlot]; }
@@ -868,6 +1077,7 @@ private:
         uint32_t id = 0;      ///< The cut's mCutId.
         bool ordered = false; ///< The atlas budget bound, forcing the priority-ordered cut.
         uint32_t entered = 0;                ///< DIAGNOSTIC: desired bricks the last cut did not desire.
+        uint32_t reentered = 0;              ///< DIAGNOSTIC: ... of them, left within the last ~4 cuts.
         std::array<uint32_t, 8> enteredLevel{}; ///< ... by level.
         double milliseconds = 0.0;
         double parallelMs = 0.0;        ///< DIAGNOSTIC: the two parallel phases ...
@@ -882,6 +1092,7 @@ private:
         std::vector<uint64_t> toLoad;  ///< Coarsest level first, then by priority.
         std::vector<uint64_t> toMap;
         std::vector<uint64_t> fading;  ///< Mapped bricks that start or keep fading.
+        std::vector<uint64_t> left;    ///< Bricks the last cut desired and this one does not (evict's new candidates).
         std::vector<uint32_t> stateChanged;      ///< GPU bricks whose scheduler state the walk changed (in the spare mSunState).
         std::vector<uint8_t> stateBlocksDirty;   ///< The same, per 4096 bricks.
     };

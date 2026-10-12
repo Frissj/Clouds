@@ -423,6 +423,7 @@ std::vector<uint32_t> CloudSea::update(float3 cameraPosition, bool applyResults)
     );
     std::vector<uint32_t> changed;
     std::vector<Result> results;
+    bool queued = false;
     {
         std::lock_guard lock(mMutex);
         if (any(cameraTile != mCenter))
@@ -455,11 +456,15 @@ std::vector<uint32_t> CloudSea::update(float3 cameraPosition, bool applyResults)
                 }
             );
             mJobs.insert(mJobs.end(), jobs.begin(), jobs.end());
+            queued = !jobs.empty();
         }
         if (applyResults)
             results.swap(mResults);
     }
-    mWake.notify_all();
+    // Only when there is work: every idle tile worker waits on mWake, and waking them all each frame for nothing was ~14% of the
+    // frame thread's CPU samples on the 4K sunset walk (cpusamp2, kernel time under CloudSea::update).
+    if (queued)
+        mWake.notify_all();
     for (Result& result : results)
     {
         if (any(mRequested[result.slot] != result.tile.world))

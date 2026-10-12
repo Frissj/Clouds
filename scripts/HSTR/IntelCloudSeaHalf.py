@@ -158,6 +158,12 @@ g.addPass(createPass("HSTRCloud", {
     # queues): off 3.86 / off2 4.25, async 3.78 / async2 3.81 ms (-0.26, 5 of 6 cycles), sanity (serial +1.7 ms probe) 5.97; churn
     # chunks at the load cap in 13-19 of 20 frames as off. asyncab1 motion score 2: off 5.75 / 5.57%, async 5.84 / 5.76% over 0.02.
     "asyncResidency": True,
+    # The residency's CPU update on its own thread, from the end of one frame's residency recording (moved to the frame's end) to
+    # the next's (HSTRCloud::mCloudResidencyWorker). worker4 (4K sunset walk at 2 units a frame, arms in one launch, 80 frames
+    # each): update 6.22 / 7.88 ms a frame on the frame's thread (off / off again); on, 8.36 ms on the worker of which the frame
+    # waited 5.33 - 3.03 ms a frame off the frame's thread; walk mean 9.39 / 8.93 / 11.87 ms, p50 5.62 / 4.60 / 8.60. Motion score 2
+    # (worker3): over 0.02 9.12 / 8.87 / 8.75%, p99.9 0.97 / 0.58 / 1.16; parked mapped = desired.
+    "cloudResidencyWorker": True,
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
     # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
     # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:

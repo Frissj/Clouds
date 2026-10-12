@@ -91,7 +91,10 @@ if args.nsys:
     session = f"hstr_{args.tag}"
     env.update(HSTR_NSYS=NSYS, HSTR_NSYS_SESSION=session, HSTR_NSYS_OUTPUT=str(RESULTS / "nsight" / args.tag),
                HSTR_NSYS_SET=args.nsys_set)
-    command = [NSYS, "launch", f"--session-new={session}", "--trace=dx12,dx12-annotations,nvtx", "--wait=all"] + command
+    # HSTR_NSYS_SAMPLE (CPU samples, sunset harness): no API tracing - its hooks on every D3D12 call were most of the frame thread's
+    # samples (cpusamp2: ToolsInjection64.dll under 52% of them).
+    trace = "--trace=none" if os.environ.get("HSTR_NSYS_SAMPLE") else "--trace=dx12,dx12-annotations,nvtx"
+    command = [NSYS, "launch", f"--session-new={session}", trace, "--wait=all"] + command
 if args.ngfx:
     # Nsight Graphics GPU Trace: ngfx launches Mogwai with the trace injected and idle; sea_motion.py starts it before flight frame
     # START and stops it after frame STOP-1 through the SDK (Mogwai's gpuTraceStart/Stop), so only those frames are traced.

@@ -299,6 +299,9 @@ HSTRCloud::HSTRCloud(ref<Device> pDevice, const Properties& props) : RenderPass(
 
 void HSTRCloud::parseProperties(const Properties& props)
 {
+    // A residency update on its own thread (cloudResidencyWorker) reads what some properties set.
+    if (mpCloudResidency)
+        mpCloudResidency->waitUpdate();
     for (const auto& [key, value] : props)
     {
         // Split from the chain below, which is at MSVC's nesting limit.
@@ -636,6 +639,46 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "cloudCutThresholdCheck")
         {
             mCloudCutThresholdCheck = value;
+            continue;
+        }
+        if (key == "cloudFadeEndOrder")
+        {
+            mCloudFadeEndOrder = value;
+            continue;
+        }
+        if (key == "cloudResidencyWorker")
+        {
+            mCloudResidencyWorker = value;
+            continue;
+        }
+        if (key == "cloudResidencySkipBusy")
+        {
+            mCloudResidencySkipBusy = value;
+            continue;
+        }
+        if (key == "cloudDeferArena")
+        {
+            mCloudDeferArena = value;
+            continue;
+        }
+        if (key == "cloudStepTiming")
+        {
+            mCloudStepTiming = value;
+            continue;
+        }
+        if (key == "cloudMapEvents")
+        {
+            mCloudMapEvents = value;
+            continue;
+        }
+        if (key == "cloudParallelFades")
+        {
+            mCloudParallelFades = value;
+            continue;
+        }
+        if (key == "cloudParallelMaps")
+        {
+            mCloudParallelMaps = value;
             continue;
         }
         if (key == "cloudSunEvery")
@@ -1891,6 +1934,9 @@ void HSTRCloud::setProperties(const Properties& props)
 
 Properties HSTRCloud::getProperties() const
 {
+    // The residency's statistics, once an update on its own thread (cloudResidencyWorker) has finished writing them.
+    if (mpCloudResidency)
+        mpCloudResidency->waitUpdate();
     Properties props;
     props[kBaseSteps] = mParams.baseSteps;
     props[kRefinementLevel] = mParams.refinementLevel;
@@ -2270,6 +2316,28 @@ Properties HSTRCloud::getProperties() const
         cloud["evictCalls"] = stats.evictCalls;
         cloud["evictFreed"] = stats.evictFreed;
         cloud["evictCandidates"] = stats.evictCandidates;
+        cloud["evictScans"] = stats.evictScans;
+        cloud["updateUs"] = stats.updateUs;
+        cloud["workerUpdateUs"] = stats.workerUpdateUs;
+        cloud["takeWaitUs"] = stats.takeWaitUs;
+        cloud["replayUs"] = stats.replayUs;
+        cloud["workerRunCycles"] = stats.workerRunCycles;
+        cloud["workerWallCycles"] = stats.workerWallCycles;
+        cloud["workerKernelUs"] = stats.workerKernelUs;
+        cloud["fadeParallelBuckets"] = stats.fadeParallelBuckets;
+        cloud["mapParallelRuns"] = stats.mapParallelRuns;
+        for (size_t k = 0; k < stats.stepCycles.size(); ++k)
+            cloud[fmt::format("step{}", k)] = stats.stepCycles[k];
+        cloud["workerUserUs"] = stats.workerUserUs;
+        cloud["workerUpdates"] = stats.workerUpdates;
+        cloud["submitMainUs"] = mSubmitMainUs;
+        cloud["submitResidencyUs"] = mSubmitResidencyUs;
+        cloud["residencySkips"] = mResidencySkips;
+        const char* phaseNames[] = {"Merge", "Loads", "Evict", "Maps", "Stage", "Fades", "Sun", "Upload", "Launch"};
+        for (size_t k = 0; k < stats.phaseUs.size(); ++k)
+            cloud[std::string("phase") + phaseNames[k] + "Us"] = stats.phaseUs[k];
+        cloud["walkTouchedCalls"] = stats.walkTouchedCalls;
+        cloud["walkTouchedListed"] = stats.walkTouchedListed;
         cloud["loadHeld"] = stats.loadHeld;
         cloud["loadScanned"] = stats.loadScanned;
         cloud["freeSlots"] = stats.freeSlots;
@@ -2327,6 +2395,7 @@ Properties HSTRCloud::getProperties() const
         cloud["fadeStarts"] = stats.fadeStarts;
         cloud["fadeEnds"] = stats.fadeEnds;
         cloud["fadeVoid"] = stats.fadeVoid;
+        cloud["fadeEndIns"] = stats.fadeEndIns;
         const auto audit = mpCloudResidency->auditMapped();
         cloud["undesiredFadingOut"] = audit.fadingOut;
         cloud["undesiredHeld"] = audit.held;
@@ -2337,6 +2406,7 @@ Properties HSTRCloud::getProperties() const
         cloud["cutOrderedCount"] = stats.cutOrderedCount;
         cloud["cutEntered"] = stats.cutEntered;
         cloud["cutLeft"] = stats.cutLeft;
+        cloud["cutReentered"] = stats.cutReentered;
         for (uint32_t k = 0; k < 8; ++k)
             cloud[fmt::format("cutEnteredL{}", k)] = stats.cutEnteredLevel[k];
         cloud["cutTotalMs"] = stats.cutTotalMs;
@@ -3803,9 +3873,8 @@ void HSTRCloud::invalidateBeamColumn(int2 worldTile)
     (mAsyncResidencyActive ? mDeferredInvalidations : mBeamInvalidations).push_back(float4(0.5f * (lo + hi), 0.5f * length(hi - lo) + margin));
 }
 
-void HSTRCloud::markResidencyChanges(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t bakes)
+void HSTRCloud::publishBeamChanges(RenderContext* pRenderContext)
 {
-    std::vector<uint4>& changes = mpCloudResidency->getBeamChanges();
     // The last asyncResidency frame's changes, published now (the main queue waited for them at that frame's end).
     if (!mDeferredBeamChanges.empty() || mDeferredBeamBakes > 0)
     {
@@ -3813,6 +3882,14 @@ void HSTRCloud::markResidencyChanges(RenderContext* pRenderContext, ComputeConte
         mDeferredBeamChanges.clear();
         mDeferredBeamBakes = 0;
     }
+}
+
+void HSTRCloud::markResidencyChanges(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t bakes)
+{
+    std::vector<uint4>& changes = mpCloudResidency->getBeamChanges();
+    // At the frame's end (mLateDomain) the frame's start has published the last frame's changes and run the cycle.
+    if (!mLateDomain)
+        publishBeamChanges(pRenderContext);
     if (mAsyncResidencyActive)
     {
         // This frame's wait for the next: the march beside the compute queue may read them half-written, so the re-march they
@@ -3835,7 +3912,8 @@ void HSTRCloud::markResidencyChanges(RenderContext* pRenderContext, ComputeConte
     else
         markBeamChanges(pRenderContext, changes, bakes, mpCloudResidency->getSunBakes());
     changes.clear();
-    markBeamChangeCycle(pRenderContext);
+    if (!mLateDomain)
+        markBeamChangeCycle(pRenderContext);
 }
 
 void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, std::vector<uint4>& changes, uint32_t bakes, const ref<Buffer>& pBakes)
@@ -4190,6 +4268,42 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     FALCOR_PROFILE(pRenderContext, "cloudSea");
     mpDomainStaging->beginFrame(pRenderContext);
     const auto& camera = mpScene->getCamera();
+    // cloudResidencyWorker: the update launched at the end of the last frame's residency recording is this frame's (it reads the
+    // sea's tiles, so it is taken before they change). What it queued records into this frame's residency context.
+    std::optional<bool> residencyTaken;
+    // cloudResidencySkipBusy: still running, it is left alone (nothing here may touch the residency, cutInFlight included).
+    const bool residencyBusy = mCloudResidencySkipBusy && mpCloudResidency && mpCloudResidency->updatePending() && !mpCloudResidency->updateReady();
+    mResidencySkips += residencyBusy ? 1u : 0u;
+    ++mResidencyFramesCovered;
+    ++mResidencyFrame;
+    if (!residencyBusy && mpCloudResidency && mpCloudResidency->updatePending())
+    {
+        FALCOR_PROFILE(pRenderContext, "residencyTake");
+        residencyTaken = mpCloudResidency->takeUpdate();
+        mResidencyFadesRunning = mpCloudResidency->fadesRunning();
+        // Never behind the residency's own count (it ran a frame at a time before, e.g. through the settle).
+        mResidencyFrame = std::max(mResidencyFrame, mpCloudResidency->getFrame());
+    }
+    const bool frameClock = mCloudResidencySkipBusy && mLateDomain;
+    // The GPU's fades at this frame (after the replayed update's own fade frame, which is its launch frame's): every frame under
+    // cloudResidencySkipBusy, those without an update included.
+    auto advanceFades = [&](ComputeContext* pContext)
+    {
+        if (frameClock)
+        {
+            const HSTRCloudFadeFrame frame = mpCloudResidency->fadeFrameAt(mResidencyFrame);
+            pContext->updateBuffer(mpCloudResidency->getFadeFrame().get(), &frame, 0, sizeof(frame));
+        }
+        if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), mpAdvanceFadesPass.get()) == mResidencyPassesBound.end())
+        {
+            // Only the bricks and the fade frame, which live as long as the residency.
+            ShaderVar var = mpAdvanceFadesPass->getRootVar()["CB"]["gHSTRCloud"];
+            var["hstrCloudBricksOutput"] = mpCloudResidency->getBricks();
+            var["hstrCloudFadeFrame"] = mpCloudResidency->getFadeFrame();
+            mResidencyPassesBound.push_back(mpAdvanceFadesPass.get());
+        }
+        mpAdvanceFadesPass->execute(pContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+    };
     std::vector<uint32_t> changed;
     {
         FALCOR_PROFILE(pRenderContext, "seaTiles");
@@ -4199,7 +4313,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         if (mCloudResidencyFrozen)
             changed = mpCloudSea->fill(camera->getPosition());
         else
-            changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && mpCloudResidency->cutInFlight()));
+            changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && (residencyBusy || mpCloudResidency->cutInFlight())));
     }
     mSeaTilesChanged += uint32_t(changed.size()); // Tiles whose cloud the sea replaced, cumulative (cloudStats seaTilesChanged).
     // The persistent beam image holds radiance marched through the old cloud: both the world column a slot held and the one it now
@@ -4293,6 +4407,23 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.position = camera->getPosition();
     view.viewProjection = camera->getViewProjMatrixNoJitter();
     mParams.cloudPixelAngle = camera->getFrameHeight() / camera->getFocalLength() / float(std::max(1u, mParams.frameDim.y));
+    if (residencyBusy)
+    {
+        // Tiles the sea changed (none finish beside an update) wait for the next launch with the rest.
+        const std::vector<uint32_t> slots = mpCloudSea->instanceSlots(changed);
+        mResidencyPendingSlots.insert(mResidencyPendingSlots.end(), slots.begin(), slots.end());
+        mDensityChangedFrame = false;
+        if (mResidencyFadesRunning)
+        {
+            FALCOR_PROFILE(pRenderContext, "fades");
+            advanceFades(mpCloudResidency->getContext());
+            // The fading bricks' density changed, as on a frame whose update left fades running.
+            mDensityChangedFrame = true;
+            mBeamReusable = false;
+            ++mDensityChangedFrames;
+        }
+        return;
+    }
     view.pixelAngle = mParams.cloudPixelAngle;
     view.lodBias = mParams.cloudLodBias;
     view.visibilityFloor = mCloudVisibilityFloor;
@@ -4328,6 +4459,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.cutStick = mCloudCutStick;
     view.cutThreshold = mCloudCutThreshold;
     view.cutThresholdCheck = mCloudCutThresholdCheck;
+    view.fadeEndOrder = mCloudFadeEndOrder;
     view.cutAsync = mCloudCutAsync;
     bool densityChanged = false;
     // Frozen (benchmarks only): the resident set stays as it is. A moving camera re-runs the whole residency cut on the CPU - over
@@ -4346,6 +4478,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame);
     mpCloudResidency->setScatterUploads(mCloudScatterUploads);
     mpCloudResidency->setScatterDense(mCloudScatterDense);
+    mpCloudResidency->setDeferArena(mCloudDeferArena);
+    mpCloudResidency->setStepTiming(mCloudStepTiming);
+    mpCloudResidency->setMapEvents(mCloudMapEvents);
+    mpCloudResidency->setParallelFades(mCloudParallelFades);
+    mpCloudResidency->setParallelMaps(mCloudParallelMaps);
     // asyncResidency: everything from here to the sun resolve records into the compute queue's context (beginAsyncResidency), which
     // has no profiler: its scopes time only on the main queue.
     ComputeContext* pContext = mpCloudResidency->getContext();
@@ -4364,22 +4501,27 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setSunBakesCap(
         mCloudSunBakesCap > 0 && movingCap > 0 ? std::min(mCloudSunBakesCap, movingCap) : std::max(mCloudSunBakesCap, movingCap)
     );
+    // cloudResidencyWorker: only on asyncResidency frames, whose residency work all records into the compute queue's context
+    // (diagnostic frames read the residency back mid-frame and run it serially).
+    const bool residencyWorker = mCloudResidencyWorker && mAsyncResidencyActive && !mCloudResidencyFrozen;
+    if (residencyTaken)
+        densityChanged = *residencyTaken;
     if (!mCloudResidencyFrozen)
     {
         FALCOR_PROFILE(pRenderContext, "residency");
-        densityChanged = mpCloudResidency->update(*mpCloudSea, view, mpCloudSea->instanceSlots(changed));
+        const std::vector<uint32_t> slots = mpCloudSea->instanceSlots(changed);
+        mResidencyPendingSlots.insert(mResidencyPendingSlots.end(), slots.begin(), slots.end());
+        // This frame's update, unless the frame took one the last frame launched (the slots then wait for the next) or launches
+        // its own at the end; the first frame that launches records nothing new, as a frozen frame.
+        if (!residencyTaken && !residencyWorker)
+        {
+            densityChanged = mpCloudResidency->update(*mpCloudSea, view, mResidencyPendingSlots);
+            mResidencyPendingSlots.clear();
+        }
         if (mpCloudResidency->fadesRunning())
         {
             OptionalProfile scope(pProfile, "fades");
-            if (std::find(mResidencyPassesBound.begin(), mResidencyPassesBound.end(), mpAdvanceFadesPass.get()) == mResidencyPassesBound.end())
-            {
-                // Only the bricks and the fade frame, which live as long as the residency.
-                ShaderVar var = mpAdvanceFadesPass->getRootVar()["CB"]["gHSTRCloud"];
-                var["hstrCloudBricksOutput"] = mpCloudResidency->getBricks();
-                var["hstrCloudFadeFrame"] = mpCloudResidency->getFadeFrame();
-                mResidencyPassesBound.push_back(mpAdvanceFadesPass.get());
-            }
-            mpAdvanceFadesPass->execute(pContext, uint3(mpCloudResidency->getBrickCapacity(), 1, 1));
+            advanceFades(pContext);
         }
     }
     // The staged bricks' residuals decode from the payload pool in one dispatch; then one reconstruction dispatch per level,
@@ -4791,6 +4933,20 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             stats.pagesLoaded,
             stats.committed
         );
+    }
+    // Last: from here to the next frame's take, nothing on this thread touches the residency (waitUpdate guards the rest).
+    if (residencyWorker)
+    {
+        std::sort(mResidencyPendingSlots.begin(), mResidencyPendingSlots.end());
+        mResidencyPendingSlots.erase(std::unique(mResidencyPendingSlots.begin(), mResidencyPendingSlots.end()), mResidencyPendingSlots.end());
+        if (frameClock)
+        {
+            mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame * std::max(mResidencyFramesCovered, 1u));
+            mpCloudResidency->setFrameClock(mResidencyFrame + 1); // The earliest frame it lands in.
+        }
+        mResidencyFramesCovered = 0;
+        mpCloudResidency->launchUpdate(*mpCloudSea, view, std::move(mResidencyPendingSlots));
+        mResidencyPendingSlots.clear();
     }
 }
 
@@ -5343,9 +5499,13 @@ void HSTRCloud::submitAsyncResidency(RenderContext* pRenderContext)
         return;
     // HSTRCloud's main-queue work first, so both queues start on it together (the frame is CPU-bound: recorded for ~10-40 ms and
     // submitted at once; work submitted earlier runs on an idle GPU and overlaps nothing, qtrace_compute6).
+    const auto submitStart = std::chrono::steady_clock::now(); // DIAGNOSTIC (submitMainUs / submitResidencyUs)
     pRenderContext->submit();
     mMainFenceValue = pRenderContext->signal(mpMainFence.get());
+    const auto mainDone = std::chrono::steady_clock::now();
+    mSubmitMainUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(mainDone - submitStart).count());
     mpResidencyContext->submit();
+    mSubmitResidencyUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - mainDone).count());
     mpResidencyContext->getLowLevelData()->closeCommandBuffer();
     mpResidencyHeaps[mResidencyHeap]->finish();
     const uint64_t done = mpResidencyContext->signal(mpResidencyFence.get());
@@ -7121,6 +7281,7 @@ void HSTRCloud::runPushProbe(RenderContext* pRenderContext)
 
 void HSTRCloud::runSpanProbe(RenderContext* pRenderContext)
 {
+    mpCloudResidency->waitUpdate(); // DIAGNOSTIC passes read the residency beside a cloudResidencyWorker update.
     // The recorded rays, integrated from their spans alone: timed ("spans"), then again untimed against the march ("spanCheck").
     // spanEval: one thread a span, listed in ray, brick or scrambled order by an untimed counting sort; spanShare: the
     // shared-transfer table. Allocated on first use (1.3M rays: list 62 MB, outputs 250 MB; table 4M slots, 100 MB).
@@ -7386,6 +7547,11 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     }
     beginAsyncResidency(pRenderContext);
     executeFrame(pRenderContext, renderData);
+    if (mDomainDue)
+    {
+        mDomainDue = false;
+        updateCloudDomain(pRenderContext);
+    }
     // cloudSunBeside: the deferred run's rest, after everything that samples the sun atlas, whatever path the frame took.
     if (mpCloudResidency)
         finishDeferredSun(pRenderContext);
@@ -7530,7 +7696,16 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         pRenderContext->clearUAV(cutStats->getUAV().get(), float4(0.f));
         return;
     }
-    if (mpCloudSea)
+    // cloudResidencyWorker: at the frame's end (execute), once the instances are up; the tiles and residency it changes are the next
+    // frame's, as the residency's GPU work already is.
+    mLateDomain = mCloudResidencyWorker && mAsyncResidencyActive && !mCloudResidencyFrozen && mpCloudResidency && mCloudInstancesUploaded;
+    if (mpCloudSea && mLateDomain)
+    {
+        publishBeamChanges(pRenderContext);
+        markBeamChangeCycle(pRenderContext);
+        mDomainDue = true;
+    }
+    else if (mpCloudSea)
         updateCloudDomain(pRenderContext);
     updateAtmosphere(pRenderContext);
     // compactDensity: this frame's bricks into the apron-free copy before anything marches (a full repack for the A/B; a shipping
@@ -10229,6 +10404,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
 
 void HSTRCloud::runRtSpanProbe(RenderContext* pRenderContext)
 {
+    mpCloudResidency->waitUpdate();
     FALCOR_PROFILE(pRenderContext, "rtProbe");
     const hstrcloud::CloudResidency& residency = *mpCloudResidency;
     const uint32_t assetCount = residency.getAssetCount();
@@ -10468,6 +10644,7 @@ static_assert(sizeof(RasterInstance) == 128);
 
 void HSTRCloud::packCompactAtlases(RenderContext* pRenderContext, bool sun)
 {
+    mpCloudResidency->waitUpdate();
     const ref<Texture>& atlas = mpCloudResidency->getAtlas();
     const ref<Texture>& sunAtlas = mpCloudResidency->getSunAtlas();
     if (!mpSpanCompact)
@@ -10497,6 +10674,8 @@ void HSTRCloud::packCompactAtlases(RenderContext* pRenderContext, bool sun)
 
 void HSTRCloud::runRasterProbe(RenderContext* pRenderContext)
 {
+    if (mpCloudResidency)
+        mpCloudResidency->waitUpdate();
     // rasterProbeFetchMask 4: density from the apron-free 8^3 copy (spanLoop 4096's), packed untimed before the probe's scope; the
     // probe's own boxes, slices and polygons (hundreds of MB) pass through L2 before the draw reads it.
     if ((mRasterProbeFetchMask & 4u) != 0 && mpCloudResidency)
@@ -10815,6 +10994,7 @@ void HSTRCloud::runRasterProbe(RenderContext* pRenderContext)
 
 void HSTRCloud::updateHullTlas(RenderContext* pRenderContext)
 {
+    mpCloudResidency->waitUpdate();
     FALCOR_PROFILE(pRenderContext, "formR");
     const hstrcloud::CloudResidency& residency = *mpCloudResidency;
     const uint32_t assetCount = residency.getAssetCount();
@@ -11031,6 +11211,7 @@ void HSTRCloud::updateHullTlas(RenderContext* pRenderContext)
 
 void HSTRCloud::updateFormBTable(RenderContext* pRenderContext)
 {
+    mpCloudResidency->waitUpdate();
     // Exact only where levels 0-2 align (cloudSeaAlign >= 2) and the packed atlas holds the bakes (cloudSunPacked 1).
     const float s = mpCloudSea->getAlignVoxelWorld();
     if (mCloudSeaAlign < 2 || !(s > 0.f) || mParams.cloudSunPackedAtlas != 1u)

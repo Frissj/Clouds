@@ -32,13 +32,14 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
             "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
             "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames", "uploadRuns", "uploadBytes", "scatterJobs", "scatterChecks", "scatterMismatches", "commitChecks", "commitMismatches", "sunResolveListFrames", "sunResolveListBricks", "sunResolveListChecks",
-            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames",
+            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames", "walkTouchedCalls", "walkTouchedListed", "updateUs", "workerUpdateUs", "takeWaitUs", "replayUs", "workerRunCycles", "workerWallCycles", "workerKernelUs", "workerUserUs", *[f"step{k}" for k in range(16)], "workerUpdates", "submitMainUs", "submitResidencyUs", "residencySkips", "fadeParallelBuckets", "mapParallelRuns", "phaseMergeUs", "phaseLoadsUs", "phaseEvictUs", "phaseMapsUs", "phaseStageUs", "phaseFadesUs", "phaseSunUs",
+            "phaseUploadUs", "phaseLaunchUs", "fadeStarts", "fadeEnds", "fadeVoid", "fadeEndIns", "maps", "unmaps",
             "beamHistoryProbeUnits", "beamHistoryProbe02", "beamHistoryProbe10",
-            "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft") + tuple(
+            "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
             f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
           "beamMarchTiles", "bindCpuMs", "loaded", "slotsUsed", "freeSlots", "freeBricks", "committed", "commitFails",
-          "evictCalls", "evictFreed", "evictCandidates", "loadHeld", "loadScanned", "undesiredFadingOut", "undesiredHeld",
+          "evictCalls", "evictFreed", "evictCandidates", "evictScans", "loadHeld", "loadScanned", "undesiredFadingOut", "undesiredHeld",
           "undesiredIdle", "activeFades", "cuts", "cutEntered", "sunStampStores", "sunStampFresh", "sunStampCheckStores",
           "sunStampCheckFresh", "sunFineCellsPeak", "sunFineWaves", "sunFinePassed", "sunFineTested") + tuple(  # rtSpanProbe's last frame (present only while it is on).
           f"rtProbe{n}" for n in ("Boxes", "Instances", "Rays", "HitRays", "Candidates", "Max", "Overflow", "Covered")) + tuple(
@@ -269,12 +270,34 @@ def levels(s):
     return {k: s.get(k) for k in LEVELS if k in s}
 
 
-def profile(tag, frames, speed):
+NSYS = os.environ.get("HSTR_NSYS")  # run_sea.py --nsys: an nsys report of each live flight's profiled frames, and only those.
+
+
+def nsys(verb, *options):
+    import subprocess
+    subprocess.run([NSYS, verb, f"--session={os.environ['HSTR_NSYS_SESSION']}", *options], creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def profile(tag, frames, speed, report=None):
+    if NSYS and report:
+        metric_set = [f"--gpu-metrics-set={os.environ['HSTR_NSYS_SET']}"] if os.environ.get("HSTR_NSYS_SET") else []
+        # HSTR_NSYS_SAMPLE=1: CPU call-stack samples of the process instead of GPU metrics (where the CPU frame goes, by function).
+        what = (["--sample=process-tree", "--sampling-frequency=8000"] if os.environ.get("HSTR_NSYS_SAMPLE") else
+                ["--sample=none", "--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000", *metric_set])
+        nsys("start", *what, "--force-overwrite=true", f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
+        if os.environ.get("HSTR_NSYS_SAMPLE"):
+            # CPU samples of the shipping frame: Falcor's profiler off (its endFrame alone was 12% of the frame thread's samples).
+            fly(frames, speed)
+            nsys("stop")
+            return
+    m.profiler.paused = False
     m.profiler.enabled = True
     m.profiler.start_capture()
     fly(frames, speed)
     capture = m.profiler.end_capture()
     m.profiler.enabled = False
+    if NSYS and report:
+        nsys("stop")  # After end_capture, which has waited for the flight's GPU work.
     for kind in ("gpu_time", "cpu_time"):
         lanes = {name: lane for name, lane in capture["events"].items() if name.endswith("/" + kind)}
         paths = [name.rsplit("/", 1)[0] for name in lanes]
@@ -316,6 +339,8 @@ def set_arm(props):
     if res != res_now[0]:
         m.resizeFrameBuffer(*[int(v) for v in res.split("x")])
         res_now[0] = res
+    # _profilerPaused: Falcor's Profiler::endFrame returns at once (off, it still waits for the last frame's fence and submits).
+    m.profiler.paused = bool(props.get("_profilerPaused", False))
     hstr.set_properties({k: v for k, v in props.items() if not k.startswith("_")})
 
 settle = int(os.environ.get("HSTR_MOTION_SETTLE", "1800"))
@@ -358,7 +383,7 @@ for speed in speeds:
     prev = [before] + per_frame[:-1]
     for i in sorted(range(len(walls)), key=lambda i: -walls[i])[:10]:
         print(f"MOTION {tag}   frame {i}: {walls[i]:.2f} ms {delta(prev[i], per_frame[i])} {levels(per_frame[i])}", flush=True)
-    profile(f"{tag} live", 60, speed)
+    profile(f"{tag} live", 60, speed, report=f"{tag}_live")
     if ORACLE:
         # Today's moving frame (score) and the capture oracle at the same cameras; no arms.
         for stop in range(int(os.environ.get("HSTR_MOTION_ORACLE_STOPS", "3"))):
@@ -390,10 +415,13 @@ for speed in speeds:
                                                                       "cutParallelMsTotal", "cutHeapMsTotal", "cutPriorityRises",
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
-                                                                      "scatterJobs", "scatterChecks", "scatterMismatches")}
+                                                                      "scatterJobs", "scatterChecks", "scatterMismatches",
+                                                                      "seaTilesChanged", "residencySkips", "workerUpdateUs", "takeWaitUs")}
             gpu = float(d.get("gpuTimeSum") or 0) / max(float(d.get("gpuTimeFrames") or 0), 1.0) / 1000.0
             print(f"MOTION {tag} chunk {cycle} {name}: gpu {gpu:.3f} ms ({d.get('gpuTimeFrames')} frames), wall p50 "
-                  f"{sorted(walls)[len(walls) // 2]:.2f} ms, mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
+                  f"{sorted(walls)[len(walls) // 2]:.2f} ms mean {sum(walls[DROP:]) / max(len(walls) - DROP, 1):.2f}, tiles changed "
+                  f"{d.get('seaTilesChanged')}, skips {d.get('residencySkips')}, worker {float(d.get('workerUpdateUs') or 0) / 1e3:.0f} ms "
+                  f"wait {float(d.get('takeWaitUs') or 0) / 1e3:.0f} ms, mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
                   f"pending {now.get('pending')} committed {d.get('committedTotal')} ({d.get('committedCapped')} frames at the cap), "
                   f"cuts {d.get('cuts')} entered {d.get('cutEntered')} evicted {d.get('evictFreed')} "
                   f"fading out {now.get('undesiredFadingOut')} free {now.get('freeSlots')}, walk {d.get('cutWalkMsTotal'):.0f} ms "
