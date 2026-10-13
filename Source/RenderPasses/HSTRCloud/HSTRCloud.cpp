@@ -455,6 +455,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamFusedOverlap = bool(value);
             continue;
         }
+        if (key == "beamFusedOverlapUnits")
+        {
+            mBeamFusedOverlapUnits = bool(value);
+            continue;
+        }
         if (key == "beamFusedInline")
         {
             mBeamFusedInline = bool(value);
@@ -528,6 +533,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             while (64u % segments != 0u)
                 --segments;
             mParams.beamDirtySegments = segments;
+            continue;
+        }
+        if (key == "beamQueryPair")
+        {
+            mBeamQueryPair = bool(value);
+            continue;
+        }
+        if (key == "beamQueryPairCheck")
+        {
+            mBeamQueryPairCheck = bool(value);
             continue;
         }
         if (key == "beamInvalidate")
@@ -2195,6 +2210,8 @@ Properties HSTRCloud::getProperties() const
     props["colorFormat"] = mColorFormat;
     props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
+    props["beamQueryPair"] = mBeamQueryPair;
+    props["beamQueryPairCheck"] = mBeamQueryPairCheck;
     props["beamOrderProbe"] = mParams.beamOrderProbe;
     props["beamQueryCompact"] = mBeamQueryCompact;
     props["beamDirtyFused"] = mBeamDirtyFused;
@@ -2202,6 +2219,7 @@ Properties HSTRCloud::getProperties() const
     props["beamFusedUnits"] = mBeamFusedUnits;
     props["beamFusedRaysOnly"] = mBeamFusedRaysOnly;
     props["beamFusedOverlap"] = mBeamFusedOverlap;
+    props["beamFusedOverlapUnits"] = mBeamFusedOverlapUnits;
     props["beamFusedInline"] = mBeamFusedInline;
     props["beamDirtyTilesDense"] = mBeamDirtyTilesDense;
     props["sunColumns"] = mSunColumns;
@@ -2887,6 +2905,12 @@ Properties HSTRCloud::getProperties() const
                     cloud["beamSplit" + std::to_string(layer) + splitNames[k]] = mBeamLevelCounts[kBeamLayerSplit + 7 * layer + k];
             cloud["beamSplit1EmptyAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 14];
             cloud["beamSplit1DenseAfterDense"] = mBeamLevelCounts[kBeamLayerSplit + 15];
+            const char* pairNames[4] = {"Rays", "Steps", "Far", "Bits"};
+            for (uint32_t k = 0; k < 4; ++k)
+                cloud[std::string("beamPairCheck") + pairNames[k]] = mBeamLevelCounts[kBeamPairCheck + k];
+            const char* warpNames[4] = {"Waves", "TwoChains", "SomeBoth", "LanesBoth"};
+            for (uint32_t k = 0; k < 4; ++k)
+                cloud[std::string("beamLayerWarp") + warpNames[k]] = mBeamLevelCounts[kBeamLayerWarp + k];
             cloud["beamLayerUnitLaneSteps"] = mBeamLevelCounts[kBeamLayerUnitSteps];
             cloud["beamLayerUnitPaidSteps"] = mBeamLevelCounts[kBeamLayerUnitSteps + 1];
             cloud["beamLayerUnitWarps"] = mBeamLevelCounts[kBeamLayerUnitSteps + 2];
@@ -5791,6 +5815,91 @@ void HSTRCloud::finishDeferredSun(RenderContext* pRenderContext)
     mSunBaked = true;
 }
 
+void HSTRCloud::logBeamTail()
+{
+    const std::vector<uint4> probe = mpBeamTailProbe->getElements<uint4>();
+    const uint4 header = probe[0];
+    const uint32_t rays = std::min<uint32_t>(header.x, uint32_t(probe.size()) - 1u);
+    if (rays == 0)
+        return;
+    // Times in us against the earliest recorded ray start. The global timer is the low 32 bits of a ns count, so times are taken as
+    // signed differences from one record (the header's dispatch-wide min / max read ~4 s off in nvtail1 and are not used).
+    const uint32_t ref = probe[1].x;
+    auto rel = [&](uint32_t t) { return double(int32_t(t - ref)) * 1e-3; };
+    double base = 1e30;
+    for (uint32_t i = 0; i < rays; ++i)
+        base = std::min(base, rel(probe[1 + i].x));
+    std::vector<double> ends(rays);
+    // Per wave (thread >> 5): a lane's end is its wave's leaving the march loop, so the wave's longest ray sets every lane's end.
+    struct Wave
+    {
+        uint32_t lanes = 0, maxSteps = 0;
+        double start = 1e30, end = -1e30;
+    };
+    std::unordered_map<uint32_t, Wave> waves;
+    uint64_t steps = 0;
+    for (uint32_t i = 0; i < rays; ++i)
+    {
+        const uint4 r = probe[1 + i];
+        const double s = rel(r.x) - base, e = rel(r.y) - base;
+        ends[i] = e;
+        steps += r.z;
+        Wave& w = waves[r.w >> 5];
+        ++w.lanes;
+        w.maxSteps = std::max(w.maxSteps, r.z);
+        w.start = std::min(w.start, s);
+        w.end = std::max(w.end, e);
+    }
+    std::vector<double> sortedEnds = ends;
+    std::sort(sortedEnds.begin(), sortedEnds.end());
+    auto at = [](const std::vector<double>& v, double q) { return v[std::min(size_t(q * double(v.size())), v.size() - 1)]; };
+    // Waves by end: all, and the last 10% to end (the tail), with their longest ray's steps and time a wave step.
+    std::vector<const Wave*> byEnd;
+    for (const auto& [id, w] : waves)
+        byEnd.push_back(&w);
+    std::sort(byEnd.begin(), byEnd.end(), [](const Wave* a, const Wave* b) { return a->end < b->end; });
+    auto summary = [&](size_t from, size_t to, double& maxSteps, double& lanes, double& duration, double& nsPerStep, double& start)
+    {
+        double s = 0.0, l = 0.0, d = 0.0, st = 0.0;
+        for (size_t k = from; k < to; ++k)
+        {
+            s += byEnd[k]->maxSteps;
+            l += byEnd[k]->lanes;
+            d += byEnd[k]->end - byEnd[k]->start;
+            st += byEnd[k]->start;
+        }
+        const double n = double(std::max<size_t>(to - from, 1));
+        maxSteps = s / n;
+        lanes = l / n;
+        duration = d / n;
+        start = st / n;
+        nsPerStep = s > 0.0 ? d * 1e3 / s : 0.0;
+    };
+    const size_t n = byEnd.size(), tailFrom = n - std::max<size_t>(n / 10, 1);
+    double allSteps, allLanes, allDuration, allNs, allStart, tailSteps, tailLanes, tailDuration, tailNs, tailStart;
+    summary(0, n, allSteps, allLanes, allDuration, allNs, allStart);
+    summary(tailFrom, n, tailSteps, tailLanes, tailDuration, tailNs, tailStart);
+    // Waves by their longest ray: how many have 64+ steps, and when those end.
+    uint32_t long64 = 0;
+    double long64End = 0.0;
+    for (const Wave* w : byEnd)
+        if (w->maxSteps >= 64)
+        {
+            ++long64;
+            long64End += w->end;
+        }
+    const Wave& last = *byEnd.back();
+    logInfo(
+        "TAIL build {}: {} marched rays in {} waves ({:.1f} lanes), {:.1f} steps a ray; ray ends 50% {:.1f} / 90% {:.1f} / 99% {:.1f} / "
+        "max {:.1f} us; waves: start {:.1f} us mean, {:.1f} us long, longest ray {:.1f} steps, {:.0f} ns a wave step | last 10% of "
+        "waves: start {:.1f} us, {:.1f} us long, longest ray {:.1f} steps, {:.1f} lanes, {:.0f} ns a wave step | waves with a 64+ "
+        "step ray: {} ending at {:.1f} us mean | last wave: start {:.1f} us, end {:.1f} us, longest ray {} steps, {} lanes",
+        mBeamTailBuilds, rays, n, allLanes, double(steps) / rays, at(sortedEnds, 0.5), at(sortedEnds, 0.9), at(sortedEnds, 0.99),
+        sortedEnds.back(), allStart, allDuration, allSteps, allNs, tailStart, tailDuration, tailSteps, tailLanes, tailNs, long64,
+        long64 ? long64End / long64 : 0.0, last.start, last.end, last.maxSteps, last.lanes
+    );
+}
+
 void HSTRCloud::bakeScheduledSun(RenderContext* pRenderContext, ComputeContext* pContext)
 {
     auto& residency = *mpCloudResidency;
@@ -6763,6 +6872,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
     var["hstrBeamOrderProbe"] = mpBeamOrderProbe;
+    var["hstrBeamTailProbe"] = mpBeamTailProbe;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
     var["hstrBeamWarpArgs"] = mpBeamWarpArgs;
     var["hstrBeamDirtyArgs"] = mpBeamDirtyArgs;
@@ -9428,6 +9538,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     mpBeamDirtyQueryPass->getProgram()->addDefine(
                                         "HSTR_BEAM_DIRTY_SLICES", mParams.beamDirtySegments > 1 ? "1" : "0"
                                     );
+                                    // beamQueryPair: the sliced dispatch's two threads a ray march it together instead of a half each.
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine(
+                                        "HSTR_QUERY_PAIR", mBeamQueryPair && mParams.beamDirtySegments == 2 ? "1" : "0"
+                                    );
+                                    mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_QUERY_PAIR_CHECK", mBeamQueryPairCheck ? "1" : "0");
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_ORDER_PROBE", mParams.beamOrderProbe != 0 ? "1" : "0");
                                     mpBeamDirtyQueryPass->getProgram()->addDefine("HSTR_DIRTY_OVERLAP", "0");
                                     // beamQueryCompact: this pass only lists the points to march; marchBeamDirtyListed marches them.
@@ -9440,6 +9555,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         if (!mpBeamOrderProbe)
                                             mpBeamOrderProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 21);
                                         pRenderContext->clearUAV(mpBeamOrderProbe->getUAV().get(), uint4(0));
+                                        // The query's timing: every 10th build's records are summarised (a blocking read) before
+                                        // the next build clears them.
+                                        if (!mpBeamTailProbe)
+                                            mpBeamTailProbe = mpDevice->createStructuredBuffer(sizeof(uint4), 65537);
+                                        else if (mBeamTailBuilds % 10 == 0)
+                                            logBeamTail();
+                                        ++mBeamTailBuilds;
+                                        pRenderContext->clearUAV(mpBeamTailProbe->getUAV().get(), uint4(0, 0xFFFFFFFFu, 0, 0));
                                     }
                                     setBeamDirtyMarchDefines(mpBeamDirtyQueryPass);
                                     // beamWarpHistory (ORACLE): the beam state the held blocks' warp reads, before this build's
@@ -9562,6 +9685,21 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         // profiled): with the far sea between the query and this pass, its barrier waited for the far
                                         // sea, which ran ~2x longer alone - query range ship 1.07 / 0.98, cap 32 x 8 / 16 slices
                                         // 1.28 / 1.17, cap 24 x 16 1.21, cap 48 x 16 1.08 ms.
+                                        // MEASURED again 2026-10-13 (the far sea now runs in ~1 frame of 4, 0.06 ms; the query's
+                                        // last ~0.4 ms at 1-4% warps in flight, gputl1): cont2 chunk GPU no better than the anchors;
+                                        // scope2 (profiled, far sea scoped) cap 16 x 32: the capped query ~0.29 ms but this pass
+                                        // 0.51 ms. WHY (contsteps1, layer + order probes, per frame): query lane / warp-paid steps
+                                        // ship 284k / 479k (again 299k / 505k), cap 16 x 32 607k / 936k, cap 48 x 16 344k / 550k -
+                                        // a slice starts at transmittance 1 (small steps) and marches its whole segment, past where
+                                        // the ray would have ended, so ~45k steps replace the ~2k past 48. Not the restart: ray setup
+                                        // is 0.02 ms for the whole query (unitstrip1). CEILING (capceil1, the cap alone,
+                                        // an ORACLE with a wrong image): chunk GPU -0.13 (cap 32) / -0.11 ms (cap 48) against anchors
+                                        // 0.4 ms apart - under a 0.2 ms stop rule, so hiding the cut rays on the compute queue (a
+                                        // cross-queue fence mid-frame, the extinction copy) was not built. The oracle understates
+                                        // the tail (contsteps1): cap 32 leaves the query's steps at 282k (rays past 32 hold ~10k),
+                                        // but its wrong partials fail more tiles - units marched 38k -> 59k, unit lane steps 1.78M
+                                        // -> 2.50M. The tail itself: ~80 rays a frame of 64-99 steps (2.2k of 32-63, 6.6k of
+                                        // 16-31), a few rays' step latency, not work that splitting or filling can move.
                                         FALCOR_PROFILE(pRenderContext, "continue");
                                         auto bindContinue = [&](const ref<ComputePass>& pPass)
                                         {
@@ -10260,7 +10398,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                             pPass->getRootVar()["gFusedLattice"] = mpBeamLattice;
                         };
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_DIRTY_FUSED", "1");
-                        mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_UNITS", mBeamFusedUnits && !mBeamFusedOverlap ? "1" : "0");
+                        mpBeamDirtyFusedPass->getProgram()->addDefine(
+                            "HSTR_FUSED_UNITS", mBeamFusedUnits && (!mBeamFusedOverlap || mBeamFusedOverlapUnits) ? "1" : "0"
+                        );
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_RAYS_ONLY", mBeamFusedRaysOnly ? "1" : "0");
                         mpBeamDirtyFusedPass->getProgram()->addDefine("HSTR_FUSED_TILES_ONLY", mBeamFusedOverlap ? "1" : "0");
                         setBeamDirtyMarchDefines(mpBeamDirtyFusedPass);

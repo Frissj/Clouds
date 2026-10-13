@@ -79,6 +79,10 @@ DIRTY = ("beamDirtyBlocks", "beamDirtyUnverified", "beamDirtyOwnMarched", "beamD
                for n in ("BlockSkip", "VoxelSkip", "NoCloud", "OutOfBox", "BrickEmpty", "Density", "Proxy")) +
          ("beamSplit1EmptyAfterDense", "beamSplit1DenseAfterDense", "beamLayerUnitLaneSteps", "beamLayerUnitPaidSteps",
           "beamLayerUnitWarps") +
+         # ... and the layer loop's waves: walking a chain, two chains one after the other, a lane needing both; lanes needing both.
+         tuple(f"beamLayerWarp{n}" for n in ("Waves", "TwoChains", "SomeBoth", "LanesBoth")) +
+         # ... and beamQueryPairCheck: paired query rays, and those whose serial march differs in steps / beyond 1e-5 / in any bit.
+         tuple(f"beamPairCheck{n}" for n in ("Rays", "Steps", "Far", "Bits")) +
          # ... and a perfect ray start's oracle (kBeamLeadSteps): leading empty steps, warp-paid steps with that run as one step,
          # rays with no density and their steps, for the dirty query and the units.
          tuple(f"beamLead{p}{n}" for p in ("Query", "Unit") for n in ("Empty", "IdealPaid", "NoneRays", "NoneSteps")) +
@@ -272,6 +276,7 @@ def levels(s):
 
 
 NSYS = os.environ.get("HSTR_NSYS")  # run_sea.py --nsys: an nsys report of each live flight's profiled frames, and only those.
+ARM_NSYS = NSYS and os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0"
 
 
 def nsys(verb, *options):
@@ -279,13 +284,17 @@ def nsys(verb, *options):
     subprocess.run([NSYS, verb, f"--session={os.environ['HSTR_NSYS_SESSION']}", *options], creationflags=subprocess.CREATE_NO_WINDOW)
 
 
+def nsys_start(report):
+    metric_set = [f"--gpu-metrics-set={os.environ['HSTR_NSYS_SET']}"] if os.environ.get("HSTR_NSYS_SET") else []
+    # HSTR_NSYS_SAMPLE=1: CPU call-stack samples of the process instead of GPU metrics (where the CPU frame goes, by function).
+    what = (["--sample=process-tree", "--sampling-frequency=8000"] if os.environ.get("HSTR_NSYS_SAMPLE") else
+            ["--sample=none", "--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000", *metric_set])
+    nsys("start", *what, "--force-overwrite=true", f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
+
+
 def profile(tag, frames, speed, report=None):
     if NSYS and report:
-        metric_set = [f"--gpu-metrics-set={os.environ['HSTR_NSYS_SET']}"] if os.environ.get("HSTR_NSYS_SET") else []
-        # HSTR_NSYS_SAMPLE=1: CPU call-stack samples of the process instead of GPU metrics (where the CPU frame goes, by function).
-        what = (["--sample=process-tree", "--sampling-frequency=8000"] if os.environ.get("HSTR_NSYS_SAMPLE") else
-                ["--sample=none", "--gpu-metrics-devices=all", "--gpu-metrics-frequency=20000", *metric_set])
-        nsys("start", *what, "--force-overwrite=true", f"--output={os.environ['HSTR_NSYS_OUTPUT']}_{report}")
+        nsys_start(report)
         if os.environ.get("HSTR_NSYS_SAMPLE"):
             # CPU samples of the shipping frame: Falcor's profiler off (its endFrame alone was 12% of the frame thread's samples).
             fly(frames, speed)
@@ -388,7 +397,8 @@ for speed in speeds:
     prev = [before] + per_frame[:-1]
     for i in sorted(range(len(walls)), key=lambda i: -walls[i])[:10]:
         print(f"MOTION {tag}   frame {i}: {walls[i]:.2f} ms {delta(prev[i], per_frame[i])} {levels(per_frame[i])}", flush=True)
-    profile(f"{tag} live", 60, speed, report=f"{tag}_live")
+    # Under --nsys with HSTR_MOTION_ARM_PROFILE the arms take the launch's one report (below), so the live flight takes none.
+    profile(f"{tag} live", 60, speed, report=None if ARM_NSYS else f"{tag}_live")
     if ORACLE:
         # Today's moving frame (score) and the capture oracle at the same cameras; no arms.
         for stop in range(int(os.environ.get("HSTR_MOTION_ORACLE_STOPS", "3"))):
@@ -497,12 +507,26 @@ for speed in speeds:
                   f"{100 * max(x['over02'] for x in e):.3f}%, p99.9 {max(x['p999'] for x in e):.3g}, marched "
                   f"{100 * sum(x['marched'] for x in e) / len(e):.1f}%; per score {e}", flush=True)
     if os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0":
-        for name, props in ARMS:
-            set_arm(props)
-            # HSTR_MOTION_PROFILE_LEAD: frames flown before the profile, so an arm whose properties rebuild the beam (beamOctScale)
-            # is timed after its rebuild, not during it.
-            fly(int(os.environ.get("HSTR_MOTION_PROFILE_LEAD", "5")), speed)
-            profile(f"{tag} arm {name}", int(os.environ.get("HSTR_MOTION_PROFILE_FRAMES", "20")), speed)
+        # Under --nsys every arm's profiled frames go into ONE report (TAG_<speed>_arms): a later nsys session in the same launch
+        # records no DX12 GPU workloads (sunevery1: five per-arm reports held only Map / Unmap calls; the launch's first, the live
+        # flight, held them). The lead frames carry scope ranges too (sunevery2: 265 = 5 x (5 + 48)), so the arms split by count, in
+        # ARMS order (and round by round with HSTR_MOTION_PROFILE_ROUNDS).
+        if ARM_NSYS:
+            nsys_start(f"{tag}_arms")
+        # HSTR_MOTION_PROFILE_ROUNDS: the arms' profiles taken round-robin in that many rounds of PROFILE_FRAMES each, so every arm
+        # is timed along the same stretches of the path (layerloop1: one profile an arm, ship 3.58 against ship again 2.68 ms -
+        # each arm had flown a different stretch).
+        rounds = int(os.environ.get("HSTR_MOTION_PROFILE_ROUNDS", "1"))
+        for r in range(rounds):
+            for name, props in ARMS:
+                set_arm(props)
+                # HSTR_MOTION_PROFILE_LEAD: frames flown before the profile, so an arm whose properties rebuild the beam (beamOctScale)
+                # is timed after its rebuild, not during it.
+                fly(int(os.environ.get("HSTR_MOTION_PROFILE_LEAD", "5")), speed)
+                profile(f"{tag} arm {name}" + (f" round {r}" if rounds > 1 else ""), int(os.environ.get("HSTR_MOTION_PROFILE_FRAMES", "20")),
+                        speed)
+        if ARM_NSYS:
+            nsys("stop")
     set_arm(ARMS[0][1])
     # Back to parked: how long the backlog takes to drain.
     for window in range(3):

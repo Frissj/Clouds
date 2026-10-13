@@ -53,7 +53,14 @@ static const uint kBeamMaxLevels = 4;      ///< Beam tile levels, each halving t
 /// Beam count entries: one per level and the march list, then (beamRefreshDebug 7) the steps marched and carried by root queries.
 // The first kBeamMaxLevels + 3 entries retain the legacy level/refresh counters. The
 // remaining entries are sparse-query instrumentation (see kBeamSparse* below).
-static const uint kBeamCountSlots = 502;
+static const uint kBeamCountSlots = 510;
+/// beamQueryPairCheck SANITY: paired query rays marched again serially - rays, steps differing, a value differing beyond 1e-5
+/// relative, a value differing in any bit.
+static const uint kBeamPairCheck = 506;
+/// beamLayerProbe ORACLE (leanExtinctionLayered's layer loop), per call over the waves at it: waves where some lane walks a layer's
+/// lookup chain, waves walking both layers' chains one after the other (some lanes need layer 0, some layer 1), waves where some
+/// lane needs both; then lanes needing both. [1] - [2] is what the per-lane layer loop (HSTR_SHIP 65536) walks once.
+static const uint kBeamLayerWarp = 502;
 /// beamHalfResolve counters (always on with it): filled pixels, and the exact ones because a neighbour was not from a basis, or
 /// because the neighbours disagreed past beamHalfContrast; then the shaded half's basis pixels; the fill's waves, and those with
 /// any lane resolved exactly (which pays the whole resolve for the wave). Counted only under beamHalfProbe.

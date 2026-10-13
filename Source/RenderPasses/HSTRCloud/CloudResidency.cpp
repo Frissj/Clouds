@@ -4596,6 +4596,10 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         // settle at 255 bakes a frame, against 0 at 1024 a frame in sunset_hill_bakestep5 - the hill gates scored a half-baked sun).
         // By the frames elapsed since the last run, not mFrame % n: a residency clocked by frames (setFrameClock) skips frame numbers,
         // and would land on a multiple of n a third as often. Advancing by one, the runs fall on the same frames as the modulo did.
+        // MEASURED with the compute queue (sunevery2, 4K sunset walk, one nsys report, 43 frames an arm, HSTRCloud GPU mean / median
+        // ms): every 4 2.241 / 2.111, every 1 2.265 / 2.101, every 2 2.268 / 2.136, every 16 (sanity) 2.306 / 2.209, every 4 again
+        // 2.385 / 2.242. Spreading the runs beside every frame's query gains nothing; the bursts' cost is under the anchors' 0.14 ms
+        // drift. Left at 4.
         const uint32_t sunElapsed = mFrame - mSunRunFrame;
         if (mSunEvery > 1 && mSunBakesCap > 0 && sunElapsed < mSunEvery)
         {

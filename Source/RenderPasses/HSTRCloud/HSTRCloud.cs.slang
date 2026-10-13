@@ -40,6 +40,18 @@ import Atmosphere;
 #ifndef HSTR_ORDER_PROBE
 #define HSTR_ORDER_PROBE 0 // beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe).
 #endif
+#ifndef HSTR_QUERY_PAIR
+#define HSTR_QUERY_PAIR 0 // beamQueryPair: the dirty query's two lanes a ray march it together (marchBeamLeanPair).
+#endif
+#ifndef HSTR_QUERY_PAIR_CHECK
+#define HSTR_QUERY_PAIR_CHECK 0 // SANITY (beamQueryPairCheck): each paired ray marched again serially and compared (kBeamPairCheck).
+#endif
+static bool gPairSerial = false; ///< beamQueryPairCheck: marchBeamLean takes the serial loop even where HSTR_QUERY_PAIR is set.
+#if HSTR_ORDER_PROBE
+// The query's timing (hstrBeamTailProbe); only here, so no other program carries NVAPI's resource. Needs NVAPI in the build
+// (packman nvapi, FALCOR_HAS_NVAPI): without it GpuTimer returns 0 and the TAIL log lines read 0 (tail1).
+import Utils.Timing.GpuTimer;
+#endif
 #ifndef HSTR_QUERY_COMPACT
 #define HSTR_QUERY_COMPACT 0 // beamQueryCompact: the dirty query only lists the points it would march (marchBeamDirtyListed).
 #endif
@@ -124,6 +136,7 @@ static uint gLayerBlockDenseEdge; ///< ... 7+ sea tiles from the ray's origin (+
 static uint gLayerMissBins[4];    ///< ... by density under 1% / under 1x / over the thin bound, and fading bricks (+ 13 .. 16).
 static uint gLayerMissLevels[4];  ///< ... by brick level 0-1, 2, 3, 4+ (+ 17 .. 20).
 static uint gLayerSplit[16];      ///< kBeamLayerSplit: per layer, visits by what answered; layer 1's after a dense layer 0.
+static uint gLayerWarp[4];        ///< kBeamLayerWarp: waves walking a layer chain, two chains, a lane needing both; lanes needing both.
 static uint gLayerUnitsPass = 0u; ///< 1 in marchBeamDirtyUnits: its lane / paid steps and warps also go to kBeamLayerUnitSteps.
 static bool gLayerPrevTight;
 static uint gLeadSteps;  ///< beamLayerProbe: steps before the ray's first sample with density (kBeamLeadSteps).
@@ -692,6 +705,9 @@ struct HSTRCloudRenderer
     /// no stored step count, [4] sum |stored - actual| and [5] sum actual over the others, [6..17] rays by log2(steps) (1, 2-3, 4-7,
     /// ..., 2048+), [18] rays at least the threshold, [19] rays predicted at least it, [20] both.
     RWStructuredBuffer<uint> hstrBeamOrderProbe;
+    /// beamOrderProbe, the dirty query's timing (DIAGNOSTIC): [0] = (rays recorded, first thread start, last thread end, -), then a
+    /// record per marched ray: (thread start, ray end, steps, thread), GPU global timer (ns, low 32 bits).
+    RWStructuredBuffer<uint4> hstrBeamTailProbe;
     RWStructuredBuffer<uint> hstrBeamDirtyCount;
     RWStructuredBuffer<uint> hstrBeamDirtyArgs;
     /// Per guard block: the first dirty-list slot it was listed in this build, ~0 when not listed (cleared every build). Lets
@@ -6007,6 +6023,8 @@ struct HSTRCloudRenderer
         }
         for (uint k = 0; k < 16; ++k)
             gLayerSplit[k] = 0;
+        for (uint k = 0; k < 4; ++k)
+            gLayerWarp[k] = 0;
         gLayerPrevTight = false;
         gLeadSteps = 0;
         gLeadDone = false;
@@ -6078,6 +6096,15 @@ struct HSTRCloudRenderer
             {
                 uint unused;
                 InterlockedAdd(hstrBeamCounts[(k < 3 ? kBeamLookupProbe : kBeamLockstepProbe - 3) + k], sum, unused);
+            }
+        }
+        for (uint k = 0; k < 4; ++k)
+        {
+            const uint sum = WaveActiveSum(gLayerWarp[k]);
+            if (WaveIsFirstLane())
+            {
+                uint unused;
+                InterlockedAdd(hstrBeamCounts[kBeamLayerWarp + k], sum, unused);
             }
         }
         for (uint k = 0; k < 16; ++k)
@@ -8510,6 +8537,41 @@ struct HSTRCloudRenderer
     /// squared excess 0.020293 on and off), but no faster (4K walk off 6.02 / on 5.94 / off 5.98 / on 5.93 ms): it answered 29% /
     /// 38% of the layers' lookups, mostly the cheap out-of-box ones; the brick walks that end on an empty brick remain.
     /// MEASURED and REMOVED (04675421, cloudLayerCut, wrong image): layer 1 counted empty after its instance and box test.
+    /// leanExtinctionLayered's mask skips (cloudLayerTightSkip 2 / 4), as its unrolled loop takes them: true when the layer's block
+    /// or voxel bit is clear, with exit lowered to that block's / voxel's exit. For the per-lane layer loop (HSTR_SHIP 65536).
+    bool leanLayerSkipped(CutRay ray, float3 v, float tSample, uint layer, uint layerMask, uint voxelMask, float blockExit, inout float exit)
+    {
+        const bool layerEmpty = (layerMask & (1u << layer)) == 0u;
+#if HSTR_LAYER_PROBE
+        gLayerMaskEmpty[layer] += layerEmpty ? 1u : 0u;
+#endif
+        if (params.cloudLayerTightSkip >= 2u && layerEmpty)
+        {
+#if HSTR_LAYER_PROBE
+            ++gLayerSplit[layer * 7u];
+#endif
+            exit = min(exit, blockExit);
+            return true;
+        }
+        if (params.cloudLayerTightSkip >= 4u && (voxelMask & (1u << layer)) == 0u)
+        {
+#if HSTR_LAYER_PROBE
+            ++gLayerSplit[layer * 7u + 1u];
+#endif
+            const float3 s = seaVoxel(v);
+            const float3 lo = floor(s + 0.5f) - 0.5f;
+            const float3 dv = ray.direction * float(params.hstrCellWidth);
+            float leave = 1e30f;
+            [unroll]
+            for (uint a = 0; a < 3; ++a)
+                if (abs(dv[a]) > 1e-12f)
+                    leave = min(leave, ((dv[a] > 0.f ? lo[a] + 1.f : lo[a]) - s[a]) / dv[a]);
+            exit = min(exit, tSample + max(leave, 0.f));
+            return true;
+        }
+        return false;
+    }
+
     float leanExtinctionLayered(CutRay ray, float3 v, float footprint, float tSample, float proxy, inout float fineVoxels, out LeanHit hit,
                                 out float skipTo)
     {
@@ -8649,6 +8711,52 @@ struct HSTRCloudRenderer
             return 0.f;
         }
 #endif
+#if HSTR_LAYER_PROBE
+        {
+            // ORACLE (kBeamLayerWarp): which layers' lookup chains this sample walks (past the mask skips), and per wave whether the
+            // unrolled loop below walks two chains one after the other (some lanes need layer 0, some layer 1) and whether any lane
+            // needs both. Waves walking two chains with no lane needing both are what a per-lane layer loop (HSTR_SHIP 65536)
+            // walks once.
+            const uint tight = params.cloudLayerTightSkip;
+            const bool walk0 = params.cloudLayers > 0u && !(tight >= 2u && (layerMask & 1u) == 0u) && !(tight >= 4u && (voxelMask & 1u) == 0u);
+            const bool walk1 = params.cloudLayers > 1u && !(tight >= 2u && (layerMask & 2u) == 0u) && !(tight >= 4u && (voxelMask & 2u) == 0u);
+            const bool anyWalk = WaveActiveAnyTrue(walk0 || walk1);
+            const bool twoChains = WaveActiveAnyTrue(walk0) && WaveActiveAnyTrue(walk1);
+            const bool someBoth = WaveActiveAnyTrue(walk0 && walk1);
+            if (WaveIsFirstLane())
+            {
+                gLayerWarp[0] += anyWalk ? 1u : 0u;
+                gLayerWarp[1] += twoChains ? 1u : 0u;
+                gLayerWarp[2] += someBoth ? 1u : 0u;
+            }
+            gLayerWarp[3] += walk0 && walk1 ? 1u : 0u;
+        }
+#endif
+#if (HSTR_SHIP & 65536) != 0
+        // Per-lane layer loop: the mask skips first, then one loop over each lane's own walked layers in layer order, so lanes
+        // needing only layer 0 and lanes needing only layer 1 walk the lookup chain in the same pass; a second pass only for lanes
+        // needing both. Exact: each lane visits its layers in the unrolled loop's order (density sum, densest hit, exit, early
+        // proxy returns unchanged).
+        // MEASURED (4K sunset walk): layerloop1 probe (kBeamLayerWarp, per frame): 87.5k wave calls walk a chain, 23.7k walk both
+        // one after the other, 12.6k with a lane needing both - the loop saves 11.1k of 111k chain passes (10%). layerloop3 (six
+        // round-robin profiles, 16 frames each): query 0.716 / 0.709 -> 0.681, units 0.781 / 0.781 -> 0.768 ms (ship / ship
+        // again -> loop). lanept1 (path trace, 960 wide): excess 0.024305, p99 0.4871, p99.9 0.6889 in ship, loop and ship again
+        // to the last digit; sanity tol 10 0.025822 / 0.5793. Shipped (launchers' beamShipMask).
+        uint walkMask = 0u;
+        [unroll]
+        for (uint skipLayer = 0; skipLayer < kCloudSeaLayers; ++skipLayer)
+        {
+            if (skipLayer >= params.cloudLayers)
+                break;
+            if (!leanLayerSkipped(ray, v, tSample, skipLayer, layerMask, voxelMask, blockExit, exit))
+                walkMask |= 1u << skipLayer;
+        }
+        [loop]
+        while (walkMask != 0u)
+        {
+            const uint layer = firstbitlow(walkMask);
+            walkMask &= walkMask - 1u;
+#else
         [unroll]
         for (uint layer = 0; layer < kCloudSeaLayers; ++layer)
         {
@@ -8682,6 +8790,7 @@ struct HSTRCloudRenderer
                 exit = min(exit, tSample + max(leave, 0.f));
                 continue;
             }
+#endif
 #if HSTR_LAYER_ORACLE != 0
             // ORACLE (cloudLayerOracle), timing only: the layer answered by the world proxy this sample already read, as one read of
             // a merged world-space structure would answer it - no instance, box or brick chain.
@@ -9212,6 +9321,163 @@ struct HSTRCloudRenderer
     /// from the page, before the empty-cell test, and the brick record only decoded it - one dependent round trip off every
     /// density sample. Walk 1.88 / 1.85 -> 1.98 ms, sprint 2.06 / 2.06 -> 2.16. The texel held live across the cell test and the
     /// wasted fetches of empty samples cost more than the latency saved: the chain is occupancy-bound, not latency-bound.
+#if HSTR_QUERY_PAIR
+    /// marchBeamLean's step length at t, as its loop sizes it.
+    float leanStepLength(CutRay ray, float t, float majorant, float fineVoxels, float transmittance, float unitsPerVoxel, float end)
+    {
+        const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+        const float stepVoxels =
+            clamp(params.stepOpticalDepth / max(1e-6f, majorant * ray.worldLength * unitsPerVoxel), minimumStep, params.maxStepVoxels);
+#if (HSTR_SHIP & (16384 | 32768)) != 0
+        const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
+        return min(boost * stepVoxels * unitsPerVoxel, end - t);
+#else
+        return min(stepVoxels * unitsPerVoxel, end - t);
+#endif
+    }
+
+    /// beamQueryPair (HSTR_QUERY_PAIR, the dirty query only, two lanes a ray: lane ^ 1): marchBeamLean with the ray's two lanes
+    /// stepping together. Each iteration lane 0 takes the step at t and lane 1 the step after it; their lookups and lighting run
+    /// at once, then both read each other's sample (WaveReadLaneAt) and composite them in order, so both hold the same t,
+    /// transmittance and sums. Lane 1's sample is dropped where the serial march would not take it next: lane 0's skip passing it,
+    /// lane 0 closing the ray, or the step cap. Why: the query is latency-bound with occupancy to spare (nvtail2: ~450 waves, ~8 an
+    /// SM, a wave's every step ~9 us whether the GPU is busy or idle), so a second lane halves the serial chain where the units'
+    /// occupancy-bound march could not (leanbatch1's steps in flight in one thread doubled registers and lost).
+    /// Exact: lane 1 sizes its step from the state before lane 0's sample, and its sample is kept only where the step the serial
+    /// march would size after it is the same; otherwise the next iteration takes that step. Rim taps and the centroid oracle are
+    /// not taken (beamRimTaps 1 ships).
+    /// MEASURED (4K sunset walk, round-robin profiles, ms): first form, lane 1 always kept, its step sized from the state before
+    /// lane 0's sample (pair1): query 0.656 / 0.666 -> 0.568, units 0.744 / 0.753 -> 0.774 (its differing values fail more of
+    /// the serial units' tests). Exact form (pair3, rounds 1-3): query 0.706 / 0.697 -> 0.626, units 0.788 / 0.797 -> 0.790.
+    /// pair2's per-arm counters (unverified 1,841 / 982 -> 2,700) are the path's stretch, not the pair: pair3 counted ship 2,700.
+    /// paircheck1 (beamQueryPairCheck, per frame): 22,013 paired rays marched again serially - steps differ on 0.2, values differ
+    /// in some bit on 54% (contraction / rounding order), beyond 1e-5 of max(|v|, 1e-3) on 5.3%. pairq1 (motion score 2): over
+    /// 0.02 ship 3.532% / pair 3.600% / ship again 5.554%, p99.9 0.344 in all three. Shipped (launchers: beamDirtySegments 2,
+    /// beamQueryPair). Four lanes a ray did not fit (segnow1: plain slices 4 0.703 against ship 0.677 / 0.655).
+    void marchBeamLeanPair(CutRay ray, float2 segment, bool withSource, bool residual, inout float3 radiance, inout float3 residualRadiance,
+                           inout float transmittance, inout uint steps, inout float opacityDistance, uint maxSteps)
+    {
+        const float cellWidth = float(params.hstrCellWidth);
+        const float voxelsPerUnit = length(ray.direction) * cellWidth;
+        if (voxelsPerUnit <= 1e-6f)
+            return;
+        const float unitsPerVoxel = 1.f / voxelsPerUnit;
+        const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
+        const uint partner = WaveGetLaneIndex() ^ 1u;
+        const bool second = (WaveGetLaneIndex() & 1u) != 0u;
+        float fineVoxels = 1.f;
+        float t = segment.x;
+        [loop]
+        while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
+        {
+            // Lane 0's step; lane 1 needs its length to place its own step after it.
+            const float majorant0 = majorantAt((ray.position + t * ray.direction) * cellWidth);
+            const float dt0 = leanStepLength(ray, t, majorant0, fineVoxels, transmittance, unitsPerVoxel, segment.y);
+            const float t1 = t + dt0;
+            float myT = t, myDt = dt0, myMajorant = majorant0;
+            bool valid = true;
+            if (second)
+            {
+                myT = t1;
+                valid = t1 < segment.y && steps + 1u < maxSteps;
+                myMajorant = valid ? majorantAt((ray.position + t1 * ray.direction) * cellWidth) : 0.f;
+                myDt = valid ? leanStepLength(ray, t1, myMajorant, fineVoxels, transmittance, unitsPerVoxel, segment.y) : 0.f;
+            }
+            // This lane's sample: its alpha and its lighting and distance before the serial march's T * alpha weight (applied in
+            // that order, so the sums round as the serial march's do).
+            float alpha = 0.f;
+            float myNext = myT + myDt;
+            float myFine = fineVoxels;
+            float3 light = 0.f, residualLight = 0.f;
+            float distance = 0.f;
+            if (valid && myMajorant > 0.f)
+            {
+                const float tSample = myT + 0.5f * myDt;
+                const float3 midpoint = (ray.position + tSample * ray.direction) * cellWidth;
+                const float footprint = rayFootprint(ray, tSample);
+                LeanHit hit;
+                float skipTo;
+                const float sigma = leanExtinction(ray, midpoint, footprint, tSample, myFine, hit, skipTo);
+                alpha = 1.f - exp(-(sigma * myDt * ray.worldLength));
+                if (alpha > 1e-6f)
+                {
+                    if (residual)
+                        residualLight = residualAtDepth(midpoint, leanSunDepth(midpoint, footprint, hit), ray.sunOctaves);
+                    if (withSource)
+#if HSTR_CACHE_VIEW
+                        light = cached ? worldCacheViewRadiance(midpoint) : sourceAtVoxel(midpoint);
+#else
+                        light = cached ? worldCacheRadiance(midpoint, ray.viewDirection) : sourceAtVoxel(midpoint);
+#endif
+                }
+                distance = ray.entryDistance + tSample * ray.worldLength;
+                if (skipTo >= 0.f)
+                    myNext = min(max(myNext, skipTo), segment.y);
+            }
+            else if (valid)
+#if (HSTR_SHIP & 8192) != 0
+                myNext = min(max(myNext, majorantZeroExitFine(ray, myT)), segment.y);
+#else
+                myNext = min(max(myNext, majorantZeroExit(ray, myT)), segment.y);
+#endif
+            // leanExtinction sets fineVoxels from the sample alone (1 on entry); an air step leaves the carried value.
+            const bool touched = valid && myMajorant > 0.f;
+            // Both lanes' samples on both lanes, then composited in order: lane 0's, and lane 1's where the serial march takes it next.
+            const float alphaP = WaveReadLaneAt(alpha, partner);
+            const float nextP = WaveReadLaneAt(myNext, partner);
+            const float fineP = WaveReadLaneAt(myFine, partner);
+            const float3 lightP = WaveReadLaneAt(light, partner);
+            const float3 residualP = WaveReadLaneAt(residualLight, partner);
+            const float distanceP = WaveReadLaneAt(distance, partner);
+            const bool validP = WaveReadLaneAt(valid, partner);
+            const bool touchedP = WaveReadLaneAt(touched, partner);
+            const float majorantP = WaveReadLaneAt(myMajorant, partner);
+            const float dtP = WaveReadLaneAt(myDt, partner);
+            const float alpha0 = second ? alphaP : alpha, alpha1 = second ? alpha : alphaP;
+            const float next0 = second ? nextP : myNext, next1 = second ? myNext : nextP;
+            const bool touched0 = second ? touchedP : touched, touched1 = second ? touched : touchedP;
+            const float fine0 = touched0 ? (second ? fineP : myFine) : fineVoxels;
+            const float fine1 = touched1 ? (second ? myFine : fineP) : fine0;
+            const bool valid1 = second ? valid : validP;
+            const float majorant1 = second ? myMajorant : majorantP, dt1 = second ? myDt : dtP;
+            if (alpha0 > 1e-6f)
+            {
+                radiance += transmittance * alpha0 * (second ? lightP : light);
+                residualRadiance += transmittance * alpha0 * (second ? residualP : residualLight);
+            }
+            opacityDistance += transmittance * alpha0 * (second ? distanceP : distance);
+            transmittance *= 1.f - alpha0;
+#if HSTR_UNIT_START
+            if (gFirstDistance < 0.f && transmittance < 1.f)
+                gFirstDistance = ray.entryDistance + t * ray.worldLength;
+#endif
+            ++steps;
+            t = next0;
+            fineVoxels = fine0;
+            // Lane 1 sized its step from the state before lane 0's sample; the serial march sizes it from the state after. Taken only
+            // where the two agree (lane 0 empty, or the transmittance boost at its cap), so the result is the serial march's.
+            const bool sameStep = leanStepLength(ray, t1, majorant1, fine0, transmittance, unitsPerVoxel, segment.y) == dt1;
+            if (valid1 && next0 <= t1 && transmittance > params.cloudMinTransmittance && sameStep)
+            {
+                if (alpha1 > 1e-6f)
+                {
+                    radiance += transmittance * alpha1 * (second ? light : lightP);
+                    residualRadiance += transmittance * alpha1 * (second ? residualLight : residualP);
+                }
+                opacityDistance += transmittance * alpha1 * (second ? distance : distanceP);
+                transmittance *= 1.f - alpha1;
+#if HSTR_UNIT_START
+                if (gFirstDistance < 0.f && transmittance < 1.f)
+                    gFirstDistance = ray.entryDistance + t1 * ray.worldLength;
+#endif
+                ++steps;
+                t = next1;
+                fineVoxels = fine1;
+            }
+        }
+    }
+#endif
+
 #if HSTR_FORM_R != 0
     /// formR: the nearest hull face of any instance on hullRay past from (ray parameter), 1e30 if none; front: entering a hull.
     float hullNextFace(RayDesc hullRay, float from, out bool front)
@@ -9304,6 +9570,13 @@ struct HSTRCloudRenderer
         const uint maxSteps = HSTR_STRIP == 2 ? 1u
                               : gQueryMarch && params.beamQueryStepCap != 0 ? min(params.maxMarchSteps, params.beamQueryStepCap)
                                                                             : params.maxMarchSteps;
+#if HSTR_QUERY_PAIR
+        if (!gPairSerial)
+        {
+            marchBeamLeanPair(ray, segment, withSource, residual, radiance, residualRadiance, transmittance, steps, opacityDistance, maxSteps);
+            return;
+        }
+#endif
 #if HSTR_FORM_B >= 2
         for (uint k = 0; k < kFormBProbeSlots; ++k)
             gFormBCount[k] = 0u;
@@ -16145,12 +16418,39 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     else if (shadowCarried)
         gHSTRCloud.beamShadowCertify(gHSTRCloud.beamGuardCell(position));
 #else
+#if HSTR_ORDER_PROBE
+    // The query's anatomy: when each marched ray's thread started and its ray ended, against the dispatch's first start and last end.
+    const uint tailStart = GpuTimer::getCurrentTimePoint();
+    {
+        const uint first = WaveActiveMin(tailStart);
+        if (WaveIsFirstLane())
+            InterlockedMin(gHSTRCloud.hstrBeamTailProbe[0].y, first);
+    }
+#endif
     if (!march)
+    {
+#if HSTR_ORDER_PROBE
+        const uint last = WaveActiveMax(GpuTimer::getCurrentTimePoint());
+        if (WaveIsFirstLane())
+            InterlockedMax(gHSTRCloud.hstrBeamTailProbe[0].z, last);
+#endif
         return;
+    }
     // DIAGNOSTIC (beamQueryKnock 1, wrong image, read for time): the ray is not marched; everything around it runs.
     BeamSample ray = {};
     if (gHSTRCloud.params.beamQueryKnock == 0u)
         ray = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+#if HSTR_ORDER_PROBE
+    {
+        const uint tailEnd = GpuTimer::getCurrentTimePoint();
+        uint slot, capacity, stride;
+        InterlockedAdd(gHSTRCloud.hstrBeamTailProbe[0].x, 1u, slot);
+        gHSTRCloud.hstrBeamTailProbe.GetDimensions(capacity, stride);
+        if (slot + 1u < capacity)
+            gHSTRCloud.hstrBeamTailProbe[slot + 1u] = uint4(tailStart, tailEnd, uint(ray.steps), thread);
+        InterlockedMax(gHSTRCloud.hstrBeamTailProbe[0].z, tailEnd);
+    }
+#endif
 #if HSTR_STRIP != 0
     gHSTRCloud.beamStripSink(ray);
     return;
@@ -16200,6 +16500,49 @@ void buildBeamDirtyQueries(uint3 groupId: SV_GroupID, uint3 groupThreadId: SV_Gr
     const bool march = packed != 0xFFFFFFFFu;
     const uint2 position = uint2(packed & 0xFFFFu, packed >> 16);
     BeamSample sample = {};
+#if HSTR_QUERY_PAIR
+    // beamQueryPair (beamDirtySegments 2): both lanes march the whole ray together (marchBeamLeanPair) and end holding the same
+    // result; the lead writes it as the one-thread query does.
+    if (march)
+        sample = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+    if (!march || slice != 0)
+        return;
+#if HSTR_QUERY_PAIR_CHECK
+    {
+        // SANITY: the same ray marched serially by the lead alone - rays checked, steps differing, any value differing beyond 1e-5
+        // relative, any value differing at all.
+#if HSTR_UNIT_START
+        const float pairFirst = gFirstDistance;
+#endif
+        gPairSerial = true;
+        const BeamSample serial = gHSTRCloud.marchBeam(gHSTRCloud.beamRayDirection(float2(position)), float2(0.f, 1.f));
+        gPairSerial = false;
+#if HSTR_UNIT_START
+        gFirstDistance = pairFirst;
+#endif
+        const float a[8] = {sample.depth, sample.cache.x, sample.cache.y, sample.cache.z, sample.single.x, sample.single.y, sample.single.z,
+                            sample.distance};
+        const float b[8] = {serial.depth, serial.cache.x, serial.cache.y, serial.cache.z, serial.single.x, serial.single.y, serial.single.z,
+                            serial.distance};
+        bool far = false, any = false;
+        [unroll]
+        for (uint k = 0; k < 8; ++k)
+        {
+            far = far || abs(a[k] - b[k]) > 1e-5f * max(abs(b[k]), 1e-3f);
+            any = any || asuint(a[k]) != asuint(b[k]);
+        }
+        uint unused;
+        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamPairCheck], 1u, unused);
+        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamPairCheck + 1u], sample.steps != serial.steps ? 1u : 0u, unused);
+        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamPairCheck + 2u], far ? 1u : 0u, unused);
+        InterlockedAdd(gHSTRCloud.hstrBeamCounts[kBeamPairCheck + 3u], any ? 1u : 0u, unused);
+    }
+#endif
+    if (!(1.f - exp(-sample.depth) > 1e-4f))
+        sample.distance = 0.f;
+    gHSTRCloud.beamQueryMarched(position, sample);
+    return;
+#endif
     if (march)
         sample = gHSTRCloud.marchBeam(
             gHSTRCloud.beamRayDirection(float2(position)), float2(float(slice), float(slice + 1)) / float(segments)
@@ -16587,7 +16930,7 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
                 continue;
             }
         }
-#if HSTR_FUSED_TILES_ONLY
+#if HSTR_FUSED_TILES_ONLY && !HSTR_FUSED_UNITS
         // The rays are the separate query's, another dispatch still running: until every tile item is claimed, a wave waits for
         // blocks to finish rather than leaving. It waits only on query waves already running - the query's groups all launch
         // before any of this dispatch's. Every unit is the units pass's.
@@ -16660,6 +17003,22 @@ void runBeamDirtyFused(uint3 groupThreadId: SV_GroupThreadID)
         // lines slowed the waves still working to a crawl, the last tile items taking longer than 20k polls. Whatever is claimable
         // later - the tiles of blocks whose rays are still being marched, units still being listed - is claimed by the waves that
         // make it claimable, which are still running and loop back here.
+#if HSTR_FUSED_TILES_ONLY
+        // beamFusedOverlapUnits: the blocks still unfinished are the separate query's, whose waves never loop back here. Until
+        // every tile item is claimed a wave waits for them (as the tiles-only form does) instead of leaving, marching the units
+        // their tests list in the query's tail.
+        if (WaveReadLaneFirst(gFusedState[kFusedItemNext]) < items)
+        {
+            if (idle >= kFusedWaitLimit)
+            {
+                if (WaveIsFirstLane())
+                    gHSTRCloud.fusedGiveUp(8u, uint4(WaveReadLaneFirst(gFusedState[kFusedBlocksReserved]), blocks, 0, 0), uint4(0, 0, 0, 0));
+                break;
+            }
+            sink += fusedBackoff(idle++);
+            continue;
+        }
+#endif
         break;
     }
     // Never true; keeps the backoff's arithmetic from being optimised away.

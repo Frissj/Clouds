@@ -54,8 +54,13 @@ g.addPass(createPass("HSTRCloud", {
     # cacheviewpt2; numbers beside worldCacheView). An explicit approximation (the cell centre's view direction), owner-approved.
     "worldCacheView": True,
     # The shipping switch mask (11773) with transmittance-scaled steps (bit 32768: behind transmittance T a step grows by up to
-    # 1 / sqrt(T), 4x at most): walk 4.14 -> 3.91 ms at 0.425 -> 0.513% (budgetstep1).
-    "beamShipMask": 11773 | 32768,
+    # 1 / sqrt(T), 4x at most): walk 4.14 -> 3.91 ms at 0.425 -> 0.513% (budgetstep1). Bit 65536: the per-lane layer loop
+    # (leanExtinctionLayered), exact (lanept1); query 0.716 / 0.709 -> 0.681, units 0.781 / 0.781 -> 0.768 ms (layerloop3).
+    "beamShipMask": 11773 | 32768 | 65536,
+    # The dirty query's two threads a ray march it together, two steps an iteration (marchBeamLeanPair; same steps as the serial
+    # march, paircheck1): query 0.706 / 0.697 -> 0.626 ms, units unchanged (pair3); motion over 0.02 3.53 / 5.55 -> 3.60% (pairq1).
+    "beamDirtySegments": 2,
+    "beamQueryPair": True,
     # Per-layer occupancy at majorant-block scale (hstrDomainLayers, from the domain build's conservative maxima widened by the
     # coarsest brick level's reach): a sample in a block with no layer skips to the end of the run of such blocks (up to 8), and a
     # layer without its bit is skipped without its lookup. 4K sunset walk, units + query ms, two pairs in one launch (tight16): off

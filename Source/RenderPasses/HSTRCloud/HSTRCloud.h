@@ -327,6 +327,10 @@ private:
     /// count the same rays), so packing has nothing to pack. Quality (compact1, SCORE 2): 5.73 / 5.56% vs base 5.49 / 5.34 / 6.16%,
     /// knock sanity 53.9%. No gain; off.
     bool mBeamQueryCompact = false;
+    /// With beamDirtySegments 2: the dirty query's two threads a ray march the whole ray together, two steps an iteration
+    /// (HSTR_QUERY_PAIR, marchBeamLeanPair), instead of a half each.
+    bool mBeamQueryPair = false;
+    bool mBeamQueryPairCheck = false; ///< SANITY: each paired ray also marched serially and compared (kBeamPairCheck).
     LazyComputePass mpBeamDirtyListedPass;
     ref<Buffer> mpBeamQueue;
     ref<Buffer> mpBeamQueueCounts;
@@ -525,6 +529,8 @@ private:
     bool mBeamGuardCleared = false; ///< The guard holds no claim about any block until a build clears it.
     ref<Buffer> mpBeamDirty;        ///< Blocks whose certificate failed, compacted; sized to hold every block, so it cannot overflow.
     ref<Buffer> mpBeamOrderProbe;   ///< beamOrderProbe: the dirty query's step counters (hstrBeamOrderProbe), 21 uints.
+    ref<Buffer> mpBeamTailProbe;    ///< beamOrderProbe: the dirty query's per-ray timing (hstrBeamTailProbe).
+    uint32_t mBeamTailBuilds = 0;   ///< beamOrderProbe: dirty builds since the probe went on; every 10th is summarised in the log.
     /// beamDirtyFused: the query, tile test, rebuild, warp field and the units there is time for in one persistent dispatch
     /// (runBeamDirtyFused). Its claim counters, per-block ray counts and finished-block queue, and per-tile reader counts.
     bool mBeamDirtyFused = false;
@@ -537,6 +543,14 @@ private:
     /// With beamDirtyFused: the separate dirty query (its own 96 registers) counts finished blocks, and runBeamDirtyFused, compiled
     /// without its ray loop, tests their tiles in a dispatch right behind it with no barrier between - filling the query's tail.
     bool mBeamFusedOverlap = false;
+    /// With beamFusedOverlap: the dispatch behind the query also marches the units its tile tests list (HSTR_FUSED_UNITS), so the
+    /// unit march, not only the small tile test, fills the query's idle tail; the units it does not take are the units pass's.
+    /// MEASURED (ovunits2, 4K sunset walk, one launch, profiled frame GPU ms): ship 3.44, overlap + units 3.86, overlap tiles only
+    /// 3.28, ship again 3.11. The kernel took about half the units (units pass 0.93 -> 0.44 ms) and costs more than it saves. Off.
+    /// Where (ovtrace1, Nsight GPU trace frames 60-61): the fused range (query + this kernel + rebuild + warp field) 2.29-2.37 ms
+    /// at 10-16 warps a cycle, units pass after it 0.43-0.86 - the persistent tile test (0.69 ms with every item ready, overlap2,
+    /// against the owner-rule tile pass's ~0.085) and its waits cost more than the ~0.3 ms tail it fills.
+    bool mBeamFusedOverlapUnits = false;
     /// With beamDirtyFused: the separate dirty query tests the tiles of its own wave's blocks once past its march, through the
     /// fused chain's per-tile reader join - no queue, no consumer, no dirty tile pass (HSTR_DIRTY_OVERLAP 2). MEASURED and off
     /// (inline1/2, 4K, tiles/units/errors identical): walk 1.91 -> 2.12, jog 2.41 -> 2.75, sprint 2.33 -> 2.54 ms. At sprint the
@@ -1092,6 +1106,8 @@ private:
     void bakeScheduledSun(RenderContext* pRenderContext, ComputeContext* pContext);
     /// cloudSunBeside's deferred run: its stamps (unless they ran beside the dirty query), scan to assign and bakes, at the frame's end.
     void finishDeferredSun(RenderContext* pRenderContext);
+    /// DIAGNOSTIC (beamOrderProbe): logs the last dirty query's anatomy from hstrBeamTailProbe (a blocking read).
+    void logBeamTail();
     /// asyncProbe: dispatched right after the dirty query (dispatchAsyncProbe); mode 1's main-queue wait at the frame's end
     /// (finishAsyncProbe).
     void dispatchAsyncProbe(RenderContext* pRenderContext);
