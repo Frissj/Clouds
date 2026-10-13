@@ -162,6 +162,11 @@ public:
     void invalidateViews() const;
 
     /**
+     * Counts invalidateViews calls: a view recorded under an older epoch may no longer be the resource's current view.
+     */
+    uint32_t getViewEpoch() const { return mViewEpoch; }
+
+    /**
      * Set the resource name
      */
     void setName(const std::string& name);
@@ -207,6 +212,7 @@ protected:
     size_t mSize = 0; ///< Size of the resource in bytes.
     std::string mName;
     mutable SharedResourceApiHandle mSharedApiHandle = 0;
+    mutable uint32_t mViewEpoch = 0;
 
     mutable std::unordered_map<ResourceViewInfo, ref<ShaderResourceView>, ViewInfoHashFunc> mSrvs;
     mutable std::unordered_map<ResourceViewInfo, ref<RenderTargetView>, ViewInfoHashFunc> mRtvs;

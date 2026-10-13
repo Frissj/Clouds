@@ -1893,7 +1893,10 @@ namespace Falcor
         mUpdates |= updateEnvMap(false);
         mUpdates |= updateGeometry(pRenderContext, false);
         mUpdates |= updateSDFGrids(pRenderContext);
-        pRenderContext->submit();
+        // Only when something was recorded: an empty submit still signals, a kernel call every frame (cpusamp5: Scene::update's
+        // submit was ~13% of an HSTRCloud walk frame thread's samples).
+        if (pRenderContext->hasPendingCommands())
+            pRenderContext->submit();
 
         if (is_set(mUpdates, IScene::UpdateFlags::GeometryMoved))
         {

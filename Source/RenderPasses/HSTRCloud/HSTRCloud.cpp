@@ -2344,6 +2344,17 @@ Properties HSTRCloud::getProperties() const
         cloud["gpuVisApplied"] = stats.gpuVisApplied;
         cloud["gpuVisBatches"] = stats.gpuVisBatches;
         cloud["gpuVisDropped"] = stats.gpuVisDropped;
+        {
+            const DispatchTiming& timing = getDispatchTiming();
+            cloud["dispatchCount"] = timing.count;
+            cloud["dispatchPrepareCycles"] = timing.prepare;
+            cloud["dispatchPipelineCycles"] = timing.pipeline;
+            cloud["dispatchBindCycles"] = timing.bind;
+            cloud["dispatchCycles"] = timing.dispatch;
+            cloud["bindSceneCycles"] = mBindSceneCycles;
+            cloud["bindParamsCycles"] = mBindParamsCycles;
+            cloud["bindFieldsCycles"] = mBindFieldsCycles;
+        }
         cloud["cutVisAsyncRuns"] = mCutVisAsyncRuns;
         cloud["cutVisMainRuns"] = mCutVisMainRuns;
         cloud["cutVisDeferred"] = mCutVisDeferred;
@@ -2481,6 +2492,8 @@ Properties HSTRCloud::getProperties() const
         cloud["sunSlotsFree"] = stats.sunSlotsFree;
         cloud["sunStale"] = stats.sunStale;
         cloud["sunBakesFrame"] = stats.sunBakesFrame;
+        cloud["sunRuns"] = stats.sunRuns;
+        cloud["sunIdleFrames"] = stats.sunIdleFrames;
         cloud["maps"] = stats.maps;
         // Cumulative sun page work (the harness diffs them over a flight): tiles re-sunned, tiles whose cloud changed (each
         // re-suns itself and the tiles it shadows), and tiles the sun-move queue released.
@@ -5720,7 +5733,8 @@ void HSTRCloud::beginAsyncResidency(RenderContext* pRenderContext)
         nameQueue(mpResidencyQueue.get(), L"HSTR residency COMPUTE queue");
         nameQueue(pRenderContext->getLowLevelData()->getGfxCommandQueue(), L"Falcor main DIRECT queue");
         mpResidencyFence = mpDevice->createFence();
-        mpMainFence = mpDevice->createFence();
+        // The main context's own fence: every submit already signals it, so the compute queue's wait needs no Signal of its own.
+        mpMainFence = pRenderContext->getLowLevelData()->getFence();
         logInfo("HSTRCloud: asyncResidency compute queue created.");
     }
     // The next heap of the ring (as Device::endFrame rotates the main context's): reset once its last frame has finished.
@@ -5735,7 +5749,7 @@ void HSTRCloud::beginAsyncResidency(RenderContext* pRenderContext)
     // a serial one waited only for the last async frame's value, and its decode wrote residency.Residuals while the serial frame's
     // decode was still in flight on the main queue (D3D12 1047, frame 621).
     if (!mAsyncResidencyLastFrame)
-        mMainFenceValue = pRenderContext->signal(mpMainFence.get());
+        mMainFenceValue = mpMainFence->getSignaledValue();
     mAsyncResidencyLastFrame = true;
     mpResidencyContext->wait(mpMainFence.get(), mMainFenceValue);
     mpCloudResidency->setAsyncContext(mpResidencyContext.get());
@@ -5749,7 +5763,7 @@ void HSTRCloud::submitAsyncResidency(RenderContext* pRenderContext)
     // submitted at once; work submitted earlier runs on an idle GPU and overlaps nothing, qtrace_compute6).
     const auto submitStart = std::chrono::steady_clock::now(); // DIAGNOSTIC (submitMainUs / submitResidencyUs)
     pRenderContext->submit();
-    mMainFenceValue = pRenderContext->signal(mpMainFence.get());
+    mMainFenceValue = mpMainFence->getSignaledValue(); // The submit's own signal (cpusamp5: a second Signal was a kernel call).
     const auto mainDone = std::chrono::steady_clock::now();
     mSubmitMainUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(mainDone - submitStart).count());
     mpResidencyContext->submit();
@@ -6500,6 +6514,16 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
             ++self.mBindCalls;
         }
     } bindTimer{*this, bindStart};
+    // DIAGNOSTIC: rdtsc cycles of the scene's bind, the params blob and the fields (bindSceneCycles / bindParamsCycles /
+    // bindFieldsCycles).
+    struct FieldsTimer
+    {
+        uint64_t& sink;
+        uint64_t start = __rdtsc();
+        ~FieldsTimer() { sink += __rdtsc() - start; }
+    };
+    std::optional<FieldsTimer> fieldsTimer;
+    const uint64_t sceneStart = __rdtsc();
     // The scene's TLAS and camera go into its (shared) block once a frame, not on every bind: nothing in them changes within a frame.
     if (mSceneBoundFrame != mExecuteFrames)
     {
@@ -6524,7 +6548,15 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
         cacheIt = mBindCache.end();
     }
     if (cacheIt == mBindCache.end())
-        cacheIt = mBindCache.emplace(pPass.get(), BindCache{pPass->getVars(), pPass->getRootVar()["CB"]["gHSTRCloud"], {}}).first;
+    {
+        const ShaderVar root = pPass->getRootVar();
+        cacheIt = mBindCache
+                      .emplace(
+                          pPass.get(),
+                          BindCache{pPass->getVars(), root["CB"]["gHSTRCloud"], {}, root["gFusedState"], root["gFusedBlocks"], root["gFusedTiles"]}
+                      )
+                      .first;
+    }
     BindCache& cache = cacheIt->second;
     struct CachedFields
     {
@@ -6551,7 +6583,12 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
                 sizeof(mParams), shaderMatrix, hostMatrix
             );
     }
+    const uint64_t paramsStart = __rdtsc();
+    mBindSceneCycles += paramsStart - sceneStart;
     var["params"].setBlob(mParams);
+    const uint64_t fieldsStart = __rdtsc();
+    mBindParamsCycles += fieldsStart - paramsStart;
+    fieldsTimer.emplace(FieldsTimer{mBindFieldsCycles, fieldsStart});
     var["hstrRadiance"] = mpLeafRadiance;
     var["hstrLeafResidualBounds"] = mpLeafResidualBounds;
     var["hstrCutNodes"] = mpCutNodes;
@@ -6732,9 +6769,9 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamDirtyMark"] = mpBeamDirtyMark;
     var["hstrBeamDirtyUnits"] = mpBeamDirtyUnits;
     // Globals, not block fields, so that they keep globallycoherent (see gFusedState).
-    pPass->getRootVar()["gFusedState"] = mpBeamFusedState;
-    pPass->getRootVar()["gFusedBlocks"] = mpBeamFusedBlocks;
-    pPass->getRootVar()["gFusedTiles"] = mpBeamFusedTiles;
+    cache.fusedState = mpBeamFusedState;
+    cache.fusedBlocks = mpBeamFusedBlocks;
+    cache.fusedTiles = mpBeamFusedTiles;
     var["hstrBeamCoarse"] = mpBeamCoarse;
     var["hstrBeamCoarseState"] = mpBeamCoarseState;
     var["hstrBeamDescend"] = mpBeamDescend;

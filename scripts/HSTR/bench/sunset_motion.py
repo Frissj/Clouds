@@ -423,6 +423,9 @@ for speed in speeds:
                                                                       "cutVisitsTotal", "cutRefreshesTotal", "cutRaysTotal",
                                                                       "gpuVisRequests", "gpuVisApplied", "gpuVisBatches", "gpuVisDropped",
                                                                       "cutVisAsyncRuns", "cutVisMainRuns", "cutVisDeferred",
+                                                                      "dispatchCount", "dispatchPrepareCycles", "dispatchPipelineCycles",
+                                                                      "dispatchBindCycles", "dispatchCycles", "bindCpuMs", "executeFrames",
+                                                                      "bindSceneCycles", "bindParamsCycles", "bindFieldsCycles", "bindCalls",
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
                                                                       "scatterJobs", "scatterChecks", "scatterMismatches",
@@ -445,6 +448,17 @@ for speed in speeds:
                   f"{d.get('cutThresholdTrims')} underfilled {d.get('cutUnderfilled')} check {d.get('cutCheckMismatches')} of "
                   f"{d.get('cutCheckBricks')}; upload {float(d.get('uploadBytes') or 0) / 1e6:.1f} MB in {d.get('uploadRuns')} runs + "
                   f"{d.get('scatterJobs')} scatters, checks {d.get('scatterChecks')} mismatches {d.get('scatterMismatches')}", flush=True)
+            # Dispatch recording on the CPU (Falcor's DispatchTiming, rdtsc ~2.5 GHz on this rig): per frame and per dispatch.
+            frames = max(float(d.get("executeFrames") or 0), 1.0)
+            n = max(float(d.get("dispatchCount") or 0), 1.0)
+            stages = {s: float(d.get(f"dispatch{s}Cycles") or 0) for s in ("Prepare", "Pipeline", "Bind", "")}
+            print(f"MOTION {tag} chunk {cycle} {name} recording: {n / frames:.0f} dispatches a frame, k cycles each: prepare "
+                  f"{stages['Prepare'] / n / 1e3:.1f} pipeline {stages['Pipeline'] / n / 1e3:.1f} bind {stages['Bind'] / n / 1e3:.1f} "
+                  f"dispatch {stages[''] / n / 1e3:.1f}; M cycles a frame {sum(stages.values()) / frames / 1e6:.2f}; bindRenderer "
+                  f"{float(d.get('bindCpuMs') or 0) / frames:.3f} ms a frame in {float(d.get('bindCalls') or 0) / frames:.1f} calls, k cycles "
+                  f"a call: scene {float(d.get('bindSceneCycles') or 0) / max(float(d.get('bindCalls') or 0), 1) / 1e3:.1f} params "
+                  f"{float(d.get('bindParamsCycles') or 0) / max(float(d.get('bindCalls') or 0), 1) / 1e3:.1f} fields "
+                  f"{float(d.get('bindFieldsCycles') or 0) / max(float(d.get('bindCalls') or 0), 1) / 1e3:.1f}", flush=True)
             if COUNT:
                 arm_dirty[name] += counted(COUNT, speed)
             if SCORE:

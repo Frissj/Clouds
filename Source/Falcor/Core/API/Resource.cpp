@@ -119,6 +119,7 @@ void Resource::invalidateViews() const
     invalidateAll(mUavs);
     invalidateAll(mRtvs);
     invalidateAll(mDsvs);
+    ++mViewEpoch;
 }
 
 void Resource::setName(const std::string& name)

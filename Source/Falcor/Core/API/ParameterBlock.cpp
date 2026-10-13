@@ -227,7 +227,7 @@ void ParameterBlock::prepareResource(CopyContext* pContext, Resource* pResource,
         return;
 
     // If it's a buffer with a UAV counter, insert a UAV barrier
-    const Buffer* pBuffer = pResource->asBuffer().get();
+    const Buffer* pBuffer = pResource->getType() == Resource::Type::Buffer ? static_cast<const Buffer*>(pResource) : nullptr;
     if (isUav && pBuffer && pBuffer->getUAVCounter())
     {
         pContext->resourceBarrier(pBuffer->getUAVCounter().get(), Resource::State::UnorderedAccess);
@@ -484,6 +484,27 @@ bool isBound(const Map& map, const gfx::ShaderOffset& offset, const View& view)
 }
 } // namespace
 
+bool ParameterBlock::isDefaultBound(const gfx::ShaderOffset& offset, const Resource* pResource) const
+{
+    if (offset.bindingArrayIndex != 0 || offset.bindingRangeIndex < 0 || size_t(offset.bindingRangeIndex) >= mDefaultBindings.size())
+        return false;
+    const DefaultBinding& binding = mDefaultBindings[offset.bindingRangeIndex];
+    return binding.valid && binding.pResource == pResource && (!pResource || binding.viewEpoch == pResource->getViewEpoch());
+}
+
+void ParameterBlock::setDefaultBound(const gfx::ShaderOffset& offset, const Resource* pResource, bool valid)
+{
+    if (offset.bindingArrayIndex != 0 || offset.bindingRangeIndex < 0)
+        return;
+    if (size_t(offset.bindingRangeIndex) >= mDefaultBindings.size())
+    {
+        if (!valid)
+            return;
+        mDefaultBindings.resize(offset.bindingRangeIndex + 1);
+    }
+    mDefaultBindings[offset.bindingRangeIndex] = {pResource, pResource ? pResource->getViewEpoch() : 0u, valid};
+}
+
 //
 // Buffer
 //
@@ -496,11 +517,14 @@ void ParameterBlock::setBuffer(std::string_view name, const ref<Buffer>& pBuffer
 void ParameterBlock::setBuffer(const BindLocation& bindLoc, const ref<Buffer>& pBuffer)
 {
     gfx::ShaderOffset gfxOffset = getGFXShaderOffset(bindLoc);
+    if (isDefaultBound(gfxOffset, pBuffer.get()))
+        return;
     if (isUavType(bindLoc.getType()))
     {
         if (pBuffer && !is_set(pBuffer->getBindFlags(), ResourceBindFlags::UnorderedAccess))
             FALCOR_THROW("Trying to bind buffer '{}' created without UnorderedAccess flag as a UAV.", pBuffer->getName());
         auto pUAV = pBuffer ? pBuffer->getUAV() : nullptr;
+        setDefaultBound(gfxOffset, pBuffer.get(), true);
         if (isBound(mUAVs, gfxOffset, pUAV))
             return;
         mpShaderObject->setResource(gfxOffset, pUAV ? pUAV->getGfxResourceView() : nullptr);
@@ -512,6 +536,7 @@ void ParameterBlock::setBuffer(const BindLocation& bindLoc, const ref<Buffer>& p
         if (pBuffer && !is_set(pBuffer->getBindFlags(), ResourceBindFlags::ShaderResource))
             FALCOR_THROW("Trying to bind buffer '{}' created without ShaderResource flag as an SRV.", pBuffer->getName());
         auto pSRV = pBuffer ? pBuffer->getSRV() : nullptr;
+        setDefaultBound(gfxOffset, pBuffer.get(), true);
         if (isBound(mSRVs, gfxOffset, pSRV))
             return;
         mpShaderObject->setResource(gfxOffset, pSRV ? pSRV->getGfxResourceView() : nullptr);
@@ -566,11 +591,14 @@ void ParameterBlock::setTexture(std::string_view name, const ref<Texture>& pText
 void ParameterBlock::setTexture(const BindLocation& bindLocation, const ref<Texture>& pTexture)
 {
     gfx::ShaderOffset gfxOffset = getGFXShaderOffset(bindLocation);
+    if (isDefaultBound(gfxOffset, pTexture.get()))
+        return;
     if (isUavType(bindLocation.getType()))
     {
         if (pTexture && !is_set(pTexture->getBindFlags(), ResourceBindFlags::UnorderedAccess))
             FALCOR_THROW("Trying to bind texture '{}' created without UnorderedAccess flag as a UAV.", pTexture->getName());
         auto pUAV = pTexture ? pTexture->getUAV() : nullptr;
+        setDefaultBound(gfxOffset, pTexture.get(), true);
         if (isBound(mUAVs, gfxOffset, pUAV))
             return;
         mpShaderObject->setResource(gfxOffset, pUAV ? pUAV->getGfxResourceView() : nullptr);
@@ -582,6 +610,7 @@ void ParameterBlock::setTexture(const BindLocation& bindLocation, const ref<Text
         if (pTexture && !is_set(pTexture->getBindFlags(), ResourceBindFlags::ShaderResource))
             FALCOR_THROW("Trying to bind texture '{}' created without ShaderResource flag as an SRV.", pTexture->getName());
         auto pSRV = pTexture ? pTexture->getSRV() : nullptr;
+        setDefaultBound(gfxOffset, pTexture.get(), true);
         if (isBound(mSRVs, gfxOffset, pSRV))
             return;
         mpShaderObject->setResource(gfxOffset, pSRV ? pSRV->getGfxResourceView() : nullptr);
@@ -633,6 +662,7 @@ void ParameterBlock::setSrv(const BindLocation& bindLocation, const ref<ShaderRe
     if (isSrvType(bindLocation.getType()))
     {
         gfx::ShaderOffset gfxOffset = getGFXShaderOffset(bindLocation);
+        setDefaultBound(gfxOffset, nullptr, false);
         mpShaderObject->setResource(gfxOffset, pSrv ? pSrv->getGfxResourceView() : nullptr);
         mSRVs[gfxOffset] = pSrv;
         // Note: The resource view does not hold a strong reference to the resource, so we need to keep it alive here.
@@ -665,6 +695,7 @@ void ParameterBlock::setUav(const BindLocation& bindLocation, const ref<Unordere
     if (isUavType(bindLocation.getType()))
     {
         gfx::ShaderOffset gfxOffset = getGFXShaderOffset(bindLocation);
+        setDefaultBound(gfxOffset, nullptr, false);
         mpShaderObject->setResource(gfxOffset, pUav ? pUav->getGfxResourceView() : nullptr);
         mUAVs[gfxOffset] = pUav;
         // Note: The resource view does not hold a strong reference to the resource, so we need to keep it alive here.
@@ -841,7 +872,7 @@ bool ParameterBlock::prepareDescriptorSets(CopyContext* pCopyContext)
         Resource* pResource = uav.second ? uav.second->getResource() : nullptr;
         if (!pResource)
             continue;
-        const Buffer* pBuffer = pResource->asBuffer().get();
+        const Buffer* pBuffer = pResource->getType() == Resource::Type::Buffer ? static_cast<const Buffer*>(pResource) : nullptr;
         if (pBuffer && pBuffer->getUAVCounter())
         {
             pCopyContext->resourceBarrier(pBuffer->getUAVCounter().get(), Resource::State::UnorderedAccess);

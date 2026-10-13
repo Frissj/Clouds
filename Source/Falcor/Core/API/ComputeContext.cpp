@@ -29,6 +29,7 @@
 #include "GFXAPI.h"
 #include "Core/State/ComputeState.h"
 #include "Core/Program/ProgramVars.h"
+#include <intrin.h>
 
 namespace Falcor
 {
@@ -51,12 +52,30 @@ void ComputeContext::dispatch(ComputeState* pState, ProgramVars* pVars, const ui
 {
     if (mLogBarriers)
         logInfo("DISPATCH {} {}x{}x{}", dispatchEntryName(pState), dispatchSize.x, dispatchSize.y, dispatchSize.z);
+    DispatchTiming& timing = getDispatchTiming();
+    const uint64_t t0 = __rdtsc();
     pVars->prepareDescriptorSets(this);
+    const uint64_t t1 = __rdtsc();
 
     auto computeEncoder = mpLowLevelData->getComputeCommandEncoder();
-    FALCOR_GFX_CALL(computeEncoder->bindPipelineWithRootObject(pState->getCSO(pVars)->getGfxPipelineState(), pVars->getShaderObject()));
+    auto pPipeline = pState->getCSO(pVars)->getGfxPipelineState();
+    const uint64_t t2 = __rdtsc();
+    FALCOR_GFX_CALL(computeEncoder->bindPipelineWithRootObject(pPipeline, pVars->getShaderObject()));
+    const uint64_t t3 = __rdtsc();
     FALCOR_GFX_CALL(computeEncoder->dispatchCompute((int)dispatchSize.x, (int)dispatchSize.y, (int)dispatchSize.z));
+    const uint64_t t4 = __rdtsc();
+    timing.prepare += t1 - t0;
+    timing.pipeline += t2 - t1;
+    timing.bind += t3 - t2;
+    timing.dispatch += t4 - t3;
+    ++timing.count;
     mCommandsPending = true;
+}
+
+DispatchTiming& getDispatchTiming()
+{
+    static DispatchTiming timing;
+    return timing;
 }
 
 void ComputeContext::dispatchIndirect(ComputeState* pState, ProgramVars* pVars, const Buffer* pArgBuffer, uint64_t argBufferOffset)

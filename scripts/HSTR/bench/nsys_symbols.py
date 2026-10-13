@@ -131,3 +131,15 @@ for tid, ids in sorted(ours.items(), key=lambda kv: -len(kv[1]))[:thread_count]:
     print("-- self")
     for f, n in self_count.most_common(rows // 2):
         print(f"{100 * n / len(ids):5.1f}%  {f[:150]}")
+    # HSTR_SYMBOL_CALLERS=name[,name...]: per named function, the share of the thread's samples under it by its symbolised
+    # caller chain (the nearest few named frames above it), e.g. which code paths a submit or a wait comes from.
+    for target in filter(None, os.environ.get("HSTR_SYMBOL_CALLERS", "").split(",")):
+        callers = Counter()
+        for cid in ids:
+            frames = [name_of(p, ip) for p, ip in chains.get(cid, [])]
+            if target in frames:
+                above = [f for f in frames[frames.index(target) + 1:] if "!" not in f and "." not in f.split("::")[-1]][:3]
+                callers[" < ".join(above)] += 1
+        print(f"-- callers of {target}")
+        for f, n in callers.most_common(rows // 2):
+            print(f"{100 * n / len(ids):5.1f}%  {f[:200]}")

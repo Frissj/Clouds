@@ -152,9 +152,12 @@ std::vector<uint8_t> CopyContext::readTextureSubresource(const Texture* pTexture
 
 bool CopyContext::resourceBarrier(const Resource* pResource, Resource::State newState, const ResourceViewInfo* pViewInfo)
 {
-    const Texture* pTexture = dynamic_cast<const Texture*>(pResource);
-    if (pTexture)
+    // Buffer and Texture are the only resources, so the type tag replaces dynamic_cast (an RTTI walk on MSVC): every bound resource
+    // of every dispatch comes through here (prepareDescriptorSets). MEASURED (HSTRCloud 4K sunset walk at 2, ~120 resources a
+    // dispatch, with prepareDescriptorSets' asBuffer() casts; bindfast1 -> bindfast2): prepare 52-73k -> 34-52k cycles a dispatch.
+    if (pResource->getType() != Resource::Type::Buffer)
     {
+        const Texture* pTexture = static_cast<const Texture*>(pResource);
         bool globalBarrier = pTexture->isStateGlobal();
         if (pViewInfo)
         {
@@ -175,8 +178,7 @@ bool CopyContext::resourceBarrier(const Resource* pResource, Resource::State new
     }
     else
     {
-        const Buffer* pBuffer = dynamic_cast<const Buffer*>(pResource);
-        return bufferBarrier(pBuffer, newState);
+        return bufferBarrier(static_cast<const Buffer*>(pResource), newState);
     }
 }
 

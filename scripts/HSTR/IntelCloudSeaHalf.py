@@ -149,6 +149,8 @@ g.addPass(createPass("HSTRCloud", {
     # p99.9 unchanged 0.487 / 0.689, max 0.720 -> 0.722), sanity thin 1.0 0.024740 (+20%, max 0.948), ship again 0.020607.
     # Time (thintime2, 4K sunset walk, query + units ms): ship 1.631 / again 1.686, thin 1.585, thin + 0.02 1.484 (-0.17 against
     # the anchors' mean); motion score 6.4 / 6.1% anchors, 5.8% / 2.4%.
+    # Higher, MEASURED, no gain (2026-10-13): path trace (thinpt1) excess 0.024574 -> 0.1 0.024558 / 0.2 0.024809 (+1.0%) / 0.4
+    # 0.026017 (+5.9%, past the sanity arm's +4.6%); walk (thintime3, arm means) ship 2.95 / 3.11, 0.1 3.04, 0.2 3.03, 0.4 3.47 ms.
     "cloudThinDepth": 0.05,
     "cloudMinTransmittance": 0.02,
     # Sun bakes scheduled on the GPU (read when the residency is created; HSTR_GPU_SUN=0 keeps the CPU scheduler).

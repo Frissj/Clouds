@@ -405,6 +405,21 @@ protected:
     std::map<gfx::ShaderOffset, ref<Resource>> mResources;
     std::map<gfx::ShaderOffset, ref<Sampler>> mSamplers;
     std::map<gfx::ShaderOffset, ref<RtAccelerationStructure>> mAccelerationStructures;
+
+    /// Per binding range (array element 0 only): the resource whose default view setBuffer / setTexture last bound there. A rebind
+    /// of the same resource is then one flat load, not std::map walks plus the resource's view lookup. setSrv / setUav (which may
+    /// bind a non-default view) invalidate the entry, and so does the resource's invalidateViews (its view epoch).
+    /// MEASURED (HSTRCloud 4K sunset walk at 2, ~170 fields x 29 binds a frame; disp2 -> bindfast1): bindRenderer fields 132-149k
+    /// -> 40-73k cycles a call, bindRenderer 1.64-1.86 -> 0.51-0.97 ms a frame.
+    struct DefaultBinding
+    {
+        const Resource* pResource = nullptr;
+        uint32_t viewEpoch = 0;
+        bool valid = false;
+    };
+    std::vector<DefaultBinding> mDefaultBindings;
+    bool isDefaultBound(const gfx::ShaderOffset& offset, const Resource* pResource) const;
+    void setDefaultBound(const gfx::ShaderOffset& offset, const Resource* pResource, bool valid);
 };
 
 template<typename T>

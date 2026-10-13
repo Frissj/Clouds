@@ -59,7 +59,8 @@ print(f"HILL crop {cx},{cy} {cw}x{ch} rendered at {OW}x{OH}: focal {cam.focalLen
 OUT = os.environ.get("HSTR_HILL_OUT", "C:/Users/Friss/Documents/HSTR_results/sunset_hill")
 os.makedirs(OUT, exist_ok=True)
 m.frameCapture.outputDir = OUT
-LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBaked", "sunSlotsFree", "sunStale", "sunBakesFrame")
+LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBaked", "sunSlotsFree", "sunStale", "sunBakesFrame", "sunRuns",
+          "sunIdleFrames")
 
 
 def stats():

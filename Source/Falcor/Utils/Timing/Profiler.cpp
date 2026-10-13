@@ -393,6 +393,23 @@ void Profiler::endFrame(RenderContext* pRenderContext)
     if (mPaused)
         return;
 
+    // Disabled, no event times anything, so there is nothing to flush or fence: the submit, the signal and the wait for the last
+    // frame cost an HSTRCloud walk frame ~14% of the frame thread's samples (cpusamp5). The last enabled frame's timings are still
+    // collected, once. MEASURED with Scene::update's empty submit and HSTRCloud's second main-queue Signal also cut (4K sunset walk at
+    // 2; bindfast2 -> submit1, across runs): walk wall p50 2.5-3.3 -> 2.2-2.6 ms against 2.1-2.7 ms of GPU; debug layer clean (subdbg1).
+    if (!mEnabled)
+    {
+        if (mFenceValue == uint64_t(-1))
+            return;
+        mpFence->wait();
+        for (Event* pEvent : mAllEvents)
+            pEvent->endFrame(mFrameIndex);
+        mFenceValue = uint64_t(-1);
+        mLastFrameEvents = std::move(mCurrentFrameEvents);
+        ++mFrameIndex;
+        return;
+    }
+
     // Wait for GPU timings to be available from last frame.
     // We use a single fence here instead of one per event, which gets too inefficient.
     // TODO: This code should refactored to batch the resolve and readback of timestamps.

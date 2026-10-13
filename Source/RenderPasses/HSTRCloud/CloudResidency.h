@@ -286,6 +286,8 @@ public:
         uint32_t sunWaiting = 0;    ///< Mapped bricks still on the live march (not yet baked, or neighbourhood still streaming).
         uint32_t sunBakesFrame = 0; ///< Bakes staged this frame.
         uint32_t sunSlotsFree = 0;  ///< Free sun atlas slots.
+        uint32_t sunRuns = 0;       ///< DIAGNOSTIC: GPU sun scheduling runs (cumulative).
+        uint32_t sunIdleFrames = 0; ///< DIAGNOSTIC: frames the GPU sun scheduler idled on a zero-bake run's inputs (cumulative).
         uint32_t sunStale = 0;      ///< Bakes dropped this frame because their neighbourhood was mapped or unmapped since.        // The last cut.
         uint32_t cutPops = 0;      ///< Bricks refined.
         bool cutOrdered = false;   ///< Whether the atlas budget bound, forcing the priority-ordered cut.
@@ -1083,7 +1085,6 @@ private:
     uint32_t mSunEvery = 1;
     uint32_t mSunRunFrame = 0; ///< mFrame of the last scheduling run (cloudSunEvery counts frames from it).
     uint32_t mSunFreeStack = 0;      ///< The free sun slot stack the next scheduling run pops (HSTRCloudSunFrame::freePop).
-    bool mSunSlotQuarantine = false; ///< setAsyncContext: a run's freed sun slots go onto the other stack.
     bool mLoadsBesideCut = true; ///< Loads run on the frames a walk is on the worker (free slots only).
     uint32_t mLoadCap = 1024;    ///< setLoadCap.
     std::vector<uint8_t> mSunTableBlocksDirty; ///< Per 4096 bricks.
@@ -1097,10 +1098,11 @@ private:
         size_t freeSlots = 0;
         size_t mapped = 0;
         float3 direction = float3(0.f);
+        uint32_t freeStack = 0; ///< The free slot stack the run pops (sun slot quarantine alternates two).
         bool operator==(const SunScheduleInputs& o) const
         {
             return cutFrame == o.cutFrame && generation == o.generation && lastChange == o.lastChange && freeSlots == o.freeSlots &&
-                   mapped == o.mapped && all(direction == o.direction);
+                   mapped == o.mapped && all(direction == o.direction) && freeStack == o.freeStack;
         }
     };
     SunScheduleInputs mSunScheduleIdle;

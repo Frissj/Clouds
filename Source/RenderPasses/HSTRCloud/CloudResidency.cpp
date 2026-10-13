@@ -430,11 +430,14 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
         mpSunFrames = create(sizeof(uint32_t), uint32_t(mSunBakeFrames.size()), mSunBakeFrames.data());
         const std::vector<uint32_t> untouched(brickCapacity, 0u); // Residency frames start at 1.
         mpSunTouched = create(sizeof(uint32_t), brickCapacity, untouched.data());
-        // Two free stacks of sunSlots entries (HSTRCloudSunFrame::freePop / freePush), every slot on the first.
+        // Two free stacks of sunSlots entries (HSTRCloudSunFrame::freePop / freePush), the free slots split between them: the runs
+        // alternate the two (slot quarantine), so with every slot on one stack every other run had none to bake into.
         std::vector<uint32_t> free(2 * size_t(sunSlots), 0u);
-        std::copy(mFreeSunSlots.begin(), mFreeSunSlots.end(), free.begin());
+        const size_t half = mFreeSunSlots.size() / 2;
+        std::copy(mFreeSunSlots.begin(), mFreeSunSlots.begin() + half, free.begin());
+        std::copy(mFreeSunSlots.begin() + half, mFreeSunSlots.end(), free.begin() + sunSlots);
         mpSunFree = create(sizeof(uint32_t), uint32_t(free.size()), free.data());
-        const uint32_t freeTops[2] = {uint32_t(mFreeSunSlots.size()), 0u};
+        const uint32_t freeTops[2] = {uint32_t(half), uint32_t(mFreeSunSlots.size() - half)};
         mpSunFreeTop = create(sizeof(uint32_t), 2, freeTops);
         mpSunCounters = create(sizeof(uint32_t), kCloudSunCounters, nullptr);
         mpSunHistogram = create(sizeof(uint32_t), 2 * kCloudSunBins, nullptr);
@@ -1340,7 +1343,6 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     const auto startTime = std::chrono::steady_clock::now();
     if (!mDeferDevice)
         mUpdateAsync = mpAsyncContext != nullptr;
-    mSunSlotQuarantine = mUpdateAsync;
     mFrame = mNextFrame > mFrame ? mNextFrame : mFrame + 1;
     mNextFrame = 0;
     mFadeEndOrder = view.fadeEndOrder;
@@ -4570,12 +4572,20 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         inputs.freeSlots = mSunRelease.size(); // Releases change the pool: never idle across one.
         inputs.mapped = mMappedList.size();
         inputs.direction = sunDirection;
+        // FOUND (thinpt1, 2026-10-13): with the slot quarantine the runs alternate two free stacks, and the parked pool sat on one.
+        // A run popping the other staged nothing, read back 0, and the scheduler idled on unchanged inputs: a parked 600-frame settle
+        // baked ~1k of 340k waiting bricks (hillthin1, before async residency: 302k baked, 0 waiting). The stack is an input, and the
+        // free slots start split over both stacks. fixpt1: 340,566 baked, 0 waiting (400 runs, 42 idle frames once drained); path
+        // trace p99 / p99.9 0.5793 / 0.8192 -> 0.4871 / 0.6889, excess 0.024574 -> 0.024306. fixtime1 (4K walk, across runs against
+        // submit1): chunk GPU 2.13-2.26 against 2.10-2.66 ms, bakes waiting while walking ~353k against ~417k.
+        inputs.freeStack = mSunFreeStack;
         mGpuSunInputs = inputs;
         const bool fieldChanged =
             mSunFieldBlocksDirty || mSunResetAll || !mSunBlockResets.empty() || !mSunNodeResets.empty() || !mSunChanges.empty();
         if (mSunRelease.empty() && !fieldChanged && mGpuSunIdleValid && inputs == mGpuSunIdle)
         {
             mStats.sunBakesFrame = 0;
+            ++mStats.sunIdleFrames;
             return;
         }
         // cloudSunEvery n: the scheduling runs every nth frame with n times the bake cap, so its capacity-wide passes (scan, emit,
@@ -4601,6 +4611,7 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
             return;
         }
         mSunRunFrame = mFrame;
+        ++mStats.sunRuns;
         for (size_t c = 0; c < mSunClasses.size(); ++c)
             mSunDirections[c] = float4(normalize(mul(mSunClasses[c], sunDirection)), 0.f);
         uploadBlob(mpSunDirections.get(), mSunDirections.data(), 0, mSunDirections.size() * sizeof(float4));
@@ -4624,12 +4635,10 @@ void CloudResidency::scheduleSunBakes(const CloudSea& sea, const CloudView& view
         mGpuSunFrame.info.stampSkipSame = mSunStampSkipSame ? 1u : 0u;
         // Slot quarantine (asyncResidency): the run's releases and evictions go onto the other stack, which the next run pops. A
         // slot freed here is then baked over at the earliest in a later frame, after the frame beside this run - which may still
-        // resolve a sample to it - has finished.
-        if (mSunSlotQuarantine)
-        {
-            mGpuSunFrame.info.freePush = mSunFreeStack ^ 1u;
-            mSunFreeStack ^= 1u;
-        }
+        // resolve a sample to it - has finished. Serial frames alternate too (a slot's reuse waits one run): the free slots start split
+        // over both stacks, and a run popping one stack alone would strand the other's half.
+        mGpuSunFrame.info.freePush = mSunFreeStack ^ 1u;
+        mSunFreeStack ^= 1u;
         uploadSunChanges();
         return;
     }

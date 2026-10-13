@@ -1027,6 +1027,9 @@ private:
     std::vector<const ComputePass*> mResidencyPassesBound; ///< Residency passes holding the current residency's bindings.
     double mBindCpuMs = 0.0;  ///< CPU time in bindRenderer since load, its calls, and the frames executed (cloudStats).
     uint64_t mBindCalls = 0;
+    uint64_t mBindSceneCycles = 0;  ///< DIAGNOSTIC: bindRenderer's rdtsc cycles in the scene's bind, the params blob and the fields.
+    uint64_t mBindParamsCycles = 0;
+    uint64_t mBindFieldsCycles = 0;
     uint64_t mExecuteFrames = 0;
     uint64_t mSceneBoundFrame = ~0ull; ///< The frame bindRenderer last wrote the scene's TLAS and camera.
     /// Per pass: its gHSTRCloud fields as bindRenderer resolved them, by the (literal) name's address; valid while its vars live.
@@ -1035,6 +1038,9 @@ private:
         ref<ProgramVars> pVars;
         ShaderVar root;
         std::unordered_map<const char*, ShaderVar> fields;
+        ShaderVar fusedState; ///< The gFused* globals, resolved once too (by name they were ~3 reflection lookups a bind).
+        ShaderVar fusedBlocks;
+        ShaderVar fusedTiles;
     };
     std::unordered_map<const ComputePass*, BindCache> mBindCache;
     /// Binds a residency pass (bindResidencyPass in the .cpp) and sets its params; true on its first bind.

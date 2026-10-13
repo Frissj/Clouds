@@ -40,6 +40,17 @@ class ProgramVars;
 class ProgramKernels;
 class UnorderedAccessView;
 
+/// DIAGNOSTIC: rdtsc cycles of every dispatch's CPU stages since start (all contexts and threads), and the dispatches counted.
+struct DispatchTiming
+{
+    uint64_t prepare = 0; ///< ProgramVars::prepareDescriptorSets (resource barriers, descriptor sets)
+    uint64_t pipeline = 0; ///< ComputeState::getCSO
+    uint64_t bind = 0;    ///< bindPipelineWithRootObject (the root object's descriptors and constants)
+    uint64_t dispatch = 0; ///< dispatchCompute
+    uint64_t count = 0;
+};
+FALCOR_API DispatchTiming& getDispatchTiming();
+
 class FALCOR_API ComputeContext : public CopyContext
 {
 public:
