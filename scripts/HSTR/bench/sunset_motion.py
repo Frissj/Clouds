@@ -36,6 +36,17 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames", "walkTouchedCalls", "walkTouchedListed", "updateUs", "workerUpdateUs", "takeWaitUs", "replayUs", "workerRunCycles", "workerWallCycles", "workerKernelUs", "workerUserUs", *[f"step{k}" for k in range(40)], "workerUpdates", "submitMainUs", "submitResidencyUs", "residencySkips", "fadeParallelBuckets", "fadeParallelEnds", "mapParallelRuns","phaseMergeUs", "phaseLoadsUs", "phaseEvictUs", "phaseMapsUs", "phaseStageUs", "phaseFadesUs", "phaseSunUs",
             "phaseUploadUs", "phaseLaunchUs", "fadeStarts", "fadeEnds", "fadeVoid", "fadeEndIns", "maps", "unmaps",
             "beamHistoryProbeUnits", "beamHistoryProbe02", "beamHistoryProbe10",
+            # World cache photon updates run, and those focused (worldCacheFocusFar) with their probability-1 / starving tiles summed.
+            "worldCacheUpdatesRun", "worldCacheFocusUpdates", "worldCacheFocusNear", "worldCacheFocusHungry",
+            # worldCacheAsync: updates recorded on the compute queue, frames a pending one waited, ones that fell back to the main queue.
+            "worldCacheAsyncRuns", "worldCacheAsyncWaits", "worldCacheAsyncFallbacks",
+            # worldCacheAsyncSpan: main-queue writes that waited for a running slice, slices that followed a running one, bakes put off.
+            "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy", "worldCacheBakesPutOff", "worldCacheBakes",
+            # Async slices timed on their own queue (hstrPhotonProbe): summed span in us, how many, how many over 4 ms.
+            "worldCacheSliceUs", "worldCacheSlicesTimed", "worldCacheSlicesOver4Ms",
+            # Their waves and photons (hstrPhotonProbe, traceWorldCachePhotons).
+            "photonWaveUs", "photonWaves", "photonLongestWaveUs", "photonLongestWaveFlights", "photonFlights", "photonsTraced",
+            "photonSunFlights", "photonSunTraced", "photonCells", "photonDeposited", "photonSteps",
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
             f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",

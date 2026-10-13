@@ -70,6 +70,17 @@ class DomainStaging : public hstrcloud::TileStaging
 public:
     DomainStaging(ref<Device> pDevice, uint32_t tileValues, uint32_t count);
 
+    /// cloudStagingPool: where the workers stage the tiles they finish from now on. 0: `count` upload buffers in system memory (the
+    /// copy to the GPU crosses PCIe); 1: one per sea tile in CPU-visible video memory (resizable BAR, through NVAPI: the workers
+    /// write VRAM and the copy stays on the GPU); 2: one per sea tile in system memory. Pools are made on first use (main thread).
+    /// MEASURED (rebar2, 4K walk, each arm reloading the window, GPU timer around each 8-tile copy batch; BAR1 16384 MiB, so the
+    /// whole 12 GB is CPU-visible): 8 tiles staged in video memory 0.021 ms (n 4), in system memory 0.479 ms (n 41), packed
+    /// through Falcor's upload heap 0.481 ms (n 91) - 0.0026 against 0.060 ms a tile (~13 GB/s, PCIe). The sprint's bulk change of
+    /// 160 tiles paid 8.61 ms in `volumes` in one frame (sprtile1); in video memory it is ~0.4 ms.
+    void usePool(uint32_t pool, uint32_t tiles);
+    uint32_t getPool() const { return mPool; }
+    bool isVidmem(int32_t handle) const { return mBuffers[handle].pool == 1; }
+
     int32_t acquire(uint32_t*& data) override;
     void discard(int32_t handle) override;
 
@@ -84,10 +95,17 @@ private:
     {
         ref<Buffer> pBuffer;
         uint32_t* pData = nullptr;
+        uint32_t pool = 0;
     };
-    std::vector<Staged> mBuffers;
+    void addBuffers(uint32_t pool, uint32_t count);
+    ref<Device> mpDevice;
+    size_t mTileBytes = 0;
+    std::vector<Staged> mBuffers;                          ///< Grown only on the main thread while holding mMutex.
     std::mutex mMutex;
-    std::vector<int32_t> mFree;                            ///< Guarded by mMutex (workers take buffers).
+    std::array<std::vector<int32_t>, 3> mFree;             ///< Per pool, guarded by mMutex (workers take buffers).
+    std::array<bool, 3> mPoolMade = {true, false, false};
+    std::array<uint32_t, 3> mPoolSize = {0, 0, 0};
+    uint32_t mPool = 0;                                    ///< Guarded by mMutex.
     std::vector<int32_t> mRecorded;                        ///< Main thread only.
     std::vector<std::pair<uint64_t, int32_t>> mInFlight;   ///< Fence value and buffer, main thread only.
     ref<Fence> mpFence;
@@ -225,7 +243,140 @@ private:
     uint32_t mWorldCacheUpdates = 1;      ///< Cache gather passes per frame in the world cache view.
     /// Photon updates only while some sea tile holds fewer batches than this (0: every frame): the converged state the benchmarks
     /// score, which the shipped scene (CloudSea.py, worldCacheUpdates 1) otherwise kept paying for every frame.
+    /// MEASURED (refillpt1, sunset_hill path trace, 960 wide, three rows ahead restarted and refilled to N batches, scored frozen):
+    /// N 10 0.024077, 18 0.023195 / 0.023323, 26 0.022991, 34 0.023193 / 0.023070, 64 0.023024 / 0.022836; ship 0.022970. A
+    /// refilled tile is at its converged score from ~26 batches. A lower refill target alone does not save a sprint, though: a
+    /// row restarts every ~16 frames, so any target above ~16 keeps an update running every frame.
     uint32_t mWorldCacheTarget = 64;
+    /// worldCacheFocusFar (0 off): while only some sea tiles are under worldCacheTarget (tiles a moving camera streamed in), photon
+    /// updates are spent on them. A photon spawned over a tile neither starving nor upwind of one (the sun's reach across the
+    /// layer, one tile either side) survives its spawn with this probability and is weighted by its inverse, so every tile's
+    /// estimate stays unbiased; only the starving tiles take deposits and count the batch.
+    /// Why: a sprint changes tiles every ~16 frames, and each change restarted full-sea updates until the new tiles held 64 batches
+    /// (sprtile1 nsys, 4K sprint 20: HSTRCloud 2.4 -> 5 ms in those frames, all of it the worldCache scope, 0.013 -> 3.28 ms).
+    /// MEASURED (focuspt2, sunset_hill path trace, 960 wide, excess squared log error, three tile rows in view restarted with
+    /// worldCacheRestartRows and refilled over 80 frames): ship 0.022970, full refill 0.022957, focused 1/8 0.023080, 1/16
+    /// 0.022927, ship again 0.022875 (seed noise ~0.0001); sanity, 6 batches refilled, 0.023557.
+    /// MEASURED, left off (focustime1, 4K sprint 20, round-robin profiles): it saves nothing at the sunset. Focused updates had
+    /// 160 of 256 tiles starving (tile results land in bulk: one chunk took 160, the rest 0) and the upwind dilation marked all
+    /// 256 near (worldCacheFocusHungry / Near 2880 / 4608 over 18 updates); worldCache 3.03 ms focused against 3.25-3.39 ship.
+    float mWorldCacheFocusFar = 0.f;
+    /// worldCacheSlices: each light-tracing batch spread over this many updates (frames), counted as fractions of a batch.
+    /// MEASURED (slicetime1, 4K sprint 20, round-robin profiles, refill rounds): worldCache 3.34-3.62 ms (ship) -> 2.01-2.11 (4)
+    /// -> 1.78-1.91 (8); HSTRCloud 4.95-5.73 -> 3.46-4.13 -> 3.25-3.79. Not 1/slices: the update is set by its longest photon walk
+    /// (~1.6 ms), not its photon count. A refill takes slices x as many frames: asyncpt2 (path trace, three rows restarted, scored
+    /// frozen) 130 frames of 8 slices left 14.6 batches, excess 0.023106 against 0.022970 ship; 40 frames of 4 slices 9 batches,
+    /// 0.023435 (sanity, 8 batches: 0.023442).
+    uint32_t mWorldCacheSlices = 1;
+    /// worldCacheAsync: the photon update records into the residency's compute queue at the frame's end (dispatchAsyncPhotons) and
+    /// runs beside this frame's main-queue work, which waits for it at the frame's end. The pass reads buffer
+    /// copies of the domain, fine sun and sky (HSTR_PHOTON_BUFFERS), refreshed on the main queue when their textures change; a
+    /// slice waits while the main queue wrote any of them this frame or the last, or read or wrote the deposits this frame (bake,
+    /// decay, clear), and falls back to the main queue after a few frames of waiting.
+    /// MEASURED (asynctime1, 4K sprint 20, refill rounds, HSTRCloud span over both queues): ship 4.22-5.71 ms, 4 slices 3.48-3.92,
+    /// 8 slices 3.26-3.68; worldCache on the main queue 0.05 ms. The slice on the compute queue (~3.3 ms: the longest walk, and the
+    /// buffer copies' 8-tap trilinear reads) outlasts the rest of the frame, whose end waits for it. Quality (asyncpt1, path trace,
+    /// three rows restarted, refilled over 130 frames, scored frozen): 4 slices 0.022957, ship 0.022970, the 8-slice refill 0.023900
+    /// at 16 batches.
+    bool mWorldCacheAsync = false;
+    /// worldCacheAsyncSpan: the slice goes to a compute queue of its own instead of the residency's, and nothing waits for it at the
+    /// frame's end: it runs on beside this frame's rest and the next frame. A main-queue write of what it reads (the deposits, the
+    /// buffer copies, the extinction's) waits for it first (waitPhotonSlice: the work before goes in its own submit); a bake due
+    /// beside it is put off a frame; the next slice starts once it finished.
+    /// Why: asynctime1 (4K sprint 20): the residency queue's slices took refill frames 4.2-5.7 -> 3.3-3.9 ms (HSTRCloud span), not
+    /// to the ~1.8-2.2 ms of the rest of the frame - the frame's end waited for the slice's ~1.6 ms longest photon walk.
+    /// MEASURED, left off (spantime2, same bench, whole graph in refill rounds): ship 3.99-5.14 ms, async4 2.08-4.76, span4
+    /// 1.82-3.77, span2 1.76-2.62, span1 1.79-3.59; no main-queue write waited (worldCacheAsyncSpanWaits 0). But a slice outlasts a
+    /// frame on its own queue (worldCacheAsyncBusy 9 / 12 / 13 frames), so a flight traced 2.25 batches (span4), 3 (span2), 7
+    /// (span1) against 4.25 (async4) and 30 (ship): the refill takes 4-13x as many frames. The span arms' chunks also ran with a
+    /// residency backlog (88-116k bricks) the ship arms mostly did not: unknown whether the photon queue slowed the residency.
+    /// Quality is the batch count's (spanpt1, path trace, 7 batches: excess 0.02357; sync, 8 batches: 0.02391).
+    bool mWorldCacheAsyncSpan = false;
+    Slang::ComPtr<gfx::ICommandQueue> mpPhotonQueue; ///< Declared before the context, which keeps a raw pointer to it.
+    std::array<Slang::ComPtr<gfx::ITransientResourceHeap>, 3> mpPhotonHeaps;
+    uint32_t mPhotonHeap = 0;
+    std::unique_ptr<ComputeContext> mpPhotonContext;
+    ref<Fence> mpPhotonFence;
+    uint64_t mPhotonFenceValue = 0;  ///< The last slice's signal ...
+    uint64_t mPhotonWaitedValue = 0; ///< ... and the last the main queue was made to wait for.
+    bool mWorldCacheBakeOwed = false; ///< A bake fell due beside a running slice.
+    uint64_t mWorldCacheAsyncSpanWaits = 0, mWorldCacheAsyncBusy = 0, mWorldCacheBakesPutOff = 0; ///< cloudStats.
+    /// DIAGNOSTIC: each async slice's own span on its queue (hstrPhotonProbe), copied to a ring read once its frame has retired.
+    static constexpr uint32_t kPhotonProbes = 16;
+    static constexpr uint32_t kPhotonProbeWords = 13; ///< hstrPhotonProbe's layout: traceWorldCachePhotons.
+    /// cloudStats, summed over the slices read: waves' spans (us) and count, each slice's longest wave (us) and that wave's most
+    /// flights, flights and photons, the sun's flights and photons; and the most flights any photon took.
+    uint64_t mPhotonWaveUs = 0, mPhotonWaves = 0, mPhotonLongestWaveUs = 0, mPhotonLongestWaveFlights = 0, mPhotonFlights = 0,
+             mPhotonsTraced = 0, mPhotonSunFlights = 0, mPhotonSunTraced = 0, mPhotonMostFlights = 0, mPhotonCells = 0,
+             mPhotonDeposited = 0, mPhotonSteps = 0;
+    ref<Buffer> mpPhotonProbe, mpPhotonProbeReadback;
+    std::array<uint64_t, kPhotonProbes> mPhotonProbeFrame = {}; ///< The frame each slot was written in, 0 when read.
+    uint32_t mPhotonProbeNext = 0;
+    uint64_t mPhotonSliceUs = 0, mPhotonSlices = 0, mPhotonSlicesOver4Ms = 0; ///< cloudStats.
+    bool photonSliceRunning() const { return mpPhotonFence && mpPhotonFence->getCurrentValue() < mPhotonFenceValue; }
+    void waitPhotonSlice(RenderContext* pRenderContext);
+    bool mAsyncPhotonPending = false; ///< An update the worldCache block left for dispatchAsyncPhotons.
+    uint32_t mAsyncPhotonWaits = 0;
+    bool mDepositsTouched = false;    ///< The main queue baked, decayed or cleared the deposits this frame.
+    bool mWorldCacheWanted = false;   ///< This frame's worldCache block wanted a photon update.
+    bool mWorldCachePhotonAsyncDefined = false;
+    static constexpr uint32_t kPhotonSkyTexels = 64 * 32; ///< kPhotonSkyWidth x kPhotonSkyHeight in HSTRCloud.cs.slang.
+    uint64_t mPhotonPackFrame = 0;     ///< Last frame the main queue refreshed a photon buffer copy.
+    uint64_t mFineSunWrittenFrame = 0; ///< Last frame dispatchResidualPages wrote the fine sun.
+    uint64_t mPhotonDomainPacked = ~0ull; ///< mDomainUploads when the domain copies were last packed.
+    uint64_t mDomainUploads = 0;          ///< uploadDomainExtinction calls that wrote slots.
+    uint64_t mPhotonFineSunPacked = ~0ull;
+    float3 mPhotonSkySun = float3(0.f);
+    bool mPhotonSkyBaked = false;
+    uint64_t mWorldCacheAsyncRuns = 0, mWorldCacheAsyncWaits = 0, mWorldCacheAsyncFallbacks = 0; ///< cloudStats.
+    uint32_t mWorldCacheBakeSamples = 0; ///< cloudStats: worldCacheSamples at the last bake ...
+    float mWorldCacheBakeLowBatches = 0.f; ///< ... and the fewest batches a tile had then.
+    bool mWorldCacheBakeSliced = false; ///< TEST: bake every worldCacheBakeInterval batches, not updates, under worldCacheSlices.
+    LazyComputePass mpWorldCachePhotonAsyncPass;
+    LazyComputePass mpBakePhotonSkyPass;
+    /// worldCacheDeferredDeposit (HSTR_DEFERRED_DEPOSIT): the photon passes record their flights (mpPhotonSegments, three float4 a
+    /// flight, kPhotonSegmentsPerPhoton a photon of the batch before the rest deposit in place), and depositPhotonSegments deposits
+    /// them, a thread each, on the photon pass's queue.
+    /// MEASURED, left off (dodtime2, 4K sprint 20, refill rounds): full batch on the main queue worldCache 3.65 ms (photon pass
+    /// ~1.4, deposit pass 2.2) against 3.34-3.59 inline; a quarter batch on the residency queue 3.45 ms a slice (photon waves 3.44
+    /// -> 2.00, the deposits the rest) against 3.44. The deposit walk is not hidden latency but throughput: ~340k flights x 3.9
+    /// cells x up to 16 coefficient atomics a batch. Quality (dodpt2, path trace, three rows refilled over 130 frames, scored
+    /// frozen): 0.023384 against 0.022957 inline (sanity, 6 batches, 0.023441; anchor 0.023006) - within this gate's seed spread,
+    /// a bias not excluded. FOUND (dodpt1): appending with the lane count taken inside WaveIsFirstLane reserved one slot a wave.
+    bool mWorldCacheDeferredDeposit = false;
+    bool mDeferredDepositWarm = false; ///< Both variants of the main queue's photon pass compiled.
+    static constexpr uint32_t kPhotonSegmentsPerPhoton = 8;
+    ref<Buffer> mpPhotonSegments, mpPhotonSegmentCount;
+    LazyComputePass mpDepositSegmentsPass, mpDepositSegmentsAsyncPass;
+    /// Records the photon pass's flights into the segment buffer (bound to pPass), or deposits them in place.
+    void bindPhotonSegments(ComputeContext* pContext, ComputePass* pPass, uint32_t photons);
+    void depositPhotonSegments(ComputeContext* pContext, ComputePass* pPass, uint32_t photons);
+    ref<ComputePass> mpPackFloatTexturePass;
+    ref<ComputePass> mpPackUintTexturePass;
+    ref<Buffer> mpPhotonMajorant, mpPhotonTightMajorant, mpPhotonOccupancy, mpPhotonFineSun, mpPhotonSky;
+    /// TEST (worldCacheRestartRows, one-shot): the world cache of this many rows of sea tiles ahead of the camera (+z) restarts
+    /// as if their cloud had changed, so a parked gate can score how the cache refills.
+    uint32_t mWorldCacheRestartRows = 0;
+    /// cloudStagingPool (DomainStaging::usePool): 0 system memory (48 buffers), 1 CPU-visible video memory, 2 system memory, one
+    /// buffer per tile for 1 and 2. TEST cloudSeaReload (one-shot): the window's tiles are all requested again.
+    /// MEASURED, default 1 (slicetime3, 4K sprint 20, GPU copy of a domain upload batch, per 8 tiles): staged in video memory median
+    /// 0.024 ms (16 uploads), system memory 0.478 (64), host memory past a full pool 0 ("packed", 95 uploads) 0.478. One buffer per
+    /// tile never runs out; the price is 256 x 0.8 MB = 205 MB of BAR video memory.
+    uint32_t mCloudStagingPool = 1;
+    bool mCloudSeaReload = false;
+    /// The domain upload's volume copies, GPU-timed (logged once resolved): timer, tiles staged in video / system memory, packed.
+    struct UploadTiming
+    {
+        ref<GpuTimer> pTimer;
+        uint32_t vidmem = 0, sysmem = 0, packed = 0;
+        uint64_t frame = 0;
+    };
+    std::vector<UploadTiming> mUploadTimings;
+    std::vector<ref<GpuTimer>> mUploadTimers;
+    uint64_t mWorldCacheFocusUpdates = 0; ///< Photon updates run focused (cloudStats).
+    uint64_t mWorldCacheFocusNear = 0;    ///< Their tiles spawning at probability 1, summed (cloudStats).
+    uint64_t mWorldCacheFocusHungry = 0;  ///< Their tiles under the target, summed (cloudStats).
+    uint64_t mWorldCacheUpdatesRun = 0;   ///< Photon updates run (cloudStats).
     /// A sun move with no photon updates to follow bakes the world cache without decaying it (the decay alone leaves the means).
     /// MEASURED (sunoct2, 4K, 0.57 deg/frame sun, cache frozen): worldCache 0.29 -> 0.04 ms, parked 1.84 -> 1.57 and walk 2.45 ->
     /// 2.20 ms, errors identical. Only a frozen cache (the benchmarks) takes this; a live one decays as before.
@@ -1072,6 +1223,9 @@ private:
     /// write the domain (`domainWritten`) and whose extinction is already a shader resource; otherwise the batch waits, or (no
     /// asyncResidency this frame) runs on the main queue.
     void dispatchCutVisibility(RenderContext* pRenderContext, bool domainWritten);
+    /// worldCacheAsync: refreshes the photon buffer copies that went stale and records the pending photon update into the residency's
+    /// compute queue, when nothing on the main queue writes what it reads (see mWorldCacheAsync).
+    void dispatchAsyncPhotons(RenderContext* pRenderContext);
     uint64_t mCutVisAsyncRuns = 0; ///< DIAGNOSTIC: batches traced on the compute queue, on the main queue, and frames a batch
     uint64_t mCutVisMainRuns = 0;  ///< waited for one without a domain write.
     uint64_t mCutVisDeferred = 0;
@@ -1336,6 +1490,8 @@ private:
     std::vector<uint32_t> mCloudTileReset;
     ref<Buffer> mpCloudTileBatches;
     ref<Buffer> mpCloudTileReset;
+    std::vector<float> mCloudTileFocus; ///< worldCacheFocusFar per tile: spawn probability, positive where the tile takes deposits.
+    ref<Buffer> mpCloudTileFocus;
     LazyComputePass mpCommitCloudPass;
     LazyComputePass mpDecodeCloudPass;
     LazyComputePass mpOccupancyCloudPass;

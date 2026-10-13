@@ -60,7 +60,11 @@ OUT = os.environ.get("HSTR_HILL_OUT", "C:/Users/Friss/Documents/HSTR_results/sun
 os.makedirs(OUT, exist_ok=True)
 m.frameCapture.outputDir = OUT
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBaked", "sunSlotsFree", "sunStale", "sunBakesFrame", "sunRuns",
-          "sunIdleFrames")
+          "sunIdleFrames",
+          # World cache photon updates (cumulative): all, on the compute queue (worldCacheAsync), fallen back to the main queue.
+          "worldCacheUpdatesRun", "worldCacheAsyncRuns", "worldCacheAsyncFallbacks", "worldCacheBakes",
+          "worldCacheBakeSamples", "worldCacheBakeLowBatches", "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy",
+          "worldCacheBakesPutOff")
 
 
 def stats():

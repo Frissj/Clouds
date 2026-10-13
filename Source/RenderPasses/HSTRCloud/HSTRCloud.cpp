@@ -19,6 +19,10 @@
 #pragma comment(lib, "dxgi.lib")        // queueOverlapTest's fresh device.
 #pragma comment(lib, "d3d12.lib")
 #include <psapi.h> // queueOverlapTest's module list.
+#if FALCOR_HAS_NVAPI
+#include <d3d12.h>
+#include <nvapi.h> // cloudStagingPool 1: upload buffers in CPU-visible video memory.
+#endif
 #pragma comment(lib, "psapi.lib")
 
 namespace
@@ -491,6 +495,61 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "worldCacheTarget")
         {
             mWorldCacheTarget = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheFocusFar")
+        {
+            mWorldCacheFocusFar = std::clamp(float(value), 0.f, 1.f);
+            continue;
+        }
+        if (key == "cloudStagingPool")
+        {
+            mCloudStagingPool = std::min(uint32_t(value), 2u);
+            continue;
+        }
+        if (key == "cloudSeaReload")
+        {
+            mCloudSeaReload = bool(value);
+            continue;
+        }
+        if (key == "worldCacheAsync")
+        {
+            mWorldCacheAsync = bool(value);
+            continue;
+        }
+        if (key == "worldCacheSlices")
+        {
+            mWorldCacheSlices = std::max(uint32_t(value), 1u);
+            continue;
+        }
+        if (key == "worldCacheRestartRows")
+        {
+            mWorldCacheRestartRows = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheDeferredDeposit")
+        {
+            mWorldCacheDeferredDeposit = bool(value);
+            continue;
+        }
+        if (key == "worldCacheKnock")
+        {
+            mParams.worldCacheKnock = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheBounceCap")
+        {
+            mParams.worldCacheBounceCap = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheAsyncSpan")
+        {
+            mWorldCacheAsyncSpan = bool(value);
+            continue;
+        }
+        if (key == "worldCacheBakeSliced")
+        {
+            mWorldCacheBakeSliced = bool(value);
             continue;
         }
         if (key == "worldCacheFrozenBake")
@@ -1286,6 +1345,11 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "beamQueryStepCap")
         {
             mParams.beamQueryStepCap = uint32_t(value);
+            continue;
+        }
+        if (key == "beamProxyVariate")
+        {
+            mParams.beamProxyVariate = uint32_t(value);
             continue;
         }
         if (key == "beamQueryContinueSlices")
@@ -2228,6 +2292,12 @@ Properties HSTRCloud::getProperties() const
     props["sunFieldAngle"] = mSunFieldAngle;
     props["sunOctaveAngle"] = mSunOctaveAngle;
     props["worldCacheTarget"] = mWorldCacheTarget;
+    props["worldCacheFocusFar"] = mWorldCacheFocusFar;
+    props["worldCacheSlices"] = mWorldCacheSlices;
+    props["worldCacheAsync"] = mWorldCacheAsync;
+    props["worldCacheAsyncSpan"] = mWorldCacheAsyncSpan;
+    props["worldCacheDeferredDeposit"] = mWorldCacheDeferredDeposit;
+    props["cloudStagingPool"] = mCloudStagingPool;
     props["worldCacheFrozenBake"] = mWorldCacheFrozenBake;    props["beamInvalidate"] = mBeamInvalidate;
     props["beamChangeCellVoxels"] = mBeamChangeCellVoxels;
     props["beamChangeInterval"] = mBeamChangeInterval;
@@ -2483,6 +2553,33 @@ Properties HSTRCloud::getProperties() const
         cloud["farSeaField"] = mParams.seaFarField;
         cloud["farSeaRuns"] = mFarSeaRuns;
         cloud["worldCacheBakes"] = mWorldCacheBakes; // sprintimg1: did the cache follow the sea's new tiles?
+        cloud["worldCacheUpdatesRun"] = mWorldCacheUpdatesRun;
+        cloud["worldCacheFocusUpdates"] = mWorldCacheFocusUpdates;
+        cloud["worldCacheFocusNear"] = mWorldCacheFocusNear;
+        cloud["worldCacheFocusHungry"] = mWorldCacheFocusHungry;
+        cloud["worldCacheAsyncRuns"] = mWorldCacheAsyncRuns;
+        cloud["worldCacheAsyncWaits"] = mWorldCacheAsyncWaits;
+        cloud["worldCacheAsyncFallbacks"] = mWorldCacheAsyncFallbacks;
+        cloud["worldCacheSliceUs"] = mPhotonSliceUs; // Async slices read back: their summed span on their queue ...
+        cloud["worldCacheSlicesTimed"] = mPhotonSlices;
+        cloud["worldCacheSlicesOver4Ms"] = mPhotonSlicesOver4Ms; // ... and those over 4 ms.
+        cloud["photonWaveUs"] = mPhotonWaveUs; // The slices' waves (hstrPhotonProbe): spans summed, count ...
+        cloud["photonWaves"] = mPhotonWaves;
+        cloud["photonLongestWaveUs"] = mPhotonLongestWaveUs; // ... each slice's longest wave, summed, and its most flights ...
+        cloud["photonLongestWaveFlights"] = mPhotonLongestWaveFlights;
+        cloud["photonFlights"] = mPhotonFlights; // ... the photons' flights and count, the sun's alone ...
+        cloud["photonsTraced"] = mPhotonsTraced;
+        cloud["photonSunFlights"] = mPhotonSunFlights;
+        cloud["photonSunTraced"] = mPhotonSunTraced;
+        cloud["photonMostFlights"] = mPhotonMostFlights; // ... and the most any photon took.
+        cloud["photonCells"] = mPhotonCells; // Deposit walks' cells crossed, cells deposited into, collision steps.
+        cloud["photonDeposited"] = mPhotonDeposited;
+        cloud["photonSteps"] = mPhotonSteps;
+        cloud["worldCacheAsyncSpanWaits"] = mWorldCacheAsyncSpanWaits;
+        cloud["worldCacheAsyncBusy"] = mWorldCacheAsyncBusy;
+        cloud["worldCacheBakesPutOff"] = mWorldCacheBakesPutOff;
+        cloud["worldCacheBakeSamples"] = mWorldCacheBakeSamples;
+        cloud["worldCacheBakeLowBatches"] = mWorldCacheBakeLowBatches;
         const float2 video = hstrcloud::queryVideoMemoryMB(mpDevice);
         cloud["videoUsedMB"] = video.x;
         cloud["videoBudgetMB"] = video.y;
@@ -3105,6 +3202,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCompareReferencePass = nullptr;
     mpWorldCachePass = nullptr;
     mpWorldCachePhotonPass = nullptr;
+    mpWorldCachePhotonAsyncPass = nullptr;
+    mpDepositSegmentsPass = nullptr;
+    mpDepositSegmentsAsyncPass = nullptr;
+    mpBakePhotonSkyPass = nullptr;
     mpWorldCacheResolvePass = nullptr;
     mpWorldCacheBakePass = nullptr;
     mpWorldCacheViewPass = nullptr;
@@ -3200,6 +3301,11 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCompareReferencePass = createPass("compareReference");
     mpWorldCachePass = createPass("updateWorldCache");
     mpWorldCachePhotonPass = createPass("traceWorldCachePhotons");
+    // worldCacheAsync: the same kernel reading buffer copies (HSTR_PHOTON_BUFFERS, set on first use), a program of its own.
+    mpWorldCachePhotonAsyncPass = createPass("traceWorldCachePhotons");
+    mpBakePhotonSkyPass = createPass("bakePhotonSky");
+    mpDepositSegmentsPass = createPass("depositPhotonSegments");
+    mpDepositSegmentsAsyncPass = createPass("depositPhotonSegments"); // HSTR_PHOTON_BUFFERS, as mpWorldCachePhotonAsyncPass.
     mpWorldCacheResolvePass = createPass("resolveWorldCache");
     mpWorldCacheBakePass = createPass("bakeWorldCache");
     mpWorldCacheViewPass = createPass("bakeWorldCacheView");
@@ -3771,25 +3877,98 @@ void HSTRCloud::createSamplers()
     mpLinearClampSampler = mpDevice->createSampler(samplerDesc);
 }
 
-DomainStaging::DomainStaging(ref<Device> pDevice, uint32_t tileValues, uint32_t count) : mpFence(pDevice->createFence())
+DomainStaging::DomainStaging(ref<Device> pDevice, uint32_t tileValues, uint32_t count)
+    : mpDevice(pDevice), mTileBytes(size_t(tileValues) * sizeof(uint32_t)), mpFence(pDevice->createFence())
 {
-    mBuffers.resize(count);
+    addBuffers(0, count);
+}
+
+namespace
+{
+/// An upload buffer in CPU-visible video memory (resizable BAR): NVAPI's CPUVISIBLE_VIDMEM hint on an upload heap. Null where the
+/// driver or NVAPI cannot make one.
+ref<Buffer> createVidmemUploadBuffer(const ref<Device>& pDevice, size_t size)
+{
+#if FALCOR_HAS_NVAPI && FALCOR_HAS_D3D12
+    // This plugin links its own copy of NVAPI (Falcor's is private to it), so it initialises its own.
+    static const bool initialized = NvAPI_Initialize() == NVAPI_OK;
+    if (!initialized || pDevice->getType() != Device::Type::D3D12)
+        return nullptr;
+    ID3D12Device* pD3D = pDevice->getNativeHandle().as<ID3D12Device*>();
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    NV_RESOURCE_PARAMS params = {};
+    params.version = NV_RESOURCE_PARAMS_VER;
+    params.NVResourceFlags = NV_D3D12_RESOURCE_FLAG_CPUVISIBLE_VIDMEM;
+    ID3D12Resource* pResource = nullptr;
+    if (NvAPI_D3D12_CreateCommittedResource(
+            pD3D, &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, &params, IID_PPV_ARGS(&pResource), nullptr
+        ) != NVAPI_OK ||
+        !pResource)
+        return nullptr;
+    ref<Buffer> pBuffer = pDevice->createBufferFromNativeHandle(NativeHandle(pResource), size, ResourceBindFlags::None, MemoryType::Upload);
+    pResource->Release(); // The buffer holds its own reference.
+    return pBuffer;
+#else
+    return nullptr;
+#endif
+}
+} // namespace
+
+void DomainStaging::addBuffers(uint32_t pool, uint32_t count)
+{
+    std::lock_guard lock(mMutex);
     for (uint32_t i = 0; i < count; ++i)
     {
+        Staged staged;
+        staged.pool = pool;
+        staged.pBuffer = pool == 1 ? createVidmemUploadBuffer(mpDevice, mTileBytes) : nullptr;
+        if (pool == 1 && !staged.pBuffer)
+        {
+            logWarning("HSTRCloud: cloudStagingPool 1: no CPU-visible video memory buffer (NVAPI / resizable BAR); staging stays in system memory.");
+            return;
+        }
+        if (!staged.pBuffer)
+            staged.pBuffer = mpDevice->createBuffer(mTileBytes, ResourceBindFlags::None, MemoryType::Upload);
         // Mapped once for its lifetime: the workers write through the pointer, never through the device.
-        mBuffers[i].pBuffer = pDevice->createBuffer(size_t(tileValues) * sizeof(uint32_t), ResourceBindFlags::None, MemoryType::Upload);
-        mBuffers[i].pData = static_cast<uint32_t*>(mBuffers[i].pBuffer->map());
-        mFree.push_back(int32_t(i));
+        staged.pData = static_cast<uint32_t*>(staged.pBuffer->map());
+        mFree[pool].push_back(int32_t(mBuffers.size()));
+        mBuffers.push_back(std::move(staged));
+        ++mPoolSize[pool];
     }
+}
+
+void DomainStaging::usePool(uint32_t pool, uint32_t tiles)
+{
+    pool = std::min(pool, 2u);
+    if (!mPoolMade[pool])
+    {
+        // Workers hold their buffers by handle and pointer and read mBuffers only under the mutex, which addBuffers holds.
+        addBuffers(pool, tiles);
+        mPoolMade[pool] = true;
+        logInfo("HSTRCloud: cloudStagingPool {}: {} tile staging buffers of {:.1f} MB.", pool, mPoolSize[pool], mTileBytes / 1048576.0);
+    }
+    std::lock_guard lock(mMutex);
+    mPool = mPoolSize[pool] == 0 ? 0u : pool; // A pool that could not be made (no CPU-visible video memory) stays on pool 0.
 }
 
 int32_t DomainStaging::acquire(uint32_t*& data)
 {
     std::lock_guard lock(mMutex);
-    if (mFree.empty())
+    auto& free = mFree[mPool];
+    if (free.empty())
         return -1;
-    const int32_t handle = mFree.back();
-    mFree.pop_back();
+    const int32_t handle = free.back();
+    free.pop_back();
     data = mBuffers[handle].pData;
     return handle;
 }
@@ -3797,7 +3976,7 @@ int32_t DomainStaging::acquire(uint32_t*& data)
 void DomainStaging::discard(int32_t handle)
 {
     std::lock_guard lock(mMutex);
-    mFree.push_back(handle);
+    mFree[mBuffers[handle].pool].push_back(handle);
 }
 
 void DomainStaging::beginFrame(RenderContext* pRenderContext)
@@ -3817,7 +3996,7 @@ void DomainStaging::beginFrame(RenderContext* pRenderContext)
     auto keep = mInFlight.begin();
     for (auto it = mInFlight.begin(); it != mInFlight.end(); ++it)
         if (it->first <= reached)
-            mFree.push_back(it->second);
+            mFree[mBuffers[it->second].pool].push_back(it->second);
         else
             *keep++ = *it;
     mInFlight.erase(keep, mInFlight.end());
@@ -3973,6 +4152,10 @@ void HSTRCloud::buildCloudDomain()
     );
     mpCloudTileReset = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileReset.data(), false
+    );
+    mCloudTileFocus.assign(tileCount, 1.f);
+    mpCloudTileFocus = mpDevice->createStructuredBuffer(
+        sizeof(float), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileFocus.data(), false
     );
     mDomainPassesBound = false; // The world cache clear reads the tile resets.
     std::vector<uint32_t> slots(tileCount);
@@ -4305,6 +4488,7 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         mpDomainFrame->setBlob(&frame, 0, sizeof(frame));
         return;
     }
+    ++mDomainUploads; // worldCacheAsync's domain copies are stale.
     const uint32_t blocksWide = r / kDomainBlock + 1;
     const uint32_t majorantWide = r / kDomainBlock + 3;
     const uint32_t cellsWide = r / (kDomainBlock * kDomainOccupancy) + 2;
@@ -4316,6 +4500,15 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
             // Region i's volume is at i tile volumes into the batch buffer. A staged tile costs a recorded copy; a tile in host
             // memory (the staging was full) uploads here.
             FALCOR_PROFILE(pRenderContext, "volumes");
+            UploadTiming timing;
+            if (!mUploadTimers.empty())
+            {
+                timing.pTimer = mUploadTimers.back();
+                mUploadTimers.pop_back();
+            }
+            else
+                timing.pTimer = GpuTimer::create(mpDevice);
+            timing.pTimer->begin();
             for (uint32_t i = 0; i < count; ++i)
             {
                 const uint32_t slot = slots[first + i];
@@ -4324,12 +4517,14 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
                 regions[i] = slot;
                 if (volume.upload == Upload::Staged)
                 {
+                    ++(mpDomainStaging->isVidmem(volume.staged) ? timing.vidmem : timing.sysmem);
                     pRenderContext->copyBufferRegion(mpDomainStaged.get(), i * tileBytes, mpDomainStaging->getBuffer(volume.staged).get(), 0, tileBytes);
                     mpDomainStaging->recorded(volume.staged);
                     volume.staged = -1;
                 }
                 else if (volume.upload == Upload::Packed)
                 {
+                    ++timing.packed;
                     mpDomainStaged->setBlob(volume.packed.data(), i * tileBytes, tileBytes);
                     volume.packed = {};
                 }
@@ -4337,6 +4532,10 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
                     regions[i] |= volume.upload == Upload::Zero ? kDomainRegionZero : kDomainRegionKeep;
                 volume.upload = Upload::Done;
             }
+            timing.pTimer->end();
+            timing.pTimer->resolve();
+            timing.frame = mExecuteFrames;
+            mUploadTimings.push_back(std::move(timing));
         }
         frame.regionCount = count;
         mpDomainRegions->setBlob(regions.data(), 0, count * sizeof(uint32_t));
@@ -4348,7 +4547,10 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         };
         run("extinction", mpDomainExtinctionPass, uint3(r, dims.y, r * count));
         if (mpVisProxy)
+        {
+            waitPhotonSlice(pRenderContext); // The photon slice reads the copy (worldCacheAsyncSpan).
             packVisibilityProxy(pRenderContext, std::vector<uint32_t>(slots.begin() + first, slots.begin() + first + count));
+        }
         run("blocks", mpDomainBlocksPass, uint3(blocksWide, blockDims.y, blocksWide * count));
         run("majorant", mpDomainMajorantPass, uint3(majorantWide, blockDims.y, majorantWide * count));
         run("occupancy", mpDomainOccupancyPass, uint3(cellsWide, occupancyDims.y, cellsWide * count));
@@ -4404,6 +4606,30 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
 {
     FALCOR_PROFILE(pRenderContext, "cloudSea");
     mpDomainStaging->beginFrame(pRenderContext);
+    if (mpCloudSea)
+    {
+        mpDomainStaging->usePool(mCloudStagingPool, mpCloudSea->getDesc().tiles * mpCloudSea->getDesc().tiles);
+        if (mCloudSeaReload)
+        {
+            mpCloudSea->requestAll();
+            mCloudSeaReload = false;
+        }
+    }
+    // The domain uploads' copy timings, once their frames have certainly finished.
+    for (auto it = mUploadTimings.begin(); it != mUploadTimings.end();)
+    {
+        if (mExecuteFrames < it->frame + 8)
+        {
+            ++it;
+            continue;
+        }
+        logInfo(
+            "HSTRCloud: domain upload of {} tiles ({} staged in video memory, {} in system memory, {} packed): volumes {:.3f} ms GPU.",
+            it->vidmem + it->sysmem + it->packed, it->vidmem, it->sysmem, it->packed, it->pTimer->getElapsedTime()
+        );
+        mUploadTimers.push_back(it->pTimer);
+        it = mUploadTimings.erase(it);
+    }
     const auto& camera = mpScene->getCamera();
     // cloudResidencyWorker: the update launched at the end of the last frame's residency recording is this frame's (it reads the
     // sea's tiles, so it is taken before they change). What it queued records into this frame's residency context.
@@ -4500,12 +4726,14 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         {
             // The clear reads the domain frame and the tile resets, bound with the domain passes (uploadDomainExtinction).
             FALCOR_PROFILE(pRenderContext, "clearCache");
+            waitPhotonSlice(pRenderContext);
             if (mpClearBoundDeposit != mpWorldCacheDeposit)
             {
                 mpClearWorldCacheTilesPass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
                 mpClearBoundDeposit = mpWorldCacheDeposit;
             }
             mpClearWorldCacheTilesPass->execute(pRenderContext, mParams.worldCacheDims);
+            mDepositsTouched = true;
         }
         mWorldCacheBakeDirty = true;
         mFarSeaTilesChanged = true;
@@ -4537,6 +4765,37 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
                 mSunPageSlots.push_back(slot);
         mSunPagesDirty = true;
         mBeamReusable = false;
+    }
+    if (mWorldCacheRestartRows > 0 && !mCloudTileBatches.empty() && mpWorldCacheDeposit && all(mParams.worldCacheDims > uint3(0)))
+    {
+        // TEST (worldCacheRestartRows): those rows' world cache restarts as a tile change restarts it.
+        const auto& seaDesc = mpCloudSea->getDesc();
+        const float3 position = camera->getPosition();
+        const int32_t cameraZ = int32_t(std::floor((position.z - seaDesc.origin.z) / seaDesc.tileWorld));
+        std::fill(mCloudTileReset.begin(), mCloudTileReset.end(), 0u);
+        for (uint32_t row = 1; row <= mWorldCacheRestartRows; ++row)
+            for (int32_t x = 0; x < int32_t(seaDesc.tiles); ++x)
+            {
+                const uint32_t slot = mpCloudSea->slotIndex(int2(x, cameraZ + int32_t(row)));
+                mCloudTileReset[slot] = 1;
+                mCloudTileBatches[slot] = 0.f;
+            }
+        mpCloudTileReset->setBlob(mCloudTileReset.data(), 0, mCloudTileReset.size() * sizeof(uint32_t));
+        mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+        // The clear reads the cache dimensions from the domain frame, written by an upload (none here: no slots, frame only).
+        // Without it the clear read a frame from before the cache existed and cleared nothing: focuspt1's restarted rows kept
+        // their deposits under reset batch counts and burnt white, worse with every restart.
+        uploadDomainExtinction({});
+        waitPhotonSlice(pRenderContext);
+        if (mpClearBoundDeposit != mpWorldCacheDeposit)
+        {
+            mpClearWorldCacheTilesPass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+            mpClearBoundDeposit = mpWorldCacheDeposit;
+        }
+        mpClearWorldCacheTilesPass->execute(pRenderContext, mParams.worldCacheDims);
+        mDepositsTouched = true;
+        mWorldCacheBakeDirty = true;
+        mWorldCacheRestartRows = 0;
     }
     if (!mpCloudResidency)
         return;
@@ -5158,6 +5417,315 @@ void HSTRCloud::packVisibilityProxy(RenderContext* pRenderContext, const std::ve
         var["CB"]["gSlotOrigin"] = uint2(slot % tiles * r, slot / tiles * r);
         mpPackVisProxyPass->execute(pRenderContext, uint3(r / 2, dims.y, r));
     }
+}
+
+void HSTRCloud::bindPhotonSegments(ComputeContext* pContext, ComputePass* pPass, uint32_t photons)
+{
+    pPass->getProgram()->addDefine("HSTR_DEFERRED_DEPOSIT", mWorldCacheDeferredDeposit ? "1" : "0");
+    if (!mWorldCacheDeferredDeposit)
+        return;
+    // Sized for a whole batch: a sliced update's photons never fill it more.
+    const uint64_t elements = 3ull * kPhotonSegmentsPerPhoton * std::max(photons, mParams.worldCachePhotons);
+    if (!mpPhotonSegments || mpPhotonSegments->getElementCount() < elements)
+    {
+        mpPhotonSegments = mpDevice->createStructuredBuffer(
+            sizeof(float4), uint32_t(elements), ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
+            nullptr, false
+        );
+        mpPhotonSegmentCount = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+        );
+    }
+    pContext->clearUAV(mpPhotonSegmentCount->getUAV().get(), uint4(0));
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["hstrPhotonSegments"] = mpPhotonSegments;
+    var["hstrPhotonSegmentCount"] = mpPhotonSegmentCount;
+}
+
+void HSTRCloud::depositPhotonSegments(ComputeContext* pContext, ComputePass* pPass, uint32_t photons)
+{
+    if (!mWorldCacheDeferredDeposit)
+        return;
+    ShaderVar var = pPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["hstrPhotonSegments"] = mpPhotonSegments;
+    var["hstrPhotonSegmentCount"] = mpPhotonSegmentCount;
+    // Every slot (the count is on the GPU; a thread past it returns): flights past the buffer were deposited in place.
+    pPass->execute(pContext, uint3(uint32_t(mpPhotonSegments->getElementCount() / 3), 1, 1));
+}
+
+void HSTRCloud::waitPhotonSlice(RenderContext* pRenderContext)
+{
+    // worldCacheAsyncSpan, before a main-queue access to what the last slice reads or writes. Still running: the main queue's work so
+    // far goes in its own submit and what follows waits for the slice. Finished: the wait costs nothing and orders its writes first.
+    if (!mpPhotonFence || mPhotonWaitedValue >= mPhotonFenceValue)
+        return;
+    if (photonSliceRunning())
+    {
+        pRenderContext->submit();
+        ++mWorldCacheAsyncSpanWaits;
+    }
+    pRenderContext->wait(mpPhotonFence.get(), mPhotonFenceValue);
+    mPhotonWaitedValue = mPhotonFenceValue;
+}
+
+void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
+{
+    const bool touched = mDepositsTouched;
+    mDepositsTouched = false;
+    if (mpPhotonProbeReadback)
+    {
+        // Slots from frames that have retired (Falcor keeps fewer than 4 in flight; a span slice is waited for before the next).
+        const uint32_t* pProbe = nullptr;
+        for (uint32_t slot = 0; slot < kPhotonProbes; ++slot)
+        {
+            if (mPhotonProbeFrame[slot] == 0 || mPhotonProbeFrame[slot] + 4 > mExecuteFrames)
+                continue;
+            if (slot == (mPhotonProbeNext + kPhotonProbes - 1) % kPhotonProbes && photonSliceRunning())
+                continue;
+            if (!pProbe)
+                pProbe = static_cast<const uint32_t*>(mpPhotonProbeReadback->map());
+            const uint32_t* p = pProbe + kPhotonProbeWords * slot;
+            const uint32_t span = p[1] - ~p[0]; // ns, the timer's low 32 bits
+            if (span < 100'000'000u) // Not across the timer's wrap.
+            {
+                mPhotonSliceUs += span / 1000u;
+                ++mPhotonSlices;
+                mPhotonSlicesOver4Ms += span > 4'000'000u;
+                mPhotonLongestWaveUs += p[2] >> 16;
+                mPhotonLongestWaveFlights += p[2] & 0xffffu;
+                mPhotonFlights += p[3];
+                mPhotonsTraced += p[4];
+                mPhotonMostFlights = std::max<uint64_t>(mPhotonMostFlights, p[5]);
+                mPhotonWaveUs += p[6];
+                mPhotonWaves += p[7];
+                mPhotonSunFlights += p[8];
+                mPhotonSunTraced += p[9];
+                mPhotonCells += p[10];
+                mPhotonDeposited += p[11];
+                mPhotonSteps += p[12];
+            }
+            mPhotonProbeFrame[slot] = 0;
+        }
+        if (pProbe)
+            mpPhotonProbeReadback->unmap();
+    }
+    if (!mWorldCacheAsync || !mpCloudSea || !mpWorldCacheDeposit || mParams.seaMode == 0)
+        return;
+    if (!mWorldCachePhotonAsyncDefined)
+    {
+        // Compiled when switched on, not at its first slice: asynctime1's first slice compiled it mid-flight (a 4.5 s frame).
+        mpWorldCachePhotonAsyncPass->getProgram()->addDefine("HSTR_PHOTON_BUFFERS", "1");
+        for (const char* deferred : {"1", "0"}) // Both, so switching worldCacheDeferredDeposit compiles nothing mid-flight.
+        {
+            mpWorldCachePhotonAsyncPass->getProgram()->addDefine("HSTR_DEFERRED_DEPOSIT", deferred);
+            mpWorldCachePhotonAsyncPass->warm();
+        }
+        mpDepositSegmentsAsyncPass->getProgram()->addDefine("HSTR_PHOTON_BUFFERS", "1");
+        mpDepositSegmentsAsyncPass->getProgram()->addDefine("HSTR_DEFERRED_DEPOSIT", "1");
+        mpDepositSegmentsAsyncPass->warm();
+        mWorldCachePhotonAsyncDefined = true;
+    }
+    // The copies, refreshed on the main queue while updates run. The compute queue reads them from the next frame on: its frame
+    // waits for this frame's main-queue work (beginAsyncResidency).
+    const uint3 domainDims = mParams.hstrExtinctionDims;
+    const uint3 blocks = mParams.hstrMajorantDims;
+    const uint3 groups = (blocks + 3u) / 4u;
+    const uint3 fineDims = mParams.hstrFineDims;
+    const float3 sun = normalize(mParams.sunDirection);
+    if (mWorldCacheWanted && mpMajorant && mpTightMajorant && mpOccupancy)
+    {
+        auto ensure = [&](ref<Buffer>& pBuffer, size_t elements, size_t stride)
+        {
+            if (!pBuffer || pBuffer->getElementCount() != elements)
+                pBuffer = mpDevice->createStructuredBuffer(
+                    uint32_t(stride), uint32_t(elements), ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                    MemoryType::DeviceLocal, nullptr, false
+                );
+        };
+        const size_t blockCount = size_t(blocks.x) * blocks.y * blocks.z;
+        if (!mpPackFloatTexturePass)
+        {
+            mpPackFloatTexturePass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/CutVisibility.cs.slang", "packFloatTexture");
+            mpPackUintTexturePass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/CutVisibility.cs.slang", "packUintTexture");
+        }
+        if (mPhotonDomainPacked != mDomainUploads || !mpPhotonMajorant)
+        {
+            FALCOR_PROFILE(pRenderContext, "photonDomainCopy");
+            waitPhotonSlice(pRenderContext);
+            ensure(mpPhotonMajorant, blockCount, sizeof(float));
+            ensure(mpPhotonTightMajorant, blockCount, sizeof(float));
+            ensure(mpPhotonOccupancy, size_t(groups.x) * groups.y * groups.z, sizeof(uint32_t));
+            ShaderVar f = mpPackFloatTexturePass->getRootVar();
+            f["CB"]["gDims"] = blocks;
+            f["gSourceFloat"] = mpMajorant;
+            f["gFloatOutput"] = mpPhotonMajorant;
+            mpPackFloatTexturePass->execute(pRenderContext, blocks);
+            f["gSourceFloat"] = mpTightMajorant;
+            f["gFloatOutput"] = mpPhotonTightMajorant;
+            mpPackFloatTexturePass->execute(pRenderContext, blocks);
+            ShaderVar u = mpPackUintTexturePass->getRootVar();
+            u["CB"]["gDims"] = groups;
+            u["gSourceUint"] = mpOccupancy;
+            u["gUintOutput"] = mpPhotonOccupancy;
+            mpPackUintTexturePass->execute(pRenderContext, groups);
+            mPhotonDomainPacked = mDomainUploads;
+            mPhotonPackFrame = mExecuteFrames;
+        }
+        const ref<Texture>& pSunField = mParams.sunColumns != 0 ? mpSunShear : mpFineSun;
+        if (pSunField && (mPhotonFineSunPacked != mFineSunWrittenFrame || !mpPhotonFineSun) && fineDims.x == fineDims.z && fineDims.x % 2 == 0)
+        {
+            // packVisibilityProxy over the whole field as one square slot: float16 pairs, like the extinction's copy.
+            FALCOR_PROFILE(pRenderContext, "photonSunCopy");
+            waitPhotonSlice(pRenderContext);
+            ensure(mpPhotonFineSun, size_t(fineDims.x) * fineDims.y * fineDims.z / 2, sizeof(uint32_t));
+            if (!mpPackVisProxyPass)
+                mpPackVisProxyPass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/CutVisibility.cs.slang", "packVisibilityProxy");
+            ShaderVar var = mpPackVisProxyPass->getRootVar();
+            var["CB"]["gDims"] = fineDims;
+            var["CB"]["gTileVoxels"] = fineDims.x;
+            var["CB"]["gSlotOrigin"] = uint2(0);
+            var["gExtinction"] = pSunField;
+            var["gProxyOutput"] = mpPhotonFineSun;
+            mpPackVisProxyPass->execute(pRenderContext, uint3(fineDims.x / 2, fineDims.y, fineDims.z));
+            mPhotonFineSunPacked = mFineSunWrittenFrame;
+            mPhotonPackFrame = mExecuteFrames;
+        }
+        if (!mPhotonSkyBaked || any(mPhotonSkySun != sun))
+        {
+            FALCOR_PROFILE(pRenderContext, "photonSky");
+            waitPhotonSlice(pRenderContext);
+            ensure(mpPhotonSky, kPhotonSkyTexels, sizeof(float));
+            bindRenderer(pRenderContext, mpBakePhotonSkyPass);
+            mpBakePhotonSkyPass->getRootVar()["CB"]["gHSTRCloud"]["hstrPhotonSkyOutput"] = mpPhotonSky;
+            mpBakePhotonSkyPass->execute(pRenderContext, uint3(kPhotonSkyTexels, 1, 1));
+            mPhotonSkyBaked = true;
+            mPhotonSkySun = sun;
+            mPhotonPackFrame = mExecuteFrames;
+        }
+    }
+    if (!mAsyncPhotonPending)
+        return;
+    if (mWorldCacheAsyncSpan && photonSliceRunning())
+    {
+        ++mWorldCacheAsyncBusy; // The last slice still runs: this one follows it (not a wait towards the fallback).
+        return;
+    }
+    // The extinction's copy (mpVisProxy) is the visibility batches': written with every domain upload (mExtinctionQuietFrames).
+    const bool ready = (mWorldCacheAsyncSpan || (mAsyncResidencyActive && mpResidencyContext)) && mpVisProxy && mpPhotonMajorant &&
+                       mpPhotonFineSun && mpPhotonSky && !touched && !mWorldCacheBakeOwed && mPhotonPackFrame != mExecuteFrames &&
+                       mFineSunWrittenFrame != mExecuteFrames && mExtinctionQuietFrames >= 2 && mPhotonFineSunPacked == mFineSunWrittenFrame &&
+                       mPhotonDomainPacked == mDomainUploads;
+    if (!ready)
+    {
+        ++mAsyncPhotonWaits;
+        ++mWorldCacheAsyncWaits;
+        return;
+    }
+    ComputeContext* pContext = mpResidencyContext.get();
+    if (mWorldCacheAsyncSpan)
+    {
+        if (!mpPhotonContext)
+        {
+            // As the residency's queue (beginAsyncResidency), without its per-frame wait.
+            gfx::ICommandQueue::Desc desc = {gfx::ICommandQueue::QueueType::Compute};
+            if (SLANG_FAILED(mpDevice->getGfxDevice()->createCommandQueue(desc, mpPhotonQueue.writeRef())))
+                FALCOR_THROW("worldCacheAsyncSpan: could not create a compute queue.");
+            for (auto& pHeap : mpPhotonHeaps)
+            {
+                gfx::ITransientResourceHeap::Desc heapDesc = {};
+                heapDesc.flags = gfx::ITransientResourceHeap::Flags::Enum(
+                    gfx::ITransientResourceHeap::Flags::AllowResizing | gfx::ITransientResourceHeap::Flags::ComputeCommandLists
+                );
+                heapDesc.constantBufferSize = 1 << 20;
+                heapDesc.samplerDescriptorCount = 64;
+                heapDesc.uavDescriptorCount = 1024;
+                heapDesc.srvDescriptorCount = 1024;
+                heapDesc.constantBufferDescriptorCount = 1024;
+                if (SLANG_FAILED(mpDevice->getGfxDevice()->createTransientResourceHeap(heapDesc, pHeap.writeRef())))
+                    FALCOR_THROW("worldCacheAsyncSpan: could not create a transient heap.");
+            }
+            mpPhotonContext = std::make_unique<ComputeContext>(mpDevice.get(), mpPhotonQueue.get(), mpPhotonHeaps[0].get());
+            mpPhotonContext->getLowLevelData()->closeCommandBuffer();
+            mpPhotonContext->setOwnResourceStates(true);
+            gfx::InteropHandle handle = {};
+            if (SLANG_SUCCEEDED(mpPhotonQueue->getNativeHandle(&handle)) && handle.handleValue != 0)
+                reinterpret_cast<ID3D12CommandQueue*>(handle.handleValue)->SetName(L"HSTR photon COMPUTE queue");
+            mpPhotonFence = mpDevice->createFence();
+        }
+        // The slice before has finished (photonSliceRunning), so its heap of the ring is free.
+        mPhotonHeap = (mPhotonHeap + 1) % uint32_t(mpPhotonHeaps.size());
+        gfx::ITransientResourceHeap* pHeap = mpPhotonHeaps[mPhotonHeap].get();
+        pHeap->synchronizeAndReset();
+        mpPhotonContext->getLowLevelData()->setTransientHeap(pHeap);
+        mpPhotonContext->getLowLevelData()->openCommandBuffer();
+        // Everything the main queue was given so far; this frame's own unsubmitted work writes none of the slice's inputs (ready).
+        const ref<Fence>& pMainFence = pRenderContext->getLowLevelData()->getFence();
+        mpPhotonContext->wait(pMainFence.get(), pMainFence->getSignaledValue());
+        pContext = mpPhotonContext.get();
+    }
+    ShaderVar var = mpWorldCachePhotonAsyncPass->getRootVar()["CB"]["gHSTRCloud"];
+    var["params"].setBlob(mParams);
+    var["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+    var["hstrCloudTileFocus"] = mpCloudTileFocus;
+    var["hstrPhotonProxy"] = mpVisProxy;
+    var["hstrPhotonMajorant"] = mpPhotonMajorant;
+    var["hstrPhotonTightMajorant"] = mpPhotonTightMajorant;
+    var["hstrPhotonOccupancy"] = mpPhotonOccupancy;
+    var["hstrPhotonFineSun"] = mpPhotonFineSun;
+    var["hstrPhotonSky"] = mpPhotonSky;
+    const uint32_t slices = std::max(mWorldCacheSlices, 1u);
+    if (!mpPhotonProbe)
+    {
+        mpPhotonProbe = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), kPhotonProbeWords, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mpPhotonProbeReadback =
+            mpDevice->createBuffer(kPhotonProbeWords * sizeof(uint32_t) * kPhotonProbes, ResourceBindFlags::None, MemoryType::ReadBack);
+    }
+    const uint32_t probeSlot = mPhotonProbeNext;
+    mPhotonProbeNext = (mPhotonProbeNext + 1) % kPhotonProbes;
+    pContext->clearUAV(mpPhotonProbe->getUAV().get(), uint4(0));
+    var["hstrPhotonProbe"] = mpPhotonProbe;
+    const uint32_t photons = (mParams.worldCachePhotons + slices - 1) / slices;
+    bindPhotonSegments(pContext, mpWorldCachePhotonAsyncPass.get(), photons);
+    mpWorldCachePhotonAsyncPass->execute(pContext, uint3(photons, 1, 1));
+    if (mWorldCacheDeferredDeposit)
+    {
+        // The deposit walk reads what the photon pass's did.
+        ShaderVar deposit = mpDepositSegmentsAsyncPass->getRootVar()["CB"]["gHSTRCloud"];
+        deposit["params"].setBlob(mParams);
+        deposit["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
+        deposit["hstrCloudTileFocus"] = mpCloudTileFocus;
+        deposit["hstrPhotonProxy"] = mpVisProxy;
+        deposit["hstrPhotonMajorant"] = mpPhotonMajorant;
+        deposit["hstrPhotonTightMajorant"] = mpPhotonTightMajorant;
+        deposit["hstrPhotonOccupancy"] = mpPhotonOccupancy;
+        deposit["hstrPhotonFineSun"] = mpPhotonFineSun;
+        deposit["hstrPhotonSky"] = mpPhotonSky;
+        deposit["hstrPhotonProbe"] = mpPhotonProbe;
+        depositPhotonSegments(pContext, mpDepositSegmentsAsyncPass.get(), photons);
+    }
+    pContext->copyBufferRegion(
+        mpPhotonProbeReadback.get(), kPhotonProbeWords * sizeof(uint32_t) * probeSlot, mpPhotonProbe.get(), 0, kPhotonProbeWords * sizeof(uint32_t)
+    );
+    mPhotonProbeFrame[probeSlot] = mExecuteFrames;
+    if (pContext == mpPhotonContext.get())
+    {
+        mpPhotonContext->submit();
+        mpPhotonContext->getLowLevelData()->closeCommandBuffer();
+        mpPhotonHeaps[mPhotonHeap]->finish();
+        mPhotonFenceValue = mpPhotonContext->signal(mpPhotonFence.get());
+    }
+    // As the main queue's update counts it (the worldCache block).
+    ++mParams.worldCacheSamples;
+    for (float& batches : mCloudTileBatches)
+        batches += 1.f / float(slices);
+    mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+    ++mWorldCacheBakes;
+    mWorldCacheBakeDirty = true;
+    ++mWorldCacheUpdatesRun;
+    ++mWorldCacheAsyncRuns;
+    mAsyncPhotonPending = false;
 }
 
 void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext, bool domainWritten)
@@ -6732,6 +7300,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     {
         var["hstrCloudTileBatches"] = mpCloudTileBatches;
         var["hstrCloudTileReset"] = mpCloudTileReset;
+        var["hstrCloudTileFocus"] = mpCloudTileFocus;
     }
     var["hstrCameraLighting"] = mpCameraLighting;
     var["hstrFineSun"] = mpFineSun;
@@ -6955,7 +7524,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext, uint32_t rowOffset
     {
         for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_WORKSET_PROBE", "HSTR_LAYER_WRAP_SELECT",
                                  "HSTR_LAYER_RUN_DISTANCE", "HSTR_UNIT_START", "HSTR_SUN_PACKED", "HSTR_FORM_B", "HSTR_LAYER_ORACLE",
-                                 "HSTR_FORM_R", "HSTR_CACHE_VIEW"})
+                                 "HSTR_PROXY_VARIATE", "HSTR_FORM_R", "HSTR_CACHE_VIEW"})
             pPass->getProgram()->removeDefine(name);
     }
     mFarSeaMarchDefines = mParams.seaFarBricks != 0;
@@ -7034,6 +7603,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext, uint32_t rowOffset
 
 void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
 {
+    mFineSunWrittenFrame = mExecuteFrames; // Every path below writes the fine sun (worldCacheAsync's copy is stale).
     const uint3 fineDims = mParams.hstrFineDims;
     const auto flags = ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
     if (!mpFineSun || mpFineSun->getWidth() != fineDims.x || mpFineSun->getHeight() != fineDims.y || mpFineSun->getDepth() != fineDims.z)
@@ -7447,6 +8017,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_SUN_PACKED", (mCloudSunPackedRead || formB) && mParams.cloudSunPackedAtlas != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_FORM_B", formB ? std::to_string(mFormB) : "0");
     pPass->getProgram()->addDefine("HSTR_LAYER_ORACLE", std::to_string(mParams.cloudLayerOracle));
+    pPass->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_FORM_R", mHullTlas && mHullTlasFrame == mExecuteFrames ? std::to_string(mFormR) : "0");
     // ORACLE beamHistoryBlendOracle: compiled in only while asked for (beamUnitWrite).
     if (mBeamHistoryBlendOracle > 0.f)
@@ -7951,6 +8522,8 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
     if (mpCloudResidency)
         finishDeferredSun(pRenderContext);
     finishAsyncProbe(pRenderContext);
+    // After the late domain update, so it knows whether this frame wrote the domain.
+    dispatchAsyncPhotons(pRenderContext);
     // Before the timer's end: with it the pass's GPU time spans both queues' work.
     submitAsyncResidency(pRenderContext);
     // asyncProbe 6 / 7: this frame's work goes to the GPU, then the probe to its queue, so both start together.
@@ -8258,6 +8831,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         const float albedo = dot(mpScene->getGridVolume(0)->getAlbedo(), float3(1.f / 3.f));
         const float diffusion = std::sqrt(std::max(0.f, 3.f * (1.f - albedo) * (1.f - albedo * mParams.anisotropy)));
         mParams.worldCacheModulation = mWorldCacheModulation < 0.f ? diffusion : mWorldCacheModulation;
+        mParams.worldCachePhotonAlbedo = albedo;
         // The ring slots (worldCacheSunOrder 4) hold the light arriving from near the sun: low-order forward scattering, which
         // travels with the sun beam and fades at the transport rate 1 - albedo g (the similarity relation's extinction).
         mParams.worldCacheRingModulation = mWorldCacheRingModulation < 0.f ? 1.f - albedo * mParams.anisotropy : mWorldCacheRingModulation;
@@ -8295,6 +8869,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         }
         const size_t depositCount = size_t(dims.x) * dims.y * dims.z * kWorldCacheSlots;
         if (mParams.worldCacheEstimator != 0 && (!mpWorldCacheDeposit || mpWorldCacheDeposit->getElementCount() != depositCount))
+        {
+            waitPhotonSlice(pRenderContext);
             mpWorldCacheDeposit = mpDevice->createStructuredBuffer(
                 sizeof(int32_t),
                 uint32_t(depositCount),
@@ -8303,12 +8879,17 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 nullptr,
                 false
             );
+        }
         mParams.worldVoxelSize = mVoxelSize;
         // Measured (frame_cost.py, 4K laptop GPU): one photon update has a ~0.8 ms floor independent of the photon count (64
         // photons cost as much as 16k, an empty dispatch 0.02 ms): the tracer is latency bound at low occupancy. Not caused
         // by path length (roulette from 8 bounces: 1k photons 1.78 -> 1.66 ms), the modulation read (off: 1.66 ms), or the
         // deposit walk. The persistent pool (worldCacheSegments > 0) does not remove it: 64k slots x 4 flights 2.12 ms against
         // 1.96 ms for 16k whole paths, and no error gain at equal time (photon_study.py).
+        // MEASURED (poolcost1, 4K sprint 20, worldCache scope per update): whole paths, 65536 photons (~337k flights) 3.65-3.99 ms;
+        // pool 256k slots x 1 flight 2.89-3.05, 128k x 2 2.93-3.03, 64k x 4 3.10, 64k x 1 1.44-1.64. ~87-89k flights per ms
+        // either way: at batch size the update is throughput bound (~11 ns a flight, ~40% of it the deposit walk: knock1), so no
+        // split of a batch - slices, queues, a pool - costs less in total; only fewer or cheaper flights do.
         // Async compute would hide it, but slang-gfx 2024.1.34 exposes only a graphics queue (ICommandQueue::QueueType), and
         // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
         // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
@@ -8326,9 +8907,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         if (mCloudCacheKeep < 1.f && mpWorldCacheDeposit && mParams.worldCacheSamples > 0)
         {
             mParams.worldCacheKeep = mCloudCacheKeep;
+            waitPhotonSlice(pRenderContext);
             bindRenderer(pRenderContext, mpDecayWorldCachePass);
             mpDecayWorldCachePass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
             mpDecayWorldCachePass->execute(pRenderContext, dims);
+            mDepositsTouched = true;
             for (float& batches : mCloudTileBatches)
                 batches *= mCloudCacheKeep;
             mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
@@ -8342,8 +8925,111 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // without this its old deposits were read under the new setting and never retraced (sunset_hill_tone_sh: 0 samples).
         const bool converged = mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && !mCloudTileBatches.empty() &&
                                *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end()) >= float(mWorldCacheTarget);
-        for (uint32_t i = 0; i < (converged ? 0u : mWorldCacheUpdates); ++i)
+        // worldCacheFocusFar: with only some tiles under the target (streamed in by a moving camera), the update is spent on them.
+        // Photons that could light them start over them or upwind (the sun's reach across the layer, as the sun pages take it,
+        // one tile either side and one downwind); the rest survive their spawn at worldCacheFocusFar, weighted by its inverse.
+        bool focus = false;
+        if (!converged && mWorldCacheFocusFar > 0.f && mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && mpCloudSea &&
+            mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 && mCloudTileFocus.size() == mCloudTileBatches.size())
         {
+            const size_t tileCount = mCloudTileBatches.size();
+            uint32_t hungry = 0;
+            for (float batches : mCloudTileBatches)
+                hungry += batches < float(mWorldCacheTarget) ? 1u : 0u;
+            if (hungry < tileCount)
+            {
+                focus = true;
+                const float3 sun = normalize(mParams.sunDirection);
+                const auto& seaDesc = mpCloudSea->getDesc();
+                const float reach = std::abs(sun.y) > 1e-3f ? seaDesc.layerHeight * length(sun.xz()) / std::abs(sun.y) : 1e9f;
+                const int32_t n = int32_t(seaDesc.tiles);
+                const int32_t steps = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
+                const float2 downwind = length(sun.xz()) > 1e-6f ? -normalize(sun.xz()) * (sun.y >= 0.f ? 1.f : -1.f) : float2(0.f);
+                std::vector<uint8_t> nearTile(tileCount, 0);
+                for (uint32_t slot = 0; slot < tileCount; ++slot)
+                {
+                    if (mCloudTileBatches[slot] >= float(mWorldCacheTarget))
+                        continue;
+                    for (int32_t k = -1; k <= steps; ++k)
+                        for (int32_t side = -1; side <= 1; ++side)
+                        {
+                            const float2 p = float2(float(slot % n), float(slot / n)) - downwind * float(k) +
+                                             float2(-downwind.y, downwind.x) * float(side);
+                            const int32_t x = ((int32_t(std::floor(p.x + 0.5f)) % n) + n) % n;
+                            const int32_t z = ((int32_t(std::floor(p.y + 0.5f)) % n) + n) % n;
+                            nearTile[x + n * z] = 1;
+                        }
+                }
+                uint32_t nearCount = 0;
+                for (size_t slot = 0; slot < tileCount; ++slot)
+                {
+                    const bool starving = mCloudTileBatches[slot] < float(mWorldCacheTarget);
+                    mCloudTileFocus[slot] = starving ? 1.f : (nearTile[slot] ? -1.f : -mWorldCacheFocusFar);
+                    nearCount += nearTile[slot];
+                }
+                waitPhotonSlice(pRenderContext);
+                mpCloudTileFocus->setBlob(mCloudTileFocus.data(), 0, mCloudTileFocus.size() * sizeof(float));
+                ++mWorldCacheFocusUpdates;
+                mWorldCacheFocusNear += nearCount;
+                mWorldCacheFocusHungry += hungry;
+            }
+        }
+        mParams.worldCacheFocus = focus ? 1u : 0u;
+        // worldCacheAsync: the update is left to dispatchAsyncPhotons (the frame's end, the compute queue) while its inputs are
+        // quiet: the fine sun not written this frame or the last, the sky baked for this sun, no domain write in the last two frame
+        // ends. One waiting too long runs here.
+        bool runHere = !converged;
+        if (!mWorldCacheAsync)
+            mAsyncPhotonPending = false;
+        else if (mWorldCacheAsyncSpan && photonSliceRunning() && !converged && !focus)
+        {
+            // worldCacheAsyncSpan: the running slice is this frame's update, and the next is due at this frame's end if it finished
+            // by then. FOUND (spantime1, 4K sprint 20): without the pending flag here a slice started every other frame at best -
+            // 7 slices a flight against 12 on the residency queue.
+            runHere = false;
+            if (!mAsyncPhotonPending)
+            {
+                mAsyncPhotonPending = true;
+                mAsyncPhotonWaits = 0;
+            }
+        }
+        else if (!converged && !focus && mWorldCacheUpdates > 0 && mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 &&
+                 mParams.worldCacheTextured != 0 && mParams.worldCacheSamples > 0 && mParams.seaMode != 0 && !mCloudTileBatches.empty() &&
+                 mExecuteFrames >= mFineSunWrittenFrame + 2 && mExtinctionQuietFrames >= 2 && mPhotonSkyBaked &&
+                 all(mPhotonSkySun == normalize(mParams.sunDirection)))
+        {
+            if (!mAsyncPhotonPending)
+            {
+                mAsyncPhotonPending = true;
+                mAsyncPhotonWaits = 0;
+                runHere = false;
+            }
+            else if (mAsyncPhotonWaits < 4)
+                runHere = false;
+            else
+            {
+                mAsyncPhotonPending = false;
+                ++mWorldCacheAsyncFallbacks;
+            }
+        }
+        mWorldCacheWanted = !converged; // dispatchAsyncPhotons refreshes stale copies only while updates run.
+        if (!mDeferredDepositWarm && mParams.worldCacheEstimator != 0 && mParams.worldCacheTextured != 0)
+        {
+            // Both variants, so switching worldCacheDeferredDeposit compiles nothing mid-flight.
+            for (const char* deferred : {"1", "0"})
+            {
+                mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_DEFERRED_DEPOSIT", deferred);
+                mpWorldCachePhotonPass->warm();
+            }
+            mpDepositSegmentsPass->getProgram()->addDefine("HSTR_DEFERRED_DEPOSIT", "1");
+            mpDepositSegmentsPass->warm();
+            mDeferredDepositWarm = true;
+        }
+        for (uint32_t i = 0; i < (runHere ? mWorldCacheUpdates : 0u); ++i)
+        {
+            waitPhotonSlice(pRenderContext);
+            ++mWorldCacheUpdatesRun;
+            float batchShare = 1.f; // Of a batch, this update's photons (worldCacheSlices).
             if (mParams.worldCacheEstimator == 0)
             {
                 bindRenderer(pRenderContext, mpWorldCachePass);
@@ -8393,7 +9079,19 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 if (!accumulate || mParams.worldCacheSamples == 0)
                     pRenderContext->clearUAV(mpWorldCacheDeposit->getUAV().get(), uint4(0));
                 bindRenderer(pRenderContext, mpWorldCachePhotonPass);
-                mpWorldCachePhotonPass->execute(pRenderContext, uint3(mParams.worldCachePhotons, 1, 1));
+                // worldCacheSlices: a batch's photons over that many updates. Weights stay normalised by worldCachePhotons, so each
+                // slice is an unbiased 1 / slices of a batch and the tiles count it so (each slice draws its own seed).
+                const uint32_t slices = accumulate && !mCloudTileBatches.empty() ? std::max(mWorldCacheSlices, 1u) : 1u;
+                batchShare = 1.f / float(slices);
+                const uint32_t photons = (mParams.worldCachePhotons + slices - 1) / slices;
+                bindPhotonSegments(pRenderContext, mpWorldCachePhotonPass.get(), photons);
+                mpWorldCachePhotonPass->execute(pRenderContext, uint3(photons, 1, 1));
+                if (mWorldCacheDeferredDeposit)
+                {
+                    FALCOR_PROFILE(pRenderContext, "photonDeposits");
+                    bindRenderer(pRenderContext, mpDepositSegmentsPass);
+                    depositPhotonSegments(pRenderContext, mpDepositSegmentsPass.get(), photons);
+                }
                 if (!accumulate)
                 {
                     bindRenderer(pRenderContext, mpWorldCacheResolvePass);
@@ -8403,8 +9101,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             ++mParams.worldCacheSamples;
             if (!mCloudTileBatches.empty())
             {
-                for (float& batches : mCloudTileBatches)
-                    batches += 1.f;
+                // Focused, only the starving tiles took deposits.
+                for (size_t slot = 0; slot < mCloudTileBatches.size(); ++slot)
+                    mCloudTileBatches[slot] += !focus || mCloudTileFocus[slot] > 0.f ? batchShare : 0.f;
                 mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
             }
             ++mWorldCacheBakes; // Buffer lookups see every update.
@@ -8434,9 +9133,21 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // A full bake cost 0.72 ms; skipping cells without medium (bakeWorldCacheCell) made it 0.24 ms, and baking every
         // mWorldCacheBakeInterval (8) updates makes it negligible per frame (16k photons per frame, side: 2.07 ms baking every
         // update, 1.95 ms every 8).
-        const bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % mWorldCacheBakeInterval == 0;
+        // Every worldCacheBakeInterval updates, sliced or not: a slice costs the bake no more than a batch, and baking per batch
+        // (worldCacheBakeSliced) left a restarted tile showing its last bake for up to interval x slices frames.
+        const uint32_t bakeEvery = mWorldCacheBakeInterval * (mWorldCacheBakeSliced ? std::max(mWorldCacheSlices, 1u) : 1u);
+        bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % bakeEvery == 0 || mWorldCacheBakeOwed;
+        // worldCacheAsyncSpan: the tile counts already hold a running slice's share, its deposits not yet: the bake waits a frame.
+        if (bakeDue && mWorldCacheBakeDirty && photonSliceRunning())
+        {
+            bakeDue = false;
+            mWorldCacheBakeOwed = true;
+            ++mWorldCacheBakesPutOff;
+        }
         if (mWorldCacheBakeDirty && mParams.worldCacheTextured != 0 && mParams.worldCacheEstimator != 0 && bakeDue)
         {
+            mWorldCacheBakeOwed = false;
+            waitPhotonSlice(pRenderContext);
             FALCOR_PROFILE(pRenderContext, "worldCacheBake");
             bindRenderer(pRenderContext, mpWorldCacheBakePass);
             ShaderVar var = mpWorldCacheBakePass->getRootVar()["CB"]["gHSTRCloud"];
@@ -8446,7 +9157,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 var["hstrWorldCacheTextureOutput"][i] = mpWorldCacheTextures[i];
             }
             mpWorldCacheBakePass->execute(pRenderContext, dims);
+            mDepositsTouched = true; // The bake reads them: no compute-queue slice beside it this frame.
             mWorldCacheBakeDirty = false;
+            mWorldCacheBakeSamples = mParams.worldCacheSamples;
+            mWorldCacheBakeLowBatches = mCloudTileBatches.empty() ? 0.f : *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end());
             ++mWorldCacheBakes;
         }
         // worldCacheView: after the cache textures, before any camera march. It depends on the cache and the camera position only:
@@ -8983,6 +9697,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+        mpBeamQueryPass->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
         mpBeamQueryPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
         mpBeamQueryPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
         const bool temporal = mParams.beamTemporal != 0;
@@ -9050,6 +9765,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                    mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                     mpBeamSparseEmitPass->getProgram()->addDefine("HSTR_BEAM_SPARSE_CUT", mBeamSparseCut ? "1" : "0");
@@ -9158,6 +9874,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                            mpBeamGridQueryPass->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
                             mpBeamGridQueryPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                             if (queue)
@@ -9797,6 +10514,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_WRAP_SELECT", mParams.cloudLayerWrapSelect != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+                                mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
                                 mpBeamQueueMarchPass->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
                                 for (uint32_t bucket = 0; bucket < kBeamQueueBuckets; ++bucket)
@@ -10264,6 +10982,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         pMarch->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
         // beamUnitStart in the full build too: the motion score's fresh rebuild then marches its units the same way.
         pMarch->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
+        pMarch->getProgram()->addDefine("HSTR_PROXY_VARIATE", mParams.beamProxyVariate != 0 ? "1" : "0");
         pMarch->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
         pMarch->getProgram()->addDefine("HSTR_SUN_PACKED", sunPackedDefine());
         auto bindMarch = [&]()

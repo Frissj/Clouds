@@ -130,6 +130,13 @@ public:
     /// The instance slots of domain slots.
     std::vector<uint32_t> instanceSlots(const std::vector<uint32_t>& domainSlots) const;
     uint32_t slotIndex(int2 worldTile) const;
+    /// TEST (cloudSeaReload): the next update requests every tile of the window again, as if all were new.
+    void requestAll()
+    {
+        std::lock_guard lock(mMutex);
+        std::fill(mRequested.begin(), mRequested.end(), int2(std::numeric_limits<int32_t>::min()));
+        mCenter = int2(std::numeric_limits<int32_t>::min());
+    }
     uint32_t pendingTiles() const;
     /// PROBE (HSTR_LAYER_OCTANT_PROBE=1 in the environment): of the (tile, domain voxel) layer bits set, how many there were and how
     /// many of their 2 x 2 x 2 octants the same reach test finds empty - a half-voxel layer mask's ceiling. MEASURED (octant1, 4K

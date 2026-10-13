@@ -33,6 +33,10 @@ if(NOT FALCOR_HAS_DIRECTSTORAGE)
     message(FATAL_ERROR "HSTRCloud needs DirectStorage (downloaded into external/ when configuring on Windows).")
 endif()
 target_link_libraries(HSTRCloud PRIVATE zlib directstorage)
+# cloudStagingPool 1: upload buffers in CPU-visible video memory (NvAPI_D3D12_CreateCommittedResource). Falcor links NVAPI privately.
+if(FALCOR_HAS_NVAPI)
+    target_link_libraries(HSTRCloud PRIVATE nvapi)
+endif()
 add_dependencies(HSTRCloud deploy_directstorage)
 
 target_copy_shaders(HSTRCloud RenderPasses/HSTRCloud)

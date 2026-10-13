@@ -2183,6 +2183,31 @@ struct HSTRCloudParams
     /// -0.13 to -0.21. Passes the stop rule, but that is the whole fill + exact work deleted; a fused fill still pays its own
     /// work (fill scope 0.15 ms) plus a shaded halo (~30% more shade), only beside the march instead of behind it.
     uint beamHalfFillSkip = 0;
+    /// ORACLE (beamProxyVariate, 0 off; serial lean march only, so arms set beamQueryPair False): the domain proxy as a control
+    /// variate for the step's density (Novak et al. 2014, residual ratio tracking; Lin, Wyman & Yuksel 2021): a density step's
+    /// extinction is the proxy averaged at this many evenly spaced points of the step plus the fine-minus-proxy residual at its
+    /// midpoint. Judged against the same longer steps without it (minStepVoxels arms): the variate only pays if the residual
+    /// varies along a step much less than the fine density does.
+    /// MEASURED (cvpt1 / focuspt1, sunset_hill path trace, 960 wide, excess squared log error; the first run's variate arms read
+    /// their plain twins to the last digit because only the dirty passes took HSTR_PROXY_VARIATE - every beam march takes it now):
+    /// ship (minStepVoxels 4) 0.022970; 1.5x steps (6) 0.023808, with the variate 0.023535; 2x (8) 0.024405, with it 0.024162;
+    /// sanity tol 10 0.025181. The variate wins back 33% / 17% of what the longer step loses: the long step's error is
+    /// sub-proxy-voxel structure, which the proxy does not carry. Time unmeasured.
+    uint beamProxyVariate = 0;
+    /// worldCacheFocusFar is spending this photon update on the starving tiles (hstrCloudTileFocus), set per frame.
+    uint worldCacheFocus = 0;
+    /// The grid volume's grey albedo, for the photon pass on the compute queue (worldCacheAsync), which has no scene bound.
+    float worldCachePhotonAlbedo = 0.f;
+    /// DIAGNOSTIC (worldCacheBounceCap, biased, read for time): a photon ends after this many scatterings; 0 none.
+    /// MEASURED (bouncecap1, 4K sprint 20, a quarter batch on the residency queue, hstrPhotonProbe): slice 3.32 ms uncapped, 3.53
+    /// at 32, 3.36 at 16, 3.35 at 8 - the tail is not scattering depth (5.1 flights a photon, the longest wave's lanes 15-18).
+    uint worldCacheBounceCap = 0;
+    /// DIAGNOSTIC (worldCacheKnock, wrong cache, read for time), bits: 1 no deposit walk, 2 the walk without its atomic flushes,
+    /// 4 the deposit modulation taken as 1.
+    /// MEASURED (knock1, same bench): slice 3.57 / 3.64 ms (anchors), no deposit walk 2.02, no flushes 2.72, no modulation 2.91.
+    /// A flight is short (13.2 collision steps, 8.5 cells walked, 3.9 deposited into); the kernel is latency bound - hence
+    /// worldCacheDeferredDeposit.
+    uint worldCacheKnock = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

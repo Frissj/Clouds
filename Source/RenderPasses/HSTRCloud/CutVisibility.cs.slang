@@ -42,6 +42,29 @@ void packVisibilityProxy(uint3 id: SV_DispatchThreadID)
     gProxyOutput[(v.x + gDims.x * (v.y + gDims.y * v.z)) >> 1] = f32tof16(a) | (f32tof16(b) << 16);
 }
 
+Texture3D<float> gSourceFloat;
+Texture3D<uint> gSourceUint;
+RWStructuredBuffer<float> gFloatOutput;
+RWStructuredBuffer<uint> gUintOutput;
+
+/// worldCacheAsync: a whole float texture (gDims) into a buffer, x + gDims.x (y + gDims.y z) - the majorants for the compute queue.
+[numthreads(8, 4, 8)]
+void packFloatTexture(uint3 id: SV_DispatchThreadID)
+{
+    if (any(id >= gDims))
+        return;
+    gFloatOutput[id.x + gDims.x * (id.y + gDims.y * id.z)] = gSourceFloat.Load(int4(id, 0));
+}
+
+/// ... and a uint texture (the occupancy).
+[numthreads(8, 4, 8)]
+void packUintTexture(uint3 id: SV_DispatchThreadID)
+{
+    if (any(id >= gDims))
+        return;
+    gUintOutput[id.x + gDims.x * (id.y + gDims.y * id.z)] = gSourceUint.Load(int4(id, 0));
+}
+
 float transmittance(float3 target, float maxDepth)
 {
     const float3 delta = target - gCamera;

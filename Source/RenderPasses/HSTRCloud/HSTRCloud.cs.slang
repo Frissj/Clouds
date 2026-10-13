@@ -47,6 +47,11 @@ import Atmosphere;
 #define HSTR_QUERY_PAIR_CHECK 0 // SANITY (beamQueryPairCheck): each paired ray marched again serially and compared (kBeamPairCheck).
 #endif
 static bool gPairSerial = false; ///< beamQueryPairCheck: marchBeamLean takes the serial loop even where HSTR_QUERY_PAIR is set.
+static uint gPhotonBounces = 0;  ///< DIAGNOSTIC (hstrPhotonProbe): the flights tracePhoton's photon took ...
+static bool gPhotonFromSun = false; ///< ... and its source, the cells its deposit walks crossed, those it deposited into, and
+static uint gPhotonCells = 0;       ///< its collision search's steps.
+static uint gPhotonDeposited = 0;
+static uint gPhotonSteps = 0;
 #if HSTR_ORDER_PROBE
 // The query's timing (hstrBeamTailProbe); only here, so no other program carries NVAPI's resource. Needs NVAPI in the build
 // (packman nvapi, FALCOR_HAS_NVAPI): without it GpuTimer returns 0 and the TAIL log lines read 0 (tail1).
@@ -78,6 +83,20 @@ import Utils.Timing.GpuTimer;
 #endif
 #ifndef HSTR_SUN_PACKED
 #define HSTR_SUN_PACKED 0 // cloudSunPackedRead: the beam marches read density and sun bake from hstrCloudSunPacked in one fetch.
+#endif
+#ifndef HSTR_PHOTON_BUFFERS
+#define HSTR_PHOTON_BUFFERS 0 // worldCacheAsync: the photon pass reads buffer copies (hstrPhoton*), never a main-queue texture.
+#endif
+#ifndef HSTR_DEFERRED_DEPOSIT
+#define HSTR_DEFERRED_DEPOSIT 0 // worldCacheDeferredDeposit: tracePhoton records its flights for depositPhotonSegments.
+#endif
+#if HSTR_PHOTON_BUFFERS && !HSTR_ORDER_PROBE
+import Utils.Timing.GpuTimer; // The slice's own span on its queue (hstrPhotonProbe).
+#endif
+static const uint kPhotonSkyWidth = 64; // worldCacheAsync's sky grid (photonSkyDirection).
+static const uint kPhotonSkyHeight = 32;
+#ifndef HSTR_PROXY_VARIATE
+#define HSTR_PROXY_VARIATE 0 // beamProxyVariate: the proxy as a control variate for each density step (oracle arm).
 #endif
 #ifndef HSTR_LAYER_ORACLE
 #define HSTR_LAYER_ORACLE 0 // cloudLayerOracle: layers answered by the world proxy instead of their chains (timing oracle).
@@ -632,6 +651,27 @@ struct HSTRCloudRenderer
     StructuredBuffer<uint> hstrCloudSunResets;              ///< First entries of the field ranges resetSunField restarts.
     StructuredBuffer<HSTRCloudSunFrame> hstrCloudSunFrameInfo; ///< This frame's scheduling (one element).
     StructuredBuffer<float> hstrCloudTileBatches; ///< Light-tracing batches deposited per sea tile since its content changed.
+    /// worldCacheFocusFar, per sea tile while params.worldCacheFocus: a photon spawned over it survives with |value| (weighted by its
+    /// inverse); the tile takes deposits where the value is positive.
+    StructuredBuffer<float> hstrCloudTileFocus;
+    /// worldCacheAsync (HSTR_PHOTON_BUFFERS): the photon pass on the residency compute queue may read no texture the main queue
+    /// uses (D3D12 1047, see dispatchCutVisibility), so it reads buffer copies: the extinction as float16 pairs (the visibility
+    /// proxy, x + dims.x (y + dims.y z)), the block majorants and tight majorants (x + blocks.x (y + blocks.y z)), the 16-voxel
+    /// occupancy, the fine sun field (float16 pairs like the extinction) and the sky's mean radiance on a 64 x 32 latitude-longitude
+    /// grid of directions.
+    StructuredBuffer<uint> hstrPhotonProxy;
+    StructuredBuffer<float> hstrPhotonMajorant;
+    StructuredBuffer<float> hstrPhotonTightMajorant;
+    StructuredBuffer<uint> hstrPhotonOccupancy;
+    StructuredBuffer<uint> hstrPhotonFineSun;
+    StructuredBuffer<float> hstrPhotonSky;
+    RWStructuredBuffer<float> hstrPhotonSkyOutput;
+    /// DIAGNOSTIC (worldCacheAsync): the slice's first wave start, complemented (so both are maxima over a zero clear), and last wave
+    /// end, in the global timer's low 32 bits.
+    RWStructuredBuffer<uint> hstrPhotonProbe;
+    /// worldCacheDeferredDeposit: the photons' flights to deposit, three float4 each (start, weight; end, field; look) ...
+    RWStructuredBuffer<float4> hstrPhotonSegments;
+    RWStructuredBuffer<uint> hstrPhotonSegmentCount; ///< ... and how many were recorded (past the buffer: deposited in place).
     StructuredBuffer<uint> hstrCloudTileReset;    ///< 1 for sea tiles whose world cache cells clearWorldCacheTiles clears.
     Texture3D<float4> hstrCameraLighting;
     RWTexture3D<float4> hstrCameraLightingOutput;
@@ -998,7 +1038,42 @@ struct HSTRCloudRenderer
     float extinctionAtVoxel(float3 v)
     {
         v = seaVoxel(v);
+#if HSTR_PHOTON_BUFFERS
+        return photonTrilinear(hstrPhotonProxy, v, params.hstrExtinctionDims, false);
+#else
         return hstrExtinction.SampleLevel(hstrExtinctionSampler, (v + 0.5f) / float3(params.hstrExtinctionDims), 0.f);
+#endif
+    }
+
+    /// HSTR_PHOTON_BUFFERS: texel p of a float16-pair buffer laid out x + dims.x (y + dims.y z), addressed as the sea's samplers
+    /// address the texture it copies - x and z wrap; y clamps (clampY) or reads zero outside (the extinction's border).
+    float photonTexel(StructuredBuffer<uint> buffer, int3 p, int3 dims, bool clampY)
+    {
+        p.x = (p.x % dims.x + dims.x) % dims.x;
+        p.z = (p.z % dims.z + dims.z) % dims.z;
+        if (clampY)
+            p.y = clamp(p.y, 0, dims.y - 1);
+        else if (p.y < 0 || p.y >= dims.y)
+            return 0.f;
+        const uint index = uint(p.x) + uint(dims.x) * (uint(p.y) + uint(dims.y) * uint(p.z));
+        return f16tof32(buffer[index >> 1] >> ((index & 1u) * 16u));
+    }
+
+    /// HSTR_PHOTON_BUFFERS: the trilinear sample a texture lookup at (v + 0.5) / dims returns, from the buffer copy.
+    float photonTrilinear(StructuredBuffer<uint> buffer, float3 v, uint3 dims, bool clampY)
+    {
+        const float3 base = floor(v);
+        const float3 f = v - base;
+        const int3 i0 = int3(base);
+        float value = 0.f;
+        [unroll]
+        for (uint k = 0; k < 8; ++k)
+        {
+            const int3 o = int3(k & 1u, (k >> 1) & 1u, k >> 2);
+            const float3 w = select(o != 0, f, 1.f - f);
+            value += w.x * w.y * w.z * photonTexel(buffer, i0 + o, int3(dims), clampY);
+        }
+        return value;
     }
 
     /// Density of one resident brick at source position x (voxel centres at integers, i its voxel), before the density scale.
@@ -1915,7 +1990,11 @@ struct HSTRCloudRenderer
     {
         v = seaVoxel(v);
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+#if HSTR_PHOTON_BUFFERS
+        return hstrPhotonMajorant[block.x + params.hstrMajorantDims.x * (block.y + params.hstrMajorantDims.y * block.z)];
+#else
         return hstrMajorant.Load(int4(block, 0));
+#endif
     }
 
     /// The layers with density over the footprint of the domain voxel nearest v (the hstrDomainVolume signs, which CloudSea widens
@@ -1945,7 +2024,11 @@ struct HSTRCloudRenderer
     {
         v = seaVoxel(v);
         const int3 block = clamp(int3(floor(v * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+#if HSTR_PHOTON_BUFFERS
+        return hstrPhotonTightMajorant[block.x + params.hstrMajorantDims.x * (block.y + params.hstrMajorantDims.y * block.z)];
+#else
         return hstrTightMajorant.Load(int4(block, 0));
+#endif
     }
 
     float3 cameraLightingAt(float3 leafPosition)
@@ -1980,11 +2063,15 @@ struct HSTRCloudRenderer
     float fineSunAt(float3 v)
     {
         if (params.sunColumns != 0)
-        {
             v.xz += params.sunShear * (float(params.hstrFineDims.y) - 0.5f - v.y);
+#if HSTR_PHOTON_BUFFERS
+        // The copy of whichever field is live (hstrSunShear under sunColumns, else hstrFineSun), sampled as hstrLinearSampler does.
+        return photonTrilinear(hstrPhotonFineSun, seaVoxel(v), params.hstrFineDims, true);
+#else
+        if (params.sunColumns != 0)
             return hstrSunShear.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
-        }
         return hstrFineSun.SampleLevel(hstrLinearSampler, (seaVoxel(v) + 0.5f) / float3(params.hstrFineDims), 0.f);
+#endif
     }
 
     float sunDepthProxy(float3 v)
@@ -3685,8 +3772,40 @@ struct HSTRCloudRenderer
     {
         if (params.skyModel == 0)
             return params.skyRadiance * (0.35f + 0.65f * saturate(0.5f + 0.5f * direction.y));
+#if HSTR_PHOTON_BUFFERS
+        // The photon pass reads only the mean (spawnPhoton's sky shape): bilinear on bakePhotonSky's latitude-longitude grid.
+        return float3(photonSkyMean(direction));
+#endif
         // skyModel 2: pl-sky's atmosphere (Atmosphere.slang).
         return atmosphereSky(hstrAtmosphere, hstrAtmosphereSky, hstrAtmosphereTransmission, hstrLinearClampSampler, direction);
+    }
+
+    /// worldCacheAsync's sky grid (kPhotonSkyWidth x kPhotonSkyHeight): texel (i, j) at azimuth 2 pi (i + 0.5) / width and polar
+    /// angle pi (j + 0.5) / height.
+    float3 photonSkyDirection(uint i, uint j)
+    {
+        const float phi = 2.f * kPi * (float(i) + 0.5f) / float(kPhotonSkyWidth);
+        const float theta = kPi * (float(j) + 0.5f) / float(kPhotonSkyHeight);
+        return float3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+    }
+    float photonSkyMean(float3 d)
+    {
+        const float phi = atan2(d.z, d.x);
+        const float u = (phi < 0.f ? phi + 2.f * kPi : phi) / (2.f * kPi) * float(kPhotonSkyWidth) - 0.5f;
+        const float w = acos(clamp(d.y, -1.f, 1.f)) / kPi * float(kPhotonSkyHeight) - 0.5f;
+        const float u0 = floor(u);
+        const float w0 = floor(w);
+        const float fu = u - u0;
+        const float fw = w - w0;
+        float value = 0.f;
+        [unroll]
+        for (uint k = 0; k < 4; ++k)
+        {
+            const int i = (int(u0) + int(k & 1u) + int(kPhotonSkyWidth)) % int(kPhotonSkyWidth);
+            const int j = clamp(int(w0) + int(k >> 1), 0, int(kPhotonSkyHeight) - 1);
+            value += ((k & 1u) != 0 ? fu : 1.f - fu) * ((k >> 1) != 0 ? fw : 1.f - fw) * hstrPhotonSky[i + kPhotonSkyWidth * j];
+        }
+        return value;
     }
 
     /// skyRadianceAt split for seaFarSky: the smooth sky the far layer carries, and the sun disk added per pixel.
@@ -4193,11 +4312,20 @@ struct HSTRCloudRenderer
         const float epsilon = 1e-3f;
         for (uint i = 0; i < 16384; ++i)
         {
+#if HSTR_PHOTON_BUFFERS
+            ++gPhotonSteps;
+#endif
             if (!insideExtinctionGrid(v))
                 return false;
             // Empty 16-voxel blocks are crossed in one jump.
             const int3 group = clamp(int3(floor(seaVoxel(v) / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
-            if (hstrOccupancy.Load(int4(group, 0)) == 0)
+#if HSTR_PHOTON_BUFFERS
+            const uint3 groups = (params.hstrMajorantDims + 3u) / 4u;
+            const uint occupied = hstrPhotonOccupancy[group.x + groups.x * (group.y + groups.y * group.z)];
+#else
+            const uint occupied = hstrOccupancy.Load(int4(group, 0));
+#endif
+            if (occupied == 0)
             {
                 v += (majorantBlockExit(v, d, 16.f) + epsilon) * d;
                 continue;
@@ -4525,6 +4653,9 @@ struct HSTRCloudRenderer
         float t = 0.f;
         for (uint i = 0; i < 1024; ++i)
         {
+#if HSTR_PHOTON_BUFFERS
+            ++gPhotonCells;
+#endif
             const float tNext = min(min(tMax.x, tMax.y), min(tMax.z, 1.f));
             const float fraction = tNext - t;
             // Cells with no medium within a majorant block of their centre are never read by the camera (its trilinear
@@ -4537,16 +4668,32 @@ struct HSTRCloudRenderer
                 storedCell.z = (cell.z % dims.z + dims.z) % dims.z;
             }
             if (fraction > 0.f && all(storedCell >= 0) && all(storedCell < int3(params.worldCacheDims)) &&
-                majorantAt((float3(storedCell) + 0.5f) * cellVoxels) > 0.f)
+                majorantAt((float3(storedCell) + 0.5f) * cellVoxels) > 0.f &&
+                (params.worldCacheFocus == 0 ||
+                 hstrCloudTileFocus[worldCacheTile(worldCacheIndex(uint3(storedCell)))] > 0.f)) // Focused: starving tiles only.
             {
                 if (any(storedCell != acc.cell))
                 {
+#if HSTR_PHOTON_BUFFERS
+                    ++gPhotonDeposited;
+                    if ((params.worldCacheKnock & 2u) != 0)
+                    {
+                        [unroll]
+                        for (uint k = 0; k < 16; ++k)
+                            acc.sums[k] = 0.f;
+                    }
+                    else
+#endif
                     flushDeposits(acc, rng);
                     acc.cell = storedCell;
                 }
                 // Deposits are divided by the modulation at the middle of this cell's part of the flight (the ring slots by their own).
                 const float3 middle = (p0 + (t + 0.5f * fraction) * delta) * cellVoxels;
+#if HSTR_PHOTON_BUFFERS
+                const float inverseModulation = (params.worldCacheKnock & 4u) != 0 ? 1.f : 1.f / worldCacheModulation(middle);
+#else
                 const float inverseModulation = 1.f / worldCacheModulation(middle);
+#endif
                 const float scale = perUnit * fraction * inverseModulation;
                 const float ringScale = extension > 0 && params.worldCacheSunOrder >= 4 ? scale / worldCacheRingFactor(middle) : scale;
                 [unroll]
@@ -4600,30 +4747,52 @@ struct HSTRCloudRenderer
     /// error 0.0241 -> 0.0273, so the roulette stays weight-bounded from bounce 8.
     void tracePhoton(uint index)
     {
+#if HSTR_PHOTON_BUFFERS
+        // On the compute queue the scene is not bound: the volume's grey albedo comes with the params.
+        if (index >= params.worldCachePhotons)
+            return;
+        const float albedo = params.worldCachePhotonAlbedo;
+#else
         if (index >= params.worldCachePhotons || gScene.getGridVolumeCount() == 0)
             return;
         const GridVolume volume = gScene.getGridVolume(0);
+        // The medium is grey: one scalar albedo.
+        const float albedo = dot(volume.data.albedo, 1.f / 3.f);
+#endif
         uint rng = hashUint(index * 2654435761u + 1013u) ^ hashUint(params.worldCacheSamples * 9781u + 6271u);
         Photon photon = spawnPhoton(rng);
         float3 v = photon.positionWeight.xyz;
-        const float weight = photon.positionWeight.w;
+        float weight = photon.positionWeight.w;
+        if (params.worldCacheFocus != 0)
+        {
+            // worldCacheFocusFar: away from the starving tiles a photon survives its spawn at that tile's probability.
+            const uint2 tile = min(uint2(max(v.xz, 0.f)) / params.cloudTileVoxels, params.cloudTiles - 1u);
+            const float survive = abs(hstrCloudTileFocus[tile.x + params.cloudTiles.x * tile.y]);
+            if (randomFloat(rng) >= survive)
+                return;
+            weight /= survive;
+        }
         float3 direction = photon.directionThroughput.xyz;
         const bool fromSun = (photon.state & kPhotonSky) == 0;
 
-        // The medium is grey: one scalar albedo.
-        const float albedo = dot(volume.data.albedo, 1.f / 3.f);
         float throughput = 1.f;
         DepositAccumulator acc = makeDepositAccumulator(fromSun ? 0u : 1u);
+        gPhotonFromSun = fromSun;
         for (uint bounce = 0; bounce < 4096; ++bounce)
         {
+            gPhotonBounces = bounce + 1;
             const float3 d = voxelDirection(direction);
             v = wrapSeaPosition(v);
             const float3 start = v;
             const bool similar = photonSimilar(bounce);
             const bool collided = sampleCollision(v, d, rng, similar ? 1.f - albedo * params.anisotropy : 1.f);
+#if HSTR_PHOTON_BUFFERS
+            if ((!fromSun || bounce > 0) && (params.worldCacheKnock & 1u) == 0)
+#else
             if (!fromSun || bounce > 0)
-                depositSegment(start, v, -direction, weight * throughput, acc, rng);
-            if (!collided)
+#endif
+                depositPhotonFlight(start, v, -direction, weight * throughput, acc, rng);
+            if (!collided || (params.worldCacheBounceCap != 0 && bounce + 1 >= params.worldCacheBounceCap))
                 break;
             photonScatter(similar, albedo, direction, throughput, rng);
             // Weight-bounded Russian roulette, as in tracePath.
@@ -4636,6 +4805,34 @@ struct HSTRCloudRenderer
             }
         }
         flushDeposits(acc, rng);
+    }
+
+    /// A photon's flight deposited, or (HSTR_DEFERRED_DEPOSIT) recorded for depositPhotonSegments: the deposit walk - its cells'
+    /// modulation and atomics - then leaves the photon's serial chain for a pass of a thread per flight.
+    /// Why: knock1 (4K sprint 20, a quarter batch on the compute queue, hstrPhotonProbe): 3.6 ms a slice, 2.0 without the deposit
+    /// walk; the kernel is latency bound (512 waves, ~5 flights a photon of 13 collision steps and 8.5 cells each).
+    /// MEASURED, left off: no faster - the separate deposit pass costs what it saved (numbers at mWorldCacheDeferredDeposit).
+    void depositPhotonFlight(float3 v0, float3 v1, float3 look, float weight, inout DepositAccumulator acc, inout uint rng)
+    {
+#if HSTR_DEFERRED_DEPOSIT
+        uint capacity, stride;
+        hstrPhotonSegments.GetDimensions(capacity, stride);
+        // Counted before the branch: inside it only the first lane is active. FOUND (dodpt1): counted inside, every wave reserved
+        // one slot for all its lanes, the waves overwrote each other's flights, and the refilled cache scored 0.059 against 0.023.
+        const uint lanes = WaveActiveCountBits(true);
+        uint first = 0;
+        if (WaveIsFirstLane())
+            InterlockedAdd(hstrPhotonSegmentCount[0], lanes, first);
+        const uint slot = WaveReadLaneFirst(first) + WavePrefixCountBits(true);
+        if (3 * slot + 2 < capacity)
+        {
+            hstrPhotonSegments[3 * slot] = float4(v0, weight);
+            hstrPhotonSegments[3 * slot + 1] = float4(v1, float(acc.field));
+            hstrPhotonSegments[3 * slot + 2] = float4(look, 0.f);
+            return;
+        }
+#endif
+        depositSegment(v0, v1, look, weight, acc, rng);
     }
 
     /// Whether a photon's flight after `bounce` scatterings runs in the similar medium: after worldCacheSimilarity exact
@@ -4858,8 +5055,10 @@ struct HSTRCloudRenderer
         // every tile counts the batches since its cloud arrived.
         float batches = params.worldCacheSegments > 0 ? float(max(hstrPhotonEmitted[0], 1u)) / float(params.worldCachePhotons)
                                                       : float(max(params.worldCacheSamples, 1u));
+        // Not clamped to a whole batch: under worldCacheSlices a restarted tile holds fractions of one for its first slices, and a
+        // bake then divided their deposits by 1 (a tile 1/8 of a batch in, 8x too dark). Deposits are 0 wherever the count is.
         if (params.cloudDomain != 0)
-            batches = max(hstrCloudTileBatches[worldCacheTile(index)], 1.f);
+            batches = max(hstrCloudTileBatches[worldCacheTile(index)], 1e-3f);
         return float(hstrWorldCacheDeposit[kWorldCacheSlots * index + slot]) / (batches * params.worldCacheDepositScale);
     }
 
@@ -9724,6 +9923,22 @@ struct HSTRCloudRenderer
                         sigma = sum / float(taps);
                     }
                 }
+#if HSTR_PROXY_VARIATE
+                // ORACLE (beamProxyVariate): the proxy averaged over the step plus the fine-minus-proxy residual at the midpoint.
+                if (skipTo < 0.f)
+                {
+                    const float fade = params.seaMode != 0 && params.cloudPixelAngle > 0.f
+                                           ? saturate((1.f - footprint / (params.cloudPixelAngle * params.seaViewDistance)) * params.seaFadeInverse)
+                                           : 1.f;
+                    float proxySum = 0.f;
+                    for (uint g = 0; g < params.beamProxyVariate; ++g)
+                    {
+                        const float tg = t + (float(g) + 0.5f) * dt / float(params.beamProxyVariate);
+                        proxySum += extinctionAtVoxel((ray.position + tg * ray.direction) * cellWidth);
+                    }
+                    sigma = max(0.f, sigma + fade * (proxySum / float(params.beamProxyVariate) - extinctionAtVoxel(midpoint)));
+                }
+#endif
                 const float alpha = 1.f - exp(-(sigma * dt * ray.worldLength));
 #if HSTR_UNIT_SPAN
                 if (alpha > 0.f)
@@ -17919,7 +18134,83 @@ void updateWorldCache(uint3 dispatchThreadId: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
+#if HSTR_PHOTON_BUFFERS
+    // hstrPhotonProbe: 0 the first wave start (complemented), 1 the last wave end, 2 the longest wave (us << 16 | its lanes' most
+    // flights), 3 flights summed, 4 photons traced, 5 the most flights, 6 wave spans summed (us), 7 waves, 8 / 9 the sun photons'
+    // flights summed and count, 10 / 11 / 12 the deposit walks' cells crossed and deposited into and the collision searches' steps.
+    const uint start = WaveActiveMin(GpuTimer::getCurrentTimePoint());
+    if (WaveIsFirstLane())
+        InterlockedMax(gHSTRCloud.hstrPhotonProbe[0], ~start);
+    gPhotonBounces = 0;
+    gPhotonCells = 0;
+    gPhotonDeposited = 0;
+    gPhotonSteps = 0;
+#endif
     gHSTRCloud.tracePhoton(dispatchThreadId.x);
+#if HSTR_PHOTON_BUFFERS
+    const uint end = WaveActiveMax(GpuTimer::getCurrentTimePoint());
+    const uint traced = gPhotonBounces > 0 ? 1u : 0u;
+    const uint flights = WaveActiveSum(gPhotonBounces);
+    const uint most = WaveActiveMax(gPhotonBounces);
+    const uint sunFlights = WaveActiveSum(gPhotonFromSun ? gPhotonBounces : 0u);
+    const uint sunTraced = WaveActiveSum(gPhotonFromSun ? traced : 0u);
+    const uint photons = WaveActiveSum(traced);
+    const uint cells = WaveActiveSum(gPhotonCells);
+    const uint deposited = WaveActiveSum(gPhotonDeposited);
+    const uint steps = WaveActiveSum(gPhotonSteps);
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[10], cells);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[11], deposited);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[12], steps);
+        const uint us = (end - start) / 1000u;
+        InterlockedMax(gHSTRCloud.hstrPhotonProbe[1], end);
+        InterlockedMax(gHSTRCloud.hstrPhotonProbe[2], (min(us, 65535u) << 16) | min(most, 65535u));
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[3], flights);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[4], photons);
+        InterlockedMax(gHSTRCloud.hstrPhotonProbe[5], most);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[6], us);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[7], 1u);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[8], sunFlights);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[9], sunTraced);
+    }
+#endif
+}
+
+/// worldCacheDeferredDeposit: a thread per recorded photon flight (depositPhotonFlight), deposited as tracePhoton would have.
+[numthreads(64, 1, 1)]
+void depositPhotonSegments(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    uint capacity, stride;
+    gHSTRCloud.hstrPhotonSegments.GetDimensions(capacity, stride);
+    if (i < gHSTRCloud.hstrPhotonSegmentCount[0] && 3 * i + 2 < capacity)
+    {
+        const float4 a = gHSTRCloud.hstrPhotonSegments[3 * i];
+        const float4 b = gHSTRCloud.hstrPhotonSegments[3 * i + 1];
+        const float3 look = gHSTRCloud.hstrPhotonSegments[3 * i + 2].xyz;
+        DepositAccumulator acc = gHSTRCloud.makeDepositAccumulator(uint(b.w));
+        uint rng = gHSTRCloud.hashUint(i * 2654435761u + 7919u) ^ gHSTRCloud.hashUint(gHSTRCloud.params.worldCacheSamples * 9781u + 3203u);
+        gHSTRCloud.depositSegment(a.xyz, b.xyz, look, a.w, acc, rng);
+        gHSTRCloud.flushDeposits(acc, rng);
+    }
+#if HSTR_PHOTON_BUFFERS
+    // The slice's end on its queue (hstrPhotonProbe 1) is this pass's.
+    const uint end = WaveActiveMax(GpuTimer::getCurrentTimePoint());
+    if (WaveIsFirstLane())
+        InterlockedMax(gHSTRCloud.hstrPhotonProbe[1], end);
+#endif
+}
+
+/// worldCacheAsync: the sky's mean radiance on the photon sky grid (photonSkyDirection), for the compute queue's photon pass.
+[numthreads(64, 1, 1)]
+void bakePhotonSky(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    const uint index = dispatchThreadId.x;
+    if (index >= kPhotonSkyWidth * kPhotonSkyHeight)
+        return;
+    const float3 d = gHSTRCloud.photonSkyDirection(index % kPhotonSkyWidth, index / kPhotonSkyWidth);
+    gHSTRCloud.hstrPhotonSkyOutput[index] = dot(gHSTRCloud.skyRadianceAt(d), 1.f / 3.f);
 }
 
 [numthreads(64, 1, 1)]
