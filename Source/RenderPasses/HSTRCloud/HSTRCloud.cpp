@@ -641,6 +641,31 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudCutThresholdCheck = value;
             continue;
         }
+        if (key == "cloudCutWaves")
+        {
+            mCloudCutWaves = value;
+            continue;
+        }
+        if (key == "cloudCutTailParallel")
+        {
+            mCloudCutTailParallel = value;
+            continue;
+        }
+        if (key == "cloudCutRays")
+        {
+            mCloudCutRays = value;
+            continue;
+        }
+        if (key == "cloudCutLowPriority")
+        {
+            mCloudCutLowPriority = value;
+            continue;
+        }
+        if (key == "cloudCutGpuVisibility")
+        {
+            mCloudCutGpuVisibility = value;
+            continue;
+        }
         if (key == "cloudFadeEndOrder")
         {
             mCloudFadeEndOrder = value;
@@ -679,6 +704,41 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "cloudParallelMaps")
         {
             mCloudParallelMaps = value;
+            continue;
+        }
+        if (key == "cloudParallelMerge")
+        {
+            mCloudParallelMerge = value;
+            continue;
+        }
+        if (key == "cloudParallelUpload")
+        {
+            mCloudParallelUpload = value;
+            continue;
+        }
+        if (key == "cloudParallelMin")
+        {
+            mCloudParallelMin = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudParallelThreads")
+        {
+            mCloudParallelThreads = uint32_t(value);
+            continue;
+        }
+        if (key == "cloudParallelSun")
+        {
+            mCloudParallelSun = value;
+            continue;
+        }
+        if (key == "cloudEvictLateMerge")
+        {
+            mCloudEvictLateMerge = value;
+            continue;
+        }
+        if (key == "cloudResidencyTrace")
+        {
+            mResidencyTrace = uint32_t(value);
             continue;
         }
         if (key == "cloudSunEvery")
@@ -2270,6 +2330,35 @@ Properties HSTRCloud::getProperties() const
         cloud["cutIdleFrames"] = stats.cutIdleFrames;
         cloud["cutParallelMsTotal"] = stats.cutParallelMsTotal;
         cloud["cutHeapMsTotal"] = stats.cutHeapMsTotal;
+        cloud["cutCoarseMsTotal"] = stats.cutCoarseMsTotal;
+        cloud["cutFineMsTotal"] = stats.cutFineMsTotal;
+        cloud["cutDesireMsTotal"] = stats.cutDesireMsTotal;
+        cloud["cutTailMsTotal"] = stats.cutTailMsTotal;
+        cloud["cutRayMismatchesTotal"] = stats.cutRayMismatchesTotal;
+        cloud["gpuVisRequests"] = stats.gpuVisRequests;
+        cloud["gpuVisApplied"] = stats.gpuVisApplied;
+        cloud["gpuVisBatches"] = stats.gpuVisBatches;
+        cloud["gpuVisDropped"] = stats.gpuVisDropped;
+        for (size_t k = 0; k < stats.cutConfigWalks.size(); ++k)
+        {
+            cloud[fmt::format("cutConfig{}Walks", k)] = stats.cutConfigWalks[k];
+            cloud[fmt::format("cutConfig{}Ms", k)] = stats.cutConfigMs[k];
+            cloud[fmt::format("cutConfig{}CoarseMs", k)] = stats.cutConfigCoarseMs[k];
+            cloud[fmt::format("cutConfig{}TailMs", k)] = stats.cutConfigTailMs[k];
+            cloud[fmt::format("cutConfig{}FineMs", k)] = stats.cutConfigFineMs[k];
+            cloud[fmt::format("cutConfig{}DesireMs", k)] = stats.cutConfigDesireMs[k];
+            cloud[fmt::format("cutConfig{}MidMs", k)] = stats.cutConfigMidMs[k];
+            cloud[fmt::format("cutConfig{}Rays", k)] = stats.cutConfigRays[k];
+            cloud[fmt::format("cutConfig{}BusyCycles", k)] = stats.cutConfigBusyCycles[k];
+            cloud[fmt::format("cutConfig{}PriorityCycles", k)] = stats.cutConfigPriorityCycles[k];
+            cloud[fmt::format("cutConfig{}RayCycles", k)] = stats.cutConfigRayCycles[k];
+            cloud[fmt::format("cutConfig{}SerialCycles", k)] = stats.cutConfigSerialCycles[k];
+            cloud[fmt::format("cutConfig{}CriticalCycles", k)] = stats.cutConfigCriticalCycles[k];
+            cloud[fmt::format("cutConfig{}Refreshes", k)] = stats.cutConfigRefreshes[k];
+        }
+        cloud["cutVisitsTotal"] = stats.cutVisitsTotal;
+        cloud["cutRefreshesTotal"] = stats.cutRefreshesTotal;
+        cloud["cutRaysTotal"] = stats.cutRaysTotal;
         cloud["cutUnorderedDesired"] = stats.cutUnorderedDesired;
         cloud["cutPriorityRises"] = stats.cutPriorityRises;
         cloud["cutThresholdTrims"] = stats.cutThresholdTrims;
@@ -2326,6 +2415,7 @@ Properties HSTRCloud::getProperties() const
         cloud["workerKernelUs"] = stats.workerKernelUs;
         cloud["fadeParallelBuckets"] = stats.fadeParallelBuckets;
         cloud["mapParallelRuns"] = stats.mapParallelRuns;
+        cloud["fadeParallelEnds"] = stats.fadeParallelEnds;
         for (size_t k = 0; k < stats.stepCycles.size(); ++k)
             cloud[fmt::format("step{}", k)] = stats.stepCycles[k];
         cloud["workerUserUs"] = stats.workerUserUs;
@@ -4413,6 +4503,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         const std::vector<uint32_t> slots = mpCloudSea->instanceSlots(changed);
         mResidencyPendingSlots.insert(mResidencyPendingSlots.end(), slots.begin(), slots.end());
         mDensityChangedFrame = false;
+        if (mResidencyTrace > 0)
+        {
+            --mResidencyTrace;
+            logInfo("HSTRCloud residency trace: busy, clock {}, fadesRunning {}", mResidencyFrame, mResidencyFadesRunning);
+        }
         if (mResidencyFadesRunning)
         {
             FALCOR_PROFILE(pRenderContext, "fades");
@@ -4459,6 +4554,11 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.cutStick = mCloudCutStick;
     view.cutThreshold = mCloudCutThreshold;
     view.cutThresholdCheck = mCloudCutThresholdCheck;
+    view.cutWaves = mCloudCutWaves;
+    view.cutTailParallel = mCloudCutTailParallel;
+    view.cutRays = mCloudCutRays;
+    view.cutLowPriority = mCloudCutLowPriority;
+    view.cutGpuVisibility = mCloudCutGpuVisibility;
     view.fadeEndOrder = mCloudFadeEndOrder;
     view.cutAsync = mCloudCutAsync;
     bool densityChanged = false;
@@ -4483,6 +4583,12 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     mpCloudResidency->setMapEvents(mCloudMapEvents);
     mpCloudResidency->setParallelFades(mCloudParallelFades);
     mpCloudResidency->setParallelMaps(mCloudParallelMaps);
+    mpCloudResidency->setParallelMerge(mCloudParallelMerge);
+    mpCloudResidency->setParallelUpload(mCloudParallelUpload);
+    mpCloudResidency->setParallelMin(mCloudParallelMin);
+    mpCloudResidency->setParallelThreads(mCloudParallelThreads);
+    mpCloudResidency->setParallelSun(mCloudParallelSun);
+    mpCloudResidency->setEvictLateMerge(mCloudEvictLateMerge);
     // asyncResidency: everything from here to the sun resolve records into the compute queue's context (beginAsyncResidency), which
     // has no profiler: its scopes time only on the main queue.
     ComputeContext* pContext = mpCloudResidency->getContext();
@@ -4934,6 +5040,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             stats.committed
         );
     }
+    dispatchCutVisibility(pRenderContext);
     // Last: from here to the next frame's take, nothing on this thread touches the residency (waitUpdate guards the rest).
     if (residencyWorker)
     {
@@ -4944,9 +5051,25 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             mpCloudResidency->setLoadCap(mCloudBrickLoadsPerFrame * std::max(mResidencyFramesCovered, 1u));
             mpCloudResidency->setFrameClock(mResidencyFrame + 1); // The earliest frame it lands in.
         }
+        if (mResidencyTrace > 0)
+        {
+            --mResidencyTrace;
+            logInfo(
+                "HSTRCloud residency trace: launch, clock {}, covered {}, taken {}, frameClock {}, slots {}; {}", mResidencyFrame,
+                mResidencyFramesCovered, residencyTaken.has_value(), frameClock, mResidencyPendingSlots.size(), mpCloudResidency->traceState()
+            );
+        }
         mResidencyFramesCovered = 0;
         mpCloudResidency->launchUpdate(*mpCloudSea, view, std::move(mResidencyPendingSlots));
         mResidencyPendingSlots.clear();
+    }
+    else if (mResidencyTrace > 0)
+    {
+        --mResidencyTrace;
+        logInfo(
+            "HSTRCloud residency trace: on this thread (worker {}, async {}, frozen {}), clock {}; {}", mCloudResidencyWorker,
+            mAsyncResidencyActive, mCloudResidencyFrozen, mResidencyFrame, mpCloudResidency->traceState()
+        );
     }
 }
 
@@ -4968,6 +5091,69 @@ bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<Compu
     }
     var["params"].setBlob(mParams);
     return first;
+}
+
+void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext)
+{
+    if (!mpCloudResidency || !mpExtinction || !mpCloudSea || (!mCloudCutGpuVisibility && mCutVisPending == 0 && !mCutVisRecorded))
+        return;
+    auto& residency = *mpCloudResidency;
+    // The copy recorded in an earlier frame went with that frame's submit; its fence is signalled now (no flush), and read once
+    // passed - never waited for.
+    if (mCutVisRecorded)
+    {
+        mCutVisPending = pRenderContext->signal(mpCutVisFence.get());
+        mCutVisRecorded = false;
+    }
+    if (mCutVisPending != 0 && mpCutVisFence->getCurrentValue() >= mCutVisPending)
+    {
+        std::vector<float> visibility(mCutVisCount);
+        std::memcpy(visibility.data(), mpCutVisReadback->map(), mCutVisCount * sizeof(float));
+        mpCutVisReadback->unmap();
+        residency.putVisibility(std::move(mCutVisBatch), std::move(visibility));
+        mCutVisBatch = {};
+        mCutVisPending = 0;
+    }
+    if (mCutVisPending != 0 || !mCloudCutGpuVisibility || !residency.takeVisibilityBatch(mCutVisBatch))
+        return;
+    FALCOR_PROFILE(pRenderContext, "cutVisibility");
+    // A walk refreshes ~10-30k bricks; more than this wait for a later walk (their requests time out and are sent again).
+    constexpr uint32_t kMaxRequests = 1u << 17;
+    if (mCutVisBatch.requests.size() > kMaxRequests)
+        mCutVisBatch.requests.resize(kMaxRequests);
+    const uint32_t count = uint32_t(mCutVisBatch.requests.size());
+    if (count > mCutVisCapacity)
+    {
+        mCutVisCapacity = std::max(count, 32768u);
+        mpCutVisBoxes = mpDevice->createStructuredBuffer(sizeof(float), 6 * mCutVisCapacity, ResourceBindFlags::ShaderResource);
+        mpCutVisResults = mpDevice->createStructuredBuffer(sizeof(float), mCutVisCapacity, ResourceBindFlags::UnorderedAccess);
+        mpCutVisReadback = mpDevice->createBuffer(sizeof(float) * mCutVisCapacity, ResourceBindFlags::None, MemoryType::ReadBack);
+    }
+    if (!mpCutVisFence)
+        mpCutVisFence = mpDevice->createFence();
+    if (!mpCutVisibilityPass)
+        mpCutVisibilityPass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/CutVisibility.cs.slang", "cutVisibility");
+    std::vector<float> boxes(6 * size_t(count));
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const auto& request = mCutVisBatch.requests[i];
+        std::memcpy(&boxes[6 * size_t(i)], &request.lo, 3 * sizeof(float));
+        std::memcpy(&boxes[6 * size_t(i) + 3], &request.hi, 3 * sizeof(float));
+    }
+    pRenderContext->updateBuffer(mpCutVisBoxes.get(), boxes.data(), 0, boxes.size() * sizeof(float));
+    ShaderVar var = mpCutVisibilityPass->getRootVar();
+    var["CB"]["gCamera"] = mCutVisBatch.camera;
+    var["CB"]["gCount"] = count;
+    var["CB"]["gOrigin"] = mpCloudSea->getDesc().origin;
+    var["CB"]["gVoxel"] = mpCloudSea->getVoxelWorld();
+    var["CB"]["gDims"] = mpCloudSea->getDims();
+    var["gBoxes"] = mpCutVisBoxes;
+    var["gExtinction"] = mpExtinction;
+    var["gResults"] = mpCutVisResults;
+    mpCutVisibilityPass->execute(pRenderContext, uint3(count, 1, 1));
+    pRenderContext->copyBufferRegion(mpCutVisReadback.get(), 0, mpCutVisResults.get(), 0, count * sizeof(float));
+    mCutVisCount = count;
+    mCutVisRecorded = true;
 }
 
 bool HSTRCloud::dispatchSunScheduling(RenderContext* pRenderContext, ComputeContext* pContext, uint32_t phases)

@@ -26,13 +26,14 @@ if SCORE:
     from sea_config import REFERENCE
 cam = m.scene.camera
 position = [float3(cam.position.x, cam.position.y, cam.position.z)]
+start_position = float3(cam.position.x, cam.position.y, cam.position.z)  # HSTR_MOTION_REPARK returns here.
 VIEW = float3(cam.target.x, cam.target.y, cam.target.z) - position[0]
 COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "beamWarpHeld", "seaTilesChanged", "sunBakeFrames",
             "densityChangedFrames", "cuts", "cutTotalMs", "cutPops", "skirtMaskChecks", "skirtMaskMismatches",
             "dirtyStatFrames", "dirtyStatBlocks", "dirtyStatUnits", "skirtFrames", "skirtRegionFrames", "skirtRegionPages",
             "skirtFullPages", "skirtDirtyRegions", "skirtDirtyWork", "sunResolveFrames", "sunResolveTouchFrames", "sunTouchChecks",
             "sunTouchMismatches", "gpuTimeSum", "gpuTimeFrames", "uploadRuns", "uploadBytes", "scatterJobs", "scatterChecks", "scatterMismatches", "commitChecks", "commitMismatches", "sunResolveListFrames", "sunResolveListBricks", "sunResolveListChecks",
-            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames", "walkTouchedCalls", "walkTouchedListed", "updateUs", "workerUpdateUs", "takeWaitUs", "replayUs", "workerRunCycles", "workerWallCycles", "workerKernelUs", "workerUserUs", *[f"step{k}" for k in range(16)], "workerUpdates", "submitMainUs", "submitResidencyUs", "residencySkips", "fadeParallelBuckets", "mapParallelRuns", "phaseMergeUs", "phaseLoadsUs", "phaseEvictUs", "phaseMapsUs", "phaseStageUs", "phaseFadesUs", "phaseSunUs",
+            "sunResolveListMismatches", "sunStampRuns", "sunStampRaw", "sunStampChanges", "sunStampCheckTotal", "sunStampCheckRuns", "sunBesideRuns", "sunSerialRuns", "asyncProbeRan", "asyncResidencyFrames", "walkTouchedCalls", "walkTouchedListed", "updateUs", "workerUpdateUs", "takeWaitUs", "replayUs", "workerRunCycles", "workerWallCycles", "workerKernelUs", "workerUserUs", *[f"step{k}" for k in range(40)], "workerUpdates", "submitMainUs", "submitResidencyUs", "residencySkips", "fadeParallelBuckets", "fadeParallelEnds", "mapParallelRuns","phaseMergeUs", "phaseLoadsUs", "phaseEvictUs", "phaseMapsUs", "phaseStageUs", "phaseFadesUs", "phaseSunUs",
             "phaseUploadUs", "phaseLaunchUs", "fadeStarts", "fadeEnds", "fadeVoid", "fadeEndIns", "maps", "unmaps",
             "beamHistoryProbeUnits", "beamHistoryProbe02", "beamHistoryProbe10",
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
@@ -341,6 +342,10 @@ def set_arm(props):
         res_now[0] = res
     # _profilerPaused: Falcor's Profiler::endFrame returns at once (off, it still waits for the last frame's fence and submits).
     m.profiler.paused = bool(props.get("_profilerPaused", False))
+    # _ui: Mogwai's UI (headless keeps showUI on: every frame builds the whole UI and renders it with ImGui into the target). Off
+    # by default: it is Falcor's debug UI, not the renderer. MEASURED (uicost1, 4K sunset walk, worker on, arms alternating): walk
+    # p50 3.87 ms off against 4.16 / 4.36 on; GPU 2.84 against 2.76 / 2.89 ms (means within the arms' spread).
+    m.ui = bool(props.get("_ui", False))
     hstr.set_properties({k: v for k, v in props.items() if not k.startswith("_")})
 
 settle = int(os.environ.get("HSTR_MOTION_SETTLE", "1800"))
@@ -398,6 +403,7 @@ for speed in speeds:
     arm_scores = {name: [] for name, _ in ARMS}
     arm_dirty = {name: [] for name, _ in ARMS}
     arm_levels = {name: [] for name, _ in ARMS}
+    walks_before = cloud_stats()
     for cycle in range(int(os.environ.get("HSTR_MOTION_CYCLES", "4"))):
         for name, props in ARMS:
             set_arm(props)
@@ -413,6 +419,9 @@ for speed in speeds:
                                                                       "committedCapped", "cuts", "cutEntered", "evictFreed",
                                                                       "cutWalkMsTotal", "cutBusyFrames", "cutIdleFrames",
                                                                       "cutParallelMsTotal", "cutHeapMsTotal", "cutPriorityRises",
+                                                                      "cutCoarseMsTotal", "cutFineMsTotal", "cutDesireMsTotal", "cutTailMsTotal",
+                                                                      "cutVisitsTotal", "cutRefreshesTotal", "cutRaysTotal",
+                                                                      "gpuVisRequests", "gpuVisApplied", "gpuVisBatches", "gpuVisDropped",
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
                                                                       "scatterJobs", "scatterChecks", "scatterMismatches",
@@ -426,7 +435,10 @@ for speed in speeds:
                   f"cuts {d.get('cuts')} entered {d.get('cutEntered')} evicted {d.get('evictFreed')} "
                   f"fading out {now.get('undesiredFadingOut')} free {now.get('freeSlots')}, walk {d.get('cutWalkMsTotal'):.0f} ms "
                   f"worker, {d.get('cutBusyFrames')} frames busy, {d.get('cutIdleFrames')} idle; parallel "
-                  f"{d.get('cutParallelMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
+                  f"{d.get('cutParallelMsTotal'):.0f} ms (coarse {d.get('cutCoarseMsTotal'):.0f}, fine {d.get('cutFineMsTotal'):.0f}, "
+                  f"desire {d.get('cutDesireMsTotal'):.0f}; visits {d.get('cutVisitsTotal')} refreshes {d.get('cutRefreshesTotal')} "
+                  f"rays {d.get('cutRaysTotal')}; gpu visibility {d.get('gpuVisRequests')} sent, {d.get('gpuVisApplied')} applied, "
+                  f"{d.get('gpuVisDropped')} dropped in {d.get('gpuVisBatches')} batches), tail {d.get('cutTailMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
                   f"unordered desired {now.get('cutUnorderedDesired')}, priority rises {d.get('cutPriorityRises')}; threshold trims "
                   f"{d.get('cutThresholdTrims')} underfilled {d.get('cutUnderfilled')} check {d.get('cutCheckMismatches')} of "
                   f"{d.get('cutCheckBricks')}; upload {float(d.get('uploadBytes') or 0) / 1e6:.1f} MB in {d.get('uploadRuns')} runs + "
@@ -435,6 +447,22 @@ for speed in speeds:
                 arm_dirty[name] += counted(COUNT, speed)
             if SCORE:
                 arm_scores[name].append(score())
+    # Cut walks by the configuration they ran under (cutWaves | cutTailParallel << 1 | ray mode << 2, 0 reference, 1 stepped,
+    # 2 blocked, 3 cut off | cutLowPriority << 4): walks straddle arms.
+    walks_after = cloud_stats()
+    for k in range(32):
+        w = lambda key: float(walks_after.get(f"cutConfig{k}{key}") or 0) - float(walks_before.get(f"cutConfig{k}{key}") or 0)
+        if w("Walks") > 0:
+            print(f"MOTION {tag} walk config {k}: {w('Walks'):.0f} walks, {w('Ms') / w('Walks'):.1f} ms a walk (coarse "
+                  f"{w('CoarseMs') / w('Walks'):.1f}, fine {w('FineMs') / w('Walks'):.1f}, desire {w('DesireMs') / w('Walks'):.1f}, "
+                  f"mid {w('MidMs') / w('Walks'):.1f}, tail {w('TailMs') / w('Walks'):.1f}),{w('Rays') / w('Walks'):.0f} rays, coarse "
+                  f"{1000 * w('CoarseMs') / max(w('Rays'), 1):.2f} ms per 1k rays; coarse thread Gcycles a walk: busy "
+                  f"{w('BusyCycles') / w('Walks') / 1e9:.3f}, brickPriority {w('PriorityCycles') / w('Walks') / 1e9:.3f}, rays "
+                  f"{w('RayCycles') / w('Walks') / 1e9:.3f}, waves serial {w('SerialCycles') / w('Walks') / 1e9:.3f}, critical "
+                  f"{w('CriticalCycles') / w('Walks') / 1e9:.3f}; {w('Refreshes') / w('Walks'):.0f} refreshes, "
+                  f"{w('RayCycles') / max(w('Refreshes'), 1) / 1e3:.1f}k ray cycles a refresh", flush=True)
+    print(f"MOTION {tag} ray mismatches {float(walks_after.get('cutRayMismatchesTotal') or 0) - float(walks_before.get('cutRayMismatchesTotal') or 0):.0f}"
+          f" of {float(walks_after.get('cutRaysTotal') or 0) - float(walks_before.get('cutRaysTotal') or 0):.0f} rays", flush=True)
     for name, _ in ARMS:
         print(f"MOTION {tag} arm {name}: {summary(arm_walls[name])} counters {arm_counts[name]}", flush=True)
         ends = arm_levels[name]
@@ -464,4 +492,12 @@ for speed in speeds:
     for window in range(3):
         walls, _ = fly(60, 0.0)
         print(f"MOTION {tag} parkedAfter{window}: {summary(walls)} {levels(cloud_stats())}", flush=True)
+    # HSTR_MOTION_REPARK=1: back at the parked camera after the flights, settled, and profiled as "parked" was - the same view, so a
+    # GPU time above parked's is the run's clocks or accumulated state, not the content the walk reached.
+    if os.environ.get("HSTR_MOTION_REPARK", "0") != "0":
+        position[0] = start_position
+        for window in range(int(os.environ.get("HSTR_MOTION_REPARK_SETTLE", "300")) // 60):
+            walls, _ = fly(60, 0.0)
+            print(f"MOTION {tag} repark{window}: {summary(walls)} {levels(cloud_stats())}", flush=True)
+        profile(f"{tag} reparked", 60, 0.0)
 exit()

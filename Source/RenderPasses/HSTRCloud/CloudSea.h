@@ -107,6 +107,12 @@ public:
         const uint32_t slot = voxel.x / r + mDesc.tiles * (voxel.z / r);
         return mVolumes[slot].mean[voxel.x % r + size_t(r) * (voxel.y + size_t(mDims.y) * (voxel.z % r))];
     }
+    /// meanAt by tile (x and z tiles) and tile-local voxel, without the divisions.
+    float meanAtTile(uint32_t tileX, uint32_t tileZ, uint32_t x, uint32_t y, uint32_t z) const
+    {
+        const uint32_t r = mDesc.tileVoxels;
+        return mVolumes[tileX + mDesc.tiles * tileZ].mean[x + size_t(r) * (y + size_t(mDims.y) * z)];
+    }
     const TileVolume& getVolume(uint32_t slot) const { return mVolumes[slot]; }
     /// The volume of a slot the GPU upload takes on (it sets Upload::Done and frees the packed copy).
     TileVolume& getUploadVolume(uint32_t slot) { return mVolumes[slot]; }

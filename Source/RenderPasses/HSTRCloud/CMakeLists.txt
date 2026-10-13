@@ -17,6 +17,7 @@ target_sources(HSTRCloud PRIVATE
     CloudScatter.cs.slang
     CloudSea.cpp
     CloudSea.h
+    CutVisibility.cs.slang
     HSTRAsyncProbe.cs.slang
     HSTRCloud.cpp
     HSTRCloud.cs.slang

@@ -968,6 +968,9 @@ private:
     /// update, the atlas full of bricks fading out (mapped 270336 at a chunk's end).
     uint32_t mResidencyFrame = 0;
     bool mResidencyFadesRunning = false;
+    /// DIAGNOSTIC cloudResidencyTrace: frames left to log a line each of the domain update's residency steps (busy, taken,
+    /// launched, the frame clocks; the residency's own counters after a take).
+    uint32_t mResidencyTrace = 0;
     uint32_t mCloudSeaTiles = 8;
     uint32_t mCloudSeaSeed = 1;
     float mCloudSeaCoverage = 0.85f;
@@ -1044,6 +1047,19 @@ private:
     ref<Fence> mpSunFence;
     uint64_t mSunReadbackPending = 0;
     bool mSunReadbackRecorded = false; ///< The copy is in the command list; its fence is signalled next frame.
+    /// cloudCutGpuVisibility (CloudView::cutGpuVisibility): the walk's visibility refreshes traced here (CutVisibility.cs.slang) and
+    /// read back without waiting, one batch at a time, as the sun's count is.
+    void dispatchCutVisibility(RenderContext* pRenderContext);
+    ref<ComputePass> mpCutVisibilityPass;
+    ref<Buffer> mpCutVisBoxes;
+    ref<Buffer> mpCutVisResults;
+    ref<Buffer> mpCutVisReadback;
+    ref<Fence> mpCutVisFence;
+    uint32_t mCutVisCapacity = 0;
+    uint32_t mCutVisCount = 0;
+    uint64_t mCutVisPending = 0;
+    bool mCutVisRecorded = false;
+    hstrcloud::CloudResidency::VisibilityBatch mCutVisBatch;
     /// Returns whether a scheduling run was dispatched (it can evict and assign sun slots).
     /// dispatchSunScheduling's parts, in order: the readback, age, counter clears and releases; the field resets and stamps; scan
     /// to assign; the bakes.
@@ -1340,6 +1356,11 @@ private:
     float mCloudCutStick = 0.f;                 ///< cloudCutStick: CloudView::cutStick (levels of priority).
     bool mCloudCutThreshold = true;             ///< cloudCutThreshold: CloudView::cutThreshold (MEASURED there).
     bool mCloudCutThresholdCheck = false;       ///< cloudCutThresholdCheck: CloudView::cutThresholdCheck (DIAGNOSTIC).
+    bool mCloudCutWaves = false;                ///< cloudCutWaves: CloudView::cutWaves (MEASURED there).
+    bool mCloudCutTailParallel = true;          ///< cloudCutTailParallel: CloudView::cutTailParallel.
+    uint32_t mCloudCutRays = 5;                 ///< cloudCutRays: CloudView::cutRays.
+    bool mCloudCutLowPriority = false;          ///< cloudCutLowPriority: CloudView::cutLowPriority.
+    bool mCloudCutGpuVisibility = true;         ///< cloudCutGpuVisibility: CloudView::cutGpuVisibility (MEASURED in IntelCloudSeaHalf.py).
     uint32_t mCloudFadeEndOrder = 0;            ///< cloudFadeEndOrder: CloudView::fadeEndOrder (DIAGNOSTIC).
     /// cloudResidencyWorker (asyncResidency frames): the residency's CPU update runs on its own thread from the end of the frame's
     /// residency recording to the next frame's (CloudResidency::launchUpdate), which records what it queued. The residency then acts
@@ -1349,14 +1370,21 @@ private:
     /// cloudResidencySkipBusy (cloudResidencyWorker frames): a frame whose update is still running does not wait for it. It renders
     /// with the residency it has and launches nothing; the update is taken by the first frame that finds it done. The residency then
     /// advances at its own rate (its fades and cut count updates, not frames). submit1 (4K sunset walk, worker on): the update took
-    /// 5.5 ms a frame and the frame waited 2.96 ms of it (takeWaitUs).
+    /// 5.5 ms a frame and the frame waited 2.96 ms of it (takeWaitUs). While the update did not fit a frame (skipbusy2-4) the
+    /// residency fell behind; once it did, on in IntelCloudSeaHalf.py (MEASURED there: skipbusy5 / skipbusy6).
     bool mCloudResidencySkipBusy = false;
     bool mCloudDeferArena = true; ///< DIAGNOSTIC cloudDeferArena: CloudResidency::setDeferArena.
     bool mCloudStepTiming = false; ///< DIAGNOSTIC cloudStepTiming: CloudResidency::setStepTiming.
     bool mCloudMapEvents = true;   ///< cloudMapEvents: CloudResidency::setMapEvents (false: the whole map list scanned, the anchor).
     bool mCloudParallelFades = true; ///< cloudParallelFades: CloudResidency::setParallelFades (false: one thread, the anchor).
-    /// cloudParallelMaps: CloudResidency::setParallelMaps. Off until measured (built, not yet run).
-    bool mCloudParallelMaps = false;
+    /// cloudParallelMaps: CloudResidency::setParallelMaps (MEASURED there).
+    bool mCloudParallelMaps = true;
+    bool mCloudParallelMerge = true; ///< cloudParallelMerge: CloudResidency::setParallelMerge (false: one thread, the anchor).
+    bool mCloudParallelUpload = true; ///< cloudParallelUpload: CloudResidency::setParallelUpload (false: one thread, the anchor).
+    uint32_t mCloudParallelMin = 2048; ///< cloudParallelMin: CloudResidency::setParallelMin.
+    uint32_t mCloudParallelThreads = 16; ///< cloudParallelThreads: CloudResidency::setParallelThreads.
+    bool mCloudParallelSun = true;       ///< cloudParallelSun: CloudResidency::setParallelSun (false: one thread, the anchor).
+    bool mCloudEvictLateMerge = true;    ///< cloudEvictLateMerge: CloudResidency::setEvictLateMerge (false: the anchor).
     uint64_t mResidencySkips = 0; ///< Frames that found the update running and skipped the residency (cloudStats residencySkips).
     /// cloudResidencyWorker frames: updateCloudDomain runs at the frame's end, just before the compute queue's submission, so the
     /// update it launches has the next frame's recording to run beside too; the frame's start only publishes the last frame's beam

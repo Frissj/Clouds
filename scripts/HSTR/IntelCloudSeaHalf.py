@@ -164,6 +164,25 @@ g.addPass(createPass("HSTRCloud", {
     # waited 5.33 - 3.03 ms a frame off the frame's thread; walk mean 9.39 / 8.93 / 11.87 ms, p50 5.62 / 4.60 / 8.60. Motion score 2
     # (worker3): over 0.02 9.12 / 8.87 / 8.75%, p99.9 0.97 / 0.58 / 1.16; parked mapped = desired.
     "cloudResidencyWorker": True,
+    # A frame whose residency update is still running does not wait for it (HSTRCloud::mCloudResidencySkipBusy; the residency runs
+    # on a frame clock). Once the update fitted a frame (parallel fade ends, maps, merge, upload, sun): skipbusy5 (4K sunset walk at 2
+    # units a frame, arms alternating, 80 frames each) walk mean 3.07 ms against 4.54 / 4.85 waiting, p50 2.95 against 3.80 / 3.79,
+    # p95 4.54 against 9.89 / 9.01, max 5.84 against 13.1 / 31.4; 32 updates in 80 frames, chunk-end backlogs 0 / 11k / 24k against
+    # 0 / 14k / 27k (one chunk 95k: a cut landing at its end). Motion score 2 (skipbusy6, arms on, skip, skip2, on2): over 0.02
+    # 5.48 / 4.33% against 5.23 / 5.41%, p99.9 0.344 or less in every arm.
+    "cloudResidencySkipBusy": True,
+    # The async cut walk's lists built in parallel ranges, the same lists (CloudView::cutTailParallel): cutrays1 (4K sunset walk at
+    # 2 units a frame, walks bucketed by the configuration they ran under) tail 73.7 -> 14.0 ms a walk.
+    "cloudCutTailParallel": True,
+    # Visibility rays stepping tile coordinates instead of dividing, corner rays stopped once they cannot raise the brick's best
+    # visibility (CloudView::cutRays 5): the same visibility, checked - 0 of 4.7M rays and refreshes differing (cutrays1, blocked1,
+    # cutoff1, waves2). Coarse phase 0.80 -> 0.52-0.55 ms per 1k rays against the reference loop's 0.78-1.09 (cutoff1).
+    "cloudCutRays": 5,
+    # The walk's visibility refreshes traced on the GPU and applied before the next walk (CloudView::cutGpuVisibility): gpuvis2 (4K
+    # sunset walk at 2 units a frame, arms cpu / gpu / gpu2 / cpu2, 80 frames each) walk 156 -> 91 ms, coarse phase 76.7 -> 10.8 ms and
+    # 0.869 -> 0.136 G thread cycles a walk; frame mean 4.07 / 4.09 against 4.29 / 3.90 (neutral). Motion score 2 (gpuvis1): over 0.02
+    # 5.40 / 5.49% against 5.53 / 5.45%, p99.9 0.344-0.41 in every arm; 0 results dropped.
+    "cloudCutGpuVisibility": True,
     # Fine sea detail slips between the corners and centre of larger tiles, whose centre test then accepts them as blocks. At 4K
     # against the per-pixel march (tolerance 0.05; mean 8-bit display error): near 16x3 0.52, 8x2 0.33, 4x1 0.21; far side 0.29,
     # 0.24, 0.20; sea overview 0.22, 0.14, 0.08. GPU ms with the queries rebuilt every frame (moving camera), near view:

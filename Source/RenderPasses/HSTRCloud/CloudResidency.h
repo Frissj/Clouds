@@ -10,10 +10,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <future>
 #include <memory>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 
@@ -118,6 +120,37 @@ struct CloudView
     bool cutThreshold = true;
     /// DIAGNOSTIC: unpruned threshold cut beside the heap cut (which is taken on); counts the bricks the two sets differ in.
     bool cutThresholdCheck = false;
+    /// The walk's coarse phase level by level over every instance at once, each level's priorities (and their visibility rays) in
+    /// parallel over its children; otherwise one thread per group of slots, which leaves the nearest instance's rays on one thread.
+    /// The same visits, priorities and cut either way.
+    /// MEASURED (4K sunset walk at 2 units a frame, arms alternating every 20 frames, walks bucketed by the configuration they ran
+    /// under): with slot groups the busiest thread is the coarse phase (critical 0.183 G cycles ~ 73 ms wall, waves2); waves with
+    /// threads taking chunks of entries (waves3) coarse 95.7 -> 23.3 ms, walk 191 -> 123 ms (lowprio1: 203 -> 135). But the cut
+    /// cadence does not follow (1 cut every chunk in every arm: the walk is not what limits it), the walk's thread cycles are the
+    /// same (0.96 G), and frames are slower while its burst runs: p50 4.48 / 4.38 against 4.03 / 3.95 (lowprio1), every chunk
+    /// worse in waves3 (4.48 / 3.96 / 4.41 / 4.43 against 3.97 / 3.67 / 3.59 / 3.56). Off until the frame stops paying for it.
+    bool cutWaves = false;
+    /// The walk's lists (entered, toLoad / toMap, left, fading, scheduler states) built in parallel ranges, in the same order.
+    bool cutTailParallel = false;
+    /// Visibility refreshes traced on the GPU (CloudResidency::takeVisibilityBatch) instead of by the walk's threads: the walk keeps
+    /// a brick's last visibility (a new brick its parent's) until the GPU's arrives, applied before the next walk.
+    /// MEASURED (gpuvis1 / gpuvis2, 4K sunset walk at 2 units a frame): walk 156 -> 91 ms, coarse 0.869 -> 0.136 G thread cycles;
+    /// frame mean neutral (4.07 / 4.09 against 4.29 / 3.90), motion score over 0.02 5.40 / 5.49% against 5.53 / 5.45%.
+    bool cutGpuVisibility = false;
+    /// The async walk's threads below normal priority, so its parallel bursts yield to the frame and the residency worker.
+    /// MEASURED (lowprio1, waves on): no help - arm mean 4.70 against 4.63 at normal priority (slot groups 4.45 / 4.21), p50 4.38
+    /// against 4.48. The frame does not lose cores to the burst; what it loses is unknown (memory or cache are candidates).
+    bool cutLowPriority = false;
+    /// Visibility rays (transmittance): the reference loop (0), the same samples stepping tile coordinates instead of dividing (1),
+    /// or 1 checked against the reference (2, DIAGNOSTIC: Stats::cutRayMismatchesTotal); 5 as 1 with each corner ray stopped once
+    /// it cannot raise the brick's best visibility, and 6 that checked against the corners' full rays. (3 and 4 are gone.)
+    /// MEASURED and REMOVED (blocked1): 3 / 4 read a copy of the sea's mean in 4 x 4 x 4 blocks, built with every tile: 0.55 ms per
+    /// 1k rays against stepped 0.55 - the proxy's memory layout is not the limit.
+    /// MEASURED (4K sunset walk at 2 units a frame, coarse phase per 1k rays): reference 0.78-1.09 ms, stepped 0.80 / 0.52-0.55
+    /// (cutrays1 / later runs), cut off
+    /// 0.54 against stepped 0.52 (cutoff1; ray cycles a refresh 31.5k against ~32k: corner rays rarely stop early). Mismatches 0
+    /// of 4.7M checked rays (modes 2, 4, 6). Rays are 93% of the coarse phase's thread cycles (walkcyc1), ~5k cycles each.
+    uint32_t cutRays = 0;
     /// DIAGNOSTIC: fade ends a frame handles in their bucket's order (0), sorted by handle so siblings, their parent and their
     /// pages come together (1), or sorted with the next ends' bricks prefetched (2). MEASURED (cpuprof9, 4K sunset walk at 2 units a
     /// frame, arms alternating every 20 frames, one launch): CPU per fade-out end 737 / 780 / 847 ns for 0 / 1 / 2 and 952 for the
@@ -157,6 +190,35 @@ public:
         uint32_t cutIdleFrames = 0;   ///< ... and frames with no walk running that did not start one (cumulative).
         double cutParallelMsTotal = 0.0;   ///< DIAGNOSTIC: the walks' parallel phases (cumulative) ...
         double cutHeapMsTotal = 0.0;       ///< ... and ordered heap cuts (cumulative).
+        double cutCoarseMsTotal = 0.0;     ///< DIAGNOSTIC: CutWalk::coarseMs .. rays, cumulative.
+        double cutFineMsTotal = 0.0;
+        double cutDesireMsTotal = 0.0;
+        double cutTailMsTotal = 0.0;
+        uint64_t cutVisitsTotal = 0;
+        uint64_t cutRefreshesTotal = 0;
+        uint64_t cutRaysTotal = 0;
+        uint64_t cutRayMismatchesTotal = 0;
+        uint64_t gpuVisRequests = 0; ///< DIAGNOSTIC (cutGpuVisibility): refreshes sent to the GPU, results applied, batches, and
+        uint64_t gpuVisApplied = 0;  ///< results dropped (their brick's slot or store changed meanwhile), cumulative.
+        uint64_t gpuVisBatches = 0;
+        uint64_t gpuVisDropped = 0;
+        /// DIAGNOSTIC: by the configuration a walk ran under (CutWalk::config; walks straddle benchmark arms): walks, their total
+        /// and coarse, fine, desire, middle (threshold trim and heap) and tail milliseconds, rays.
+        static constexpr size_t kCutConfigs = 32;
+        std::array<uint32_t, kCutConfigs> cutConfigWalks{};
+        std::array<double, kCutConfigs> cutConfigMs{};
+        std::array<double, kCutConfigs> cutConfigCoarseMs{};
+        std::array<double, kCutConfigs> cutConfigFineMs{};
+        std::array<double, kCutConfigs> cutConfigDesireMs{};
+        std::array<double, kCutConfigs> cutConfigMidMs{};
+        std::array<double, kCutConfigs> cutConfigTailMs{};
+        std::array<uint64_t, kCutConfigs> cutConfigRays{};
+        std::array<uint64_t, kCutConfigs> cutConfigBusyCycles{}; ///< CutWalk::coarseBusyCycles .. coarseRayCycles.
+        std::array<uint64_t, kCutConfigs> cutConfigPriorityCycles{};
+        std::array<uint64_t, kCutConfigs> cutConfigRayCycles{};
+        std::array<uint64_t, kCutConfigs> cutConfigSerialCycles{};
+        std::array<uint64_t, kCutConfigs> cutConfigCriticalCycles{};
+        std::array<uint64_t, kCutConfigs> cutConfigRefreshes{};
         uint32_t cutUnorderedDesired = 0;  ///< DIAGNOSTIC: the last walk's parallel desired count (budget: 0.9 x atlas).
         uint64_t cutPriorityRises = 0;     ///< DIAGNOSTIC: children prioritised above their parent (cumulative).
         uint32_t cutThresholdTrims = 0;    ///< Threshold cuts trimmed to the budget (cumulative) ...
@@ -184,7 +246,7 @@ public:
         /// thread): merge (taking a cut on), loads (evict included), evict, maps, stage, fades, sun scheduling, upload, cut launch.
         std::array<uint64_t, 9> phaseUs{};
         /// DIAGNOSTIC (setStepTiming): TSC cycles of the steps of unmap, map and the fade ends (CloudResidency::Step).
-        std::array<uint64_t, 16> stepCycles{};
+        std::array<uint64_t, 40> stepCycles{};
         uint64_t walkTouchedCalls = 0;  ///< DIAGNOSTIC: bricks noted as changed beside a walk, cumulative (repeats included).
         uint64_t walkTouchedListed = 0; ///< DIAGNOSTIC: of those, listed for the merge (once a brick a walk).
         uint32_t loadHeld = 0;        ///< Last frame: desired bricks skipped because their parent was not loaded.
@@ -249,6 +311,7 @@ public:
         uint32_t fadeEndIns = 0;
         uint32_t fadeParallelBuckets = 0; ///< DIAGNOSTIC: fade end buckets swept by several threads (setParallelFades).
         uint32_t mapParallelRuns = 0;     ///< DIAGNOSTIC: map queues mapped by several threads (setParallelMaps).
+        uint32_t fadeParallelEnds = 0;    ///< DIAGNOSTIC: fade ends in buckets swept by several threads.
     };
     /// Mapped bricks the cut does not want, by why they are still mapped (auditMapped walks every mapped brick: diagnostics only).
     struct MappedAudit
@@ -312,6 +375,26 @@ public:
     const Stats& getStats() const { return mStats; }
     /// Whether a cut is running on the worker (CloudView::cutAsync). The sea must not apply tile changes meanwhile: the walk reads them.
     bool cutInFlight() const { return mCutJob.valid(); }
+
+    /// CloudView::cutGpuVisibility: the visibility refreshes a walk asked for, traced on the GPU (CutVisibility.cs.slang) and handed
+    /// back; the cache takes them before the next walk. Both calls are safe beside a running update or walk (their own lock).
+    struct VisibilityRequest
+    {
+        uint64_t handle;
+        uint32_t slot;
+        uint32_t generation;
+        float3 lo; ///< The brick's world bounds.
+        float3 hi;
+    };
+    struct VisibilityBatch
+    {
+        float3 camera = float3(0.f); ///< The walk's camera: the rays start there.
+        std::vector<VisibilityRequest> requests;
+    };
+    /// The oldest batch of requests not yet traced, if any.
+    bool takeVisibilityBatch(VisibilityBatch& batch);
+    /// A traced batch: each request's visibility, in order.
+    void putVisibility(VisibilityBatch&& batch, std::vector<float>&& visibility);
     /// Whether advanceCloudFades has fades to run this frame, and what it binds.
     bool fadesRunning() const { return mActiveFades > 0; }
     /// Whether an outdated sun bake keeps answering until it rebakes in place (HSTRCloudSunFrame::keepStale).
@@ -345,6 +428,16 @@ public:
     /// The next update's frame number, when updates do not come every frame (HSTRCloud cloudResidencySkipBusy): fades, sun cadence
     /// and the other frame counts then run in frames, not updates. Called before launchUpdate.
     void setFrameClock(uint32_t frame) { mNextFrame = frame; }
+    /// DIAGNOSTIC: the frame clocks and what the updates did, for HSTRCloud's cloudResidencyTrace (not beside a running update).
+    std::string traceState() const
+    {
+        return fmt::format(
+            "frame {} next {} cutFrame {} fadeProcessed {} activeFades {} maps {} fadeEnds {} cuts {} toMap {} mapQueue {} toLoad {}/{} "
+            "cutInFlight {}",
+            mFrame, mNextFrame, mCutFrame, mFadeProcessed, mActiveFades, mStats.maps, mStats.fadeEnds, mStats.cuts, mToMap.size(),
+            mMapQueue.size(), mToLoadNext, mToLoad.size(), mCutJob.valid()
+        );
+    }
     /// DIAGNOSTIC: false copies each deferred upload into a vector of its own (the arena's A/B anchor).
     void setDeferArena(bool on) { mDeferArena = on; }
     uint32_t getFrame() const { return mFrame; }
@@ -373,6 +466,18 @@ public:
     void setParallelFades(bool on) { mParallelFades = on; }
     /// Maps by several threads (mParallelMaps); false: one (the A/B anchor).
     void setParallelMaps(bool on) { mParallelMaps = on; }
+    /// The cut merge's lists by several threads (mParallelMerge); false: one (the A/B anchor).
+    void setParallelMerge(bool on) { mParallelMerge = on; }
+    /// Upload's scatter gathers by several threads (mParallelUpload); false: one (the A/B anchor).
+    void setParallelUpload(bool on) { mParallelUpload = on; }
+    void setParallelMin(uint32_t count) { mParallelMin = std::max(count, 1u); }
+    /// The most threads a parallel residency step uses (up to 16 and the hardware's).
+    void setParallelThreads(uint32_t count) { mParallelThreads = std::max(count, 1u); }
+    /// The sun changes' sort and the fine stamp's passes by several threads (mParallelSun); false: as before (the A/B anchor).
+    void setParallelSun(bool on) { mParallelSun = on; }
+    /// evict's late candidates: only those that joined since the last call sorted, merged into its sorted remainder (false: all
+    /// sorted every call, the A/B anchor).
+    void setEvictLateMerge(bool on) { mEvictLateMerge = on; }
     /// mapReady by events (mMapEvents); false scans the whole map list every update (the A/B anchor).
     void setMapEvents(bool on)
     {
@@ -397,6 +502,26 @@ public:
         kStepMapNotes,    ///< map: noteMapped, the parent's count, noteMapped and updateFade, the list.
         kStepMapFade,     ///< map: its own updateFade.
         kStepMapSun,      ///< map: writeSunSched.
+        kStepMergeLeft,   ///< cut merge: the bricks the cut left (noteEvictCandidate).
+        kStepMergeFading, ///< cut merge: the walk's fading list (updateFade).
+        kStepMergeSun,    ///< cut merge: the sun scheduler states the walk wrote.
+        kStepMergeTouched, ///< cut merge: the bricks changed beside the walk.
+        kStepFadePartition, ///< parallel fade ends: the bucket split by chunk.
+        kStepFadeThreads,   ///< ... the threads' sweeps (wall time).
+        kStepFadeMerge,     ///< ... their sinks merged.
+        kStepFadeSerial,    ///< ... the serial sweep after (coarse stores; whole buckets below setParallelMin).
+        kStepMapCoarse,     ///< parallel maps: the coarse stores' and the split by chunk.
+        kStepMapThreads,    ///< ... the threads' maps (wall time).
+        kStepMapMerge,      ///< ... their sinks merged.
+        kStepMapSerial,     ///< ... the serial pass after (retries; whole queues below setParallelMin).
+        kStepSunSort,       ///< uploadSunChanges: the changes sorted and deduplicated.
+        kStepSunResets,     ///< ... the field resets.
+        kStepSunFine,       ///< ... buildSunFineStamp.
+        kStepSunSend,       ///< ... the changes uploaded.
+        kStepEvictSort,     ///< evict: the late candidates sorted.
+        kStepEvictCheck,    ///< ... each candidate checked as it is taken.
+        kStepEvictUnload,   ///< ... unload.
+        kStepCommit,        ///< commit, less its eviction.
         kStepCount
     };
     void addScatterChecks(uint32_t frames) { mScatterCheck += frames; }
@@ -606,7 +731,8 @@ private:
     void resetPending(const Request& request);
 
     float brickPriority(const CloudSea& sea, uint32_t slot, uint64_t handle, const CloudView& view, float& visibility);
-    float transmittance(const CloudSea& sea, const CloudView& view, float3 target) const;
+    /// `maxDepth` (CloudView::cutRays 5 / 6): stop once the optical depth reaches it (the reference stops at 6).
+    float transmittance(const CloudSea& sea, const CloudView& view, float3 target, float maxDepth = 6.f) const;
     bool inFrustum(const CloudView& view, float3 lo, float3 hi) const;
 
     bool commit(uint64_t handle, bool evictOk);
@@ -700,6 +826,11 @@ private:
     size_t mEvictNext = 0;
     bool mEvictValid = false;
     std::vector<std::pair<uint32_t, uint64_t>> mEvictLate;
+    /// setEvictLateMerge: mEvictLate's first entries, sorted by key (the last call's remainder); what joined since follows.
+    /// MEASURED (evictmerge1, 4K sunset walk, step timers): neutral - the sort was 1.0 / 1.6 ms over 80 frames against 1.1 sorting
+    /// all every call; evict is its unloads (21-34 ms) and candidate checks (5-10).
+    size_t mEvictLateSorted = 0;
+    bool mEvictLateMerge = true;
     bool evictCandidate(const Brick& b) const;
     void noteEvictCandidate(uint64_t handle);
     void scanEvictCandidates();
@@ -751,11 +882,40 @@ private:
         std::vector<uint64_t> released; ///< Bricks it mapped whose mMapWaitParent children it took (the merge erases them).
         std::vector<uint64_t> retry;    ///< Bricks it could not map (its nodes ran out): the serial pass.
         uint32_t maps = 0;
+        // Cut merge (setParallelMerge):
+        std::vector<uint64_t> toMap, toLoad; ///< Onto mToMap / mToLoad in the merge.
+        std::vector<uint32_t> stateSync;     ///< Onto mSunStateSync.
     };
+    /// setParallelMerge: the cut merge's per-brick lists (left, fading, touched) visited by several threads, by chunk as the fade
+    /// ends. stepsplit2 (4K sunset walk, the fades and maps parallel): the merge 57-86 ms over 80 frames, all on the 3-4 frames that
+    /// took a cut (~20 ms each): touched 38-45, fading 13-31, left 3-6, sun states 3. MEASURED (parmerge1, same walk, with
+    /// setParallelUpload): the merge 26 / 34 ms over 3 / 4 cuts against 84 over 4 (touched 15 / 17 against 48, fading 5 / 8 against
+    /// 26); walk mean 5.05 / 5.63 against 5.93 ms, p95 8.5 / 11.8 against 19.0. parmerge2 (arms ser, par, par2, ser2;
+    /// HSTR_MOTION_SCORE 2): 0 scatter mismatches and 0 stale skirt masks over 60 checked frames an arm; > 0.02 at 5.54 / 5.69%
+    /// parallel against 6.07 / 5.88% serial.
+    bool mParallelMerge = true;
+    /// setParallelMin: the fewest fade ends, queued maps or merge bricks the threads take (fewer: this thread). MEASURED (parmin1,
+    /// 4K sunset walk): at 2048, 99% of the fade ends were already in buckets the threads took; 256 / 512 changed nothing (176 /
+    /// 184 ns an end against 176 / 180).
+    size_t mParallelMin = 2048;
+    uint32_t mParallelThreads = 16; ///< setParallelThreads.
+    size_t parallelThreads() const { return std::clamp<size_t>(std::min<size_t>(std::thread::hardware_concurrency(), mParallelThreads), 1, 16); }
+    /// setParallelSun. stepsplit3 (4K sunset walk, 20 sun runs over 80 frames): the changes' sort 27-42 ms (15-19k changes a run),
+    /// buildSunFineStamp 30-33 ms, its per-asset passes on at most 5 threads (5 assets). MEASURED (psun1, same walk, arms
+    /// alternating): the sun phase 34 / 35 ms against 98 with both on one thread; sort 9.1 / 8.6 against 22.8, fine stamp 24 / 26
+    /// against 75 (and 30-33 per asset).
+    bool mParallelSun = true;
+    std::vector<std::vector<uint64_t>> mBrickParts; ///< parallelBricks' handles per thread.
+    /// Visits handles, a chunk's on one thread (with its sink, merged afterwards, then the coarse stores' serially, sink null); all on
+    /// this thread below a threshold or without parallelism.
+    void parallelBricks(const std::vector<uint64_t>& handles, const std::function<void(uint64_t, ResidencySink*)>& visit, bool parallel);
     bool mParallelFades = true;
     /// setParallelMaps: mapReady's queue mapped by several threads, one chunk's bricks per thread as for the fade ends (the coarse
     /// stores' first, serially: parents map first). stepsplit1 / mapevents1 (4K sunset walk): map() ~430-660 ns a brick, the maps
-    /// phase 75-122 ms over 80 frames, one thread.
+    /// phase 75-122 ms over 80 frames, one thread. MEASURED (parmaps1, same walk, arms alternating, up to 16 threads): the maps
+    /// phase 41 / 49 ms for 136k / 158k maps (0.30 us a map) against 85 ms for 125k (0.68 us); walk mean 5.45 / 6.22 against 6.21
+    /// ms, p95 10.3 / 15.1 against 14.2. parmaps2 (arms ser, par, par2, ser2; HSTR_MOTION_SCORE 2): 0 scatter mismatches and 0 stale
+    /// skirt masks over 60 checked frames an arm; > 0.02 at 5.35 / 5.40% parallel against 5.95 / 6.30% serial.
     bool mParallelMaps = true;
     std::vector<std::vector<uint64_t>> mMapParts; ///< The queue's fine bricks per thread.
     /// Maps one thread's partition into its sink (children released by its maps join entries).
@@ -860,6 +1020,11 @@ private:
     ScatterSet mStateScatter; ///< Live sun scheduler states (gpuSun).
     bool mScatterUploads = true;
     bool mScatterDense = false; ///< setScatterDense.
+    /// setParallelUpload: upload's scatter gathers (a random table read and a flag clear an element) in up to 16 ranges.
+    /// stepsplit2 (4K sunset walk, fades / maps / merge parallel): the upload phase 56-98 ms over 80 frames, ~0.5 MB a frame.
+    /// MEASURED (parmerge1, with setParallelMerge): 28 / 36 ms for 32.9 / 46.0 MB (0.85 / 0.78 ms a MB) against 65 for 42.4 MB
+    /// (1.53); exact (parmerge2: 0 scatter mismatches over 60 checked frames an arm).
+    bool mParallelUpload = true;
     bool mStepTiming = false;   ///< setStepTiming.
     uint32_t mScatterCheck = 0; ///< DIAGNOSTIC: frames left to compare the GPU tables with the CPU's.
     std::vector<uint32_t> mScatterIndex;
@@ -1045,8 +1210,24 @@ private:
         float visibility = 1.f;
         float3 camera = float3(0.f); ///< Camera position it was measured from.
         uint32_t generation = 0;     ///< The store's generation: a reused store index is another brick.
+        bool valid = false;          ///< Measured (a new entry is not).
+        uint32_t requested = 0;      ///< CloudView::cutGpuVisibility: the frame of the walk that sent it to the GPU (0: none pending).
     };
-    std::vector<std::unordered_map<uint64_t, VisibilityEntry>> mVisibility;
+    /// CloudView::cutGpuVisibility: the running walk's requests (under mVisBuildMutex), and the batches waiting for the GPU and the
+    /// traced ones waiting for the next walk (under mVisMutex).
+    std::mutex mVisBuildMutex;
+    std::vector<VisibilityRequest> mVisBuilding;
+    std::mutex mVisMutex;
+    std::deque<VisibilityBatch> mVisOutbox;
+    std::vector<std::pair<VisibilityBatch, std::vector<float>>> mVisInbox;
+    void applyVisibility();
+    /// Each slot's cache in shards by handle, each emplace under its shard's striped lock, so walk threads can share a slot (the
+    /// waves); an entry is written only by the thread that visits its brick in that slot, and a rehash moves no entry.
+    static constexpr uint32_t kVisibilityShards = 64;
+    static constexpr uint32_t kVisibilityLocks = 256;
+    std::vector<std::array<std::unordered_map<uint64_t, VisibilityEntry>, kVisibilityShards>> mVisibility;
+    std::array<std::mutex, kVisibilityLocks> mVisibilityLocks;
+    VisibilityEntry& visibilityEntry(uint32_t slot, uint64_t handle);
 
     struct CutEntry
     {
@@ -1082,6 +1263,23 @@ private:
         double milliseconds = 0.0;
         double parallelMs = 0.0;        ///< DIAGNOSTIC: the two parallel phases ...
         double heapMs = 0.0;            ///< ... and the ordered (heap) cut, when the budget binds.
+        double coarseMs = 0.0;          ///< DIAGNOSTIC: the coarse phase, the fine phase and the serial merge of the visits ...
+        double fineMs = 0.0;
+        double desireMs = 0.0;
+        double tailMs = 0.0;            ///< (the lists the frame applies, after the heap)
+        double midMs = 0.0;             ///< DIAGNOSTIC: between the desire merge and the tail (threshold trim, heap).
+        uint32_t visRequests = 0;       ///< CloudView::cutGpuVisibility: refreshes sent to the GPU.
+        uint64_t visits = 0;           ///< ... the visits, the visibility refreshes and their transmittance rays.
+        uint64_t refreshes = 0;
+        uint64_t rays = 0;
+        uint64_t rayMismatches = 0;     ///< (CloudView::cutRays 2)
+        uint64_t coarseBusyCycles = 0;  ///< DIAGNOSTIC: the coarse phase's rdtsc cycles over its threads (waves: their parallel
+        uint64_t coarsePriorityCycles = 0; ///< ranges), in brickPriority, in visibility refreshes.
+        uint64_t coarseRayCycles = 0;
+        uint64_t coarseSerialCycles = 0;   ///< DIAGNOSTIC: the waves' serial parts (cutWaves) ...
+        uint64_t coarseCriticalCycles = 0; ///< ... and the critical path: the waves' parallel wall, or the busiest slot group.
+        uint32_t config = 0;            ///< DIAGNOSTIC: the view's cutWaves | cutTailParallel << 1 | ray mode << 2 (0 reference,
+                                        ///< 1 stepped, 2 blocked (removed), 3 cut off).
         uint32_t unorderedDesired = 0;  ///< DIAGNOSTIC: what the parallel walk desired (over the budget when ordered).
         uint32_t priorityRises = 0;     ///< DIAGNOSTIC: children the parallel walk gave a higher priority than their parent.
         bool thresholdTrimmed = false;  ///< CloudView::cutThreshold: trimmed to the budget ...

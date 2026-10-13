@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <execution>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -21,6 +22,9 @@ extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
 // DIAGNOSTIC (workerKernelUs / workerUserUs): FILETIMEs as 100 ns counts.
 extern "C" __declspec(dllimport) int __stdcall GetThreadTimes(void* thread, unsigned long long* creation, unsigned long long* exit,
                                                              unsigned long long* kernel, unsigned long long* user);
+// CloudView::cutLowPriority: the walk's threads below the frame's and the residency worker's.
+extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void* thread, int priority);
+extern "C" __declspec(dllimport) int __stdcall GetThreadPriority(void* thread);
 
 namespace hstrcloud
 {
@@ -90,6 +94,65 @@ private:
     uint64_t* mpSink;
     uint64_t mStart;
 };
+/// fn(lo, hi) over [0, n) in up to `threads` contiguous ranges of at least minRange, on as many threads (the first on this one).
+template<typename Fn>
+void parallelRanges(size_t n, size_t minRange, size_t threads, Fn&& fn)
+{
+    const size_t ranges = std::min(threads, std::max<size_t>(1, n / minRange));
+    if (ranges <= 1)
+    {
+        fn(size_t(0), n);
+        return;
+    }
+    std::vector<std::future<void>> workers;
+    for (size_t r = 1; r < ranges; ++r)
+        workers.push_back(std::async(std::launch::async, [&, r] { fn(n * r / ranges, n * (r + 1) / ranges); }));
+    fn(size_t(0), n / ranges);
+    for (auto& worker : workers)
+        worker.get();
+}
+
+/// parallelRanges, telling each range its index (ranges in order, at most `threads`).
+template<typename Fn>
+void parallelParts(size_t n, size_t minRange, size_t threads, Fn&& fn)
+{
+    const size_t ranges = std::min(threads, std::max<size_t>(1, n / minRange));
+    if (ranges <= 1)
+    {
+        fn(size_t(0), size_t(0), n);
+        return;
+    }
+    std::vector<std::future<void>> workers;
+    for (size_t r = 1; r < ranges; ++r)
+        workers.push_back(std::async(std::launch::async, [&, r] { fn(r, n * r / ranges, n * (r + 1) / ranges); }));
+    fn(size_t(0), size_t(0), n / ranges);
+    for (auto& worker : workers)
+        worker.get();
+}
+
+/// While alive, the thread runs below normal priority (THREAD_PRIORITY_BELOW_NORMAL; pooled threads get their priority back).
+class LowPriority
+{
+public:
+    explicit LowPriority(bool on) : mOn(on)
+    {
+        if (mOn)
+        {
+            mOld = GetThreadPriority(GetCurrentThread());
+            SetThreadPriority(GetCurrentThread(), -1);
+        }
+    }
+    ~LowPriority()
+    {
+        if (mOn)
+            SetThreadPriority(GetCurrentThread(), mOld);
+    }
+
+private:
+    bool mOn;
+    int mOld = 0;
+};
+
 #define RESIDENCY_STEP(_step) StepClock FALCOR_CONCAT_STRINGS(_stepClock, __LINE__)(mStepTiming && !tSink, mStats.stepCycles[_step])
 } // namespace
 
@@ -749,6 +812,7 @@ void CloudResidency::releaseStore(uint32_t index)
     // store, and brick() on them would read past its bricks.
     mEvictValid = false;
     mEvictLate.clear();
+    mEvictLateSorted = 0;
 }
 
 void CloudResidency::ioWorker()
@@ -921,7 +985,15 @@ bool CloudResidency::inFrustum(const CloudView& view, float3 lo, float3 hi) cons
     return true;
 }
 
-float CloudResidency::transmittance(const CloudSea& sea, const CloudView& view, float3 target) const
+// DIAGNOSTIC: the walk thread's visibility refreshes, transmittance rays and (cutRays 2) rays whose depth differs from the
+// reference loop (walkCut reads them into its tasks).
+thread_local uint64_t tWalkRefreshes = 0;
+thread_local uint64_t tWalkRays = 0;
+thread_local uint64_t tWalkRayMismatches = 0;
+thread_local uint64_t tWalkRayCycles = 0;      ///< DIAGNOSTIC: rdtsc cycles in visibility refreshes ...
+thread_local uint64_t tWalkPriorityCycles = 0; ///< ... and in brickPriority altogether.
+
+float CloudResidency::transmittance(const CloudSea& sea, const CloudView& view, float3 target, float maxDepth) const
 {
     const CloudSeaDesc& desc = sea.getDesc();
     const uint3 dims = sea.getDims();
@@ -932,22 +1004,84 @@ float CloudResidency::transmittance(const CloudSea& sea, const CloudView& view, 
         return 1.f;
     const uint32_t steps = std::min(128u, uint32_t(std::ceil(length / voxel)));
     const float dt = length / float(steps);
+    auto reference = [&]()
+    {
+        float depth = 0.f;
+        for (uint32_t i = 0; i < steps && depth < 6.f; ++i)
+        {
+            const float3 p = view.position + delta * ((float(i) + 0.5f) / float(steps));
+            const int3 v = int3(floor((p - desc.origin) / voxel));
+            if (v.y < 0 || v.y >= int32_t(dims.y))
+                continue;
+            const int32_t x = (v.x % int32_t(dims.x) + int32_t(dims.x)) % int32_t(dims.x);
+            const int32_t z = (v.z % int32_t(dims.z) + int32_t(dims.z)) % int32_t(dims.z);
+            depth += sea.meanAt(uint3(uint32_t(x), uint32_t(v.y), uint32_t(z))) * view.densityScale * dt;
+        }
+        return depth;
+    };
+    if (view.cutRays == 0)
+        return std::exp(-reference());
+    // CloudView::cutRays: the same samples, the wrapped tile and tile-local voxel followed from step to step instead of divided out
+    // (four integer divisions a step in meanAt and two in the wrap).
+    const int32_t r = int32_t(desc.tileVoxels);
+    const int32_t tiles = int32_t(desc.tiles);
+    struct Axis
+    {
+        int32_t v = 0, tile = 0, local = 0;
+    };
+    auto place = [&](Axis& axis, int32_t v)
+    {
+        const int32_t d = v - axis.v;
+        axis.v = v;
+        if (d >= -r && d <= r)
+        {
+            axis.local += d;
+            if (axis.local >= r)
+                axis.local -= r, axis.tile = axis.tile + 1 == tiles ? 0 : axis.tile + 1;
+            else if (axis.local < 0)
+                axis.local += r, axis.tile = axis.tile == 0 ? tiles - 1 : axis.tile - 1;
+            return;
+        }
+        const int32_t n = r * tiles;
+        const int32_t w = (v % n + n) % n;
+        axis.tile = w / r;
+        axis.local = w - axis.tile * r;
+    };
+    Axis ax, az;
+    bool first = true;
     float depth = 0.f;
-    for (uint32_t i = 0; i < steps && depth < 6.f; ++i)
+    for (uint32_t i = 0; i < steps && depth < maxDepth; ++i)
     {
         const float3 p = view.position + delta * ((float(i) + 0.5f) / float(steps));
         const int3 v = int3(floor((p - desc.origin) / voxel));
+        if (first)
+        {
+            ax.v = v.x + 2 * r; // Far off, so the first place divides.
+            az.v = v.z + 2 * r;
+            first = false;
+        }
+        place(ax, v.x);
+        place(az, v.z);
         if (v.y < 0 || v.y >= int32_t(dims.y))
             continue;
-        const int32_t x = (v.x % int32_t(dims.x) + int32_t(dims.x)) % int32_t(dims.x);
-        const int32_t z = (v.z % int32_t(dims.z) + int32_t(dims.z)) % int32_t(dims.z);
-        depth += sea.meanAt(uint3(uint32_t(x), uint32_t(v.y), uint32_t(z))) * view.densityScale * dt;
+        depth += sea.meanAtTile(uint32_t(ax.tile), uint32_t(az.tile), uint32_t(ax.local), uint32_t(v.y), uint32_t(az.local)) *
+                 view.densityScale * dt;
     }
+    if (view.cutRays == 2 && depth != reference())
+        ++tWalkRayMismatches;
     return std::exp(-depth);
+}
+
+CloudResidency::VisibilityEntry& CloudResidency::visibilityEntry(uint32_t slot, uint64_t handle)
+{
+    const uint32_t shard = uint32_t((handle * 0x9E3779B97F4A7C15ull) >> 58);
+    std::lock_guard lock(mVisibilityLocks[(slot * kVisibilityShards + shard) % kVisibilityLocks]);
+    return mVisibility[slot][shard].try_emplace(handle).first->second;
 }
 
 float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t handle, const CloudView& view, float& visibility)
 {
+    StepClock clock(true, tWalkPriorityCycles); // DIAGNOSTIC
     const Brick& b = brick(handle);
     const CloudSea::Tile& tile = sea.getInstanceTiles()[slot];
     const HSTRCloudInstance& instance = tile.instance;
@@ -987,16 +1121,53 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
     if (inside && level >= 3)
     {
         const uint32_t generation = storeOf(handle).generation;
-        auto [it, inserted] = mVisibility[slot].try_emplace(handle);
-        VisibilityEntry& entry = it->second;
+        VisibilityEntry& entry = visibilityEntry(slot, handle);
         const float3 moved = view.position - entry.camera;
-        if (inserted || entry.generation != generation || dot(moved, moved) > 0.01f * distance * distance + 1.f)
+        const bool stale = !entry.valid || entry.generation != generation;
+        if (view.cutGpuVisibility && (stale || dot(moved, moved) > 0.01f * distance * distance + 1.f))
         {
+            // Traced on the GPU and applied before a later walk: meanwhile the last visibility, or (none, or another brick's) the
+            // parent's, which the walk passed in. A request lost on the way is sent again after 120 frames.
+            if (stale)
+            {
+                entry.visibility = visibility;
+                entry.valid = true;
+                entry.generation = generation;
+                entry.requested = 0;
+            }
+            if (entry.requested == 0 || mCutFrame > entry.requested + 120)
+            {
+                entry.requested = std::max(mCutFrame, 1u);
+                std::lock_guard lock(mVisBuildMutex);
+                mVisBuilding.push_back({handle, slot, generation, lo, hi});
+            }
+        }
+        else if (stale || dot(moved, moved) > 0.01f * distance * distance + 1.f)
+        {
+            StepClock rayClock(true, tWalkRayCycles); // DIAGNOSTIC
+            entry.valid = true;
+            ++tWalkRefreshes;
+            ++tWalkRays;
+            // CloudView::cutRays 5 / 6: a corner ray stops once its depth leaves it below the best so far (depth only grows, so it
+            // could not raise the maximum): the same maximum, with a margin over the rounding of the log.
+            const bool cutoff = view.cutRays >= 5;
+            auto cutoffDepth = [](float best) { return best > 0.f ? std::min(6.f, -std::log(best) * (1.f + 1e-5f) + 1e-6f) : 6.f; };
             float best = transmittance(sea, view, nearest);
+            float full = best;
             for (uint32_t corner = 0; corner < 8 && best < 0.99f; ++corner)
             {
                 const float3 p((corner & 1) ? hi.x : lo.x, (corner & 2) ? hi.y : lo.y, (corner & 4) ? hi.z : lo.z);
-                best = std::max(best, transmittance(sea, view, p));
+                best = std::max(best, transmittance(sea, view, p, cutoff ? cutoffDepth(best) : 6.f));
+                ++tWalkRays;
+            }
+            if (view.cutRays == 6)
+            {
+                for (uint32_t corner = 0; corner < 8 && full < 0.99f; ++corner)
+                {
+                    const float3 p((corner & 1) ? hi.x : lo.x, (corner & 2) ? hi.y : lo.y, (corner & 4) ? hi.z : lo.z);
+                    full = std::max(full, transmittance(sea, view, p));
+                }
+                tWalkRayMismatches += full != best ? 1u : 0u;
             }
             entry.visibility = best;
             entry.camera = view.position;
@@ -1242,7 +1413,8 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     for (uint32_t slot : changedSlots)
     {
         if (slot < mVisibility.size())
-            mVisibility[slot].clear(); // Another instance now: its bricks sit elsewhere.
+            for (auto& shard : mVisibility[slot])
+                shard.clear(); // Another instance now: its bricks sit elsewhere.
         if (mDesc.gpuSun)
             releaseSunField(slot);
         mInstances[slot] = tiles[slot].instance;
@@ -1404,10 +1576,17 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mCutSlot ^= 1u;
         // evict's order survives the cut: a candidate's key is the last cut that desired it, which a new cut leaves alone (one it
         // desires again is skipped when taken). Bricks it no longer desires join it here, keyed by the cut before.
-        for (uint64_t handle : walk->left)
         {
-            brick(handle).leftCut = mCutId;
-            noteEvictCandidate(handle);
+            RESIDENCY_STEP(kStepMergeLeft);
+            parallelBricks(
+                walk->left,
+                [&](uint64_t handle, ResidencySink*)
+                {
+                    brick(handle).leftCut = mCutId;
+                    noteEvictCandidate(handle);
+                },
+                mParallelMerge
+            );
         }
         mStats.cutReentered += walk->reentered;
         mMergeFrame = mCutFrame;
@@ -1422,11 +1601,14 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mToLoadNext = 0;
         mToMap = std::move(walk->toMap);
         ResidencyScope mergePhase(pRenderContext, "fading");
-        for (uint64_t handle : walk->fading)
-            updateFade(handle);
+        {
+            RESIDENCY_STEP(kStepMergeFading);
+            parallelBricks(walk->fading, [&](uint64_t handle, ResidencySink*) { updateFade(handle); }, mParallelMerge);
+        }
         mergePhase.next(pRenderContext, "touched");
         if (mDesc.gpuSun)
         {
+            RESIDENCY_STEP(kStepMergeSun);
             // The walk wrote the scheduler states into the spare table.
             mSunStateLive ^= 1u;
             mSunStateSync = std::move(walk->stateChanged);
@@ -1436,32 +1618,42 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
                 mStateScatter.mark(gpu);
         }
         // Bricks mapped, unmapped or faded while the walk ran: the walk saw them as they were when it started.
+        StepClock touchedClock(mStepTiming, mStats.stepCycles[kStepMergeTouched]);
         const std::vector<uint64_t> touched = std::move(mWalkTouched);
         mWalkTouched.clear();
         ++mWalkTouchedEpoch;
-        for (uint64_t handle : touched)
+        auto visitTouched = [&](uint64_t handle, ResidencySink* pSink)
         {
             const Brick& b = brick(handle);
             if (mDesc.gpuSun && b.gpu != kNone)
             {
                 mSunState[mSunStateLive][b.gpu] = sunStateOf(cutOf(b), mCutId, b.mapped);
-                mSunStateSync.push_back(b.gpu);
-                mSunStateBlocksDirty[b.gpu / kBrickBlock] = 1;
-                mStateScatter.mark(b.gpu);
+                if (pSink)
+                {
+                    pSink->stateSync.push_back(b.gpu);
+                    mStateScatter.mark(b.gpu, pSink->states); // Its block is marked in the merge.
+                }
+                else
+                {
+                    mSunStateSync.push_back(b.gpu);
+                    mSunStateBlocksDirty[b.gpu / kBrickBlock] = 1;
+                    mStateScatter.mark(b.gpu);
+                }
             }
             // Unmapped beside the walk, a candidate only now its snapshot has gone.
             noteEvictCandidate(handle);
             if (b.mapped)
                 updateFade(handle);
             else if (desired(b) && (b.flags & kLoaded))
-                mToMap.push_back(handle);
+                (pSink ? pSink->toMap : mToMap).push_back(handle);
             else if (desired(b))
             {
                 // Evicted beside the walk after it counted the brick loaded.
-                mToLoad.push_back(handle);
-                mToMap.push_back(handle);
+                (pSink ? pSink->toLoad : mToLoad).push_back(handle);
+                (pSink ? pSink->toMap : mToMap).push_back(handle);
             }
-        }
+        };
+        parallelBricks(touched, visitTouched, mParallelMerge);
         mMapReseed = true;
         mergePhase.reset();
         mStats.cutPops = walk->pops;
@@ -1472,6 +1664,29 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
         mStats.cutWalkMsTotal += walk->milliseconds;
         mStats.cutParallelMsTotal += walk->parallelMs;
         mStats.cutHeapMsTotal += walk->heapMs;
+        mStats.cutCoarseMsTotal += walk->coarseMs;
+        mStats.cutFineMsTotal += walk->fineMs;
+        mStats.cutDesireMsTotal += walk->desireMs;
+        mStats.cutTailMsTotal += walk->tailMs;
+        mStats.cutVisitsTotal += walk->visits;
+        mStats.cutRefreshesTotal += walk->refreshes;
+        mStats.cutRaysTotal += walk->rays;
+        mStats.cutRayMismatchesTotal += walk->rayMismatches;
+        mStats.gpuVisRequests += walk->visRequests;
+        ++mStats.cutConfigWalks[walk->config];
+        mStats.cutConfigMs[walk->config] += walk->milliseconds;
+        mStats.cutConfigCoarseMs[walk->config] += walk->coarseMs;
+        mStats.cutConfigTailMs[walk->config] += walk->tailMs;
+        mStats.cutConfigFineMs[walk->config] += walk->fineMs;
+        mStats.cutConfigDesireMs[walk->config] += walk->desireMs;
+        mStats.cutConfigMidMs[walk->config] += walk->midMs;
+        mStats.cutConfigRays[walk->config] += walk->rays;
+        mStats.cutConfigBusyCycles[walk->config] += walk->coarseBusyCycles;
+        mStats.cutConfigPriorityCycles[walk->config] += walk->coarsePriorityCycles;
+        mStats.cutConfigRayCycles[walk->config] += walk->coarseRayCycles;
+        mStats.cutConfigSerialCycles[walk->config] += walk->coarseSerialCycles;
+        mStats.cutConfigCriticalCycles[walk->config] += walk->coarseCriticalCycles;
+        mStats.cutConfigRefreshes[walk->config] += walk->refreshes;
         mStats.cutUnorderedDesired = walk->unorderedDesired;
         mStats.cutPriorityRises += walk->priorityRises;
         mStats.cutThresholdTrims += walk->thresholdTrimmed ? 1u : 0u;
@@ -1645,8 +1860,61 @@ void CloudResidency::cutWorker()
     }
 }
 
+bool CloudResidency::takeVisibilityBatch(VisibilityBatch& batch)
+{
+    std::lock_guard lock(mVisMutex);
+    if (mVisOutbox.empty())
+        return false;
+    batch = std::move(mVisOutbox.front());
+    mVisOutbox.pop_front();
+    return true;
+}
+
+void CloudResidency::putVisibility(VisibilityBatch&& batch, std::vector<float>&& visibility)
+{
+    std::lock_guard lock(mVisMutex);
+    mVisInbox.emplace_back(std::move(batch), std::move(visibility));
+}
+
+void CloudResidency::applyVisibility()
+{
+    // No walk runs here (beginCut): the cache is this thread's.
+    std::vector<std::pair<VisibilityBatch, std::vector<float>>> inbox;
+    {
+        std::lock_guard lock(mVisMutex);
+        inbox.swap(mVisInbox);
+    }
+    for (const auto& [batch, visibility] : inbox)
+    {
+        ++mStats.gpuVisBatches;
+        for (size_t i = 0; i < batch.requests.size() && i < visibility.size(); ++i)
+        {
+            const VisibilityRequest& request = batch.requests[i];
+            if (request.slot >= mVisibility.size())
+            {
+                ++mStats.gpuVisDropped;
+                continue;
+            }
+            auto& map = mVisibility[request.slot][uint32_t((request.handle * 0x9E3779B97F4A7C15ull) >> 58)];
+            const auto it = map.find(request.handle);
+            if (it == map.end() || it->second.generation != request.generation)
+            {
+                ++mStats.gpuVisDropped;
+                continue;
+            }
+            VisibilityEntry& entry = it->second;
+            entry.visibility = visibility[i];
+            entry.camera = batch.camera;
+            entry.requested = 0;
+            ++mStats.gpuVisApplied;
+        }
+    }
+}
+
 void CloudResidency::beginCut(const CloudSea& sea, const CloudView& view)
 {
+    if (view.cutGpuVisibility)
+        applyVisibility();
     mCutCommits = 0;
     mCutPosition = view.position;
     mCutViewProjection = view.viewProjection;
@@ -1673,6 +1941,8 @@ void CloudResidency::noteWalkTouched(uint64_t handle)
 
 CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const CloudView& view)
 {
+    // The walk's own thread (its serial parts) too; with view.cutAsync off it is the frame's, which keeps its priority.
+    LowPriority low(view.cutLowPriority && view.cutAsync);
     const auto start = std::chrono::steady_clock::now();
     const auto& tiles = sea.getInstanceTiles();
     // The spare scheduler state table catches up with the live one: the entries the last cut changed.
@@ -1697,6 +1967,34 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
         std::vector<CutEntry> frontier;
         uint32_t pops = 0;
         uint32_t rises = 0; ///< Children with a higher priority than their parent (walk.priorityRises).
+        uint64_t refreshes = 0; ///< DIAGNOSTIC: walk.refreshes / rays / rayMismatches.
+        uint64_t rays = 0;
+        uint64_t mismatches = 0;
+        uint64_t busyCycles = 0; ///< DIAGNOSTIC: rdtsc cycles the task ran, in brickPriority, in its visibility refreshes.
+        uint64_t priorityCycles = 0;
+        uint64_t rayCycles = 0;
+        uint64_t serialCycles = 0;   ///< DIAGNOSTIC (cutWaves): the waves' serial parts and their parallel parts' wall time.
+        uint64_t criticalCycles = 0;
+    };
+    // DIAGNOSTIC: a task's share of the thread's refresh and ray counts and cycles.
+    struct RayCount
+    {
+        Task& task;
+        uint64_t refreshes = tWalkRefreshes;
+        uint64_t rays = tWalkRays;
+        uint64_t mismatches = tWalkRayMismatches;
+        uint64_t priorityCycles = tWalkPriorityCycles;
+        uint64_t rayCycles = tWalkRayCycles;
+        uint64_t start = __rdtsc();
+        ~RayCount()
+        {
+            task.refreshes += tWalkRefreshes - refreshes;
+            task.rays += tWalkRays - rays;
+            task.mismatches += tWalkRayMismatches - mismatches;
+            task.priorityCycles += tWalkPriorityCycles - priorityCycles;
+            task.rayCycles += tWalkRayCycles - rayCycles;
+            task.busyCycles += __rdtsc() - start;
+        }
     };
     std::vector<Task> coarse(tasks);
     std::vector<Task> fine(tasks);
@@ -1752,6 +2050,8 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     };
     auto walkCoarse = [&](uint32_t index)
     {
+        LowPriority low(view.cutLowPriority);
+        RayCount count{coarse[index]};
         std::vector<CutEntry> stack;
         for (uint32_t slot = index; slot < tiles.size(); slot += tasks)
         {
@@ -1781,6 +2081,8 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     auto walkFine = [&](uint32_t index)
     {
         // Round robin, so the subtrees of one near instance spread over every thread.
+        LowPriority low(view.cutLowPriority);
+        RayCount count{fine[index]};
         std::vector<CutEntry> stack;
         for (size_t i = index; i < frontier.size(); i += tasks)
             stack.push_back(frontier[i]);
@@ -1795,10 +2097,125 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
         for (auto& worker : workers)
             worker.get();
     };
-    parallel(walkCoarse);
+    // CloudView::cutWaves: the coarse phase a level at a time over every instance. Threads take chunks of a wave's entries in turn
+    // and list and prioritize their children (the rays; the visibility cache is sharded under locks), and the chunks join in order:
+    // the same visits, in level order (parents before children), into the first task; no slot trace.
+    auto walkWaves = [&]()
+    {
+        Task& task = coarse[0];
+        std::vector<CutEntry> wave;
+        auto enter = [&](const CutEntry& entry)
+        {
+            if (brick(entry.handle).record.level <= 3)
+                task.frontier.push_back(entry);
+            else
+                wave.push_back(entry);
+        };
+        for (uint32_t slot = 0; slot < tiles.size(); ++slot)
+        {
+            CutEntry top;
+            if (!cutSeed(sea, view, slot, top))
+                continue;
+            task.visits.push_back({top.handle, top.priority, slot, kSeedAdmit});
+            if (cutRefinable(top.handle) && top.priority >= prune)
+                enter(top);
+        }
+        struct Item
+        {
+            uint64_t child;
+            uint32_t parent; ///< Index into the wave.
+            float priority;
+            float visibility;
+        };
+        // A chunk of the wave's entries: their children, prioritized, and their page requests.
+        struct Chunk
+        {
+            std::vector<Item> items;
+            std::vector<Request> requests;
+            uint32_t pops = 0;
+        };
+        // Entries a chunk; chunks taken in turn rather than one range a thread: the refreshes (the rays) cluster where the near
+        // instance's entries lie in the wave.
+        constexpr size_t kChunk = 4;
+        std::vector<Chunk> chunks;
+        std::mutex countMutex;
+        while (!wave.empty())
+        {
+            const uint64_t parallelStart = __rdtsc();
+            const size_t chunkCount = (wave.size() + kChunk - 1) / kChunk;
+            chunks.resize(chunkCount);
+            for (Chunk& chunk : chunks)
+            {
+                chunk.items.clear();
+                chunk.requests.clear();
+                chunk.pops = 0;
+            }
+            std::atomic<size_t> cursor = 0;
+            const size_t workers = std::min<size_t>(tasks, std::max<size_t>(1, chunkCount / 4));
+            parallelRanges(
+                workers, 1, tasks,
+                [&](size_t, size_t)
+                {
+                    LowPriority low(view.cutLowPriority);
+                    Task local;
+                    std::vector<uint64_t> children;
+                    {
+                        RayCount count{local};
+                        for (size_t c = cursor.fetch_add(1); c < chunkCount; c = cursor.fetch_add(1))
+                        {
+                            Chunk& chunk = chunks[c];
+                            for (size_t i = c * kChunk; i < std::min((c + 1) * kChunk, wave.size()); ++i)
+                            {
+                                const CutEntry& entry = wave[i];
+                                ++chunk.pops;
+                                cutChildren(entry, children, chunk.requests);
+                                for (uint64_t child : children)
+                                {
+                                    Item item{child, uint32_t(i), 0.f, entry.visibility};
+                                    item.priority = brickPriority(sea, entry.slot, child, view, item.visibility);
+                                    chunk.items.push_back(item);
+                                }
+                            }
+                        }
+                    }
+                    std::lock_guard lock(countMutex);
+                    task.refreshes += local.refreshes;
+                    task.rays += local.rays;
+                    task.mismatches += local.mismatches;
+                    task.priorityCycles += local.priorityCycles;
+                    task.rayCycles += local.rayCycles;
+                    task.busyCycles += local.busyCycles;
+                }
+            );
+            const uint64_t parallelEnd = __rdtsc();
+            task.criticalCycles += parallelEnd - parallelStart;
+            std::vector<CutEntry> parents = std::move(wave);
+            wave.clear();
+            for (const Chunk& chunk : chunks)
+            {
+                task.pops += chunk.pops;
+                task.requests.insert(task.requests.end(), chunk.requests.begin(), chunk.requests.end());
+                for (const Item& item : chunk.items)
+                {
+                    const CutEntry& entry = parents[item.parent];
+                    task.visits.push_back({item.child, item.priority, entry.slot, entry.priority});
+                    task.rises += item.priority > entry.priority ? 1u : 0u;
+                    if (item.priority > 0.f && item.priority >= prune && cutRefinable(item.child))
+                        enter({item.priority, item.child, entry.slot, item.visibility});
+                }
+            }
+            task.serialCycles += __rdtsc() - parallelEnd;
+        }
+    };
+    if (view.cutWaves)
+        walkWaves();
+    else
+        parallel(walkCoarse);
+    const auto coarseEnd = std::chrono::steady_clock::now();
     for (const Task& task : coarse)
         frontier.insert(frontier.end(), task.frontier.begin(), task.frontier.end());
     parallel(walkFine);
+    const auto fineEnd = std::chrono::steady_clock::now();
 
     // The cut's state goes into the bricks' spare slot, under the next cut id. A visit marks its brick at the highest priority any
     // instance gives it; merged in slot order, coarse phase first, which keeps parents before children.
@@ -1806,6 +2223,9 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     const uint32_t budget = uint32_t(0.9f * float(mBricks.size()));
     CutWalk walk;
     walk.id = mCutId + 1;
+    // (cutGpuVisibility in the low-priority bit's place: the two are not measured together)
+    walk.config = (view.cutWaves ? 1u : 0u) | (view.cutTailParallel ? 2u : 0u) | (((view.cutRays + 1) / 2) << 2) |
+                  (view.cutLowPriority || view.cutGpuVisibility ? 16u : 0u);
     auto desire = [&](uint64_t handle, float priority, uint32_t slot, float admit)
     {
         CutState& state = brick(handle).cut[next];
@@ -1831,9 +2251,26 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
             walk.requests.insert(walk.requests.end(), task.requests.begin(), task.requests.end());
             walk.pops += task.pops;
             walk.priorityRises += task.rises;
+            walk.visits += task.visits.size();
+            walk.refreshes += task.refreshes;
+            walk.rays += task.rays;
+            walk.rayMismatches += task.mismatches;
+            if (phase == &coarse)
+            {
+                walk.coarseBusyCycles += task.busyCycles;
+                walk.coarsePriorityCycles += task.priorityCycles;
+                walk.coarseRayCycles += task.rayCycles;
+                walk.coarseSerialCycles += task.serialCycles;
+                // The critical path: the waves' parallel wall time, or the busiest slot group's thread.
+                walk.coarseCriticalCycles = view.cutWaves ? walk.coarseCriticalCycles + task.criticalCycles
+                                                          : std::max(walk.coarseCriticalCycles, task.busyCycles);
+            }
         }
     const auto parallelEnd = std::chrono::steady_clock::now();
     walk.parallelMs = std::chrono::duration<double, std::milli>(parallelEnd - start).count();
+    walk.coarseMs = std::chrono::duration<double, std::milli>(coarseEnd - start).count();
+    walk.fineMs = std::chrono::duration<double, std::milli>(fineEnd - coarseEnd).count();
+    walk.desireMs = std::chrono::duration<double, std::milli>(parallelEnd - fineEnd).count();
     walk.unorderedDesired = uint32_t(walk.desired.size());
     // The walk refines every brick with a positive priority, whatever the order; only when that desires more than the atlas budget
     // does the order matter, and the cut runs again as the greedy one (under a fresh id, so the walk's marks do not count).
@@ -1969,68 +2406,158 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     // What the frame applies. Loads go most important first within each level, coarsest level first (a parent before its children);
     // the walk leaves parents first but not in priority order, and the loads per frame are capped.
     // DIAGNOSTIC: the cut's churn against the last one taken on, by level (bricks entering; leaving is the difference of sizes).
-    walk.entered = 0;
-    walk.enteredLevel.fill(0);
-    for (uint64_t handle : walk.desired)
+    // CloudView::cutTailParallel: each list in parallel ranges, one part a range, the parts joined in order (the same lists).
+    const auto tailStart = std::chrono::steady_clock::now();
+    walk.midMs = std::chrono::duration<double, std::milli>(tailStart - parallelEnd).count();
+    const size_t tailThreads = view.cutTailParallel ? tasks : 1;
+    struct TailPart
     {
-        const Brick& b = brick(handle);
-        if (b.cut[mCutSlot].id != mCutId)
+        uint32_t entered = 0;
+        uint32_t reentered = 0;
+        std::array<uint32_t, 8> enteredLevel{};
+        std::vector<uint64_t> toLoad, toMap, left, fading;
+        std::vector<uint32_t> stateChanged;
+    };
+    std::vector<TailPart> parts(tailThreads);
+    auto join = [&](std::vector<uint64_t> TailPart::*list, std::vector<uint64_t>& out)
+    {
+        size_t total = out.size();
+        for (const TailPart& part : parts)
+            total += (part.*list).size();
+        out.reserve(total);
+        for (TailPart& part : parts)
         {
-            ++walk.entered;
-            // Left within the last few cuts (ids rise by 1-2 a cut): the cut gives back what it just dropped.
-            walk.reentered += b.leftCut != 0 && b.leftCut + 8 >= mCutId ? 1u : 0u;
-            ++walk.enteredLevel[std::min<uint32_t>(b.record.level, 7u)];
+            out.insert(out.end(), (part.*list).begin(), (part.*list).end());
+            (part.*list).clear();
         }
-        if (!(b.flags & kLoaded))
-            walk.toLoad.push_back(handle);
-        if (b.gpu == kNone || !(mMappedSnapshot[b.gpu] & kSnapMapped))
-            walk.toMap.push_back(handle);
-    }
-    // The frame changes mDesired only when it takes a cut on, and releases no store holding a brick of it.
-    for (uint64_t handle : mDesired)
-        if (brick(handle).cut[next].id != walk.id)
-            walk.left.push_back(handle);
-    std::sort(
-        walk.toLoad.begin(), walk.toLoad.end(),
-        [&](uint64_t a, uint64_t c)
+    };
+    parallelParts(
+        walk.desired.size(), 4096, tailThreads,
+        [&](size_t index, size_t begin, size_t end)
         {
-            const Brick& ba = brick(a);
-            const Brick& bc = brick(c);
-            return ba.record.level != bc.record.level ? ba.record.level > bc.record.level : ba.cut[next].priority > bc.cut[next].priority;
+            LowPriority low(view.cutLowPriority);
+            TailPart& part = parts[index];
+            for (size_t i = begin; i < end; ++i)
+            {
+                const uint64_t handle = walk.desired[i];
+                const Brick& b = brick(handle);
+                if (b.cut[mCutSlot].id != mCutId)
+                {
+                    ++part.entered;
+                    // Left within the last few cuts (ids rise by 1-2 a cut): the cut gives back what it just dropped.
+                    part.reentered += b.leftCut != 0 && b.leftCut + 8 >= mCutId ? 1u : 0u;
+                    ++part.enteredLevel[std::min<uint32_t>(b.record.level, 7u)];
+                }
+                if (!(b.flags & kLoaded))
+                    part.toLoad.push_back(handle);
+                if (b.gpu == kNone || !(mMappedSnapshot[b.gpu] & kSnapMapped))
+                    part.toMap.push_back(handle);
+            }
         }
     );
+    walk.entered = 0;
+    walk.enteredLevel.fill(0);
+    for (const TailPart& part : parts)
+    {
+        walk.entered += part.entered;
+        walk.reentered += part.reentered;
+        for (size_t l = 0; l < 8; ++l)
+            walk.enteredLevel[l] += part.enteredLevel[l];
+    }
+    join(&TailPart::toLoad, walk.toLoad);
+    join(&TailPart::toMap, walk.toMap);
+    // The frame changes mDesired only when it takes a cut on, and releases no store holding a brick of it.
+    parallelParts(
+        mDesired.size(), 4096, tailThreads,
+        [&](size_t index, size_t begin, size_t end)
+        {
+            LowPriority low(view.cutLowPriority);
+            TailPart& part = parts[index];
+            for (size_t i = begin; i < end; ++i)
+                if (brick(mDesired[i]).cut[next].id != walk.id)
+                    part.left.push_back(mDesired[i]);
+        }
+    );
+    join(&TailPart::left, walk.left);
+    auto loadOrder = [&](uint64_t a, uint64_t c)
+    {
+        const Brick& ba = brick(a);
+        const Brick& bc = brick(c);
+        return ba.record.level != bc.record.level ? ba.record.level > bc.record.level : ba.cut[next].priority > bc.cut[next].priority;
+    };
+    if (view.cutTailParallel)
+        std::sort(std::execution::par, walk.toLoad.begin(), walk.toLoad.end(), loadOrder);
+    else
+        std::sort(walk.toLoad.begin(), walk.toLoad.end(), loadOrder);
     // Mapped bricks fade in while desired, and out once undesired with no mapped children; the scheduler's states follow the cut.
     if (mDesc.gpuSun)
         walk.stateBlocksDirty.assign(mSunStateBlocksDirty.size(), 0);
     // Maps and fades run meanwhile, so what they change comes from the snapshot (and the owners stay: loads wait for the walk).
-    for (uint32_t gpu = 0; gpu < uint32_t(mMappedSnapshot.size()); ++gpu)
-    {
-        const uint8_t snapshot = mMappedSnapshot[gpu];
-        if (!(snapshot & kSnapMapped))
-            continue;
-        const uint64_t handle = mBrickOwner[gpu];
-        const Brick& b = brick(handle);
-        const bool inCut = b.cut[next].id == walk.id;
-        // Only bricks whose fade turns under this cut (updateFade decides again when it is taken on).
-        const int current = (snapshot & kSnapFadeIn) ? 1 : (snapshot & kSnapFadeOut) ? -1 : 0;
-        const bool full = current == 0 && (snapshot & kSnapFull);
-        const int direction = inCut ? (full ? 0 : 1) : ((snapshot & kSnapChildren) ? 0 : -1);
-        if (direction != current)
-            walk.fading.push_back(handle);
-        if (mDesc.gpuSun)
+    // Ranges of whole scheduler blocks, so no two threads write one dirty byte.
+    const size_t gpuBricks = mMappedSnapshot.size();
+    const size_t blocks = (gpuBricks + kBrickBlock - 1) / kBrickBlock;
+    parallelParts(
+        blocks, 4, tailThreads,
+        [&](size_t index, size_t blockBegin, size_t blockEnd)
         {
-            const uint32_t state = sunStateOf(inCut ? b.cut[next] : b.cut[mCutSlot], walk.id, true);
-            if (state != spareState[gpu])
+            LowPriority low(view.cutLowPriority);
+            TailPart& part = parts[index];
+            const uint32_t end = uint32_t(std::min(gpuBricks, blockEnd * kBrickBlock));
+            for (uint32_t gpu = uint32_t(blockBegin * kBrickBlock); gpu < end; ++gpu)
             {
-                spareState[gpu] = state;
-                walk.stateChanged.push_back(gpu);
-                walk.stateBlocksDirty[gpu / kBrickBlock] = 1;
+                const uint8_t snapshot = mMappedSnapshot[gpu];
+                if (!(snapshot & kSnapMapped))
+                    continue;
+                const uint64_t handle = mBrickOwner[gpu];
+                const Brick& b = brick(handle);
+                const bool inCut = b.cut[next].id == walk.id;
+                // Only bricks whose fade turns under this cut (updateFade decides again when it is taken on).
+                const int current = (snapshot & kSnapFadeIn) ? 1 : (snapshot & kSnapFadeOut) ? -1 : 0;
+                const bool full = current == 0 && (snapshot & kSnapFull);
+                const int direction = inCut ? (full ? 0 : 1) : ((snapshot & kSnapChildren) ? 0 : -1);
+                if (direction != current)
+                    part.fading.push_back(handle);
+                if (mDesc.gpuSun)
+                {
+                    const uint32_t state = sunStateOf(inCut ? b.cut[next] : b.cut[mCutSlot], walk.id, true);
+                    if (state != spareState[gpu])
+                    {
+                        spareState[gpu] = state;
+                        part.stateChanged.push_back(gpu);
+                        walk.stateBlocksDirty[gpu / kBrickBlock] = 1;
+                    }
+                }
             }
         }
-    }
+    );
+    join(&TailPart::fading, walk.fading);
+    for (TailPart& part : parts)
+        walk.stateChanged.insert(walk.stateChanged.end(), part.stateChanged.begin(), part.stateChanged.end());
     // Page requests, most important first (enqueue keeps the head of the list).
-    std::sort(walk.requests.begin(), walk.requests.end(), [](const Request& a, const Request& b) { return a.priority > b.priority; });
-    walk.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    auto requestOrder = [](const Request& a, const Request& b) { return a.priority > b.priority; };
+    if (view.cutTailParallel)
+        std::sort(std::execution::par, walk.requests.begin(), walk.requests.end(), requestOrder);
+    else
+        std::sort(walk.requests.begin(), walk.requests.end(), requestOrder);
+    const auto end = std::chrono::steady_clock::now();
+    walk.tailMs = std::chrono::duration<double, std::milli>(end - tailStart).count();
+    walk.milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
+    if (view.cutGpuVisibility)
+    {
+        VisibilityBatch batch;
+        batch.camera = view.position;
+        {
+            std::lock_guard lock(mVisBuildMutex);
+            batch.requests = std::move(mVisBuilding);
+            mVisBuilding.clear();
+        }
+        walk.visRequests = uint32_t(batch.requests.size());
+        if (!batch.requests.empty())
+        {
+            std::lock_guard lock(mVisMutex);
+            mVisOutbox.push_back(std::move(batch));
+        }
+    }
     if (mTraceSlot != ~0u)
     {
         std::lock_guard lock(mTraceMutex);
@@ -2111,6 +2638,7 @@ bool CloudResidency::commit(uint64_t handle, bool evictOk)
     if ((mFreeSlots.empty() || mFreeBricks.empty()) &&
         (!evictOk || !evict(2 * mLoadCap, 2 * mLoadCap) || mFreeSlots.empty() || mFreeBricks.empty()))
         return false;
+    RESIDENCY_STEP(kStepCommit);
     const Store& store = storeOf(handle);
     const Brick* parent = b.parent != kNoHandle ? &brick(b.parent) : nullptr;
     b.gpu = mFreeBricks.back();
@@ -2189,9 +2717,15 @@ bool CloudResidency::evict(uint32_t slotsNeeded, uint32_t metasNeeded)
     size_t lateNext = 0;
     auto takeLateList = [&]
     {
+        RESIDENCY_STEP(kStepEvictSort);
         late = std::move(mEvictLate);
         mEvictLate.clear();
-        std::sort(late.begin(), late.end(), [](const auto& a, const auto& c) { return a.first < c.first; });
+        auto byKey = [](const auto& a, const auto& c) { return a.first < c.first; };
+        // setEvictLateMerge: the last call's remainder is sorted (mEvictLateSorted); only what joined since is sorted, then merged.
+        const size_t sorted = mEvictLateMerge ? std::min(mEvictLateSorted, late.size()) : 0;
+        std::sort(late.begin() + sorted, late.end(), byKey);
+        std::inplace_merge(late.begin(), late.begin() + sorted, late.end(), byKey);
+        mEvictLateSorted = 0;
         lateNext = 0;
     };
     takeLateList();
@@ -2217,19 +2751,29 @@ bool CloudResidency::evict(uint32_t slotsNeeded, uint32_t metasNeeded)
         const bool takeLate = fromLate && (!fromOrder || late[lateNext].first < mEvictOrder[mEvictNext].first);
         const auto [key, handle] = takeLate ? late[lateNext++] : mEvictOrder[mEvictNext++];
         const Brick& b = brick(handle);
-        if (!evictCandidate(b))
-            continue; // Unloaded, mapped or desired since, or (beside a walk) mapped in its snapshot.
-        if (lastDesired(b) != key)
         {
-            // A running walk desired it since (it writes the spare cut slot): a scan would order it last, so it goes behind the rest.
-            mEvictLate.push_back({lastDesired(b), handle});
-            continue;
+            RESIDENCY_STEP(kStepEvictCheck);
+            if (!evictCandidate(b))
+                continue; // Unloaded, mapped or desired since, or (beside a walk) mapped in its snapshot.
+            if (lastDesired(b) != key)
+            {
+                // A running walk desired it since (it writes the spare cut slot): a scan would order it last, so it goes behind the
+                // rest.
+                mEvictLate.push_back({lastDesired(b), handle});
+                continue;
+            }
         }
-        unload(handle);
+        {
+            RESIDENCY_STEP(kStepEvictUnload);
+            unload(handle);
+        }
         ++freed;
     }
-    // Late candidates this call did not reach stay for the next.
-    mEvictLate.insert(mEvictLate.end(), late.begin() + lateNext, late.end());
+    // Late candidates this call did not reach stay for the next, sorted in front of those that join meanwhile.
+    std::vector<std::pair<uint32_t, uint64_t>> joined = std::move(mEvictLate);
+    mEvictLate.assign(late.begin() + lateNext, late.end());
+    mEvictLateSorted = mEvictLate.size();
+    mEvictLate.insert(mEvictLate.end(), joined.begin(), joined.end());
     mStats.evictCandidates = uint32_t(mEvictOrder.size() - mEvictNext + mEvictLate.size());
     mStats.evictFreed += freed;
     return freed > 0;
@@ -2316,6 +2860,7 @@ void CloudResidency::scanEvictCandidates()
     mEvictNext = 0;
     mEvictValid = true;
     mEvictLate.clear(); // The scan saw them.
+    mEvictLateSorted = 0;
 }
 
 void CloudResidency::unload(uint64_t handle)
@@ -2462,11 +3007,11 @@ void CloudResidency::mapReady(bool& changed)
                 mMapQueue.push_back(it->second);
             mMapWaitParent.erase(first, last);
         };
-        // Below this the queue is mapped on this thread (the threads' start and the merge cost more than they save).
-        constexpr size_t kParallelMaps = 1024;
-        if (mParallelMaps && mDesc.gpuSun && mMapQueue.size() >= kParallelMaps)
+        // Below mParallelMin the queue is mapped on this thread (the threads' start and the merge cost more than they save).
+        if (mParallelMaps && mDesc.gpuSun && mMapQueue.size() >= mParallelMin)
         {
             // The coarse stores' bricks here first: their maps release the chunk-level children the threads take.
+            std::optional<StepClock> coarseClock(std::in_place, mStepTiming, mStats.stepCycles[kStepMapCoarse]);
             std::vector<uint64_t> fine;
             for (size_t i = 0; i < mMapQueue.size(); ++i)
             {
@@ -2477,7 +3022,7 @@ void CloudResidency::mapReady(bool& changed)
                     tryMap(handle);
             }
             mMapQueue.clear();
-            const size_t threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+            const size_t threads = parallelThreads();
             mSinks.resize(threads);
             mMapParts.resize(threads);
             for (uint64_t handle : fine)
@@ -2492,22 +3037,30 @@ void CloudResidency::mapReady(bool& changed)
                 mSinks[t].nodePool.assign(mFreeNodes.end() - take, mFreeNodes.end());
                 mFreeNodes.resize(mFreeNodes.size() - take);
             }
-            std::vector<std::future<void>> workers;
-            for (size_t t = 1; t < threads; ++t)
-                if (!mMapParts[t].empty())
-                    workers.push_back(std::async(std::launch::async, [this, t] { mapPartition(mMapParts[t], mSinks[t]); }));
-            mapPartition(mMapParts[0], mSinks[0]);
-            for (auto& worker : workers)
-                worker.get();
-            for (size_t t = 0; t < threads; ++t)
+            coarseClock.reset();
             {
-                changed |= mSinks[t].changed;
-                mSinks[t].changed = false;
-                mergeMapSink(mSinks[t]); // Its retries join mMapQueue for the serial pass.
-                mMapParts[t].clear();
+                RESIDENCY_STEP(kStepMapThreads);
+                std::vector<std::future<void>> workers;
+                for (size_t t = 1; t < threads; ++t)
+                    if (!mMapParts[t].empty())
+                        workers.push_back(std::async(std::launch::async, [this, t] { mapPartition(mMapParts[t], mSinks[t]); }));
+                mapPartition(mMapParts[0], mSinks[0]);
+                for (auto& worker : workers)
+                    worker.get();
+            }
+            {
+                RESIDENCY_STEP(kStepMapMerge);
+                for (size_t t = 0; t < threads; ++t)
+                {
+                    changed |= mSinks[t].changed;
+                    mSinks[t].changed = false;
+                    mergeMapSink(mSinks[t]); // Its retries join mMapQueue for the serial pass.
+                    mMapParts[t].clear();
+                }
             }
             ++mStats.mapParallelRuns; // DIAGNOSTIC
         }
+        RESIDENCY_STEP(kStepMapSerial);
         for (size_t i = 0; i < mMapQueue.size(); ++i)
             tryMap(mMapQueue[i]);
         mMapQueue = std::move(retry);
@@ -2578,6 +3131,61 @@ void CloudResidency::mapPartition(std::vector<uint64_t>& entries, ResidencySink&
         }
     }
     tSink = nullptr;
+}
+
+void CloudResidency::parallelBricks(const std::vector<uint64_t>& handles, const std::function<void(uint64_t, ResidencySink*)>& visit, bool parallel)
+{
+    // Below mParallelMin the threads' start and the merge cost more than they save.
+    if (!parallel || !mDesc.gpuSun || handles.size() < mParallelMin)
+    {
+        for (uint64_t handle : handles)
+            visit(handle, nullptr);
+        return;
+    }
+    const size_t threads = parallelThreads();
+    mSinks.resize(threads);
+    mBrickParts.resize(threads);
+    std::vector<uint64_t> coarse;
+    for (uint64_t handle : handles)
+    {
+        const uint32_t key = partitionOf(handle);
+        if (key == kNone)
+            coarse.push_back(handle);
+        else
+            mBrickParts[(uint64_t(key) * 0x9E3779B1u >> 16) % threads].push_back(handle);
+    }
+    auto run = [&](size_t t)
+    {
+        ResidencySink& sink = mSinks[t];
+        tSink = &sink;
+        sink.pCurrent = nullptr;
+        sink.currentBucket = UINT32_MAX; // Fades started here end in later buckets.
+        for (uint64_t handle : mBrickParts[t])
+            visit(handle, &sink);
+        tSink = nullptr;
+    };
+    std::vector<std::future<void>> workers;
+    for (size_t t = 1; t < threads; ++t)
+        if (!mBrickParts[t].empty())
+            workers.push_back(std::async(std::launch::async, run, t));
+    run(0);
+    for (auto& worker : workers)
+        worker.get();
+    for (size_t t = 0; t < threads; ++t)
+    {
+        ResidencySink& sink = mSinks[t];
+        mergeResidencySink(sink, 0);
+        mToMap.insert(mToMap.end(), sink.toMap.begin(), sink.toMap.end());
+        mToLoad.insert(mToLoad.end(), sink.toLoad.begin(), sink.toLoad.end());
+        mSunStateSync.insert(mSunStateSync.end(), sink.stateSync.begin(), sink.stateSync.end());
+        sink.toMap.clear();
+        sink.toLoad.clear();
+        sink.stateSync.clear();
+        sink.changed = false;
+        mBrickParts[t].clear();
+    }
+    for (uint64_t handle : coarse)
+        visit(handle, nullptr);
 }
 
 void CloudResidency::mergeMapSink(ResidencySink& sink)
@@ -2922,49 +3530,59 @@ void CloudResidency::processFadeEnds(bool& changed)
     changed |= mActiveFades > 0;
     const uint32_t ring = uint32_t(mFadeEnds.size());
     const uint32_t count = std::min(mFrame - mFadeProcessed, ring);
-    // Below this a bucket is swept on this thread (the threads' start and the merge cost more than they save).
-    constexpr size_t kParallelEnds = 2048;
+    // Below mParallelMin a bucket is swept on this thread (the threads' start and the merge cost more than they save).
     for (uint32_t k = 0; k < count; ++k)
     {
         const uint32_t index = (mFrame - count + 1 + k) % ring;
         std::vector<FadeEnd>& bucket = mFadeEnds[index];
-        if (mParallelFades && mDesc.gpuSun && mFadeEndOrder == 0 && bucket.size() >= kParallelEnds)
+        if (mParallelFades && mDesc.gpuSun && mFadeEndOrder == 0 && bucket.size() >= mParallelMin)
         {
+            mStats.fadeParallelEnds += uint32_t(bucket.size()); // DIAGNOSTIC
             // By chunk: a page store goes with its chunk store; coarse-store ends (and void ones) stay for the serial sweep.
-            const size_t threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+            const size_t threads = parallelThreads();
             mSinks.resize(threads);
             mFadeParts.resize(threads);
             std::vector<FadeEnd> serial;
-            for (const FadeEnd& end : bucket)
             {
-                const uint32_t key = partitionOf(end.handle);
-                if (key == kNone)
-                    serial.push_back(end);
-                else
-                    mFadeParts[(uint64_t(key) * 0x9E3779B1u >> 16) % threads].push_back(end);
-            }
-            bucket.clear();
-            std::vector<std::future<void>> workers;
-            for (size_t t = 1; t < threads; ++t)
-                if (!mFadeParts[t].empty())
+                RESIDENCY_STEP(kStepFadePartition);
+                for (const FadeEnd& end : bucket)
                 {
-                    mSinks[t].currentBucket = index;
-                    workers.push_back(std::async(std::launch::async, [this, t] { sweepFadePartition(mFadeParts[t], mSinks[t]); }));
+                    const uint32_t key = partitionOf(end.handle);
+                    if (key == kNone)
+                        serial.push_back(end);
+                    else
+                        mFadeParts[(uint64_t(key) * 0x9E3779B1u >> 16) % threads].push_back(end);
                 }
-            mSinks[0].currentBucket = index;
-            sweepFadePartition(mFadeParts[0], mSinks[0]);
-            for (auto& worker : workers)
-                worker.get();
-            for (size_t t = 0; t < threads; ++t)
+                bucket.clear();
+            }
             {
-                changed |= mSinks[t].changed;
-                mSinks[t].changed = false;
-                mergeResidencySink(mSinks[t], index);
-                mFadeParts[t].clear();
+                RESIDENCY_STEP(kStepFadeThreads);
+                std::vector<std::future<void>> workers;
+                for (size_t t = 1; t < threads; ++t)
+                    if (!mFadeParts[t].empty())
+                    {
+                        mSinks[t].currentBucket = index;
+                        workers.push_back(std::async(std::launch::async, [this, t] { sweepFadePartition(mFadeParts[t], mSinks[t]); }));
+                    }
+                mSinks[0].currentBucket = index;
+                sweepFadePartition(mFadeParts[0], mSinks[0]);
+                for (auto& worker : workers)
+                    worker.get();
+            }
+            {
+                RESIDENCY_STEP(kStepFadeMerge);
+                for (size_t t = 0; t < threads; ++t)
+                {
+                    changed |= mSinks[t].changed;
+                    mSinks[t].changed = false;
+                    mergeResidencySink(mSinks[t], index);
+                    mFadeParts[t].clear();
+                }
             }
             bucket.insert(bucket.end(), serial.begin(), serial.end());
             ++mStats.fadeParallelBuckets; // DIAGNOSTIC
         }
+        RESIDENCY_STEP(kStepFadeSerial);
         sweepFadeEnds(bucket, changed);
     }
     mFadeProcessed = mFrame;
@@ -3416,20 +4034,36 @@ void CloudResidency::upload()
         if (taken)
         {
             const uint32_t count = uint32_t(set.list.size());
-            jobs.push_back({pPass, pTarget, var, count, words, uint32_t(mScatterIndex.size()), uint32_t(mScatterData.size()),
+            const size_t indexBase = mScatterIndex.size();
+            const size_t wordBase = mScatterData.size();
+            jobs.push_back({pPass, pTarget, var, count, words, uint32_t(indexBase), uint32_t(wordBase),
                             pPass == mpScatterUints.get() ? count * words : count});
             const uint32_t* pWords = static_cast<const uint32_t*>(pTable);
-            for (uint32_t element : set.list)
+            mScatterIndex.resize(indexBase + count);
+            mScatterData.resize(wordBase + size_t(count) * words);
+            // Each element a random read of its table (a node is 256 bytes); its flag cleared on the way.
+            auto gather = [&](size_t lo, size_t hi)
             {
-                mScatterIndex.push_back(element);
-                mScatterData.insert(mScatterData.end(), pWords + size_t(element) * words, pWords + size_t(element + 1) * words);
-            }
+                for (size_t k = lo; k < hi; ++k)
+                {
+                    const uint32_t element = set.list[k];
+                    mScatterIndex[indexBase + k] = element;
+                    std::memcpy(&mScatterData[wordBase + k * words], pWords + size_t(element) * words, words * sizeof(uint32_t));
+                    set.flag[element] = 0;
+                }
+            };
+            if (mParallelUpload)
+                parallelRanges(count, 4096, parallelThreads(), gather);
+            else
+                gather(0, count);
+            set.list.clear();
             std::fill(blocks.begin(), blocks.end(), uint8_t(0));
             ++mStats.scatterJobs;
             mStats.uploadBytes += size_t(count) * (words + 1) * sizeof(uint32_t);
+            return true;
         }
         set.clear();
-        return taken;
+        return false;
     };
     if (!scatter(mNodeScatter, mNodeBlocksDirty, kNodeBlock, mNodes.data(), 64, mpScatterUints.get(), mpNodes.get(), "gUints"))
         uploadRuns(mNodeBlocksDirty, size_t(kNodeBlock) * 64, mNodes.data(), mNodes.size(), sizeof(uint32_t), mpNodes.get());
@@ -3606,7 +4240,9 @@ void CloudResidency::buildSunFineStamp()
     // stampSunChange's levels), and the cells whose entries can reach a changed cell (the candidates).
     const uint32_t assets = uint32_t(mGpuAssetRecords.size());
     const uint32_t classes = std::min(uint32_t(mSunClasses.size()), kCloudSunClasses);
-    std::fill(mSunChangeSat.begin(), mSunChangeSat.end(), 0u);
+    const size_t threads = mParallelSun ? parallelThreads() : 1;
+    parallelRanges(mSunChangeSat.size(), size_t(1) << 16, threads, [&](size_t lo, size_t hi)
+                   { std::fill(mSunChangeSat.begin() + lo, mSunChangeSat.begin() + hi, 0u); });
     std::vector<uint3> grids(assets);
     uint32_t offset = 4u * assets;
     for (uint32_t a = 0; a < assets; ++a)
@@ -3647,33 +4283,68 @@ void CloudResidency::buildSunFineStamp()
     // the same order as before. MEASURED before (cpuprof1, 4K sunset walk, asyncResidency): every changed cell marking its whole
     // reach box (7^3 cells and more along the sweep), then the sums through an indexing lambda, 7-9 ms of CPU a run, 1.8 ms a walk
     // frame.
-    std::vector<std::vector<uint2>> cells(assets);
-    auto build = [&](uint32_t a)
+    // Over the touched assets, in three passes, each one parallel loop over its slices (every slice writes only its own entries):
+    // the prefix sums along x and y (a z slice of a grid), then along z (a y row of a grid), then the candidates from them (a z
+    // slice: a cell is one iff the box of cells whose entries it can reach holds a changed cell, a constant-time box sum), joined in
+    // asset and z order: the same cells in the same order as before. MEASURED before (cpuprof1, 4K sunset walk, asyncResidency):
+    // every changed cell marking its whole reach box (7^3 cells and more along the sweep), then the sums through an indexing lambda,
+    // 7-9 ms of CPU a run, 1.8 ms a walk frame. Per asset (5 assets, at most 5 threads): stepsplit3, 30-33 ms over 20 runs.
+    struct Slice
     {
-        const uint3 g = grids[a];
-        const size_t sy = g.x + 1u;
-        const size_t sz = sy * (g.y + 1u);
-        // Inclusive prefix sums of both grids, in place (index 0 along each axis stays 0).
+        uint32_t asset, grid, index;
+    };
+    std::vector<Slice> zSlices, yRows, candidateSlices;
+    for (uint32_t a = 0; a < assets; ++a)
+    {
+        if (!touched[a])
+            continue;
         for (uint32_t grid = 0; grid < 2; ++grid)
         {
+            for (uint32_t z = 1; z <= grids[a].z; ++z)
+                zSlices.push_back({a, grid, z});
+            for (uint32_t y = 1; y <= grids[a].y; ++y)
+                yRows.push_back({a, grid, y});
+        }
+        for (uint32_t z = 0; z < grids[a].z; ++z)
+            candidateSlices.push_back({a, 0, z});
+    }
+    // Inclusive prefix sums of both grids, in place (index 0 along each axis stays 0).
+    parallelRanges(zSlices.size(), 4, threads, [&](size_t lo, size_t hi)
+    {
+        for (size_t k = lo; k < hi; ++k)
+        {
+            const auto [a, grid, z] = zSlices[k];
+            const uint3 g = grids[a];
+            const size_t sy = g.x + 1u, sz = sy * (g.y + 1u);
+            uint32_t* s = mSunChangeSat.data() + mSunChangeSat[4u * a + grid];
+            for (uint32_t y = 1; y <= g.y; ++y)
+                for (uint32_t x = 1; x <= g.x; ++x)
+                    s[x + sy * y + sz * z] += s[x - 1 + sy * y + sz * z];
+            for (uint32_t y = 1; y <= g.y; ++y)
+                for (uint32_t x = 1; x <= g.x; ++x)
+                    s[x + sy * y + sz * z] += s[x + sy * (y - 1) + sz * z];
+        }
+    });
+    parallelRanges(yRows.size(), 2, threads, [&](size_t lo, size_t hi)
+    {
+        for (size_t k = lo; k < hi; ++k)
+        {
+            const auto [a, grid, y] = yRows[k];
+            const uint3 g = grids[a];
+            const size_t sy = g.x + 1u, sz = sy * (g.y + 1u);
             uint32_t* s = mSunChangeSat.data() + mSunChangeSat[4u * a + grid];
             for (uint32_t z = 1; z <= g.z; ++z)
-                for (uint32_t y = 1; y <= g.y; ++y)
-                    for (uint32_t x = 1; x <= g.x; ++x)
-                        s[x + sy * y + sz * z] += s[x - 1 + sy * y + sz * z];
-            for (uint32_t z = 1; z <= g.z; ++z)
-                for (uint32_t y = 1; y <= g.y; ++y)
-                    for (uint32_t x = 1; x <= g.x; ++x)
-                        s[x + sy * y + sz * z] += s[x + sy * (y - 1) + sz * z];
-            for (uint32_t z = 1; z <= g.z; ++z)
-                for (uint32_t y = 1; y <= g.y; ++y)
-                    for (uint32_t x = 1; x <= g.x; ++x)
-                        s[x + sy * y + sz * z] += s[x + sy * y + sz * (z - 1)];
+                for (uint32_t x = 1; x <= g.x; ++x)
+                    s[x + sy * y + sz * z] += s[x + sy * y + sz * (z - 1)];
         }
-        // Candidates: a cell holds level-0 positions up to 24 voxels in and level-1 ones up to 16, whose supports reach at most
-        // 20.5 + the sweep's positive part past their position and 5.5 + its negative part before it (s <= 2); one cell more
-        // either side for rounding. A changed cell p makes [p - below, p + above] candidates: cell c is one iff a changed cell lies
-        // in [c - above, c + below].
+    });
+    // Candidates: a cell holds level-0 positions up to 24 voxels in and level-1 ones up to 16, whose supports reach at most 20.5 +
+    // the sweep's positive part past their position and 5.5 + its negative part before it (s <= 2); one cell more either side for
+    // rounding. A changed cell p makes [p - below, p + above] candidates: cell c is one iff a changed cell lies in [c - above, c +
+    // below].
+    std::vector<int3> below(assets), above(assets);
+    for (uint32_t a = 0; a < assets; ++a)
+    {
         const float reach = mGpuSunFrame.info.reachScale / mGpuAssetRecords[a].sourceVoxelWorld;
         float3 up(0.f), down(0.f);
         for (uint32_t c = 0; c < classes; ++c)
@@ -3682,42 +4353,32 @@ void CloudResidency::buildSunFineStamp()
             up = max(up, max(sweep, float3(0.f)));
             down = max(down, max(-sweep, float3(0.f)));
         }
-        const int3 below = int3(ceil((44.5f + up) / 32.f)) + 1;
-        const int3 above = int3(ceil((37.5f + down) / 32.f)) + 1;
-        const uint32_t* s = mSunChangeSat.data() + mSunChangeSat[4u * a];
-        auto prefix = [&](int x, int y, int z) { return s[x + sy * y + sz * z]; };
-        for (uint32_t z = 0; z < g.z; ++z)
+        below[a] = int3(ceil((44.5f + up) / 32.f)) + 1;
+        above[a] = int3(ceil((37.5f + down) / 32.f)) + 1;
+    }
+    std::vector<std::vector<uint2>> cells(candidateSlices.size());
+    parallelRanges(candidateSlices.size(), 4, threads, [&](size_t lo, size_t hi)
+    {
+        for (size_t k = lo; k < hi; ++k)
+        {
+            const uint32_t a = candidateSlices[k].asset, z = candidateSlices[k].index;
+            const uint3 g = grids[a];
+            const size_t sy = g.x + 1u, sz = sy * (g.y + 1u);
+            const uint32_t* s = mSunChangeSat.data() + mSunChangeSat[4u * a];
+            auto prefix = [&](int x, int y, int zz) { return s[x + sy * y + sz * zz]; };
             for (uint32_t y = 0; y < g.y; ++y)
                 for (uint32_t x = 0; x < g.x; ++x)
                 {
                     // Cells lo..hi are prefix entries lo..hi + 1 (unsigned wrap cancels in the inclusion-exclusion).
-                    const int3 lo = max(int3(x, y, z) - above, int3(0));
-                    const int3 hi = min(int3(x, y, z) + below, int3(g) - 1) + 1;
-                    const uint32_t sum = prefix(hi.x, hi.y, hi.z) - prefix(lo.x, hi.y, hi.z) - prefix(hi.x, lo.y, hi.z) -
-                                         prefix(hi.x, hi.y, lo.z) + prefix(lo.x, lo.y, hi.z) + prefix(lo.x, hi.y, lo.z) +
-                                         prefix(hi.x, lo.y, lo.z) - prefix(lo.x, lo.y, lo.z);
+                    const int3 l = max(int3(x, y, z) - above[a], int3(0));
+                    const int3 h = min(int3(x, y, z) + below[a], int3(g) - 1) + 1;
+                    const uint32_t sum = prefix(h.x, h.y, h.z) - prefix(l.x, h.y, h.z) - prefix(h.x, l.y, h.z) - prefix(h.x, h.y, l.z) +
+                                         prefix(l.x, l.y, h.z) + prefix(l.x, h.y, l.z) + prefix(h.x, l.y, l.z) - prefix(l.x, l.y, l.z);
                     if (sum != 0u)
-                        cells[a].push_back(uint2(a, x | (y << 10) | (z << 20)));
+                        cells[k].push_back(uint2(a, x | (y << 10) | (z << 20)));
                 }
-    };
-    {
-        std::vector<uint32_t> work;
-        for (uint32_t a = 0; a < assets; ++a)
-            if (touched[a])
-                work.push_back(a);
-        const size_t chunkCount = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
-        auto run = [&](size_t index)
-        {
-            for (size_t k = index; k < work.size(); k += chunkCount)
-                build(work[k]);
-        };
-        std::vector<std::future<void>> workers;
-        for (size_t index = 1; index < std::min(chunkCount, work.size()); ++index)
-            workers.push_back(std::async(std::launch::async, run, index));
-        run(0);
-        for (auto& worker : workers)
-            worker.get();
-    }
+        }
+    });
     mSunFineCells.clear();
     for (const auto& list : cells)
         mSunFineCells.insert(mSunFineCells.end(), list.begin(), list.end());
@@ -3761,12 +4422,13 @@ void CloudResidency::uploadSunChanges()
     mStats.sunStampRaw += uint32_t(mSunChanges.size()); // DIAGNOSTIC
     RenderContext* pRenderContext = mpProfileContext;
     ResidencyScope phase(pRenderContext,"sortChanges");
-    std::sort(
-        mSunChanges.begin(),
-        mSunChanges.end(),
-        [](const HSTRCloudSunChange& a, const HSTRCloudSunChange& b)
-        { return std::tie(a.asset, a.first, a.last, b.level) < std::tie(b.asset, b.first, b.last, a.level); }
-    );
+    std::optional<StepClock> step(std::in_place, mStepTiming, mStats.stepCycles[kStepSunSort]); // Each emplace ends the last.
+    auto order = [](const HSTRCloudSunChange& a, const HSTRCloudSunChange& b)
+    { return std::tie(a.asset, a.first, a.last, b.level) < std::tie(b.asset, b.first, b.last, a.level); };
+    if (mParallelSun)
+        std::sort(std::execution::par, mSunChanges.begin(), mSunChanges.end(), order);
+    else
+        std::sort(mSunChanges.begin(), mSunChanges.end(), order);
     mSunChanges.erase(
         std::unique(
             mSunChanges.begin(),
@@ -3782,6 +4444,7 @@ void CloudResidency::uploadSunChanges()
         mSunChanges.clear();
     }
     phase.next(pRenderContext,"resets");
+    step.emplace(mStepTiming, mStats.stepCycles[kStepSunResets]);
     if (mSunResetAll)
     {
         mSunBlockResets.clear();
@@ -3827,9 +4490,11 @@ void CloudResidency::uploadSunChanges()
     mGpuSunFrame.info.stampFine = 0;
     mGpuSunFrame.info.fineCells = 0;
     phase.next(pRenderContext,"fineStamp");
+    step.emplace(mStepTiming, mStats.stepCycles[kStepSunFine]);
     if (mSunStampFine && !mSunChanges.empty() && mpSunChangeSat)
         buildSunFineStamp();
     phase.next(pRenderContext,"sendChanges");
+    step.emplace(mStepTiming, mStats.stepCycles[kStepSunSend]);
     mGpuSunFrame.info.changeCount = uint32_t(mSunChanges.size());
     mStats.sunStampChanges += uint32_t(mSunChanges.size()); // DIAGNOSTIC
     ++mStats.sunStampRuns;
