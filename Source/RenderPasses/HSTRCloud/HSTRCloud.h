@@ -1048,8 +1048,24 @@ private:
     uint64_t mSunReadbackPending = 0;
     bool mSunReadbackRecorded = false; ///< The copy is in the command list; its fence is signalled next frame.
     /// cloudCutGpuVisibility (CloudView::cutGpuVisibility): the walk's visibility refreshes traced here (CutVisibility.cs.slang) and
-    /// read back without waiting, one batch at a time, as the sun's count is.
-    void dispatchCutVisibility(RenderContext* pRenderContext);
+    /// read back without waiting, one batch at a time, as the sun's count is. On the residency's compute queue in a frame that did not
+    /// write the domain (`domainWritten`) and whose extinction is already a shader resource; otherwise the batch waits, or (no
+    /// asyncResidency this frame) runs on the main queue.
+    void dispatchCutVisibility(RenderContext* pRenderContext, bool domainWritten);
+    uint64_t mCutVisAsyncRuns = 0; ///< DIAGNOSTIC: batches traced on the compute queue, on the main queue, and frames a batch
+    uint64_t mCutVisMainRuns = 0;  ///< waited for one without a domain write.
+    uint64_t mCutVisDeferred = 0;
+    /// cloudCutVisMainQueue (DIAGNOSTIC): the batches on the main queue, as before the compute queue. MEASURED (visq1, 4K sunset walk
+    /// at 2 units a frame, arms main / async / async2 / main2): on the main queue a batch cost 2.02 ms GPU in the frames that ran one
+    /// in the first live flight (6 of 60) and 0.47 ms later; on the compute queue it overlaps the frame. Arm means 4.37 / 4.59 ms
+    /// against 4.48 / 4.69 (inside the spread: a batch runs about once a chunk). Debug layer clean (visdbg3).
+    bool mCutVisMainQueue = false;
+    uint32_t mExtinctionQuietFrames = 0; ///< Frames in a row (to 2) whose main queue wrote no visibility proxy, this one included.
+    /// The extinction's float16 values two to a word (CutVisibility.cs.slang), for the compute queue: the texture is the main
+    /// queue's. Refreshed for each slot the domain uploads (packVisibilityProxy), all of it when first made.
+    ref<Buffer> mpVisProxy;
+    ref<ComputePass> mpPackVisProxyPass;
+    void packVisibilityProxy(RenderContext* pRenderContext, const std::vector<uint32_t>& slots);
     ref<ComputePass> mpCutVisibilityPass;
     ref<Buffer> mpCutVisBoxes;
     ref<Buffer> mpCutVisResults;

@@ -3,6 +3,9 @@
 /// same samples as CloudResidency::transmittance - up to 128 steps a ray, voxel centres of the wrapped domain, stopped at depth 6 -
 /// read from the domain's extinction (the mean density times the density scale, in float16), so not bit-identical to the CPU's.
 /// A corner ray stops once it cannot raise the best so far.
+/// It runs on the residency's compute queue, which may not touch the extinction texture while the main queue uses it (D3D12 1047 on
+/// a non-simultaneous-access texture, visdbg2, even read beside read): it reads a buffer copy of the same float16 values, two to a
+/// word, x + dims.x * (y + dims.y * z), which packVisibilityProxy refreshes for each slot the domain uploads.
 
 cbuffer CB
 {
@@ -11,12 +14,33 @@ cbuffer CB
     float3 gOrigin; ///< The sea's world corner (CloudSeaDesc::origin).
     float gVoxel;   ///< Domain voxel world size.
     uint3 gDims;    ///< Domain voxels.
-    uint _pad0;
+    uint gTileVoxels; ///< packVisibilityProxy: the slot's voxels a side ...
+    uint2 gSlotOrigin; ///< ... and its first voxel's x and z.
 };
 
 StructuredBuffer<float> gBoxes; ///< Per request: lo.xyz, hi.xyz.
-Texture3D<float> gExtinction;
+StructuredBuffer<uint> gProxy;
 RWStructuredBuffer<float> gResults;
+Texture3D<float> gExtinction;
+RWStructuredBuffer<uint> gProxyOutput;
+
+float proxyAt(int3 v)
+{
+    const uint index = uint(v.x) + gDims.x * (uint(v.y) + gDims.y * uint(v.z));
+    return f16tof32(gProxy[index >> 1] >> ((index & 1u) * 16u));
+}
+
+/// A slot's extinction into the proxy buffer: a thread per two voxels along x.
+[numthreads(8, 4, 8)]
+void packVisibilityProxy(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= gTileVoxels / 2 || id.y >= gDims.y || id.z >= gTileVoxels)
+        return;
+    const uint3 v = uint3(gSlotOrigin.x + 2 * id.x, id.y, gSlotOrigin.y + id.z);
+    const float a = gExtinction.Load(int4(v, 0));
+    const float b = gExtinction.Load(int4(v + uint3(1, 0, 0), 0));
+    gProxyOutput[(v.x + gDims.x * (v.y + gDims.y * v.z)) >> 1] = f32tof16(a) | (f32tof16(b) << 16);
+}
 
 float transmittance(float3 target, float maxDepth)
 {
@@ -35,7 +59,7 @@ float transmittance(float3 target, float maxDepth)
             continue;
         const int x = ((v.x % int(gDims.x)) + int(gDims.x)) % int(gDims.x);
         const int z = ((v.z % int(gDims.z)) + int(gDims.z)) % int(gDims.z);
-        depth += gExtinction.Load(int4(x, v.y, z, 0)) * dt;
+        depth += proxyAt(int3(x, v.y, z)) * dt;
     }
     return exp(-depth);
 }

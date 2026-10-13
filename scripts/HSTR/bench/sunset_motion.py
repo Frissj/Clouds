@@ -422,6 +422,7 @@ for speed in speeds:
                                                                       "cutCoarseMsTotal", "cutFineMsTotal", "cutDesireMsTotal", "cutTailMsTotal",
                                                                       "cutVisitsTotal", "cutRefreshesTotal", "cutRaysTotal",
                                                                       "gpuVisRequests", "gpuVisApplied", "gpuVisBatches", "gpuVisDropped",
+                                                                      "cutVisAsyncRuns", "cutVisMainRuns", "cutVisDeferred",
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
                                                                       "scatterJobs", "scatterChecks", "scatterMismatches",
@@ -438,7 +439,8 @@ for speed in speeds:
                   f"{d.get('cutParallelMsTotal'):.0f} ms (coarse {d.get('cutCoarseMsTotal'):.0f}, fine {d.get('cutFineMsTotal'):.0f}, "
                   f"desire {d.get('cutDesireMsTotal'):.0f}; visits {d.get('cutVisitsTotal')} refreshes {d.get('cutRefreshesTotal')} "
                   f"rays {d.get('cutRaysTotal')}; gpu visibility {d.get('gpuVisRequests')} sent, {d.get('gpuVisApplied')} applied, "
-                  f"{d.get('gpuVisDropped')} dropped in {d.get('gpuVisBatches')} batches), tail {d.get('cutTailMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
+                  f"{d.get('gpuVisDropped')} dropped in {d.get('gpuVisBatches')} batches, {d.get('cutVisAsyncRuns')} on the compute queue "
+                  f"{d.get('cutVisMainRuns')} main, {d.get('cutVisDeferred')} deferred), tail {d.get('cutTailMsTotal'):.0f} ms, heap {d.get('cutHeapMsTotal'):.0f} ms, ordered {d.get('cutOrderedCount')}, "
                   f"unordered desired {now.get('cutUnorderedDesired')}, priority rises {d.get('cutPriorityRises')}; threshold trims "
                   f"{d.get('cutThresholdTrims')} underfilled {d.get('cutUnderfilled')} check {d.get('cutCheckMismatches')} of "
                   f"{d.get('cutCheckBricks')}; upload {float(d.get('uploadBytes') or 0) / 1e6:.1f} MB in {d.get('uploadRuns')} runs + "

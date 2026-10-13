@@ -666,6 +666,11 @@ void HSTRCloud::parseProperties(const Properties& props)
             mCloudCutGpuVisibility = value;
             continue;
         }
+        if (key == "cloudCutVisMainQueue")
+        {
+            mCutVisMainQueue = value;
+            continue;
+        }
         if (key == "cloudFadeEndOrder")
         {
             mCloudFadeEndOrder = value;
@@ -2339,6 +2344,9 @@ Properties HSTRCloud::getProperties() const
         cloud["gpuVisApplied"] = stats.gpuVisApplied;
         cloud["gpuVisBatches"] = stats.gpuVisBatches;
         cloud["gpuVisDropped"] = stats.gpuVisDropped;
+        cloud["cutVisAsyncRuns"] = mCutVisAsyncRuns;
+        cloud["cutVisMainRuns"] = mCutVisMainRuns;
+        cloud["cutVisDeferred"] = mCutVisDeferred;
         for (size_t k = 0; k < stats.cutConfigWalks.size(); ++k)
         {
             cloud[fmt::format("cutConfig{}Walks", k)] = stats.cutConfigWalks[k];
@@ -4302,6 +4310,8 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
             pPass->execute(pRenderContext, threads);
         };
         run("extinction", mpDomainExtinctionPass, uint3(r, dims.y, r * count));
+        if (mpVisProxy)
+            packVisibilityProxy(pRenderContext, std::vector<uint32_t>(slots.begin() + first, slots.begin() + first + count));
         run("blocks", mpDomainBlocksPass, uint3(blocksWide, blockDims.y, blocksWide * count));
         run("majorant", mpDomainMajorantPass, uint3(majorantWide, blockDims.y, majorantWide * count));
         run("occupancy", mpDomainOccupancyPass, uint3(cellsWide, occupancyDims.y, cellsWide * count));
@@ -5040,7 +5050,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             stats.committed
         );
     }
-    dispatchCutVisibility(pRenderContext);
+    dispatchCutVisibility(pRenderContext, !changed.empty());
     // Last: from here to the next frame's take, nothing on this thread touches the residency (waitUpdate guards the rest).
     if (residencyWorker)
     {
@@ -5093,8 +5103,33 @@ bool HSTRCloud::bindResidencyPass(RenderContext* pRenderContext, const ref<Compu
     return first;
 }
 
-void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext)
+void HSTRCloud::packVisibilityProxy(RenderContext* pRenderContext, const std::vector<uint32_t>& slots)
 {
+    FALCOR_PROFILE(pRenderContext, "visibilityProxy");
+    if (!mpPackVisProxyPass)
+        mpPackVisProxyPass = ComputePass::create(mpDevice, "RenderPasses/HSTRCloud/CutVisibility.cs.slang", "packVisibilityProxy");
+    const uint3 dims = mpCloudSea->getDims();
+    const uint32_t r = mpCloudSea->getDesc().tileVoxels;
+    const uint32_t tiles = mpCloudSea->getDesc().tiles;
+    ShaderVar var = mpPackVisProxyPass->getRootVar();
+    var["CB"]["gDims"] = dims;
+    var["CB"]["gTileVoxels"] = r;
+    var["gExtinction"] = mpExtinction;
+    var["gProxyOutput"] = mpVisProxy;
+    for (uint32_t slot : slots)
+    {
+        var["CB"]["gSlotOrigin"] = uint2(slot % tiles * r, slot / tiles * r);
+        mpPackVisProxyPass->execute(pRenderContext, uint3(r / 2, dims.y, r));
+    }
+}
+
+void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext, bool domainWritten)
+{
+    // The compute queue reads the proxy only in a frame whose main queue does not write it, nor did in the frame before (its
+    // writes are the domain uploads'). The extinction texture itself is off limits there: FOUND (visdbg1 / visdbg2, debug layer,
+    // D3D12 1047) "non-simultaneous-access texture still referenced by read|write|transition operations in flight on the main
+    // queue", in frames with no domain write at all - the march reads it every frame.
+    mExtinctionQuietFrames = domainWritten ? 0u : std::min(mExtinctionQuietFrames + 1u, 2u);
     if (!mpCloudResidency || !mpExtinction || !mpCloudSea || (!mCloudCutGpuVisibility && mCutVisPending == 0 && !mCutVisRecorded))
         return;
     auto& residency = *mpCloudResidency;
@@ -5114,9 +5149,36 @@ void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext)
         mCutVisBatch = {};
         mCutVisPending = 0;
     }
-    if (mCutVisPending != 0 || !mCloudCutGpuVisibility || !residency.takeVisibilityBatch(mCutVisBatch))
+    if (mCutVisPending != 0 || !mCloudCutGpuVisibility)
         return;
-    FALCOR_PROFILE(pRenderContext, "cutVisibility");
+    if (!mpVisProxy)
+    {
+        const uint3 dims = mpCloudSea->getDims();
+        mpVisProxy = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), uint32_t(size_t(dims.x) * dims.y * dims.z / 2), ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        std::vector<uint32_t> all(size_t(mpCloudSea->getDesc().tiles) * mpCloudSea->getDesc().tiles);
+        std::iota(all.begin(), all.end(), 0u);
+        packVisibilityProxy(pRenderContext, all);
+        mExtinctionQuietFrames = 0;
+        return;
+    }
+    // On the residency's compute queue, which runs beside this frame's main-queue work and before the next frame's (the main queue
+    // waits for it at the frame's end).
+    ComputeContext* pContext = pRenderContext;
+    if (mAsyncResidencyActive && mpResidencyContext && !mCutVisMainQueue)
+    {
+        if (mExtinctionQuietFrames < 2)
+        {
+            ++mCutVisDeferred;
+            return;
+        }
+        pContext = mpResidencyContext.get();
+    }
+    if (!residency.takeVisibilityBatch(mCutVisBatch))
+        return;
+    ++(pContext == pRenderContext ? mCutVisMainRuns : mCutVisAsyncRuns);
+    OptionalProfile scope(pContext == pRenderContext ? pRenderContext : nullptr, "cutVisibility");
     // A walk refreshes ~10-30k bricks; more than this wait for a later walk (their requests time out and are sent again).
     constexpr uint32_t kMaxRequests = 1u << 17;
     if (mCutVisBatch.requests.size() > kMaxRequests)
@@ -5140,7 +5202,7 @@ void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext)
         std::memcpy(&boxes[6 * size_t(i)], &request.lo, 3 * sizeof(float));
         std::memcpy(&boxes[6 * size_t(i) + 3], &request.hi, 3 * sizeof(float));
     }
-    pRenderContext->updateBuffer(mpCutVisBoxes.get(), boxes.data(), 0, boxes.size() * sizeof(float));
+    pContext->updateBuffer(mpCutVisBoxes.get(), boxes.data(), 0, boxes.size() * sizeof(float));
     ShaderVar var = mpCutVisibilityPass->getRootVar();
     var["CB"]["gCamera"] = mCutVisBatch.camera;
     var["CB"]["gCount"] = count;
@@ -5148,10 +5210,10 @@ void HSTRCloud::dispatchCutVisibility(RenderContext* pRenderContext)
     var["CB"]["gVoxel"] = mpCloudSea->getVoxelWorld();
     var["CB"]["gDims"] = mpCloudSea->getDims();
     var["gBoxes"] = mpCutVisBoxes;
-    var["gExtinction"] = mpExtinction;
+    var["gProxy"] = mpVisProxy;
     var["gResults"] = mpCutVisResults;
-    mpCutVisibilityPass->execute(pRenderContext, uint3(count, 1, 1));
-    pRenderContext->copyBufferRegion(mpCutVisReadback.get(), 0, mpCutVisResults.get(), 0, count * sizeof(float));
+    mpCutVisibilityPass->execute(pContext, uint3(count, 1, 1));
+    pContext->copyBufferRegion(mpCutVisReadback.get(), 0, mpCutVisResults.get(), 0, count * sizeof(float));
     mCutVisCount = count;
     mCutVisRecorded = true;
 }
