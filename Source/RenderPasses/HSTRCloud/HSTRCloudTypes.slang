@@ -746,7 +746,12 @@ struct HSTRCloudParams
     /// stop refinement at all. Go to beamEdgeContrast instead.
     float beamTolerance = 0.02f;
 
-    uint worldCacheBands = 2; ///< Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
+    /// Highest SH band the light tracer deposits (1: 4 coefficients per field, 2: 9).
+    /// MEASURED and REJECTED (bandpt1, sunset hill 960 wide vs the 326 spp trace, each arm's cache converged fresh to 64 batches,
+    /// deterministic: a fresh band-2 cache reproduced ship to the digit): band 1 excess 0.025432 (twice) against 0.022970, p99
+    /// 0.4871 -> 0.5793, p99.9 0.689 -> 0.819 - worse than a band-2 cache of 4 batches (sanity, 0.024785, p99 0.4871). Fails the
+    /// tail gate whatever its saving (the flush's 9 atomics a cell are ~0.9 ms of a 3.6 ms batch: knock1).
+    uint worldCacheBands = 2;
     uint worldCacheWindow = 1; ///< 1: Hanning-window the evaluated SH bands against truncation ringing.
     uint worldCacheTextured = 1; ///< 1: the camera reads the cache from baked, hardware-filtered 3D textures.
     /// The camera march re-evaluates the cache every lightingStride steps and holds it between.

@@ -247,7 +247,40 @@ private:
     /// N 10 0.024077, 18 0.023195 / 0.023323, 26 0.022991, 34 0.023193 / 0.023070, 64 0.023024 / 0.022836; ship 0.022970. A
     /// refilled tile is at its converged score from ~26 batches. A lower refill target alone does not save a sprint, though: a
     /// row restarts every ~16 frames, so any target above ~16 keeps an update running every frame.
+    /// MEASURED (t40pt1, same gate, whole cache from a restart): 40 batches 0.023239 against 64 0.022971 / 0.022971 (anchor), p99
+    /// 0.4871 / p99.9 0.6889 unchanged, max 0.824 / 0.827; sanity 10 0.023832. The sunset launcher ships 40 with focus (its note).
     uint32_t mWorldCacheTarget = 64;
+    /// worldCacheUrgentTarget (0 off): while some tile holds fewer batches than this, updates run on the main queue as whole
+    /// batches (worldCacheSlices ignored), as without worldCacheAsync; from here to worldCacheTarget they take the async path
+    /// (worldCacheAsync / worldCacheAsyncSpan, sliced). refillpt1 / targetpt1: a restarted tile scores converged from ~26 batches.
+    /// CAVEAT: urgent1 below ran with the sea's old apply gate, under which the sprint's desired bricks fell to ~0 (applywalk1,
+    /// seaApplyAfterWalk): its sprint milliseconds are of a near-empty view. The parked numbers and urgentpt1 stand.
+    /// MEASURED (urgent1, 4K sunset sprint 20, one 240-frame chunk an arm, main-queue GPU per frame; fewest batches within 3 tiles
+    /// of the camera, mean / frames under 26 / under 10): ship (t64 sync) 3.46 ms, 54.0 / 31 / 15; t26 sync 2.18, 31.2 / 26 / 15;
+    /// urgent 26 + span slices 4 2.47, 33.8 / 30 / 10 (26 urgent batches, 95 slices of ~3.9 ms on the photon queue); urgent 26 +
+    /// span slices 1 3.16, 42.9 / 61 / 22 (two sea bursts in its chunk, 380 tiles; its 42 whole-batch slices took ~7.1 ms each);
+    /// norefill 1.72, 15.9 / 118 / 118; ship again 3.69, 45.5 / 55 / 23. Parked after the sprint in urgent 26 + span 4: 26 urgent
+    /// batches in the first 60 frames (3.27 ms), then the continuation at 1.30-1.38 ms main GPU, ~6.5 batches per 60 frames, the
+    /// camera's tiles 28.75 -> 58.75 batches in 360 frames.
+    /// MEASURED (urgentpt1, sunset_hill path trace 960 wide, each arm from a restarted cache): urgent 26 + span 4 converged under
+    /// its own settings (26 urgent batches + 152 slices, 200 frames) excess 0.022945, p99 0.4871, p99.9 0.6889, max 0.825; ship
+    /// 0.022970 / 0.4871 / 0.6889 / 0.827, ship again identical; t10 sanity 0.023832.
+    uint32_t mWorldCacheUrgentTarget = 26;
+    /// worldCacheUrgentNear (0: every tile): worldCacheUrgentTarget counts only the tiles within this many of the camera's.
+    uint32_t mWorldCacheUrgentNear = 0;
+    /// worldCacheContinueEvery (0 / 1: every frame): with no tile urgent, the update on to worldCacheTarget runs every this many frames.
+    /// MEASURED, left off (continue1, 4K sunset sprint 20, tiles applied after each walk, focus 1/16 sync, 3 x 240 frames an arm;
+    /// chunk GPU, near-camera batches mean / frames under 26 of 720): t40 3.69 / 3.57 ms, 32.6 / 168 and 31.2 / 198; target 64
+    /// with urgent 40 within 3 tiles every 4 4.11, 32.6 / 233; urgent 40 anywhere every 4 4.19, 32.5 / 241; urgent 26 within 3
+    /// every 4 3.64, 26.4 / 287; urgent 40 within 3 every 8 3.79, 30.9 / 227; norefill 2.42. Capping the far rows' updates only
+    /// defers them: those tiles reach the camera short and run urgent (319-371 of 370-454 updates). Parked it reaches 64 in ~180
+    /// frames.
+    uint32_t mWorldCacheContinueEvery = 0;
+    /// seaApplyAfterWalk: finished sea tiles are held only while a residency cut is still walking, not until the residency took
+    /// the finished walk on (which launched the next at once: in a sprint the sea applied in bursts, see the sea update).
+    /// Held, the sprinting camera outran its window and the desired bricks fell to ~0 (applywalk1): the old gate's speed was missing
+    /// clouds, so this is on.
+    bool mSeaApplyAfterWalk = true;
     /// worldCacheFocusFar (0 off): while only some sea tiles are under worldCacheTarget (tiles a moving camera streamed in), photon
     /// updates are spent on them. A photon spawned over a tile neither starving nor upwind of one (the sun's reach across the
     /// layer, one tile either side) survives its spawn with this probability and is weighted by its inverse, so every tile's
@@ -260,6 +293,11 @@ private:
     /// MEASURED, left off (focustime1, 4K sprint 20, round-robin profiles): it saves nothing at the sunset. Focused updates had
     /// 160 of 256 tiles starving (tile results land in bulk: one chunk took 160, the rest 0) and the upwind dilation marked all
     /// 256 near (worldCacheFocusHungry / Near 2880 / 4608 over 18 updates); worldCache 3.03 ms focused against 3.25-3.39 ship.
+    /// The bulk landing was the sea's old apply gate (seaApplyAfterWalk). MEASURED again with tiles applied after each walk
+    /// (focushonest1/2, 4K sunset sprint 20, sync, 1/16, chunk GPU; near-camera batches mean / frames under 26 of 720): hungry ~85
+    /// tiles an update, near still ~231 of 256, but an update costs ~2.6 ms over norefill against ~3.7 (deposits land only in
+    /// starving tiles). t64 focused 4.73 ms, 37.6 / 230; t40 focused 3.69, 32.8 / 147; t26 focused 3.26, 22.6 / 170; the urgent 26
+    /// + span 4 default 4.10 / 3.79, 28.5 / 186 and 23.6 / 280; norefill 2.42. Desired 243k in every arm.
     float mWorldCacheFocusFar = 0.f;
     /// worldCacheSlices: each light-tracing batch spread over this many updates (frames), counted as fractions of a batch.
     /// MEASURED (slicetime1, 4K sprint 20, round-robin profiles, refill rounds): worldCache 3.34-3.62 ms (ship) -> 2.01-2.11 (4)
@@ -291,6 +329,11 @@ private:
     /// (span1) against 4.25 (async4) and 30 (ship): the refill takes 4-13x as many frames. The span arms' chunks also ran with a
     /// residency backlog (88-116k bricks) the ship arms mostly did not: unknown whether the photon queue slowed the residency.
     /// Quality is the batch count's (spanpt1, path trace, 7 batches: excess 0.02357; sync, 8 batches: 0.02391).
+    /// MEASURED (slicecost1, 4K sunset parked, 10 rows (160 tiles) restarted at each 240-frame chunk's start, 2 cycles, main-queue
+    /// GPU per frame and per delivered batch over the restart-only arm's 0.945 ms): sync 2.09 / 1.95 ms, 4.03 ms a batch; span
+    /// slices 1 1.86, 3.44 a batch; 2 1.89, 4.54; 4 1.57, 5.56; 8 1.43, 8.0. The photon queue does not hide the refill: the main
+    /// queue pays about all of it (the slice shares the SMs), and each slice adds its floor. Slicing spreads the cost over more
+    /// frames, it does not shrink it - a 4-slice batch costs the main frame 1.4x a sync one. Only fewer or cheaper batches save.
     bool mWorldCacheAsyncSpan = false;
     Slang::ComPtr<gfx::ICommandQueue> mpPhotonQueue; ///< Declared before the context, which keeps a raw pointer to it.
     std::array<Slang::ComPtr<gfx::ITransientResourceHeap>, 3> mpPhotonHeaps;
@@ -329,8 +372,17 @@ private:
     float3 mPhotonSkySun = float3(0.f);
     bool mPhotonSkyBaked = false;
     uint64_t mWorldCacheAsyncRuns = 0, mWorldCacheAsyncWaits = 0, mWorldCacheAsyncFallbacks = 0; ///< cloudStats.
+    uint64_t mWorldCacheUrgentRuns = 0; ///< cloudStats: main-queue updates run under worldCacheUrgentTarget.
     uint32_t mWorldCacheBakeSamples = 0; ///< cloudStats: worldCacheSamples at the last bake ...
     float mWorldCacheBakeLowBatches = 0.f; ///< ... and the fewest batches a tile had then.
+    /// cloudStats: what the camera's own tiles show. Per tile, the batches its last bake held (a tile restarted since counts its
+    /// batches now); per frame, the fewest of those within kWorldCacheNearTiles tiles of the camera (refillpt1 scores 3 rows
+    /// ahead restarted to k batches: 10 0.0241, 18 0.0232, 26 0.0230, ship 0.02297).
+    static constexpr int32_t kWorldCacheNearTiles = 3;
+    std::vector<float> mCloudTileBakedBatches;
+    float mWorldCacheNearLow = 0.f;
+    double mWorldCacheNearLowSum = 0.0;
+    uint64_t mWorldCacheNearFrames = 0, mWorldCacheNearUnder10 = 0, mWorldCacheNearUnder26 = 0;
     bool mWorldCacheBakeSliced = false; ///< TEST: bake every worldCacheBakeInterval batches, not updates, under worldCacheSlices.
     LazyComputePass mpWorldCachePhotonAsyncPass;
     LazyComputePass mpBakePhotonSkyPass;
@@ -494,6 +546,11 @@ private:
     void writeBeamQueueArgs(RenderContext* pRenderContext, uint32_t threadsPerEntry);
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
     uint32_t mSeaTilesChanged = 0;      ///< Sea tiles whose cloud was replaced, cumulative (cloudStats).
+    uint32_t mSeaApplyEvents = 0;       ///< Frames that replaced any, cumulative (cloudStats).
+    /// cloudStats, cumulative: beam builds that invalidated everything / CPU spheres (and how many) / the GPU change list; the
+    /// change list's inputs and bakes, and frames whose inputs overflowed it.
+    uint64_t mBeamInvalidateAllBuilds = 0, mBeamSphereBuilds = 0, mBeamSpheresTotal = 0, mBeamChangeBuilds = 0;
+    uint64_t mBeamChangeInputsTotal = 0, mBeamChangeBakesTotal = 0, mBeamChangeOverflows = 0;
     std::vector<int2> mSeaSlotWorld;    ///< Per sea slot: the world tile the beam image last saw it hold.
     /// World regions whose density or lighting changed since the last guard build, as spheres (invalidateBeamGuardBlock).
     std::vector<float4> mBeamInvalidations;

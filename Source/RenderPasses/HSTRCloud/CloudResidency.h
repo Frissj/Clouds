@@ -377,6 +377,8 @@ public:
     const Stats& getStats() const { return mStats; }
     /// Whether a cut is running on the worker (CloudView::cutAsync). The sea must not apply tile changes meanwhile: the walk reads them.
     bool cutInFlight() const { return mCutJob.valid(); }
+    /// Whether that cut is still walking: one that finished is taken by the next update, which accepts changed slots with it.
+    bool cutRunning() const { return mCutJob.valid() && mCutJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready; }
 
     /// CloudView::cutGpuVisibility: the visibility refreshes a walk asked for, traced on the GPU (CutVisibility.cs.slang) and handed
     /// back; the cache takes them before the next walk. Both calls are safe beside a running update or walk (their own lock).

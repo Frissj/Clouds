@@ -40,6 +40,8 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "worldCacheUpdatesRun", "worldCacheFocusUpdates", "worldCacheFocusNear", "worldCacheFocusHungry",
             # worldCacheAsync: updates recorded on the compute queue, frames a pending one waited, ones that fell back to the main queue.
             "worldCacheAsyncRuns", "worldCacheAsyncWaits", "worldCacheAsyncFallbacks",
+            # worldCacheUrgentTarget: main-queue whole-batch updates run while a tile was under it.
+            "worldCacheUrgentRuns", "seaApplyEvents",
             # worldCacheAsyncSpan: main-queue writes that waited for a running slice, slices that followed a running one, bakes put off.
             "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy", "worldCacheBakesPutOff", "worldCacheBakes",
             # Async slices timed on their own queue (hstrPhotonProbe): summed span in us, how many, how many over 4 ms.
@@ -47,6 +49,8 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             # Their waves and photons (hstrPhotonProbe, traceWorldCachePhotons).
             "photonWaveUs", "photonWaves", "photonLongestWaveUs", "photonLongestWaveFlights", "photonFlights", "photonsTraced",
             "photonSunFlights", "photonSunTraced", "photonCells", "photonDeposited", "photonSteps",
+            # The fewest baked batches among the tiles within 3 of the camera, summed over frames, and frames under 10 / 26.
+            "worldCacheNearLowSum", "worldCacheNearFrames", "worldCacheNearUnder10", "worldCacheNearUnder26",
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
             f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
@@ -134,7 +138,7 @@ def score():
     # over 0.02 parked, so it cannot judge motion here. SCORE 2: the launcher's own beam view rebuilt from nothing at that camera
     # (beamReset, then parked frames), i.e. what a parked camera shows there - the error that moving adds. Either way the beam
     # history is dropped, so the next frames re-march everything.
-    fresh = os.environ.get("HSTR_MOTION_SCORE") == "2"
+    fresh = os.environ.get("HSTR_MOTION_SCORE") in ("2", "3")
     saved = {k: hstr.properties[k] for k in REFERENCE if k in hstr.properties}
     hstr.set_properties({"storeExact": True, "compareReference": True, "compareExact": True, "compareBlock": 1})
     # HSTR_MOTION_PATH (with HSTR_MOTION_OUT): the moving frame's per-pixel resolve path beside its image (beamPathDump).
@@ -160,6 +164,36 @@ def score():
     p = hstr.properties
     result = {"over02": float(p["referenceNoiseError"]), "p999": float(p["referenceLogP999"]), "max": float(p["referenceLogMax"]),
               "marched": marched, **{k: s.get(k) for k in DIRTY}}
+    if os.environ.get("HSTR_MOTION_SCORE") == "3":
+        # SCORE 3: score 2's fresh beam reads the cache as the flight left it, so it cannot see refill lag. Here the same moving
+        # frame is scored again after the world cache has converged in place (sync full batches until no tile is short of the
+        # target), the beam rebuilt from nothing over it: "over02Converged" minus "over02" is what the cache's refill lag costs.
+        # Residency frozen meanwhile: FOUND (lagscore3) ~67 parked frames of live streaming changed the resident bricks too, and
+        # every arm, refilling or not, scored 9-12% against that frame instead of 4-6%.
+        # FOUND (lagscore4, residency frozen): still not a refill gate. Converging adds batches to every tile, not only the
+        # restarted ones, so the second score compares two noise realizations of the cache: ship 5.57 -> 12.18%, no refill 4.72 ->
+        # 9.40%, span4 5.42 -> 9.23%, the difference signed ~0 and spread over 14-40% of the band's pixels (difference images).
+        keys = ("worldCacheUpdates", "worldCacheAsync", "worldCacheAsyncSpan", "worldCacheSlices", "cloudResidencyFrozen")
+        arm = {k: hstr.properties[k] for k in keys if k in hstr.properties}
+        hstr.set_properties({"compareReference": False, "compareExact": False, "worldCacheUpdates": 1, "worldCacheAsync": False,
+                             "worldCacheAsyncSpan": False, "worldCacheSlices": 1, "cloudResidencyFrozen": True})
+        last, idle, converge = None, 0, 0
+        while idle < 3 and converge < 150:
+            m.renderFrame()
+            converge += 1
+            run = int(cloud_stats().get("worldCacheUpdatesRun") or 0)
+            idle = idle + 1 if run == last else 0
+            last = run
+        hstr.set_properties({"beamReset": True})
+        for _ in range(4):
+            m.renderFrame()
+        capture(f"score{score.taken}_converged")
+        hstr.set_properties({"compareReference": True, "compareExact": True, "compareBlock": 1})
+        m.renderFrame()
+        p = hstr.properties
+        result.update(over02Converged=float(p["referenceNoiseError"]), p999Converged=float(p["referenceLogP999"]),
+                      convergeFrames=converge)
+        hstr.set_properties(arm)
     hstr.set_properties(dict(saved, storeExact=False, compareReference=False, compareExact=False))
     return result
 
@@ -229,6 +263,8 @@ def counted(frames, speed):
 
 def capture(label):
     if os.environ.get("HSTR_MOTION_OUT"):
+        # FOUND (lagscore1 / lagscore2): a directory that did not exist ended Mogwai silently a few frames after the capture.
+        os.makedirs(os.environ["HSTR_MOTION_OUT"], exist_ok=True)
         m.frameCapture.outputDir = os.environ["HSTR_MOTION_OUT"]
         m.frameCapture.baseFilename = f"sunset_motion_{label}"
         m.frameCapture.capture()
@@ -398,7 +434,7 @@ speeds = [float(v) for v in os.environ.get("HSTR_MOTION_SPEEDS", "2,20").split("
 # The live flights (and the --ngfx trace taken in the first) run in the first arm's state. Since the settle restores its own state
 # after compiling the arms (packview1), they had run in the launcher's: halftrace1 traced resolveBeam with beamHalfResolve armed.
 set_arm(ARMS[0][1])
-for speed in speeds:
+for speed_i, speed in enumerate(speeds):
     tag = f"v{speed:g}"
     before = cloud_stats()
     walls, per_frame = fly(120, speed, stats=True, trace=speed == speeds[0])
@@ -429,7 +465,17 @@ for speed in speeds:
         for name, props in ARMS:
             set_arm(props)
             before = cloud_stats()
-            walls, _ = fly(CHUNK, speed)
+            # HSTR_MOTION_TRACE=N: the chunk flown N frames at a time, the world cache's and the sea window's state printed after each.
+            trace_every = int(os.environ.get("HSTR_MOTION_TRACE", "0")) or CHUNK
+            walls = []
+            for start in range(0, CHUNK, trace_every):
+                piece, _ = fly(min(trace_every, CHUNK - start), speed)
+                walls += piece
+                if trace_every < CHUNK:
+                    s = cloud_stats()
+                    print(f"MOTION {tag} trace {name} frame {start + len(piece)}: " + str({k: s.get(k) for k in (
+                        "cameraTileZ", "seaPendingTiles", "seaTilesChanged", "worldCacheUpdatesRun", "worldCacheStarving",
+                        "worldCacheEmpty", "worldCacheNearLow", "worldCacheBakeLowBatches")}), flush=True)
             arm_walls[name] += walls[DROP:]
             for k, v in delta(before, cloud_stats()).items():
                 arm_counts[name][k] = round(arm_counts[name].get(k, 0) + v, 2)
@@ -517,6 +563,11 @@ for speed in speeds:
             print(f"MOTION {tag} arm {name} quality: >0.02 mean {100 * sum(x['over02'] for x in e) / len(e):.3f}% worst "
                   f"{100 * max(x['over02'] for x in e):.3f}%, p99.9 {max(x['p999'] for x in e):.3g}, marched "
                   f"{100 * sum(x['marched'] for x in e) / len(e):.1f}%; per score {e}", flush=True)
+            if "over02Converged" in e[0]:
+                print(f"MOTION {tag} arm {name} against a converged cache: >0.02 mean "
+                      f"{100 * sum(x['over02Converged'] for x in e) / len(e):.3f}% worst "
+                      f"{100 * max(x['over02Converged'] for x in e):.3f}%, p99.9 {max(x['p999Converged'] for x in e):.3g}, "
+                      f"converge frames {[x['convergeFrames'] for x in e]}", flush=True)
     if os.environ.get("HSTR_MOTION_ARM_PROFILE", "0") != "0":
         # Under --nsys every arm's profiled frames go into ONE report (TAG_<speed>_arms): a later nsys session in the same launch
         # records no DX12 GPU workloads (sunevery1: five per-arm reports held only Map / Unmap calls; the launch's first, the live
@@ -538,11 +589,35 @@ for speed in speeds:
                         speed)
         if ARM_NSYS:
             nsys("stop")
-    set_arm(ARMS[0][1])
+    # HSTR_MOTION_PARK_ARM: the parked windows in that arm's state (default the first's); HSTR_MOTION_PARK_WINDOWS of them, each
+    # with its GPU time and the world cache's refill state (does an async continuation reach worldCacheTarget parked, at what cost).
+    # A comma list names one arm per entry of HSTR_MOTION_SPEEDS (two drains A/B in one run: HSTR_MOTION_SPEEDS=20,20).
+    park_names = os.environ.get("HSTR_MOTION_PARK_ARM", ARMS[0][0]).split(",")
+    park_arm = dict(ARMS).get(park_names[min(speed_i, len(park_names) - 1)], ARMS[0][1])
+    set_arm(park_arm)
     # Back to parked: how long the backlog takes to drain.
-    for window in range(3):
+    for window in range(int(os.environ.get("HSTR_MOTION_PARK_WINDOWS", "3"))):
+        before = cloud_stats()
         walls, _ = fly(60, 0.0)
-        print(f"MOTION {tag} parkedAfter{window}: {summary(walls)} {levels(cloud_stats())}", flush=True)
+        s = cloud_stats()
+        churn = ("maps", "unmaps", "fadeStarts", "fadeEnds", "cuts", "cutEntered", "uploadRuns", "seaTilesChanged", "sunBakeFrames",
+                 "evictFreed", "committedTotal", "beamInvalidatedBuilds", "beamInvalidateAllBuilds", "beamSphereBuilds",
+                 "beamSpheresTotal", "beamChangeBuilds", "beamChangeInputsTotal", "beamChangeBakesTotal", "beamChangeOverflows")
+        d = {k: float(s.get(k) or 0) - float(before.get(k) or 0) for k in (
+            "gpuTimeSum", "gpuTimeFrames", "worldCacheUpdatesRun", "worldCacheUrgentRuns", "worldCacheAsyncRuns", "worldCacheBakes") + churn}
+        print(f"MOTION {tag} parkedAfter{window}: gpu {d['gpuTimeSum'] / max(d['gpuTimeFrames'], 1.0) / 1000.0:.3f} ms, updates "
+              f"{d['worldCacheUpdatesRun']:.0f} (urgent {d['worldCacheUrgentRuns']:.0f}, async {d['worldCacheAsyncRuns']:.0f}), bakes "
+              f"{d['worldCacheBakes']:.0f}, starving {s.get('worldCacheStarving')} empty {s.get('worldCacheEmpty')} near low "
+              f"{s.get('worldCacheNearLow')} bake low {s.get('worldCacheBakeLowBatches')}; churn { {k: int(d[k]) for k in churn} }; "
+              f"{summary(walls)} {levels(s)}", flush=True)
+        # HSTR_MOTION_PARK_PROFILE=N: each parked window followed by N profiled frames (what the drain after a flight costs).
+        if int(os.environ.get("HSTR_MOTION_PARK_PROFILE", "0")):
+            profile(f"{tag} parkedAfter{window}", int(os.environ["HSTR_MOTION_PARK_PROFILE"]), 0.0)
+        # With HSTR_MOTION_COUNT: what the parked beam re-marches, and why (dirty reasons), window by window.
+        if COUNT:
+            c = counted(COUNT, 0.0)
+            print(f"MOTION {tag} parkedAfter{window} dirty per frame (counted): "
+                  f"{ {k: round(sum(float(x.get(k) or 0) for x in c) / len(c), 1) for k in c[0]} }", flush=True)
     # HSTR_MOTION_REPARK=1: back at the parked camera after the flights, settled, and profiled as "parked" was - the same view, so a
     # GPU time above parked's is the run's clocks or accumulated state, not the content the walk reached.
     if os.environ.get("HSTR_MOTION_REPARK", "0") != "0":

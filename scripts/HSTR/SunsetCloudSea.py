@@ -51,6 +51,11 @@ m.activeGraph.getPass("HSTRCloud").set_properties({
     # Two layers ask for about twice the sun bakes of one; until a brick's bake lands its samples take the live sun march. 1024 a frame
     # (bakeCloudSun ~0.2-2 ms while baking). NOT MEASURED against 256: the A/B that seemed to show it (1871ae53) changed the rate at
     # runtime, which did not rebuild the residency then, so its second arm was the first one settled longer.
+    # MEASURED (sunpark1/2, sundrain1, 4K, parked after a 240-frame sprint 20, main-queue GPU per 60-frame window): the outdated
+    # bakes (~250-330k once residency settles, ~240 frames in) drain at the cap - 1024: ~420 frames at 2.1-2.4 ms; 4096 (buffer
+    # 4096, cloudSunBakesCap 0): ~120 frames at 5.9-6.4 ms; settled 0.74-0.86 ms. The beam's unit march holds ~0.6 ms (and its
+    # queries ~0.7) in every draining frame at either rate - a full rebuild - and the bakes, on the residency's compute queue,
+    # cost the main queue ~1 us each. Before tiles applied after each walk (seaApplyAfterWalk) a sprint left no backlog.
     "cloudSunBakesPerFrame": 1024,
     # The GPU sun scheduling every 4th frame with 4x the moving cap (the frames between release only). MEASURED (sunevery1, 4K walk
     # 2, live residency, one launch, every 1 / 2 / 4 / 1 / 2): cloudSea 0.446 / 0.286 / 0.144 / 0.417 / 0.230 ms (scheduleSun 0.295

@@ -27,6 +27,22 @@ g.addPass(createPass("HSTRCloud", {
     "worldCachePhotons": 65536,
     "worldCacheUpdates": 1,
     "worldCacheBakeInterval": 8,
+    # Refill: 40 batches a tile, sync, photons focused on the starving tiles (1/16 survive elsewhere, weighted 16). A deliberate
+    # approximation of the parked image: path trace (t40pt1, hill 960 wide, whole cache from a restart) excess 0.023239 against
+    # 0.022971 at 64 (+1.2%), p99 0.4871 / p99.9 0.6889 unchanged, max 0.824 / 0.827 (sanity t10 0.023832); focus 1/16 0.022927
+    # (focuspt2). For it, honest sprint (focushonest2 / continue1, 4K sunset sprint 20, tiles applied after each walk, 3 x 240
+    # frames, chunk GPU, near-camera batches mean): 3.69 / 3.69 / 3.57 ms, 32.8 / 32.6 / 31.2, against the urgent 26 + span 4
+    # policy (worldCacheUrgentTarget, kept in C++) 4.10 / 3.79 ms, 28.5 / 23.6 and t64 focused 4.73, 37.6; norefill 2.42.
+    # The photon queue and slices do not shrink the refill, they spread it (slicecost1, beside worldCacheAsyncSpan).
+    # current1 (these launcher defaults, 2 x 240-frame chunks, desired 243k): walk 2 2.70 / 2.90 ms (160 focused updates, 48
+    # tiles applied in 4 events, backlog 55-77k), sprint 20 3.76 / 3.31 (204 updates, 447 tiles); parked after either, draining
+    # at the 512 bake cap, 1.46-1.81. The walk refills now: under the old apply gate it applied no tile in 240 frames.
+    "worldCacheTarget": 40,
+    "worldCacheFocusFar": 0.0625,
+    "worldCacheUrgentTarget": 0,
+    "worldCacheAsync": False,
+    "worldCacheAsyncSpan": False,
+    "worldCacheSlices": 1,
     "sunNearVoxels": 2.0,
     # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross
     # ~5 of its voxels with one sample: against the 4K path tracer (farside, 8x8 blocks) 0.1265 log error, 0.0998 capped, 0.0996 at
@@ -118,6 +134,13 @@ g.addPass(createPass("HSTRCloud", {
     # 60-85% of lit samples light from an ancestor's bake ~1.5 levels coarser (300-400k bakes waiting); the path-trace gate, run
     # parked and fully baked, never sees it.
     "cloudSunBakesMoving": 64,
+    # Parked at most 512 bakes a frame (under cloudSunBakesPerFrame's 1024; moving, cloudSunBakesMoving's 64 still rules). Parked
+    # after a sprint ~250-330k outdated bakes drain, outdated ones answering meanwhile (cloudSunKeepStale), and the main queue
+    # waits at the frame's end for the residency queue's bakes. MEASURED (bakecap1, 4K, parked after a 240-frame sprint 20,
+    # four sprint + park passes in one launch, the last three 60-frame windows of each): cap 1024 2.36 / 2.76 / 2.55 ms and
+    # again 1.65 / 2.05 / 2.38; 512 1.62 / 1.62 / 1.66; 256 1.61 / 1.63 / 1.69; settled ~0.8-0.95. Drain ~24k bakes a window
+    # at 512 against ~60k at 1024: twice as long, under 2 ms. Benchmarks that score a settled sun settle uncapped (sunset_hill).
+    "cloudSunBakesCap": 512,
     # Sun stamp, levels 0-1 by changed-cell prefix sums (stampSunFine) instead of every change's sweep box (stampSunChange). The full
     # stamp stored 9-34M times a run, 88-93% into entries already holding the run's epoch (stampskip2: overlapping sweeps); reading
     # first (cloudSunStampSkipSame) was no faster. stampfine4 (4K sunset walk, 96 profiled frames, scheduleSun every 4th): stamp
@@ -135,6 +158,10 @@ g.addPass(createPass("HSTRCloud", {
     # GPU sun bakes mark the beam blocks that read them (markBeamChanges). Never happened before: the bake count was read after
     # gpuSunDispatched cleared it. markbakes1 (4K sunset walk, motion score 2): ship 8.00% / on 5.24% / ship again 5.13% over 0.02,
     # markBeamChanges 0.031 / 0.027 / 0.033 ms, units 0.73 / 0.82 / 0.95 - no measurable cost or quality change; on as correct.
+    # Parked after a sprint the ~250-330k outdated bakes drain at 1024 a frame and each frame's marks re-march ~982 beam blocks
+    # (sundirty2: the change list's bakes are the only invalidator; march 0.63-0.69 ms profiled, 0.007-0.010 with marks off -
+    # markdrain2). But it costs nothing measurable (markdrain3, clean, on / off / on: drain windows 2.36-2.86 / 1.79-2.76 /
+    # 1.80-2.30 ms): the main queue waits at the frame's end for the residency queue's bakes anyway.
     "beamMarkBakes": True,
     # worldCacheView rebaked every 4th frame while the camera moves (never while parked and unchanged). cacheview1 (4K sunset walk,
     # motion score 2, share over 0.02 / p99.9): every 1 0.065 ms a frame 4.84% / 0.97, every 2 0.028 5.66% / 0.49, every 4 0.015

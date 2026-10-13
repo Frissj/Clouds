@@ -497,6 +497,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheTarget = uint32_t(value);
             continue;
         }
+        if (key == "worldCacheUrgentTarget")
+        {
+            mWorldCacheUrgentTarget = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheUrgentNear")
+        {
+            mWorldCacheUrgentNear = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheContinueEvery")
+        {
+            mWorldCacheContinueEvery = uint32_t(value);
+            continue;
+        }
+        if (key == "seaApplyAfterWalk")
+        {
+            mSeaApplyAfterWalk = bool(value);
+            continue;
+        }
         if (key == "worldCacheFocusFar")
         {
             mWorldCacheFocusFar = std::clamp(float(value), 0.f, 1.f);
@@ -2292,6 +2312,10 @@ Properties HSTRCloud::getProperties() const
     props["sunFieldAngle"] = mSunFieldAngle;
     props["sunOctaveAngle"] = mSunOctaveAngle;
     props["worldCacheTarget"] = mWorldCacheTarget;
+    props["worldCacheUrgentTarget"] = mWorldCacheUrgentTarget;
+    props["worldCacheUrgentNear"] = mWorldCacheUrgentNear;
+    props["worldCacheContinueEvery"] = mWorldCacheContinueEvery;
+    props["seaApplyAfterWalk"] = mSeaApplyAfterWalk;
     props["worldCacheFocusFar"] = mWorldCacheFocusFar;
     props["worldCacheSlices"] = mWorldCacheSlices;
     props["worldCacheAsync"] = mWorldCacheAsync;
@@ -2560,6 +2584,7 @@ Properties HSTRCloud::getProperties() const
         cloud["worldCacheAsyncRuns"] = mWorldCacheAsyncRuns;
         cloud["worldCacheAsyncWaits"] = mWorldCacheAsyncWaits;
         cloud["worldCacheAsyncFallbacks"] = mWorldCacheAsyncFallbacks;
+        cloud["worldCacheUrgentRuns"] = mWorldCacheUrgentRuns;
         cloud["worldCacheSliceUs"] = mPhotonSliceUs; // Async slices read back: their summed span on their queue ...
         cloud["worldCacheSlicesTimed"] = mPhotonSlices;
         cloud["worldCacheSlicesOver4Ms"] = mPhotonSlicesOver4Ms; // ... and those over 4 ms.
@@ -2580,6 +2605,25 @@ Properties HSTRCloud::getProperties() const
         cloud["worldCacheBakesPutOff"] = mWorldCacheBakesPutOff;
         cloud["worldCacheBakeSamples"] = mWorldCacheBakeSamples;
         cloud["worldCacheBakeLowBatches"] = mWorldCacheBakeLowBatches;
+        cloud["worldCacheNearLow"] = mWorldCacheNearLow;
+        cloud["worldCacheNearLowSum"] = mWorldCacheNearLowSum;
+        cloud["worldCacheNearFrames"] = mWorldCacheNearFrames;
+        cloud["worldCacheNearUnder10"] = mWorldCacheNearUnder10;
+        cloud["worldCacheNearUnder26"] = mWorldCacheNearUnder26;
+        uint32_t starving = 0, empty = 0;
+        for (float batches : mCloudTileBatches)
+        {
+            starving += batches < float(mWorldCacheTarget) ? 1u : 0u;
+            empty += batches < 1.f ? 1u : 0u;
+        }
+        cloud["worldCacheStarving"] = starving;
+        cloud["worldCacheEmpty"] = empty;
+        if (mpCloudSea && mpScene)
+        {
+            cloud["seaPendingTiles"] = mpCloudSea->pendingTiles();
+            const float3 position = mpScene->getCamera()->getPosition();
+            cloud["cameraTileZ"] = int32_t(std::floor((position.z - mpCloudSea->getDesc().origin.z) / mpCloudSea->getDesc().tileWorld));
+        }
         const float2 video = hstrcloud::queryVideoMemoryMB(mpDevice);
         cloud["videoUsedMB"] = video.x;
         cloud["videoBudgetMB"] = video.y;
@@ -2640,6 +2684,14 @@ Properties HSTRCloud::getProperties() const
         cloud["cuts"] = stats.cuts;
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         cloud["seaTilesChanged"] = mSeaTilesChanged;
+        cloud["seaApplyEvents"] = mSeaApplyEvents;
+        cloud["beamInvalidateAllBuilds"] = mBeamInvalidateAllBuilds;
+        cloud["beamSphereBuilds"] = mBeamSphereBuilds;
+        cloud["beamSpheresTotal"] = mBeamSpheresTotal;
+        cloud["beamChangeBuilds"] = mBeamChangeBuilds;
+        cloud["beamChangeInputsTotal"] = mBeamChangeInputsTotal;
+        cloud["beamChangeBakesTotal"] = mBeamChangeBakesTotal;
+        cloud["beamChangeOverflows"] = mBeamChangeOverflows;
         cloud["beamInvalidatedBuilds"] = mBeamInvalidatedBuilds;
         const char* probeNames[] = {"Scored", "InPlace", "Reprojected", "Either"};
         for (uint32_t k = 0; k < 4; ++k)
@@ -4261,8 +4313,11 @@ void HSTRCloud::markBeamChanges(RenderContext* pRenderContext, std::vector<uint4
         mpBeamChangeCells = mpDevice->createStructuredBuffer(sizeof(uint32_t), words, flags, MemoryType::DeviceLocal, nullptr, false);
         pRenderContext->clearUAV(mpBeamChangeCells->getUAV().get(), uint4(0));
     }
+    mBeamChangeInputsTotal += changes.size();
+    mBeamChangeBakesTotal += bakes;
     if (changes.size() > kBeamChangeInputCapacity)
     {
+        ++mBeamChangeOverflows;
         mBeamInvalidateAll = true; // A frame that settled this much re-verifies everything anyway.
         changes.clear();
     }
@@ -4673,12 +4728,34 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         // A residency cut running on its worker reads the tiles: finished tiles wait until it is back. With residency frozen
         // (benchmarks) the sea takes its tiles on synchronously instead, in the frame that requests them: when a worker happened
         // to deliver decided what the scored frames saw, and the same code measured sprint at 0.025% or 0.127% over 0.02.
+        // FOUND (neartrace1, 4K sprint 20, traced every 20 frames): in a sprint a walk is nearly always in flight, so finished tiles
+        // pile up (seaPendingTiles 16 a row, to 160-196) for 100-140 frames, then land at once - 160-196 of the window's 256 - while
+        // the camera has crossed 8-10 tiles over slots still holding their old clouds. The world cache restarts those tiles in one
+        // event, so the refill runs worldCacheTarget updates per burst and idles between (updates = target exactly per 240 frames).
         if (mCloudResidencyFrozen)
             changed = mpCloudSea->fill(camera->getPosition());
         else
-            changed = mpCloudSea->update(camera->getPosition(), !(mpCloudResidency && (residencyBusy || mpCloudResidency->cutInFlight())));
+        {
+            // seaApplyAfterWalk: tiles are held only while the walk still runs. A finished walk stayed in flight until the next
+            // residency update took it on and launched the next at once, so the sea never saw a gap (the bursts above); the update
+            // takes a finished walk on with changed slots (its desires are asset bricks, valid whatever a slot holds now), and the
+            // changed slots launch the next cut.
+            // FOUND (applywalk1, 4K sunset sprint 20, 2 x 240-frame chunks an arm): held, the camera outruns its own window, and
+            // the residency's desired set at chunk ends falls to 0-2.5k bricks (urgent1, nearpolicy1, neartarget1; 9.5k-123k here)
+            // against 243k - every sprint timing taken with the hold measured a near-empty view (norefill 1.56-1.72 ms). After the
+            // walk: 10-16 applies per 480 frames against 2, 6-38 tiles pending against 160-196, desired 243k; norefill 2.59 ms,
+            // refill arms 4.53-4.91 (residency backlog 5-141k bricks, ~600k sun bakes waiting).
+            // MEASURED (sprintcost1, same, after the walk, 6 x 24 profiled frames an arm round-robin): chunk GPU norefill 2.44 /
+            // 2.42 ms (HSTRCloud 2.36 / 2.40 profiled, units 0.99), urgent near 3 + span 4 3.87, + span 1 4.15, t26 sync 4.12;
+            // worldCachePhotons 3.46 / 1.09 / 0.95 ms a profiled frame. Desired 243k in every arm, mapped 153-211k.
+            // A busy residency update may be launching a cut: nothing touches mCutJob then (residencyBusy short-circuits).
+            const bool hold = mpCloudResidency &&
+                              (residencyBusy || (mSeaApplyAfterWalk ? mpCloudResidency->cutRunning() : mpCloudResidency->cutInFlight()));
+            changed = mpCloudSea->update(camera->getPosition(), !hold);
+        }
     }
     mSeaTilesChanged += uint32_t(changed.size()); // Tiles whose cloud the sea replaced, cumulative (cloudStats seaTilesChanged).
+    mSeaApplyEvents += changed.empty() ? 0u : 1u;  // Frames that applied any (seaApplyEvents).
     // The persistent beam image holds radiance marched through the old cloud: both the world column a slot held and the one it now
     // holds changed (invalidateBeamGuardBlock).
     const auto& seaTiles = mpCloudSea->getTiles();
@@ -8890,6 +8967,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // pool 256k slots x 1 flight 2.89-3.05, 128k x 2 2.93-3.03, 64k x 4 3.10, 64k x 1 1.44-1.64. ~87-89k flights per ms
         // either way: at batch size the update is throughput bound (~11 ns a flight, ~40% of it the deposit walk: knock1), so no
         // split of a batch - slices, queues, a pool - costs less in total; only fewer or cheaper flights do.
+        // MEASURED (fixcost1/2, 4K sprint 20, sync, worldCachePhotons dispatch scope per update): 1024 photons 1.33-1.45 ms, 4096
+        // 1.72-1.91 (bounce cap 8: 1.56-1.63; cap 1, one flight a photon: 0.52-0.56), 16384 2.04-2.39, 65536 3.55-3.89. The rest
+        // of the worldCache scope is small: view 0.05 ms, bake 0.29 every 8th update, no decay (the sunset's sun is static). The
+        // floor above, in motion: ~1.4 ms is chain latency, so a quarter batch costs 60% of a whole one.
         // Async compute would hide it, but slang-gfx 2024.1.34 exposes only a graphics queue (ICommandQueue::QueueType), and
         // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
         // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
@@ -8908,6 +8989,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         {
             mParams.worldCacheKeep = mCloudCacheKeep;
             waitPhotonSlice(pRenderContext);
+            FALCOR_PROFILE(pRenderContext, "worldCacheDecay");
             bindRenderer(pRenderContext, mpDecayWorldCachePass);
             mpDecayWorldCachePass->getRootVar()["CB"]["gHSTRCloud"]["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
             mpDecayWorldCachePass->execute(pRenderContext, dims);
@@ -8979,7 +9061,27 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // quiet: the fine sun not written this frame or the last, the sky baked for this sun, no domain write in the last two frame
         // ends. One waiting too long runs here.
         bool runHere = !converged;
-        if (!mWorldCacheAsync)
+        // worldCacheUrgentTarget: a tile under it is refilled here, whole batches, before any async continuation (which the sync
+        // loop's waitPhotonSlice orders after a running slice).
+        // worldCacheUrgentNear (tiles, 0: the whole window): only the tiles within it of the camera's count, so a tile restarted
+        // ahead (seaApplyAfterWalk lands new rows at the window's edge) takes the continuation and not whole main-queue batches.
+        float urgentLow = 1e30f;
+        if (mWorldCacheUrgentNear > 0 && mpCloudSea && !mCloudTileBatches.empty())
+        {
+            const auto& seaDesc = mpCloudSea->getDesc();
+            const float3 position = mpScene->getCamera()->getPosition();
+            const int32_t cameraX = int32_t(std::floor((position.x - seaDesc.origin.x) / seaDesc.tileWorld));
+            const int32_t cameraZ = int32_t(std::floor((position.z - seaDesc.origin.z) / seaDesc.tileWorld));
+            const int32_t reach = int32_t(mWorldCacheUrgentNear);
+            for (int32_t z = -reach; z <= reach; ++z)
+                for (int32_t x = -reach; x <= reach; ++x)
+                    urgentLow = std::min(urgentLow, mCloudTileBatches[mpCloudSea->slotIndex(int2(cameraX + x, cameraZ + z))]);
+        }
+        else if (!mCloudTileBatches.empty())
+            urgentLow = *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end());
+        const bool urgent = !converged && mWorldCacheUrgentTarget > 0 && mWorldCacheUrgentTarget < mWorldCacheTarget &&
+                            !mCloudTileBatches.empty() && (mParams.worldCacheSamples == 0 || urgentLow < float(mWorldCacheUrgentTarget));
+        if (!mWorldCacheAsync || urgent)
             mAsyncPhotonPending = false;
         else if (mWorldCacheAsyncSpan && photonSliceRunning() && !converged && !focus)
         {
@@ -9012,6 +9114,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 ++mWorldCacheAsyncFallbacks;
             }
         }
+        // worldCacheContinueEvery: with no tile urgent (worldCacheUrgentTarget, worldCacheUrgentNear), the update on to the target
+        // runs only every that many frames. slicecost1: the photon queue and slices do not hide or shrink the refill, they only
+        // spread it, so the continuation is spread here, sync, and stays focused (worldCacheFocusFar).
+        if (runHere && !urgent && mWorldCacheContinueEvery > 1 && mWorldCacheUrgentTarget > 0 && mExecuteFrames % mWorldCacheContinueEvery != 0)
+            runHere = false;
         mWorldCacheWanted = !converged; // dispatchAsyncPhotons refreshes stale copies only while updates run.
         if (!mDeferredDepositWarm && mParams.worldCacheEstimator != 0 && mParams.worldCacheTextured != 0)
         {
@@ -9029,6 +9136,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         {
             waitPhotonSlice(pRenderContext);
             ++mWorldCacheUpdatesRun;
+            mWorldCacheUrgentRuns += urgent ? 1u : 0u;
             float batchShare = 1.f; // Of a batch, this update's photons (worldCacheSlices).
             if (mParams.worldCacheEstimator == 0)
             {
@@ -9081,11 +9189,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 bindRenderer(pRenderContext, mpWorldCachePhotonPass);
                 // worldCacheSlices: a batch's photons over that many updates. Weights stay normalised by worldCachePhotons, so each
                 // slice is an unbiased 1 / slices of a batch and the tiles count it so (each slice draws its own seed).
-                const uint32_t slices = accumulate && !mCloudTileBatches.empty() ? std::max(mWorldCacheSlices, 1u) : 1u;
+                const uint32_t slices = accumulate && !mCloudTileBatches.empty() && !urgent ? std::max(mWorldCacheSlices, 1u) : 1u;
                 batchShare = 1.f / float(slices);
                 const uint32_t photons = (mParams.worldCachePhotons + slices - 1) / slices;
                 bindPhotonSegments(pRenderContext, mpWorldCachePhotonPass.get(), photons);
-                mpWorldCachePhotonPass->execute(pRenderContext, uint3(photons, 1, 1));
+                {
+                    FALCOR_PROFILE(pRenderContext, "worldCachePhotons");
+                    mpWorldCachePhotonPass->execute(pRenderContext, uint3(photons, 1, 1));
+                }
                 if (mWorldCacheDeferredDeposit)
                 {
                     FALCOR_PROFILE(pRenderContext, "photonDeposits");
@@ -9136,7 +9247,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // Every worldCacheBakeInterval updates, sliced or not: a slice costs the bake no more than a batch, and baking per batch
         // (worldCacheBakeSliced) left a restarted tile showing its last bake for up to interval x slices frames.
         const uint32_t bakeEvery = mWorldCacheBakeInterval * (mWorldCacheBakeSliced ? std::max(mWorldCacheSlices, 1u) : 1u);
-        bool bakeDue = mWorldCacheUpdates == 0 || mParams.worldCacheSamples % bakeEvery == 0 || mWorldCacheBakeOwed;
+        // converged: the updates have stopped, so the last ones are baked now. FOUND (neartrace1, 4K sprint 20, target 26): the
+        // cache converged at sample 218, two past the bake at 216, and the camera's tiles showed 24 batches until the next tile burst.
+        bool bakeDue = mWorldCacheUpdates == 0 || converged || mParams.worldCacheSamples % bakeEvery == 0 || mWorldCacheBakeOwed;
         // worldCacheAsyncSpan: the tile counts already hold a running slice's share, its deposits not yet: the bake waits a frame.
         if (bakeDue && mWorldCacheBakeDirty && photonSliceRunning())
         {
@@ -9161,7 +9274,27 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             mWorldCacheBakeDirty = false;
             mWorldCacheBakeSamples = mParams.worldCacheSamples;
             mWorldCacheBakeLowBatches = mCloudTileBatches.empty() ? 0.f : *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end());
+            mCloudTileBakedBatches = mCloudTileBatches;
             ++mWorldCacheBakes;
+        }
+        if (mpCloudSea && !mCloudTileBatches.empty() && mCloudTileBakedBatches.size() == mCloudTileBatches.size())
+        {
+            const auto& seaDesc = mpCloudSea->getDesc();
+            const float3 position = mpScene->getCamera()->getPosition();
+            const int32_t cameraX = int32_t(std::floor((position.x - seaDesc.origin.x) / seaDesc.tileWorld));
+            const int32_t cameraZ = int32_t(std::floor((position.z - seaDesc.origin.z) / seaDesc.tileWorld));
+            float low = 1e30f;
+            for (int32_t z = -kWorldCacheNearTiles; z <= kWorldCacheNearTiles; ++z)
+                for (int32_t x = -kWorldCacheNearTiles; x <= kWorldCacheNearTiles; ++x)
+                {
+                    const uint32_t slot = mpCloudSea->slotIndex(int2(cameraX + x, cameraZ + z));
+                    low = std::min(low, std::min(mCloudTileBakedBatches[slot], mCloudTileBatches[slot]));
+                }
+            mWorldCacheNearLow = low;
+            mWorldCacheNearLowSum += low;
+            ++mWorldCacheNearFrames;
+            mWorldCacheNearUnder10 += low < 10.f ? 1 : 0;
+            mWorldCacheNearUnder26 += low < 26.f ? 1 : 0;
         }
         // worldCacheView: after the cache textures, before any camera march. It depends on the cache and the camera position only:
         // a parked camera keeps it; a moving one rebakes every worldCacheViewEvery frames.
@@ -10074,6 +10207,11 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         ensureCellViews(pRenderContext);
                                     }
                                     constexpr uint32_t kCapacity = 256;
+                                    // cloudStats: which source unverified this build's blocks.
+                                    mBeamInvalidateAllBuilds += mBeamInvalidateAll || mBeamInvalidations.size() > kCapacity ? 1u : 0u;
+                                    mBeamSphereBuilds += mBeamInvalidations.empty() ? 0u : 1u;
+                                    mBeamSpheresTotal += uint32_t(mBeamInvalidations.size());
+                                    mBeamChangeBuilds += mBeamChangesPending ? 1u : 0u;
                                     if (mBeamInvalidateAll || mBeamInvalidations.size() > kCapacity)
                                     {
                                         pRenderContext->clearUAV(mpBeamGuardCamera->getUAV().get(), float4(0.f));

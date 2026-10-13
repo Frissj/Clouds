@@ -64,12 +64,72 @@ LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBaked"
           # World cache photon updates (cumulative): all, on the compute queue (worldCacheAsync), fallen back to the main queue.
           "worldCacheUpdatesRun", "worldCacheAsyncRuns", "worldCacheAsyncFallbacks", "worldCacheBakes",
           "worldCacheBakeSamples", "worldCacheBakeLowBatches", "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy",
-          "worldCacheBakesPutOff")
+          "worldCacheBakesPutOff", "worldCacheUrgentRuns", "worldCacheStarving", "seaTilesChanged")
 
 
 def stats():
     s = hstr.properties.get("cloudStats", {})
     return {k: s.get(k) for k in LEVELS}
+
+
+def converge_cache(limit=300, own=False):
+    # Sync full photon batches until no tile is short of the target (worldCacheUpdatesRun idle 3 frames). own: under the arm's
+    # own refill settings (worldCacheUrgentTarget, async span slices), so the end state is the one that path leaves parked; then
+    # also until worldCacheStarving is 0 (a span slice in flight leaves frames without a new update).
+    if own:
+        hstr.set_properties({"worldCacheUpdates": 1})
+    else:
+        hstr.set_properties({"worldCacheUpdates": 1, "worldCacheAsync": False, "worldCacheAsyncSpan": False, "worldCacheSlices": 1})
+    last, idle, n = None, 0, 0
+    while n < limit:
+        m.renderFrame()
+        n += 1
+        s = hstr.properties.get("cloudStats", {})
+        run = int(s.get("worldCacheUpdatesRun") or 0)
+        idle = idle + 1 if run == last else 0
+        last = run
+        if idle >= 3 and (not own or int(s.get("worldCacheStarving") or 0) == 0):
+            break
+    return n
+
+
+def run_trip(trip, props, converge_after):
+    out, speed = trip
+    home_p = float3(cam.position.x, cam.position.y, cam.position.z)
+    home_t = float3(cam.target.x, cam.target.y, cam.target.z)
+    arm_cache = {k: hstr.properties[k] for k in ("worldCacheUpdates", "worldCacheAsync", "worldCacheAsyncSpan", "worldCacheSlices")}
+    arm_cache.update({k: v for k, v in props.items() if k in arm_cache})
+    # From the same state every arm: residency settled and the cache converged at the pose.
+    hstr.set_properties({"cloudResidencyFrozen": False})
+    for _ in range(60):
+        m.renderFrame()
+    before = converge_cache()
+    hstr.set_properties(dict(arm_cache, cloudResidencyFrozen=False))
+    stats_out = None
+    for i in range(2 * out):
+        step = speed if i < out else -speed
+        cam.position = float3(cam.position.x, cam.position.y, cam.position.z + step)
+        cam.target = float3(cam.target.x, cam.target.y, cam.target.z + step)
+        m.renderFrame()
+        if i == out - 1:
+            stats_out = stats()
+    cam.position, cam.target = home_p, home_t
+    m.renderFrame()
+    back = stats()
+    # Residency settles at the pose with the cache as the trip left it (or converged), then freezes.
+    # FOUND (trippt1, 960 wide, 40 x 20 out and back): not a refill gate as it stands. After 120 frames residency was still far
+    # behind (mapped 113k-166k of 227k-243k desired) and the window kept moving after the camera stopped (seaTilesChanged +32 in
+    # the settle), restarting tiles with updates 0: every arm's last bake held a tile at 0 batches (worldCacheBakeLowBatches 0.0).
+    # So ship trip 0.024556, norefill trip 0.024502, span4 trip 0.024508 and ship trip again 0.024594 all read the same state;
+    # only "converged trip" (68 frames of converging, residency caught up: mapped = desired) differed, 0.022839 (parked ship
+    # 0.022970).
+    hstr.set_properties({"worldCacheUpdates": 0})
+    for _ in range(120):
+        m.renderFrame()
+    after = converge_cache() if converge_after else 0
+    hstr.set_properties({"worldCacheUpdates": 0, "cloudResidencyFrozen": True})
+    print(f"HILL trip {out} x {speed} out and back: converged before in {before} frames, after {after}; turned at {stats_out}; "
+          f"back {back}; settled {stats()}", flush=True)
 
 
 def capture(label):
@@ -78,6 +138,9 @@ def capture(label):
 
 
 settle = int(os.environ.get("HSTR_TRUTH_SETTLE", "600"))
+# The gate scores a fully baked sun: the settle bakes at the buffer's full rate, not the launcher's parked cap (cloudSunBakesCap,
+# which would leave ~150k bakes waiting after 600 frames).
+hstr.set_properties({"cloudSunBakesCap": 0})
 for i in range(0, settle, 300):
     for _ in range(min(300, settle - i)):
         m.renderFrame()
@@ -141,6 +204,15 @@ if SUN_ARMS or PT_ARMS:
     for label, *arm in (SUN_ARMS or PT_ARMS):
         props = dict(arm[0]) if PT_ARMS else {}
         frames = props.pop("frames", 8)
+        # "trip": (frames, speed): the world cache converged at the pose, then the camera flown that many frames along +z at speed
+        # (world units a frame) and back under the arm's settings, residency live, so the sea's tiles leave the window and return
+        # restarted. Back at the pose residency settles with the cache held as the trip left it ("tripConverge": converged
+        # instead), then freezes, and the arm's frames rebuild the beam: the path trace scores the cache the motion left.
+        trip = props.pop("trip", None)
+        trip_converge = props.pop("tripConverge", False)
+        # "converge": a cache setting that restarts the cache (worldCacheBands, ...): sync batches under it until no tile is short
+        # of the target, then updates 0 and the beam reset again (beamReset is one-shot; the parked beam ignores cache rebakes).
+        converge = props.pop("converge", False)
         for k in props:
             touched.setdefault(k, hstr.properties.get(k))
         hstr.set_properties({k: v for k, v in touched.items() if v is not None})
@@ -157,6 +229,13 @@ if SUN_ARMS or PT_ARMS:
         # instead of the exact view's, so a beam arm (with beamPolicy False, beamReset True and a few frames) is scored as shipped.
         base = beam if props.pop("launcherBeam", False) else REFERENCE
         hstr.set_properties(dict(base, compareReference=False, compareExact=False, **props))
+        if trip:
+            run_trip(trip, props, trip_converge)
+        if converge:
+            # "converge": "own" converges under the arm's own refill settings (converge_cache).
+            n = converge_cache(1500, own=True) if converge == "own" else converge_cache()
+            hstr.set_properties({"worldCacheUpdates": 0, "beamReset": True})
+            print(f"HILL {label} converged in {n} frames: {stats()}", flush=True)
         # The units the arm's rebuild lists (beamDirtyStats, when an arm sets it): the work side of its error.
         units_before = int(hstr.properties.get("cloudStats", {}).get("dirtyStatUnits", 0))
         for _ in range(frames):
