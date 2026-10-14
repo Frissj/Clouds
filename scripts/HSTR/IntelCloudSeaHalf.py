@@ -17,7 +17,8 @@ g.addPass(createPass("HSTRCloud", {
     "cloudLibrary": str(library),
     "cloudProxyResolution": int(os.environ.get("HSTR_SEA_VOXELS", "64")),
     "cloudSeaTiles": tiles,
-    "cloudSeaCoverage": 1.0,
+    # HSTR_SEA_COVERAGE: the share of tiles holding a cloud (a sparse sky for the budget-scaled refill; CloudSea.py's override).
+    "cloudSeaCoverage": float(os.environ.get("HSTR_SEA_COVERAGE", "1.0")),
     "cloudBrickPoolMB": int(os.environ.get("HSTR_CLOUD_POOL_MB", "256")),
     # 4096: 1024 was saturated on 112-115 of 120 walk frames (loadcap3); see HSTRCloud.h mCloudBrickLoadsPerFrame.
     "cloudBrickLoadsPerFrame": int(os.environ.get("HSTR_CLOUD_LOADS", "4096")),
@@ -82,7 +83,24 @@ g.addPass(createPass("HSTRCloud", {
     # 960 wide, 4 rows restarted, refilled under focus, launcher beam, seeds aligned): ship / ship again 0.024521 identical, 1/8
     # 0.024568 (+0.2%), 1/4 0.024512, sanity 1e-4 0.024796; seed spread (ship misaligned) 0.024731; p99 0.4871 / p99.9 0.6889 in all.
     "worldCacheFocusRoulette": 0.125,
-    "worldCacheUrgentTarget": 0,
+    # Refill scaled by the frame's headroom (HSTRCloud.h worldCacheBudgetMs): every tile is held at 6 batches (worldCacheUrgentAll)
+    # and the camera's 7 x 7 tiles too, baked at once (worldCacheUrgentTarget / Near); from 6 to the target 10 the refill spends only
+    # what the frame leaves under 2 ms, so a sparse sky (or a parked camera) refills at full rate and a dense sprint does not.
+    # MEASURED: targetpt1 (hill path trace, each arm converged to its own target, 262144-photon batches): 10 0.024564, 8 0.024444,
+    # 6 0.024489, sanity 2 0.027800 (p99 0.4871 -> 0.5793), 10 again 0.025184 - 6 within the anchor's drift. floor6 (4K sunset,
+    # 240-frame chunks, chunk GPU): sprint 20 ship 3.545 / 3.423, budget 3.217 ms (updates 89 / 98 -> 55, the camera's tiles 9.3
+    # batches on average, never under 6); walk 2 2.153 / 2.274, budget 2.296 (all its updates are new tiles under 6). sparse1
+    # (HSTR_SEA_COVERAGE 0.25): walk 1.779 / 1.583, budget 1.792; sprint 2.322 / 2.468, budget 2.355 - the camera's tiles at 10
+    # throughout, unchanged where there is headroom. budgetpt1 (path trace, parked): ship 0.024564, budget 0.024564 identical
+    # (converged in 69 frames against 13), sanity t2 0.025031. A floor near the camera only (6 within 3) bought the sprint 2.87 ms
+    # (budget3) but left the far tiles unrefilled: lagbudget2 14.0% over 0.02 against the converged cache, ship 7.8% (single
+    # sprint scores, noisy - lagbudget4's ship anchors 11.8 / 15.4%), the middle distance visibly darker.
+    # budgetfinal1 (these settings against the old refill, one launch): walk 2 2.111 / 2.210 against 2.363 ms (6 / 6 updates
+    # against 21), sprint 20 3.415 / 3.209 against 3.462 (66 / 61 against 104; the camera's tiles 8.4 / 8.0 batches on average).
+    "worldCacheBudgetMs": 2.0,
+    "worldCacheUrgentAll": 6,
+    "worldCacheUrgentTarget": 6,
+    "worldCacheUrgentNear": 3,
     "worldCacheAsync": False,
     "worldCacheAsyncSpan": False,
     # 2 slices with the flight cull (cullslice1, as above): walk 2.38 / 2.97 ms (3 / 6 frames over 6 ms), sprint 3.24 / 2.84 (29

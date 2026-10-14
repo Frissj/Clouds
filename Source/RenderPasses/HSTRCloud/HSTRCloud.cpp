@@ -512,6 +512,17 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheContinueEvery = uint32_t(value);
             continue;
         }
+        if (key == "worldCacheUrgentAll")
+        {
+            mWorldCacheUrgentAll = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheBudgetMs")
+        {
+            mWorldCacheBudgetMs = std::max(0.f, float(value));
+            mPhotonCreditMs = 0.f;
+            continue;
+        }
         if (key == "seaApplyAfterWalk")
         {
             mSeaApplyAfterWalk = bool(value);
@@ -2481,6 +2492,8 @@ Properties HSTRCloud::getProperties() const
     props["worldCacheUrgentTarget"] = mWorldCacheUrgentTarget;
     props["worldCacheUrgentNear"] = mWorldCacheUrgentNear;
     props["worldCacheContinueEvery"] = mWorldCacheContinueEvery;
+    props["worldCacheBudgetMs"] = mWorldCacheBudgetMs;
+    props["worldCacheUrgentAll"] = mWorldCacheUrgentAll;
     props["seaApplyAfterWalk"] = mSeaApplyAfterWalk;
     props["seaApplyDuringWalk"] = mSeaApplyDuringWalk;
     props["seaApplyBatch"] = mSeaApplyBatch;
@@ -2774,6 +2787,9 @@ Properties HSTRCloud::getProperties() const
         cloud["worldCacheAsyncWaits"] = mWorldCacheAsyncWaits;
         cloud["worldCacheAsyncFallbacks"] = mWorldCacheAsyncFallbacks;
         cloud["worldCacheUrgentRuns"] = mWorldCacheUrgentRuns;
+        cloud["worldCacheBudgetSkips"] = mWorldCacheBudgetSkips;
+        cloud["photonCostUs"] = uint32_t(mPhotonCostMs * 1000.f);
+        cloud["frameBaseUs"] = uint32_t(mFrameBaseMs * 1000.f);
         cloud["worldCacheSliceUs"] = mPhotonSliceUs; // Async slices read back: their summed span on their queue ...
         cloud["worldCacheSlicesTimed"] = mPhotonSlices;
         cloud["worldCacheSlicesOver4Ms"] = mPhotonSlicesOver4Ms; // ... and those over 4 ms.
@@ -8936,6 +8952,20 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         {
             const uint32_t ready = (mGpuTimerFrame - 2u) % 3u;
             const uint64_t us = uint64_t(mpGpuTimers[ready]->getElapsedTime() * 1000.0);
+            // worldCacheBudgetMs: frames without photon updates give the frame's cost without them; a frame with updates, less that,
+            // their cost. An update beside the query cannot be timed by timestamps of its own (they would wait for the query), and
+            // what it adds to the frame is what the budget pays anyway.
+            {
+                const float frameMs = float(us) * 1e-3f;
+                if (mPhotonTimedUpdates[ready] == 0)
+                    mFrameBaseMs = mFrameBaseMs > 0.f ? 0.9f * mFrameBaseMs + 0.1f * frameMs : frameMs;
+                else if (mFrameBaseMs > 0.f)
+                {
+                    const float perUpdate = std::max(0.05f, frameMs - mFrameBaseMs) / float(mPhotonTimedUpdates[ready]);
+                    mPhotonCostMs = mPhotonCostMs > 0.f ? 0.8f * mPhotonCostMs + 0.2f * perUpdate : perUpdate;
+                }
+                mPhotonTimedUpdates[ready] = 0;
+            }
             mGpuTimeSumUs += us;
             ++mGpuTimeFrames;
             mGpuTimeOver[0] += us > 2000u;
@@ -9516,8 +9546,15 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         }
         else if (!mCloudTileBatches.empty())
             urgentLow = *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end());
-        const bool urgent = !converged && mWorldCacheUrgentTarget > 0 && mWorldCacheUrgentTarget < mWorldCacheTarget &&
-                            !mCloudTileBatches.empty() && (mParams.worldCacheSamples == 0 || urgentLow < float(mWorldCacheUrgentTarget));
+        // worldCacheUrgentAll: a second floor over every tile of the window (an update gives every starving tile a batch, so holding
+        // them all at F costs F updates a new row whatever their number). Without it a budget that runs few updates left the tiles
+        // beyond worldCacheUrgentNear unrefilled until they came near - lagbudget2: 14.0% of the sprint frame over 0.02 against
+        // the converged cache, ship 7.8%, the middle distance darker.
+        const bool urgentAll = !converged && mWorldCacheUrgentAll > 0 && mWorldCacheUrgentAll < mWorldCacheTarget && !mCloudTileBatches.empty() &&
+                               *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end()) < float(mWorldCacheUrgentAll);
+        const bool urgentNear = !converged && mWorldCacheUrgentTarget > 0 && mWorldCacheUrgentTarget < mWorldCacheTarget &&
+                                !mCloudTileBatches.empty() && (mParams.worldCacheSamples == 0 || urgentLow < float(mWorldCacheUrgentTarget));
+        const bool urgent = urgentAll || urgentNear;
         if (!mWorldCacheAsync || urgent)
             mAsyncPhotonPending = false;
         else if (mWorldCacheAsyncSpan && photonSliceRunning() && !converged && !focus)
@@ -9556,6 +9593,22 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // spread it, so the continuation is spread here, sync, and stays focused (worldCacheFocusFar).
         if (runHere && !urgent && mWorldCacheContinueEvery > 1 && mWorldCacheUrgentTarget > 0 && mExecuteFrames % mWorldCacheContinueEvery != 0)
             runHere = false;
+        // worldCacheBudgetMs: the continuation spends the headroom only (urgent updates are the floor and always run).
+        if (runHere && !urgent && mWorldCacheBudgetMs > 0.f && mGpuTiming && mFrameBaseMs > 0.f)
+        {
+            const float cost = mPhotonCostMs > 0.f ? mPhotonCostMs : mWorldCacheBudgetMs;
+            mPhotonCreditMs = std::min(mPhotonCreditMs + std::max(0.f, mWorldCacheBudgetMs - mFrameBaseMs), 2.f * cost);
+            if (mPhotonCostMs > 0.f && mPhotonCreditMs < cost)
+            {
+                runHere = false;
+                ++mWorldCacheBudgetSkips;
+            }
+            else
+                mPhotonCreditMs = std::max(0.f, mPhotonCreditMs - cost * float(mWorldCacheUpdates));
+        }
+        // worldCacheBudgetMs: this frame's slot of the pass timer carries updates (their cost is read from it two frames late).
+        if (runHere && mWorldCacheUpdates > 0 && mGpuTiming)
+            mPhotonTimedUpdates[mGpuTimerFrame % 3u] = mWorldCacheUpdates;
         mWorldCacheWanted = !converged; // dispatchAsyncPhotons refreshes stale copies only while updates run.
         if (!mDeferredDepositWarm && mParams.worldCacheEstimator != 0 && mParams.worldCacheTextured != 0)
         {
@@ -9734,7 +9787,6 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             ++mWorldCacheBakes; // Buffer lookups see every update.
             mWorldCacheBakeDirty = true;
         }
-
         // Bake the means into hardware-filtered textures for the camera whenever the sums changed.
         if (!mpWorldCacheTextures[0] || mpWorldCacheTextures[0]->getWidth() != dims.x || mpWorldCacheTextures[0]->getHeight() != dims.y ||
             mpWorldCacheTextures[0]->getDepth() != dims.z)
@@ -9763,7 +9815,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         const uint32_t bakeEvery = mWorldCacheBakeInterval * (mWorldCacheBakeSliced ? std::max(mWorldCacheSlices, 1u) : 1u);
         // converged: the updates have stopped, so the last ones are baked now. FOUND (neartrace1, 4K sprint 20, target 26): the
         // cache converged at sample 218, two past the bake at 216, and the camera's tiles showed 24 batches until the next tile burst.
-        bool bakeDue = mWorldCacheUpdates == 0 || converged || mParams.worldCacheSamples % bakeEvery == 0 || mWorldCacheBakeOwed;
+        // worldCacheBudgetMs: an urgent update (the camera's tiles under the floor) is baked the next frame, after its deposits
+        // landed (beside the query they land after this point). Every 8 updates, a budget that runs few left the camera on a bake
+        // up to ~100 frames old (budget2: the camera's tiles 3.6 baked batches on average against 10 shipped).
+        const bool urgentLanded = mWorldCacheUrgentBakeOwed;
+        // The camera's tiles only (worldCacheUrgentTarget within worldCacheUrgentNear): with worldCacheUrgentAll every floor update
+        // baked (~0.3 ms each, 55 a sprint chunk in floor6).
+        mWorldCacheUrgentBakeOwed = runHere && urgentNear && mWorldCacheBudgetMs > 0.f;
+        bool bakeDue = mWorldCacheUpdates == 0 || converged || mParams.worldCacheSamples % bakeEvery == 0 || mWorldCacheBakeOwed || urgentLanded;
         // worldCacheAsyncSpan: the tile counts already hold a running slice's share, its deposits not yet: the bake waits a frame.
         if (bakeDue && mWorldCacheBakeDirty && photonSliceRunning())
         {

@@ -279,6 +279,9 @@ private:
     uint32_t mWorldCacheUrgentTarget = 26;
     /// worldCacheUrgentNear (0: every tile): worldCacheUrgentTarget counts only the tiles within this many of the camera's.
     uint32_t mWorldCacheUrgentNear = 0;
+    /// worldCacheUrgentAll (0: off): updates are urgent while any tile of the window holds fewer batches than this (the floor
+    /// under worldCacheBudgetMs for the tiles beyond worldCacheUrgentNear).
+    uint32_t mWorldCacheUrgentAll = 0;
     /// worldCacheContinueEvery (0 / 1: every frame): with no tile urgent, the update on to worldCacheTarget runs every this many frames.
     /// MEASURED, left off (continue1, 4K sunset sprint 20, tiles applied after each walk, focus 1/16 sync, 3 x 240 frames an arm;
     /// chunk GPU, near-camera batches mean / frames under 26 of 720): t40 3.69 / 3.57 ms, 32.6 / 168 and 31.2 / 198; target 64
@@ -287,6 +290,23 @@ private:
     /// defers them: those tiles reach the camera short and run urgent (319-371 of 370-454 updates). Parked it reaches 64 in ~180
     /// frames.
     uint32_t mWorldCacheContinueEvery = 0;
+    /// worldCacheBudgetMs (0: off): the refill on to worldCacheTarget runs only from the frame's headroom under this GPU budget, so
+    /// it scales with what the scene costs (a sparse sky refills every frame, the dense sprinting sea when it can) and the
+    /// converged image keeps the target's quality. Each frame credits max(0, budget - the frame's cost without photons) - the
+    /// pass timer of frames without updates, read two frames late and smoothed - and an update runs when the credit covers its
+    /// cost (the pass time of frames with one, less that; beside the query an update cannot be timed on its own). The credit is
+    /// capped at two updates. Urgent updates (worldCacheUrgentTarget within worldCacheUrgentNear) are the floor and run whatever
+    /// the credit. Shipped by the sunset launcher at 2 ms with floors of 6 (IntelCloudSeaHalf.py has the measurements: floor6
+    /// sprint 3.545 / 3.423 -> 3.217 ms, sparse1 unchanged, budgetpt1 identical parked score).
+    /// FOUND (budget1): beside the query (worldCacheBesideQuery) the update has no timestamps of its own, so a timer around the
+    /// update loop read 0 and the gate never closed; its cost is now the frame with it less the frames without.
+    float mWorldCacheBudgetMs = 0.f;
+    std::array<uint32_t, 3> mPhotonTimedUpdates = {}; ///< Photon updates in the pass timer's slot (0: none).
+    float mPhotonCostMs = 0.f;   ///< Smoothed frame cost of one photon update.
+    float mFrameBaseMs = 0.f;    ///< Smoothed pass GPU time less its photon updates.
+    float mPhotonCreditMs = 0.f; ///< Headroom saved toward the next update.
+    uint64_t mWorldCacheBudgetSkips = 0; ///< Frames whose wanted update waited for credit (cloudStats worldCacheBudgetSkips).
+    bool mWorldCacheUrgentBakeOwed = false; ///< worldCacheBudgetMs: last frame ran an urgent update, so this frame bakes it.
     /// seaApplyAfterWalk: finished sea tiles are held only while a residency cut is still walking, not until the residency took
     /// the finished walk on (which launched the next at once: in a sprint the sea applied in bursts, see the sea update).
     /// Held, the sprinting camera outran its window and the desired bricks fell to ~0 (applywalk1): the old gate's speed was missing

@@ -42,6 +42,8 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "worldCacheAsyncRuns", "worldCacheAsyncWaits", "worldCacheAsyncFallbacks",
             # worldCacheUrgentTarget: main-queue whole-batch updates run while a tile was under it.
             "worldCacheUrgentRuns", "seaApplyEvents",
+            # worldCacheBudgetMs: frames whose wanted continuation waited for the frame budget's credit.
+            "worldCacheBudgetSkips",
             # worldCacheAsyncSpan: main-queue writes that waited for a running slice, slices that followed a running one, bakes put off.
             "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy", "worldCacheBakesPutOff", "worldCacheBakes",
             # Async slices timed on their own queue (hstrPhotonProbe): summed span in us, how many, how many over 4 ms.
@@ -55,6 +57,7 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
             f"cutEnteredL{k}" for k in range(8))
 LEVELS = ("desired", "mapped", "pending", "mapBacklog", "sunWaiting", "sunBakesFrame", "sunSlotsFree", "sunStale","beamWarpOn", "beamPolicyToleranceNow",
+          "photonCostUs", "frameBaseUs",  # worldCacheBudgetMs: an update's smoothed GPU cost, the frame's without photons.
           "beamMarchTiles", "bindCpuMs", "loaded", "slotsUsed", "freeSlots", "freeBricks", "committed", "commitFails",
           "evictCalls", "evictFreed", "evictCandidates", "evictScans", "loadHeld", "loadScanned", "undesiredFadingOut", "undesiredHeld",
           "undesiredIdle", "activeFades", "cuts", "cutEntered", "sunStampStores", "sunStampFresh", "sunStampCheckStores",
@@ -174,10 +177,11 @@ def score():
         # FOUND (lagscore4, residency frozen): still not a refill gate. Converging adds batches to every tile, not only the
         # restarted ones, so the second score compares two noise realizations of the cache: ship 5.57 -> 12.18%, no refill 4.72 ->
         # 9.40%, span4 5.42 -> 9.23%, the difference signed ~0 and spread over 14-40% of the band's pixels (difference images).
-        keys = ("worldCacheUpdates", "worldCacheAsync", "worldCacheAsyncSpan", "worldCacheSlices", "cloudResidencyFrozen")
+        # worldCacheBudgetMs off while converging: its skips read as idle frames and ended the convergence after 4 frames (lagbudget1).
+        keys = ("worldCacheUpdates", "worldCacheAsync", "worldCacheAsyncSpan", "worldCacheSlices", "cloudResidencyFrozen", "worldCacheBudgetMs")
         arm = {k: hstr.properties[k] for k in keys if k in hstr.properties}
         hstr.set_properties({"compareReference": False, "compareExact": False, "worldCacheUpdates": 1, "worldCacheAsync": False,
-                             "worldCacheAsyncSpan": False, "worldCacheSlices": 1, "cloudResidencyFrozen": True})
+                             "worldCacheAsyncSpan": False, "worldCacheSlices": 1, "cloudResidencyFrozen": True, "worldCacheBudgetMs": 0.0})
         last, idle, converge = None, 0, 0
         while idle < 3 and converge < 150:
             m.renderFrame()
