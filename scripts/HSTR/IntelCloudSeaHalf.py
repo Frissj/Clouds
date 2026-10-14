@@ -24,10 +24,21 @@ g.addPass(createPass("HSTRCloud", {
     # Clamped to the resident window of tiles around the camera.
     "seaViewDistance": 20000.0,
     "worldCacheCellVoxels": int(os.environ.get("HSTR_SEA_CELL", "4")),
-    "worldCachePhotons": 65536,
+    # 262144 photons a batch, 10 batches a tile (worldCacheTarget below): the photon total of 40 x 65536. A focused update is
+    # bound by its latency, not its photons, so bigger batches are cheaper per photon. MEASURED (photonsize1, 4K sunset sprint
+    # 20, 3 x 240 frames, chunk GPU / ms an update over norefill 2.31): 65536 x 40 3.75 / 4.14 (anchor), 2.76-3.13 ms an update;
+    # 131072 x 20 3.43, 4.95; 262144 x 10 3.37, 8.2 - per 65536 photons 2.76-3.13 / 2.48 / 2.05. Path trace (photonpt1, hill,
+    # whole cache from a restart): excess 0.023239 (anchor identical) / 0.023433 / 0.023072, p99 0.4871 / p99.9 0.6889 in all;
+    # sanity 65536 x 10 0.023832 - quality is the photon total's. Cost: an update frame pays ~8 ms of photons, not ~3.
+    # Smaller batches do not buy the spikes back (spikefront1, stratified, 2 x 240 frames, HSTRCloud GPU per frame - mean, frames
+    # over 4 / 6 ms, longest): sprint 20 262144 x 10 3.04, 34 / 29, 16.2 ms (again 3.04 / 3.02, 25 / 22-24, 17.1); 131072 x 20
+    # 3.38, 60 / 31, 15.1; 65536 x 40 3.65 / 3.60, 101 / 17-18, 12.9-13.1. Walk 2 alike (262144 x 10 2.22-2.78, 65536 x 40 3.2-3.3).
+    # The longest frame without any refill is ~10 ms (spikes1), so the floor of the spikes is not the photons'.
+    "worldCachePhotons": 262144,
     "worldCacheUpdates": 1,
     "worldCacheBakeInterval": 8,
-    # Refill: 40 batches a tile, sync, photons focused on the starving tiles (1/16 survive elsewhere, weighted 16). A deliberate
+    # Refill: 40 batches of 65536 photons a tile (10 of 262144, worldCachePhotons above), sync, photons focused on the starving
+    # tiles (1/16 survive elsewhere, weighted 16). The numbers below are of 65536-photon batches. A deliberate
     # approximation of the parked image: path trace (t40pt1, hill 960 wide, whole cache from a restart) excess 0.023239 against
     # 0.022971 at 64 (+1.2%), p99 0.4871 / p99.9 0.6889 unchanged, max 0.824 / 0.827 (sanity t10 0.023832); focus 1/16 0.022927
     # (focuspt2). For it, honest sprint (focushonest2 / continue1, 4K sunset sprint 20, tiles applied after each walk, 3 x 240
@@ -37,11 +48,36 @@ g.addPass(createPass("HSTRCloud", {
     # current1 (these launcher defaults, 2 x 240-frame chunks, desired 243k): walk 2 2.70 / 2.90 ms (160 focused updates, 48
     # tiles applied in 4 events, backlog 55-77k), sprint 20 3.76 / 3.31 (204 updates, 447 tiles); parked after either, draining
     # at the 512 bake cap, 1.46-1.81. The walk refills now: under the old apply gate it applied no tile in 240 frames.
-    "worldCacheTarget": 40,
+    "worldCacheTarget": 10,
     "worldCacheFocusFar": 0.0625,
+    # Stratified photon spawn: consecutive photons side by side along a Morton curve of the face, sources in contiguous index
+    # ranges, every photon still uniform. MEASURED (strattime1, 4K sunset parked, 10 rows restarted, 4 profiled rounds a arm):
+    # photon update 7.56-7.67 / 7.52-7.68 ms (ship, anchor) -> 6.48-6.66 (-13%). Path trace (stratpt2, hill, whole cache from a
+    # restart, seeds 0 / 1 / 2): excess 0.023072 / 0.022793 / 0.023038 (mean 0.022968) -> 0.023335 / 0.022900 / 0.022974 (mean
+    # 0.023070, +0.4% within the 0.0003-0.0004 seed spread); p99 0.4871 / p99.9 0.6889 in all; anchor identical. At 65536 x 10
+    # it beats iid spawns (0.023488 against 0.023832, stratpt1 / patchpt1). worldCachePatch (random patches) failed the gate.
+    "worldCacheStratify": True,
+    # Flight cull: under focus, a photon flight whose cells (box + 1 cell) lie only in tiles taking no deposits skips its deposit
+    # walk. Exact by construction. MEASURED (cullpark1, 4K sunset parked, 2 rows restarted, 4 profiled rounds): photon update
+    # 6.59-6.85 ms (ship, anchor) -> 4.73-4.98 (-28%). Path trace (cullpt2, hill, 4 rows restarted, refilled under focus, seeds
+    # aligned across arms): ship / cull / ship again excess 0.023210 identical to the last digit; misaligned sanity 0.023412,
+    # flightCull 2 (cull everything) 0.077495 (cullpt1) - the gate sees the refilled rows.
+    # Moving (cullslice1, 4K sunset, 2 x 240 frames, HSTRCloud GPU, chunk mean / frames over 6 ms): walk 2 cull 2.25 / 2.41 (5 /
+    # 8), off 2.78 / 2.44 (19 / 9), cull again 2.53 / 2.58 (13 / 8); sprint 20 cull 2.82 / 2.86 (17 / 22), off 3.02 (20; its 2nd
+    # chunk's desired collapsed to 39k), again 3.07 / 2.89 (26 / 18). 70-85% of sprint photon frames still go over 6 ms.
+    "worldCacheFlightCull": True,
+    # Focus roulette: under focus, a photon scattering more than one tile (wrapped, Chebyshev) from every starving tile survives at
+    # 1/8, weighted up (weight window, never rolled twice). Unbiased. MEASURED (roulettepark1, 4K sunset parked, 2 rows restarted,
+    # 4 profiled rounds): photon update 4.20-4.57 / 4.24-4.47 ms (ship, anchor) -> 3.25-3.47 at 1/8 (-24%); 1/4 3.51-3.59; 1/8 at
+    # reach 2 3.51-3.76; ceiling (1e-4) 3.01-3.16. Frames over 6 ms in the 120-frame chunk 7 -> 0. Path trace (roulettept3, hill
+    # 960 wide, 4 rows restarted, refilled under focus, launcher beam, seeds aligned): ship / ship again 0.024521 identical, 1/8
+    # 0.024568 (+0.2%), 1/4 0.024512, sanity 1e-4 0.024796; seed spread (ship misaligned) 0.024731; p99 0.4871 / p99.9 0.6889 in all.
+    "worldCacheFocusRoulette": 0.125,
     "worldCacheUrgentTarget": 0,
     "worldCacheAsync": False,
     "worldCacheAsyncSpan": False,
+    # 2 slices with the flight cull (cullslice1, as above): walk 2.38 / 2.97 ms (3 / 6 frames over 6 ms), sprint 3.24 / 2.84 (29
+    # / 18) - fewer walk spikes, but the mean +0.1-0.4 in 3 of 4 chunks and more frames over 3 / 4 ms. Before the cull: slicespike1.
     "worldCacheSlices": 1,
     "sunNearVoxels": 2.0,
     # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross

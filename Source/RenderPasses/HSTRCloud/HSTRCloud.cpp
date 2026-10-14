@@ -522,6 +522,21 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheFocusFar = std::clamp(float(value), 0.f, 1.f);
             continue;
         }
+        if (key == "worldCacheFocusReach")
+        {
+            mWorldCacheFocusReach = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheFocusRoulette")
+        {
+            mParams.worldCacheFocusRoulette = std::clamp(float(value), 1e-6f, 1.f);
+            continue;
+        }
+        if (key == "worldCacheFocusRouletteReach")
+        {
+            mWorldCacheFocusRouletteReach = uint32_t(value);
+            continue;
+        }
         if (key == "cloudStagingPool")
         {
             mCloudStagingPool = std::min(uint32_t(value), 2u);
@@ -560,6 +575,31 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "worldCacheBounceCap")
         {
             mParams.worldCacheBounceCap = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCachePatch")
+        {
+            mParams.worldCachePatch = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCachePatchSurvive")
+        {
+            mParams.worldCachePatchSurvive = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "worldCacheStratify")
+        {
+            mParams.worldCacheStratify = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "worldCacheSeed")
+        {
+            mParams.worldCacheSeed = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheFlightCull")
+        {
+            mParams.worldCacheFlightCull = uint32_t(value); // 2: SANITY, every flight culled under focus
             continue;
         }
         if (key == "worldCacheAsyncSpan")
@@ -2317,6 +2357,9 @@ Properties HSTRCloud::getProperties() const
     props["worldCacheContinueEvery"] = mWorldCacheContinueEvery;
     props["seaApplyAfterWalk"] = mSeaApplyAfterWalk;
     props["worldCacheFocusFar"] = mWorldCacheFocusFar;
+    props["worldCacheFocusReach"] = mWorldCacheFocusReach;
+    props["worldCacheFocusRoulette"] = mParams.worldCacheFocusRoulette;
+    props["worldCacheFocusRouletteReach"] = mWorldCacheFocusRouletteReach;
     props["worldCacheSlices"] = mWorldCacheSlices;
     props["worldCacheAsync"] = mWorldCacheAsync;
     props["worldCacheAsyncSpan"] = mWorldCacheAsyncSpan;
@@ -2600,6 +2643,8 @@ Properties HSTRCloud::getProperties() const
         cloud["photonCells"] = mPhotonCells; // Deposit walks' cells crossed, cells deposited into, collision steps.
         cloud["photonDeposited"] = mPhotonDeposited;
         cloud["photonSteps"] = mPhotonSteps;
+        cloud["photonFlushLanes"] = mPhotonFlushLanes; // Cell flushes, and their groups by cell among the lanes flushing together.
+        cloud["photonFlushGroups"] = mPhotonFlushGroups;
         cloud["worldCacheAsyncSpanWaits"] = mWorldCacheAsyncSpanWaits;
         cloud["worldCacheAsyncBusy"] = mWorldCacheAsyncBusy;
         cloud["worldCacheBakesPutOff"] = mWorldCacheBakesPutOff;
@@ -2621,6 +2666,11 @@ Properties HSTRCloud::getProperties() const
         if (mpCloudSea && mpScene)
         {
             cloud["seaPendingTiles"] = mpCloudSea->pendingTiles();
+            cloud["seaReadyTiles"] = mpCloudSea->readyTiles();
+            cloud["seaHoldFrames"] = mSeaHoldFrames;
+            cloud["seaHoldBusyFrames"] = mSeaHoldBusyFrames;
+            cloud["seaHoldLongest"] = mSeaHoldLongest;
+            mSeaHoldLongest = 0;
             const float3 position = mpScene->getCamera()->getPosition();
             cloud["cameraTileZ"] = int32_t(std::floor((position.z - mpCloudSea->getDesc().origin.z) / mpCloudSea->getDesc().tileWorld));
         }
@@ -2641,6 +2691,21 @@ Properties HSTRCloud::getProperties() const
         cloud["skirtDirtyWork"] = mSkirtDirtyWork;
         cloud["gpuTimeSum"] = mGpuTimeSumUs;
         cloud["gpuTimeFrames"] = mGpuTimeFrames;
+        cloud["gpuTimeOver2Ms"] = mGpuTimeOver[0]; // Frames over 2 / 3 / 4 / 6 ms, and the longest since the last read.
+        cloud["gpuTimeOver3Ms"] = mGpuTimeOver[1];
+        cloud["gpuTimeOver4Ms"] = mGpuTimeOver[2];
+        cloud["gpuTimeOver6Ms"] = mGpuTimeOver[3];
+        cloud["gpuTimeMaxUs"] = mGpuTimeMaxUs;
+        mGpuTimeMaxUs = 0;
+        // Frames over 6 ms and what they ran, against all frames (mSpikeSnaps' events).
+        cloud["spikeFrames"] = mSpikeFrames;
+        cloud["spikeQuiet"] = mSpikeQuiet;
+        static const char* kSpikeNames[kSpikeEvents] = {"Tiles", "Cut", "SunRun", "Upload", "Photons", "Bake", "SunBakes"};
+        for (uint32_t k = 0; k < kSpikeEvents; ++k)
+        {
+            cloud[std::string("spikeWith") + kSpikeNames[k]] = mSpikeWith[k];
+            cloud[std::string("framesWith") + kSpikeNames[k]] = mFramesWith[k];
+        }
         cloud["sunResolveFrames"] = mSunResolveFrames;
         cloud["sunResolveTouchFrames"] = mSunResolveTouchFrames;
         cloud["sunTouchChecks"] = mSunTouchChecks;
@@ -2685,6 +2750,11 @@ Properties HSTRCloud::getProperties() const
         cloud["pendingTiles"] = mpCloudSea ? mpCloudSea->pendingTiles() : 0u;
         cloud["seaTilesChanged"] = mSeaTilesChanged;
         cloud["seaApplyEvents"] = mSeaApplyEvents;
+        cloud["desiredSum"] = mDesiredSum;
+        cloud["mappedSum"] = mMappedSum;
+        cloud["desiredFrames"] = mDesiredFrames;
+        cloud["desiredLow"] = mDesiredLow == UINT32_MAX ? 0u : mDesiredLow;
+        mDesiredLow = UINT32_MAX;
         cloud["beamInvalidateAllBuilds"] = mBeamInvalidateAllBuilds;
         cloud["beamSphereBuilds"] = mBeamSphereBuilds;
         cloud["beamSpheresTotal"] = mBeamSpheresTotal;
@@ -4205,9 +4275,9 @@ void HSTRCloud::buildCloudDomain()
     mpCloudTileReset = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileReset.data(), false
     );
-    mCloudTileFocus.assign(tileCount, 1.f);
+    mCloudTileFocus.assign(2 * tileCount, 1.f); // Spawn survival, then worldCacheFocusRoulette's in-flight survival.
     mpCloudTileFocus = mpDevice->createStructuredBuffer(
-        sizeof(float), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileFocus.data(), false
+        sizeof(float), 2 * tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, mCloudTileFocus.data(), false
     );
     mDomainPassesBound = false; // The world cache clear reads the tile resets.
     std::vector<uint32_t> slots(tileCount);
@@ -4702,6 +4772,17 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         // Never behind the residency's own count (it ran a frame at a time before, e.g. through the settle).
         mResidencyFrame = std::max(mResidencyFrame, mpCloudResidency->getFrame());
     }
+    if (!residencyBusy && mpCloudResidency)
+    {
+        // cloudStats: desired and mapped summed over frames (and the fewest desired), so a chunk's mean is read without the
+        // per-frame stats readbacks that perturbed sprinttrace1 (chunk GPU 5.5 ms against ~3 untraced).
+        const auto& stats = mpCloudResidency->getStats();
+        mDesiredSum += stats.desired;
+        mMappedSum += stats.mapped;
+        mDesiredLow = std::min(mDesiredLow, stats.desired);
+        ++mDesiredFrames;
+        mResidencyEventsSeen = {uint64_t(stats.cuts), uint64_t(stats.sunRuns), uint64_t(stats.uploadBytes)};
+    }
     const bool frameClock = mCloudResidencySkipBusy && mLateDomain;
     // The GPU's fades at this frame (after the replayed update's own fade frame, which is its launch frame's): every frame under
     // cloudResidencySkipBusy, those without an update included.
@@ -4751,6 +4832,21 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             // A busy residency update may be launching a cut: nothing touches mCutJob then (residencyBusy short-circuits).
             const bool hold = mpCloudResidency &&
                               (residencyBusy || (mSeaApplyAfterWalk ? mpCloudResidency->cutRunning() : mpCloudResidency->cutInFlight()));
+            // DIAGNOSTIC (cloudStats seaHold*): frames that held finished tiles back, by the residency update or the walk, and the
+            // longest run of them since the last read - a sprint's desired set collapses when the camera outruns its window.
+            // FOUND (seahold1, 4K sunset sprint 20 alone, 8 x 240 frames, traced every 20): tiles held on 1564 of 1920 frames (864
+            // of them by a busy update), runs up to 89 frames with 96 tiles (6 rows) ready; desired dipped to 122k at a 4-6 row lag.
+            // The walks are CPU-bound and back to back: 6-7 a chunk, ~200 ms each (parallel phase ~150). The window trails the camera
+            // by a walk; a slower walk past the ~7 visible rows ahead empties the view (roulettemove1 / cullslice1: chunk means of
+            // 3.6k-39k desired, tiles changed 55-137 a chunk against ~232 crossed, then 405 when they land).
+            if (hold && mpCloudSea->readyTiles() > 0)
+            {
+                ++mSeaHoldFrames;
+                mSeaHoldBusyFrames += residencyBusy ? 1u : 0u;
+                mSeaHoldLongest = std::max(mSeaHoldLongest, ++mSeaHoldRun);
+            }
+            else
+                mSeaHoldRun = 0;
             changed = mpCloudSea->update(camera->getPosition(), !hold);
         }
     }
@@ -5580,6 +5676,8 @@ void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
                 mPhotonCells += p[10];
                 mPhotonDeposited += p[11];
                 mPhotonSteps += p[12];
+                mPhotonFlushLanes += p[13];
+                mPhotonFlushGroups += p[14];
             }
             mPhotonProbeFrame[slot] = 0;
         }
@@ -8542,9 +8640,31 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
         if (mGpuTimerFrame >= 2u)
         {
             const uint32_t ready = (mGpuTimerFrame - 2u) % 3u;
-            mGpuTimeSumUs += uint64_t(mpGpuTimers[ready]->getElapsedTime() * 1000.0);
+            const uint64_t us = uint64_t(mpGpuTimers[ready]->getElapsedTime() * 1000.0);
+            mGpuTimeSumUs += us;
             ++mGpuTimeFrames;
+            mGpuTimeOver[0] += us > 2000u;
+            mGpuTimeOver[1] += us > 3000u;
+            mGpuTimeOver[2] += us > 4000u;
+            mGpuTimeOver[3] += us > 6000u;
+            mGpuTimeMaxUs = std::max(mGpuTimeMaxUs, us);
+            // That frame's events: the snapshot of the frame after it less its own.
+            const auto& from = mSpikeSnaps[ready];
+            const auto& to = mSpikeSnaps[(mGpuTimerFrame - 1u) % 3u];
+            const bool spike = us > 6000u;
+            bool any = false;
+            for (uint32_t k = 0; k < kSpikeEvents; ++k)
+            {
+                const bool ran = to[k] != from[k];
+                mFramesWith[k] += ran;
+                mSpikeWith[k] += spike && ran;
+                any = any || ran;
+            }
+            mSpikeFrames += spike;
+            mSpikeQuiet += spike && !any;
         }
+        mSpikeSnaps[slot] = {mSeaTilesChanged, mResidencyEventsSeen[0], mResidencyEventsSeen[1], mResidencyEventsSeen[2],
+                             mWorldCacheUpdatesRun, mWorldCacheBakes, mSunBakeFrames};
         pTimer = mpGpuTimers[slot].get();
         pTimer->begin();
     }
@@ -9012,7 +9132,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // one tile either side and one downwind); the rest survive their spawn at worldCacheFocusFar, weighted by its inverse.
         bool focus = false;
         if (!converged && mWorldCacheFocusFar > 0.f && mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && mpCloudSea &&
-            mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 && mCloudTileFocus.size() == mCloudTileBatches.size())
+            mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 && mCloudTileFocus.size() == 2 * mCloudTileBatches.size())
         {
             const size_t tileCount = mCloudTileBatches.size();
             uint32_t hungry = 0;
@@ -9025,7 +9145,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 const auto& seaDesc = mpCloudSea->getDesc();
                 const float reach = std::abs(sun.y) > 1e-3f ? seaDesc.layerHeight * length(sun.xz()) / std::abs(sun.y) : 1e9f;
                 const int32_t n = int32_t(seaDesc.tiles);
-                const int32_t steps = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
+                // worldCacheFocusReach (tiles, 0: the geometric reach): at a low sun the reach spans the window, so every tile is near.
+                const int32_t geometric = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
+                const int32_t steps = mWorldCacheFocusReach > 0 ? std::min(geometric, int32_t(mWorldCacheFocusReach)) : geometric;
                 const float2 downwind = length(sun.xz()) > 1e-6f ? -normalize(sun.xz()) * (sun.y >= 0.f ? 1.f : -1.f) : float2(0.f);
                 std::vector<uint8_t> nearTile(tileCount, 0);
                 for (uint32_t slot = 0; slot < tileCount; ++slot)
@@ -9042,11 +9164,23 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                             nearTile[x + n * z] = 1;
                         }
                 }
+                // worldCacheFocusRoulette: tiles within worldCacheFocusRouletteReach of a starving tile keep every scattered photon.
+                std::vector<uint8_t> keepTile(tileCount, 0);
+                const int32_t keepReach = int32_t(mWorldCacheFocusRouletteReach);
+                for (uint32_t slot = 0; slot < tileCount; ++slot)
+                {
+                    if (mCloudTileBatches[slot] >= float(mWorldCacheTarget))
+                        continue;
+                    for (int32_t dz = -keepReach; dz <= keepReach; ++dz)
+                        for (int32_t dx = -keepReach; dx <= keepReach; ++dx)
+                            keepTile[((int32_t(slot % n) + dx) % n + n) % n + n * (((int32_t(slot / n) + dz) % n + n) % n)] = 1;
+                }
                 uint32_t nearCount = 0;
                 for (size_t slot = 0; slot < tileCount; ++slot)
                 {
                     const bool starving = mCloudTileBatches[slot] < float(mWorldCacheTarget);
                     mCloudTileFocus[slot] = starving ? 1.f : (nearTile[slot] ? -1.f : -mWorldCacheFocusFar);
+                    mCloudTileFocus[tileCount + slot] = keepTile[slot] ? 1.f : mParams.worldCacheFocusRoulette;
                     nearCount += nearTile[slot];
                 }
                 waitPhotonSlice(pRenderContext);

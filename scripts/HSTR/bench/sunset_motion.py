@@ -48,7 +48,8 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "worldCacheSliceUs", "worldCacheSlicesTimed", "worldCacheSlicesOver4Ms",
             # Their waves and photons (hstrPhotonProbe, traceWorldCachePhotons).
             "photonWaveUs", "photonWaves", "photonLongestWaveUs", "photonLongestWaveFlights", "photonFlights", "photonsTraced",
-            "photonSunFlights", "photonSunTraced", "photonCells", "photonDeposited", "photonSteps",
+            "photonSunFlights", "photonSunTraced", "photonCells", "photonDeposited", "photonSteps", "photonFlushLanes",
+            "photonFlushGroups",
             # The fewest baked batches among the tiles within 3 of the camera, summed over frames, and frames under 10 / 26.
             "worldCacheNearLowSum", "worldCacheNearFrames", "worldCacheNearUnder10", "worldCacheNearUnder26",
             "sunFineRuns", "sunFineFallbacks", "sunFineCells", "sunFineUploadBytes", "cutOrderedCount", "cutEntered", "cutLeft", "cutReentered") + tuple(
@@ -361,9 +362,22 @@ def profile(tag, frames, speed, report=None):
         leaves = {n: l for n, l in lanes.items() if not any(p.startswith(n.rsplit("/", 1)[0] + "/") for p in paths)}
         means = sorted(((sum(l["records"]) / max(len(l["records"]), 1), n) for n, l in leaves.items()), reverse=True)
         frame = next((sum(l["records"]) / len(l["records"]) for n, l in lanes.items() if n.endswith("/onFrameRender/" + kind)), 0.0)
-        print(f"MOTION {tag} profiled frame {kind} {frame:.2f} ms; top leaves:", flush=True)
-        for value, name in means[:12]:
+        # HSTR_MOTION_PROFILE_LEAVES: how many leaves to print (default 12), with the sum of all leaves.
+        print(f"MOTION {tag} profiled frame {kind} {frame:.2f} ms; leaves sum {sum(v for v, _ in means):.2f} ms; top leaves:",
+              flush=True)
+        for value, name in means[:int(os.environ.get("HSTR_MOTION_PROFILE_LEAVES", "12"))]:
             print(f"MOTION {tag}   {value:6.3f} ms  {name.rsplit('/', 1)[0].split('/onFrameRender/')[-1]}", flush=True)
+        if os.environ.get("HSTR_MOTION_PROFILE_LEAVES"):
+            # Self time of every scope with children: its mean less its children's - work recorded outside any child scope (or a
+            # wait inside it), which no leaf shows.
+            mean_of = {n.rsplit("/", 1)[0]: sum(l["records"]) / max(len(l["records"]), 1) for n, l in lanes.items()}
+            selfs = []
+            for path, value in mean_of.items():
+                children = [v for p, v in mean_of.items() if p.rsplit("/", 1)[0] == path]
+                if children:
+                    selfs.append((value - sum(children), path))
+            for value, path in sorted(selfs, reverse=True)[:12]:
+                print(f"MOTION {tag}   self {value:6.3f} ms  {path.split('/onFrameRender/')[-1]}", flush=True)
         # HSTR_MOTION_PROFILE_MATCH (a regex): these scopes always, with the frames they ran in and their mean over all frames - a
         # pass that runs on some frames only (the sun stamp) drops out of the top list or reads its mean over its own frames.
         # Any scope, not only leaves: the profiler keeps every event it has seen, so a scope whose children stopped running in
@@ -474,14 +488,22 @@ for speed_i, speed in enumerate(speeds):
                 if trace_every < CHUNK:
                     s = cloud_stats()
                     print(f"MOTION {tag} trace {name} frame {start + len(piece)}: " + str({k: s.get(k) for k in (
-                        "cameraTileZ", "seaPendingTiles", "seaTilesChanged", "worldCacheUpdatesRun", "worldCacheStarving",
-                        "worldCacheEmpty", "worldCacheNearLow", "worldCacheBakeLowBatches")}), flush=True)
+                        "cameraTileZ", "seaPendingTiles", "seaReadyTiles", "seaHoldFrames", "seaHoldBusyFrames", "seaHoldLongest",
+                        "seaTilesChanged", "seaApplyEvents", "desired", "mapped", "cuts",
+                        "cutBusyFrames", "worldCacheUpdatesRun", "worldCacheStarving", "worldCacheEmpty", "worldCacheNearLow",
+                        "worldCacheBakeLowBatches")}), flush=True)
             arm_walls[name] += walls[DROP:]
-            for k, v in delta(before, cloud_stats()).items():
-                arm_counts[name][k] = round(arm_counts[name].get(k, 0) + v, 2)
-            arm_levels[name].append(levels(cloud_stats()))
-            # Per chunk: residency and the timestamp pair's GPU time, so a slow drift and an arm's own effect can be told apart.
+            # One read: cloudStats resets desiredLow on read, so a second read in the same frame sees 0.
             now = cloud_stats()
+            for k, v in delta(before, now).items():
+                arm_counts[name][k] = round(arm_counts[name].get(k, 0) + v, 2)
+            arm_levels[name].append(levels(now))
+            # The frames over 6 ms and what they ran (cloudStats spike*), against how many of all frames ran each event.
+            events = ("Tiles", "Cut", "SunRun", "Upload", "Photons", "Bake", "SunBakes")
+            sd = lambda k: int(float(now.get(k) or 0) - float(before.get(k) or 0))
+            print(f"MOTION {tag} chunk {cycle} {name} spikes {sd('spikeFrames')} (none of these {sd('spikeQuiet')}): " +
+                  ", ".join(f"{e} {sd('spikeWith' + e)} of {sd('framesWith' + e)}" for e in events), flush=True)
+            # Per chunk: residency and the timestamp pair's GPU time, so a slow drift and an arm's own effect can be told apart.
             d = {k: (now.get(k) or 0) - (before.get(k) or 0) for k in ("gpuTimeSum", "gpuTimeFrames", "committedTotal",
                                                                       "committedCapped", "cuts", "cutEntered", "evictFreed",
                                                                       "cutWalkMsTotal", "cutBusyFrames", "cutIdleFrames",
@@ -496,12 +518,18 @@ for speed_i, speed in enumerate(speeds):
                                                                       "cutOrderedCount", "cutThresholdTrims", "cutUnderfilled",
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
                                                                       "scatterJobs", "scatterChecks", "scatterMismatches",
-                                                                      "seaTilesChanged", "residencySkips", "workerUpdateUs", "takeWaitUs")}
+                                                                      "seaTilesChanged", "residencySkips", "workerUpdateUs", "takeWaitUs",
+                                                                      "desiredSum", "mappedSum", "desiredFrames", "gpuTimeOver2Ms",
+                                                                      "gpuTimeOver3Ms", "gpuTimeOver4Ms", "gpuTimeOver6Ms")}
             gpu = float(d.get("gpuTimeSum") or 0) / max(float(d.get("gpuTimeFrames") or 0), 1.0) / 1000.0
-            print(f"MOTION {tag} chunk {cycle} {name}: gpu {gpu:.3f} ms ({d.get('gpuTimeFrames')} frames), wall p50 "
+            print(f"MOTION {tag} chunk {cycle} {name}: gpu {gpu:.3f} ms ({d.get('gpuTimeFrames')} frames; over 2 / 3 / 4 / 6 ms "
+                  f"{d.get('gpuTimeOver2Ms')} / {d.get('gpuTimeOver3Ms')} / {d.get('gpuTimeOver4Ms')} / {d.get('gpuTimeOver6Ms')}, "
+                  f"longest {float(now.get('gpuTimeMaxUs') or 0) / 1000.0:.2f}), wall p50 "
                   f"{sorted(walls)[len(walls) // 2]:.2f} ms mean {sum(walls[DROP:]) / max(len(walls) - DROP, 1):.2f}, tiles changed "
                   f"{d.get('seaTilesChanged')}, skips {d.get('residencySkips')}, worker {float(d.get('workerUpdateUs') or 0) / 1e3:.0f} ms "
-                  f"wait {float(d.get('takeWaitUs') or 0) / 1e3:.0f} ms, mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
+                  f"wait {float(d.get('takeWaitUs') or 0) / 1e3:.0f} ms, desired {now.get('desired')} mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
+                  f"(chunk mean desired {float(d.get('desiredSum') or 0) / max(float(d.get('desiredFrames') or 0), 1):.0f} mapped "
+                  f"{float(d.get('mappedSum') or 0) / max(float(d.get('desiredFrames') or 0), 1):.0f}, fewest desired {now.get('desiredLow')}) "
                   f"pending {now.get('pending')} committed {d.get('committedTotal')} ({d.get('committedCapped')} frames at the cap), "
                   f"cuts {d.get('cuts')} entered {d.get('cutEntered')} evicted {d.get('evictFreed')} "
                   f"fading out {now.get('undesiredFadingOut')} free {now.get('freeSlots')}, walk {d.get('cutWalkMsTotal'):.0f} ms "

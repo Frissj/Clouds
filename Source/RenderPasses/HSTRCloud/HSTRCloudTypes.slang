@@ -2213,6 +2213,41 @@ struct HSTRCloudParams
     /// A flight is short (13.2 collision steps, 8.5 cells walked, 3.9 deposited into); the kernel is latency bound - hence
     /// worldCacheDeferredDeposit.
     uint worldCacheKnock = 0;
+    /// worldCachePatch (sea only): each thread group's photons spawn in one patch of this many voxels a side, at an origin drawn
+    /// uniformly on the sea's periodic face, and share the group's source draw (sun or sky side); 0 each photon on its own.
+    /// Every photon's marginal position and source stay uniform / by power, so the estimate is unbiased; the group's photons
+    /// start together, so their density reads and cell flushes are coherent.
+    /// MEASURED and REJECTED (patchtime3/4, 4K sunset parked, 10 rows restarted, profiled photon update; patchpt1, hill path trace,
+    /// whole cache converged at 262144 x 10): update 7.67-8.08 ms (ship, anchor) -> 6.8-7.1 at patch 1-8 (32: 7.04-7.19, 128:
+    /// 7.27-7.44), but excess 0.023072 (anchor identical) -> 0.023858 at 8, 0.024228 at 1 - the quality of a quarter of the
+    /// photons (65536 x 10: 0.023832) for 10% of the time. The iid patch origins clump 64 correlated photons, and the group's
+    /// source draw moves the sun / sky split with them. worldCacheStratify keeps the coherence without the correlation.
+    uint worldCachePatch = 0;
+    /// worldCachePatchSurvive (with worldCachePatch): under focus a group's photons share their spawn survival draw, so a group
+    /// lives or dies as one (full waves or none) instead of each wave keeping ~1/16 of its lanes. Marginally the same 1/p.
+    /// MEASURED, no gain (patchtime4, as above, 10 of 16 rows hungry): patch 8 6.91-7.09 ms an update, with it 6.96-7.09.
+    uint worldCachePatchSurvive = 0;
+    /// worldCacheStratify (sea only): photon i of a batch of N takes u = frac((i + jitter) / N + batch offset). u picks the source
+    /// by power, so each source is a contiguous range of indices with its exact share, and u's place within the source walks a
+    /// Morton curve over the periodic face, so consecutive photons spawn next to each other. Every photon stays uniform (unbiased)
+    /// and the batch is stratified over the face (no clumps): wave coherence without worldCachePatch's correlation.
+    /// MEASURED (strattime1 / stratpt2, numbers beside the launcher default in IntelCloudSeaHalf.py, which turns it on): photon
+    /// update -13%, path-trace excess +0.4% over three seeds (within their spread), p99 / p99.9 unchanged.
+    uint worldCacheStratify = 0;
+    /// TEST (worldCacheSeed): turns every light-tracing batch's seed (tracePhoton / spawnPhoton), so a gate can score one setting
+    /// at several seeds; 0 the seeds as before.
+    uint worldCacheSeed = 0;
+    /// worldCacheFlightCull: under focus, a photon flight whose cells all lie in tiles taking no deposits skips its deposit walk
+    /// (flightTouchesFocus). Exact: a rejected cell changes neither the accumulator nor the random stream.
+    uint worldCacheFlightCull = 0;
+    /// worldCacheFocusRoulette (under focus): a photon scattering in a tile farther than worldCacheFocusRouletteReach tiles from
+    /// every starving tile survives at this probability (hstrCloudTileFocus's second half), weight-window style: survival
+    /// min(1, keep x its weight over its spawn weight), the survivor weighted up to 1 / keep, so one already carrying that weight
+    /// is not rolled again. Unbiased; only the light that wanders back from afar gets noisier. 1: off.
+    /// MEASURED (roulettepark1 / roulettept3, numbers beside the launcher default in IntelCloudSeaHalf.py, which sets 1/8): photon
+    /// update -24% parked with 2 rows restarted; path-trace excess +0.2% seed-aligned, a quarter of the seed spread. A gate arm
+    /// must run the launcher beam (launcherBeam True): the exact view live through a converge timed the device out (roulettept1/2).
+    float worldCacheFocusRoulette = 1.f;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

@@ -138,6 +138,8 @@ public:
         mCenter = int2(std::numeric_limits<int32_t>::min());
     }
     uint32_t pendingTiles() const;
+    /// Of those, the rasterized tiles waiting to be applied (update's applyResults held them).
+    uint32_t readyTiles() const;
     /// PROBE (HSTR_LAYER_OCTANT_PROBE=1 in the environment): of the (tile, domain voxel) layer bits set, how many there were and how
     /// many of their 2 x 2 x 2 octants the same reach test finds empty - a half-voxel layer mask's ceiling. MEASURED (octant1, 4K
     /// sunset settle + walk, 13.9M bits): 6.86% of octants empty (stop rule was 15%) - the brick reach (1.5 x 2^2 + 1 source voxels

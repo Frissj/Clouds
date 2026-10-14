@@ -52,6 +52,8 @@ static bool gPhotonFromSun = false; ///< ... and its source, the cells its depos
 static uint gPhotonCells = 0;       ///< its collision search's steps.
 static uint gPhotonDeposited = 0;
 static uint gPhotonSteps = 0;
+static uint gPhotonFlushLanes = 0;  ///< Its cell flushes, and those that led their cell's group among the lanes flushing together
+static uint gPhotonFlushGroups = 0; ///< (one atomic set a group, were the flush summed per wave and cell).
 #if HSTR_ORDER_PROBE
 // The query's timing (hstrBeamTailProbe); only here, so no other program carries NVAPI's resource. Needs NVAPI in the build
 // (packman nvapi, FALCOR_HAS_NVAPI): without it GpuTimer returns 0 and the TAIL log lines read 0 (tail1).
@@ -4596,6 +4598,18 @@ struct HSTRCloudRenderer
         if (acc.cell.x >= 0)
         {
             const uint index = kWorldCacheSlots * worldCacheIndex(uint3(acc.cell));
+#if HSTR_PHOTON_BUFFERS
+            // The lanes flushing together, grouped by cell: a wave-summed flush would issue one atomic set a group.
+            ++gPhotonFlushLanes;
+            for (;;)
+            {
+                if (WaveReadLaneFirst(index) == index)
+                {
+                    gPhotonFlushGroups += WaveIsFirstLane() ? 1u : 0u;
+                    break;
+                }
+            }
+#endif
             const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
             const uint extension = acc.field == 0 ? worldCacheSunExtension() : 0u;
             [unroll]
@@ -4759,18 +4773,30 @@ struct HSTRCloudRenderer
         // The medium is grey: one scalar albedo.
         const float albedo = dot(volume.data.albedo, 1.f / 3.f);
 #endif
-        uint rng = hashUint(index * 2654435761u + 1013u) ^ hashUint(params.worldCacheSamples * 9781u + 6271u);
-        Photon photon = spawnPhoton(rng);
+        uint rng = hashUint(index * 2654435761u + 1013u) ^ hashUint(photonBatchSeed() + 6271u);
+        Photon photon = spawnPhoton(rng, index);
         float3 v = photon.positionWeight.xyz;
         float weight = photon.positionWeight.w;
+        float relative = 1.f; // The weight over the spawn's (worldCacheFocusRoulette's window).
         if (params.worldCacheFocus != 0)
         {
             // worldCacheFocusFar: away from the starving tiles a photon survives its spawn at that tile's probability.
             const uint2 tile = min(uint2(max(v.xz, 0.f)) / params.cloudTileVoxels, params.cloudTiles - 1u);
             const float survive = abs(hstrCloudTileFocus[tile.x + params.cloudTiles.x * tile.y]);
-            if (randomFloat(rng) >= survive)
+            // worldCachePatchSurvive: the group's own draw (a third from its stream: source, origin x, origin z, survival). Its
+            // photons can straddle a tile edge, each still surviving at its own tile's p against one uniform draw.
+            uint groupRng = hashUint((index / 64u) * 2654435761u + 4421u) ^ hashUint(photonBatchSeed() + 2203u);
+            const bool shared = params.worldCachePatch > 0 && params.worldCachePatchSurvive != 0 && params.seaMode != 0;
+            if (shared)
+            {
+                randomFloat(groupRng);
+                randomFloat(groupRng);
+                randomFloat(groupRng);
+            }
+            if ((shared ? randomFloat(groupRng) : randomFloat(rng)) >= survive)
                 return;
             weight /= survive;
+            relative /= survive;
         }
         float3 direction = photon.directionThroughput.xyz;
         const bool fromSun = (photon.state & kPhotonSky) == 0;
@@ -4803,6 +4829,22 @@ struct HSTRCloudRenderer
                     break;
                 throughput /= survive;
             }
+            // worldCacheFocusRoulette: scattered far from every starving tile, where its next flights deposit nothing, the photon
+            // lives on at the tile's survival, its weight raised to 1 / keep (unbiased); one already that heavy is not rolled again.
+            if (params.worldCacheFocus != 0 && params.worldCacheFocusRoulette < 1.f)
+            {
+                const float3 at = wrapSeaPosition(v);
+                const uint2 tile = min(uint2(max(at.xz, 0.f)) / params.cloudTileVoxels, params.cloudTiles - 1u);
+                const float keep = hstrCloudTileFocus[params.cloudTiles.x * params.cloudTiles.y + tile.x + params.cloudTiles.x * tile.y];
+                const float survive = relative * keep;
+                if (survive < 1.f)
+                {
+                    if (randomFloat(rng) >= survive)
+                        break;
+                    weight /= survive;
+                    relative /= survive;
+                }
+            }
         }
         flushDeposits(acc, rng);
     }
@@ -4814,6 +4856,13 @@ struct HSTRCloudRenderer
     /// MEASURED, left off: no faster - the separate deposit pass costs what it saved (numbers at mWorldCacheDeferredDeposit).
     void depositPhotonFlight(float3 v0, float3 v1, float3 look, float weight, inout DepositAccumulator acc, inout uint rng)
     {
+        // worldCacheFlightCull: under focus only starving tiles take deposits, and a cell the walk rejects touches neither the
+        // accumulator nor rng (flushes happen at deposited cells only) - so a flight whose cells all lie in other tiles skips its
+        // walk with nothing changed.
+        // SANITY (worldCacheFlightCull 2): every flight skips its walk under focus, so the gate must see the starving tiles unlit.
+        if (params.worldCacheFlightCull != 0 && params.worldCacheFocus != 0 && params.seaMode != 0 &&
+            (params.worldCacheFlightCull == 2 || !flightTouchesFocus(v0, v1)))
+            return;
 #if HSTR_DEFERRED_DEPOSIT
         uint capacity, stride;
         hstrPhotonSegments.GetDimensions(capacity, stride);
@@ -4833,6 +4882,44 @@ struct HSTRCloudRenderer
         }
 #endif
         depositSegment(v0, v1, look, weight, acc, rng);
+    }
+
+    /// worldCacheFlightCull: whether any cell a flight from v0 to v1 crosses (its box, a cell of margin) lies in a tile that takes
+    /// deposits this update - the tile of a cell as depositSegment finds it (wrapped storedCell, worldCacheTile). Conservative:
+    /// a box over 4 tiles along an axis counts as touching.
+    bool flightTouchesFocus(float3 v0, float3 v1)
+    {
+        const float cellVoxels = float(params.worldCacheCellVoxels);
+        const int2 low = int2(floor(min(v0.xz, v1.xz) / cellVoxels)) - 1;
+        const int2 high = int2(floor(max(v0.xz, v1.xz) / cellVoxels)) + 1;
+        const int2 dims = int2(params.worldCacheDims.xz);
+        uint tilesX[4], tilesZ[4];
+        uint countX = 0, countZ = 0;
+        for (int x = low.x; x <= high.x; ++x)
+        {
+            const uint tile = min(uint((x % dims.x + dims.x) % dims.x) * params.worldCacheCellVoxels / params.cloudTileVoxels, params.cloudTiles.x - 1u);
+            if (countX == 0 || tilesX[countX - 1] != tile)
+            {
+                if (countX == 4)
+                    return true;
+                tilesX[countX++] = tile;
+            }
+        }
+        for (int z = low.y; z <= high.y; ++z)
+        {
+            const uint tile = min(uint((z % dims.y + dims.y) % dims.y) * params.worldCacheCellVoxels / params.cloudTileVoxels, params.cloudTiles.y - 1u);
+            if (countZ == 0 || tilesZ[countZ - 1] != tile)
+            {
+                if (countZ == 4)
+                    return true;
+                tilesZ[countZ++] = tile;
+            }
+        }
+        for (uint i = 0; i < countX; ++i)
+            for (uint j = 0; j < countZ; ++j)
+                if (hstrCloudTileFocus[tilesX[i] + params.cloudTiles.x * tilesZ[j]] > 0.f)
+                    return true;
+        return false;
     }
 
     /// Whether a photon's flight after `bounce` scatterings runs in the similar medium: after worldCacheSimilarity exact
@@ -4876,7 +4963,7 @@ struct HSTRCloudRenderer
             if ((photon.state & kPhotonAlive) == 0)
             {
                 flushDeposits(acc, rng);
-                photon = spawnPhoton(rng);
+                photon = spawnPhoton(rng, ~0u);
                 acc.field = (photon.state & kPhotonSky) != 0 ? 1u : 0u;
                 ++emitted;
             }
@@ -4916,8 +5003,19 @@ struct HSTRCloudRenderer
     }
 
     /// A new photon at the grid box boundary (see tracePhoton), with its weight normalised by worldCachePhotons.
-    Photon spawnPhoton(inout uint rng)
+    /// A light-tracing batch's seed: its batch count, turned by worldCacheSeed (0 keeps the seeds every gate before it ran).
+    uint photonBatchSeed() { return params.worldCacheSamples * 9781u + params.worldCacheSeed * 0x9e3779b9u; }
+
+    /// index: the photon's index in its batch, for worldCachePatch / worldCacheStratify (~0u: drawn on its own).
+    Photon spawnPhoton(inout uint rng, uint index)
     {
+        // worldCachePatch: the group's own draws (source, patch origin), the same for every photon of the group. The sea's X/Z
+        // sides emit nothing (photonSourcePower), so every source is a y side, periodic in x and z: a uniform origin plus a
+        // wrapped offset is uniform.
+        const uint group = index / 64u; // traceWorldCachePhotons' thread group
+        const bool stratify = params.worldCacheStratify != 0 && params.seaMode != 0 && index != ~0u;
+        const bool patch = !stratify && params.worldCachePatch > 0 && params.seaMode != 0 && index != ~0u;
+        uint groupRng = hashUint(group * 2654435761u + 4421u) ^ hashUint(photonBatchSeed() + 2203u);
         const float3 dims = float3(params.hstrExtinctionDims);
         const float3 extent = dims * params.worldVoxelSize;
         const float3 faceArea = float3(extent.y * extent.z, extent.x * extent.z, extent.x * extent.y);
@@ -4929,7 +5027,15 @@ struct HSTRCloudRenderer
         float total = 0.f;
         for (uint i = 0; i < 9; ++i)
             total += photonSourcePower(i, sun, faceArea, sunMean, skyMean);
-        float u = randomFloat(rng) * total;
+        float u01 = patch ? randomFloat(groupRng) : randomFloat(rng);
+        if (stratify)
+        {
+            // worldCacheStratify: photon index's stratum of [0, 1), jittered, turned by the batch's own offset.
+            uint batchRng = hashUint(photonBatchSeed() + 5807u);
+            const float turned = (float(index) + u01) / float(params.worldCachePhotons) + randomFloat(batchRng);
+            u01 = min(turned - floor(turned), 0.99999994f);
+        }
+        float u = u01 * total;
         uint choice = 8;
         for (uint i = 0; i < 9; ++i)
         {
@@ -4949,6 +5055,27 @@ struct HSTRCloudRenderer
         float3 normal = 0.f;
         normal[axis] = side;
         float3 v = float3(randomFloat(rng), randomFloat(rng), randomFloat(rng)) * dims;
+        if (stratify)
+        {
+            // u's place within the chosen source (uniform on [0, 1), stratified like u) along a Morton curve over 1024 x 1024
+            // cells of the face, jittered within its cell (v's own draws): uniform on the face, neighbours in index side by side.
+            const float t = saturate(u / max(photonSourcePower(choice, sun, faceArea, sunMean, skyMean), 1e-30f));
+            const uint cellIndex = min(uint(t * 1048576.f), 1048575u);
+            uint2 cellXZ = uint2(cellIndex, cellIndex >> 1) & 0x55555u;
+            [unroll]
+            for (uint shift = 1; shift <= 8; shift <<= 1)
+            {
+                const uint mask = shift == 1 ? 0x33333333u : (shift == 2 ? 0x0f0f0f0fu : (shift == 4 ? 0x00ff00ffu : 0x0000ffffu));
+                cellXZ = (cellXZ | (cellXZ >> shift)) & mask;
+            }
+            v.xz = (float2(cellXZ) + v.xz / dims.xz) / 1024.f * dims.xz;
+        }
+        if (patch)
+        {
+            const float3 origin = float3(randomFloat(groupRng), 0.f, randomFloat(groupRng)) * dims;
+            v.xz = origin.xz + v.xz / dims.xz * float(params.worldCachePatch);
+            v.xz = v.xz - floor(v.xz / dims.xz) * dims.xz;
+        }
         v[axis] = side > 0.f ? dims[axis] - 1e-3f : 1e-3f;
 
         float3 direction;
@@ -18137,7 +18264,8 @@ void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
 #if HSTR_PHOTON_BUFFERS
     // hstrPhotonProbe: 0 the first wave start (complemented), 1 the last wave end, 2 the longest wave (us << 16 | its lanes' most
     // flights), 3 flights summed, 4 photons traced, 5 the most flights, 6 wave spans summed (us), 7 waves, 8 / 9 the sun photons'
-    // flights summed and count, 10 / 11 / 12 the deposit walks' cells crossed and deposited into and the collision searches' steps.
+    // flights summed and count, 10 / 11 / 12 the deposit walks' cells crossed and deposited into and the collision searches' steps, 13 / 14 cell
+    // flushes and their groups by cell among the lanes flushing together.
     const uint start = WaveActiveMin(GpuTimer::getCurrentTimePoint());
     if (WaveIsFirstLane())
         InterlockedMax(gHSTRCloud.hstrPhotonProbe[0], ~start);
@@ -18145,6 +18273,8 @@ void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
     gPhotonCells = 0;
     gPhotonDeposited = 0;
     gPhotonSteps = 0;
+    gPhotonFlushLanes = 0;
+    gPhotonFlushGroups = 0;
 #endif
     gHSTRCloud.tracePhoton(dispatchThreadId.x);
 #if HSTR_PHOTON_BUFFERS
@@ -18158,8 +18288,12 @@ void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
     const uint cells = WaveActiveSum(gPhotonCells);
     const uint deposited = WaveActiveSum(gPhotonDeposited);
     const uint steps = WaveActiveSum(gPhotonSteps);
+    const uint flushLanes = WaveActiveSum(gPhotonFlushLanes);
+    const uint flushGroups = WaveActiveSum(gPhotonFlushGroups);
     if (WaveIsFirstLane())
     {
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[13], flushLanes);
+        InterlockedAdd(gHSTRCloud.hstrPhotonProbe[14], flushGroups);
         InterlockedAdd(gHSTRCloud.hstrPhotonProbe[10], cells);
         InterlockedAdd(gHSTRCloud.hstrPhotonProbe[11], deposited);
         InterlockedAdd(gHSTRCloud.hstrPhotonProbe[12], steps);

@@ -149,6 +149,17 @@ public:
     uint32_t mGpuTimerFrame = 0;
     uint64_t mGpuTimeSumUs = 0;
     uint64_t mGpuTimeFrames = 0;
+    /// cloudStats: frames of that pair over 2 / 3 / 4 / 6 ms (cumulative), and the longest since the last read (reset on read).
+    std::array<uint64_t, 4> mGpuTimeOver = {};
+    mutable uint64_t mGpuTimeMaxUs = 0;
+    /// cloudStats: what the frames over 6 ms ran. Events, cumulative counters snapshot at each frame's start (a frame's events are
+    /// the next snapshot less its own): tiles applied, residency cuts taken, sun scheduling runs, residency upload bytes, photon
+    /// updates, cache bakes, sun bake frames. Per event, the spike frames that ran it and all frames that did; spikes with none.
+    static constexpr uint32_t kSpikeEvents = 7;
+    std::array<std::array<uint64_t, kSpikeEvents>, 3> mSpikeSnaps = {};
+    std::array<uint64_t, 3> mResidencyEventsSeen = {}; ///< The residency's cuts, sun runs and upload bytes at its last read.
+    std::array<uint64_t, kSpikeEvents> mSpikeWith = {}, mFramesWith = {};
+    uint64_t mSpikeFrames = 0, mSpikeQuiet = 0;
     void renderUI(Gui::Widgets& widget) override;
 
 private:
@@ -299,6 +310,17 @@ private:
     /// starving tiles). t64 focused 4.73 ms, 37.6 / 230; t40 focused 3.69, 32.8 / 147; t26 focused 3.26, 22.6 / 170; the urgent 26
     /// + span 4 default 4.10 / 3.79, 28.5 / 186 and 23.6 / 280; norefill 2.42. Desired 243k in every arm.
     float mWorldCacheFocusFar = 0.f;
+    /// worldCacheFocusReach (tiles, 0: geometric): the upwind dilation of worldCacheFocusFar's near set stops this many tiles out.
+    /// Unbiased either way (tiles past it take the far survival and its weight); only the variance moves.
+    /// MEASURED, left off (focusreach1, 4K sunset sprint 20, launcher defaults - target 40, focus 1/16 - 3 x 240 frames an arm;
+    /// chunk GPU, near tiles an update, ms an update over norefill, frames under 26 near-camera batches of 720): geometric 3.23 /
+    /// 3.73 (anchor) ms, 241 / 232, ~2.3, 155 / 174; reach 3 3.52, 152, ~2.4, 228; reach 2 3.42, 124, ~2.3, 221; reach 1 3.49,
+    /// 123, ~2.4, 232; norefill 2.39. Half the near set leaves an update's cost where it was - a focused update is bound by its
+    /// latency (the longest photon walk), not its photon count - and the capped arms ran more updates for worse near tiles.
+    uint32_t mWorldCacheFocusReach = 0;
+    /// worldCacheFocusRouletteReach (tiles, wrapped, Chebyshev): tiles this near a starving tile keep every scattered photon
+    /// (HSTRCloudParams::worldCacheFocusRoulette).
+    uint32_t mWorldCacheFocusRouletteReach = 1;
     /// worldCacheSlices: each light-tracing batch spread over this many updates (frames), counted as fractions of a batch.
     /// MEASURED (slicetime1, 4K sprint 20, round-robin profiles, refill rounds): worldCache 3.34-3.62 ms (ship) -> 2.01-2.11 (4)
     /// -> 1.78-1.91 (8); HSTRCloud 4.95-5.73 -> 3.46-4.13 -> 3.25-3.79. Not 1/slices: the update is set by its longest photon walk
@@ -346,12 +368,12 @@ private:
     uint64_t mWorldCacheAsyncSpanWaits = 0, mWorldCacheAsyncBusy = 0, mWorldCacheBakesPutOff = 0; ///< cloudStats.
     /// DIAGNOSTIC: each async slice's own span on its queue (hstrPhotonProbe), copied to a ring read once its frame has retired.
     static constexpr uint32_t kPhotonProbes = 16;
-    static constexpr uint32_t kPhotonProbeWords = 13; ///< hstrPhotonProbe's layout: traceWorldCachePhotons.
+    static constexpr uint32_t kPhotonProbeWords = 15; ///< hstrPhotonProbe's layout: traceWorldCachePhotons.
     /// cloudStats, summed over the slices read: waves' spans (us) and count, each slice's longest wave (us) and that wave's most
     /// flights, flights and photons, the sun's flights and photons; and the most flights any photon took.
     uint64_t mPhotonWaveUs = 0, mPhotonWaves = 0, mPhotonLongestWaveUs = 0, mPhotonLongestWaveFlights = 0, mPhotonFlights = 0,
              mPhotonsTraced = 0, mPhotonSunFlights = 0, mPhotonSunTraced = 0, mPhotonMostFlights = 0, mPhotonCells = 0,
-             mPhotonDeposited = 0, mPhotonSteps = 0;
+             mPhotonDeposited = 0, mPhotonSteps = 0, mPhotonFlushLanes = 0, mPhotonFlushGroups = 0;
     ref<Buffer> mpPhotonProbe, mpPhotonProbeReadback;
     std::array<uint64_t, kPhotonProbes> mPhotonProbeFrame = {}; ///< The frame each slot was written in, 0 when read.
     uint32_t mPhotonProbeNext = 0;
@@ -547,6 +569,15 @@ private:
     bool mCloudResidencyFrozen = false; ///< Benchmarks: skip the residency update, keeping the resident set as it is.
     uint32_t mSeaTilesChanged = 0;      ///< Sea tiles whose cloud was replaced, cumulative (cloudStats).
     uint32_t mSeaApplyEvents = 0;       ///< Frames that replaced any, cumulative (cloudStats).
+    /// cloudStats: residency desired and mapped summed over frames (residency not busy), their frames, and the fewest desired since
+    /// the last read (desiredLow resets when read).
+    uint64_t mDesiredSum = 0, mMappedSum = 0, mDesiredFrames = 0;
+    mutable uint32_t mDesiredLow = UINT32_MAX;
+    /// DIAGNOSTIC (cloudStats seaHold*): frames finished sea tiles were held back (cumulative; by a busy residency update), the
+    /// current run of them, and the longest run since the last read.
+    uint64_t mSeaHoldFrames = 0, mSeaHoldBusyFrames = 0;
+    uint32_t mSeaHoldRun = 0;
+    mutable uint32_t mSeaHoldLongest = 0;
     /// cloudStats, cumulative: beam builds that invalidated everything / CPU spheres (and how many) / the GPU change list; the
     /// change list's inputs and bakes, and frames whose inputs overflowed it.
     uint64_t mBeamInvalidateAllBuilds = 0, mBeamSphereBuilds = 0, mBeamSpheresTotal = 0, mBeamChangeBuilds = 0;
@@ -1547,7 +1578,9 @@ private:
     std::vector<uint32_t> mCloudTileReset;
     ref<Buffer> mpCloudTileBatches;
     ref<Buffer> mpCloudTileReset;
-    std::vector<float> mCloudTileFocus; ///< worldCacheFocusFar per tile: spawn probability, positive where the tile takes deposits.
+    /// worldCacheFocusFar per tile: spawn probability, positive where the tile takes deposits; then (a second tile count of
+    /// entries) worldCacheFocusRoulette's in-flight survival.
+    std::vector<float> mCloudTileFocus;
     ref<Buffer> mpCloudTileFocus;
     LazyComputePass mpCommitCloudPass;
     LazyComputePass mpDecodeCloudPass;

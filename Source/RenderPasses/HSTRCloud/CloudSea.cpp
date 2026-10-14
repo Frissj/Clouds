@@ -129,6 +129,12 @@ uint32_t CloudSea::pendingTiles() const
     return uint32_t(mJobs.size() + mResults.size()) + mBusy;
 }
 
+uint32_t CloudSea::readyTiles() const
+{
+    std::lock_guard lock(mMutex);
+    return uint32_t(mResults.size());
+}
+
 CloudSea::Tile CloudSea::makeTile(int2 world, uint32_t layer) const
 {
     Tile tile;
