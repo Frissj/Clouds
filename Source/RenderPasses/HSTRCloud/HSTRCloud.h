@@ -292,6 +292,10 @@ private:
     /// Held, the sprinting camera outran its window and the desired bricks fell to ~0 (applywalk1): the old gate's speed was missing
     /// clouds, so this is on.
     bool mSeaApplyAfterWalk = true;
+    /// seaApplyDuringWalk (with cloudCutGpuVisibility): finished sea tiles apply beside a running residency walk, which reads the
+    /// slots from its own copy (CloudView::walkBesideTileChanges). Off: they wait for the walk (seaApplyAfterWalk).
+    bool mSeaApplyDuringWalk = true;
+    uint32_t mSeaApplyBatch = 0; ///< seaApplyBatch (tiles; 0: as they are ready): see the hold in executeFrame.
     /// worldCacheFocusFar (0 off): while only some sea tiles are under worldCacheTarget (tiles a moving camera streamed in), photon
     /// updates are spent on them. A photon spawned over a tile neither starving nor upwind of one (the sun's reach across the
     /// layer, one tile either side) survives its spawn with this probability and is weighted by its inverse, so every tile's
@@ -317,10 +321,59 @@ private:
     /// 3.73 (anchor) ms, 241 / 232, ~2.3, 155 / 174; reach 3 3.52, 152, ~2.4, 228; reach 2 3.42, 124, ~2.3, 221; reach 1 3.49,
     /// 123, ~2.4, 232; norefill 2.39. Half the near set leaves an update's cost where it was - a focused update is bound by its
     /// latency (the longest photon walk), not its photon count - and the capped arms ran more updates for worse near tiles.
+    /// MEASURED again with stratify, flight cull and focus roulette 1/8 (reachpark1, 4K sunset parked, 2 rows restarted, 4 rounds):
+    /// photon update 3.20-3.44 / 3.26-3.48 ms (ship, anchor) -> reach 3 2.65-2.79, 2 2.39-2.53, 1 2.22-2.37 - it pays now. But
+    /// REJECTED on quality (reachpt1, hill path trace, 4 rows restarted, seeds aligned): ship / again 0.024568, reach 3 0.025308
+    /// (+3.0%), 2 0.025631, 1 0.025892, sanity (reach 1, far 1e-4) 0.056585; seed spread 0.024851 (+1.2%); p99 / p99.9 unchanged.
+    /// At the low sun far-upwind spawns carry real multiple scattering; weighted 16 they are too rare.
     uint32_t mWorldCacheFocusReach = 0;
     /// worldCacheFocusRouletteReach (tiles, wrapped, Chebyshev): tiles this near a starving tile keep every scattered photon
     /// (HSTRCloudParams::worldCacheFocusRoulette).
     uint32_t mWorldCacheFocusRouletteReach = 1;
+    /// worldCacheBesideQuery: a frame's sync photon update is dispatched right behind the beam's dirty query (latency-bound, the
+    /// GPU mostly idle) with no barrier between them, instead of at the world cache step; the tile counts it adds go up with the
+    /// next frame's world cache step, before its bake. A frame without the query dispatches it before the resolve.
+    /// MEASURED, left off (4K sunset, flight cull + focus roulette on): no barrier at the dispatch (worldCacheBesideLog), every update
+    /// beside the query. besideprof2 (walk 2, 2 rows restarted per arm, 4 x 24 profiled frames): serial query 0.64-0.68 ms a frame
+    /// + photons 3.38-3.83 an update; beside the query scope (query + photons) 2.00-2.34 a frame, ~3.1-3.8 an update - a third of
+    /// the query hidden at most; HSTRCloud 3.58-3.83 against 3.64-4.51. besidequery1 (2 x 240 frames, chunk GPU): sprint 4.03 /
+    /// 3.43 against 3.94 / 3.68 and 3.50 / 3.81, walk 2.44 / 2.36 against 2.17 / 2.44 and 2.24 / 2.36 - nothing. The update is
+    /// throughput-bound now (photonsplit1: first flights ~1.4 ms, scattering in starving tiles ~1, in the keep ring ~0.9).
+    bool mWorldCacheBesideQuery = false;
+    uint32_t mWorldCacheBesideLog = 0; ///< DIAGNOSTIC worldCacheBesideLog: frames whose barriers at the beside dispatch are logged.
+    struct PhotonBeside
+    {
+        bool pending = false;
+        uint32_t photons = 0;
+        float share = 1.f;
+        bool focus = false;
+    } mPhotonBeside;
+    bool mTileBatchesUploadOwed = false;
+    uint32_t mWorldCacheStepProbe = 0; ///< DIAGNOSTIC worldCacheStepProbe: updates whose collision steps are counted and logged.
+    /// worldCacheFastWrap: the main-queue photon program compiles HSTR_PHOTON_FAST_WRAP (wraps and tile lookups without integer
+    /// division; HSTRCloudParams::worldCacheWrapMaskX has the trace). Exact.
+    bool mWorldCacheFastWrap = true;
+    /// worldCacheReuseMajorant / worldCacheGateLoads: HSTR_PHOTON_REUSE_MAJORANT / HSTR_PHOTON_GATE_LOADS in the main-queue photon
+    /// program (photontrace3: the occupancy, majorant and deposit-gate loads were ~19% of its samples, long scoreboard). Exact.
+    /// MEASURED, left off (loads1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update): base 2.30 / 2.27 /
+    /// 2.41 / 2.31, reuse 2.57 / 2.57 / 2.88 / 2.60, gate 2.29 / 2.31 / 2.26 / 2.44, both 2.47 / 2.62 / 2.42 / 2.59, base again
+    /// 2.31 / 2.35 / 2.26 / 2.45. Fetching the gate's loads together changes nothing; holding the majorant costs +0.27 ms.
+    /// Why (stepprobe3, same scene): 4.45 held majorants a flight - every null collision, step counts identical to base (exact,
+    /// working as designed) - but the saving is per lane: a warp still issues the occupancy and majorant loads while any lane is
+    /// not holding (held is ~24% of the ~18.6 lane iterations a flight), and every iteration pays the block compare.
+    /// reusetrace1 (GPU Trace): 72 registers / 28 warps as without it, so occupancy is not the cost.
+    bool mWorldCacheReuseMajorant = false;
+    bool mWorldCacheGateLoads = false;
+    /// worldCacheTrimSlots: the photon program compiles the deposit accumulator with only the slots in use (HSTR_DEPOSIT_SLOTS:
+    /// 9 SH coefficients plus the sun extension's), so the unused sums and basis values leave its registers. Exact.
+    /// MEASURED (trimslots1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update, fast wrap on): 16 slots
+    /// 2.28 / 2.41 / 2.25 / 2.27, trimmed (9) 2.16 / 2.13 / 2.15 / 2.23, 16 again 2.29 / 2.32 / 2.37 / 2.37 (-6%).
+    /// Exact: trimpt1 (sunset_hill path trace, seed-aligned arms) excess 0.024568 trimmed, 16 slots, trimmed again; sanity 0.024796.
+    bool mWorldCacheTrimSlots = true;
+    ref<Buffer> mpPhotonStepProbe;
+    uint64_t mPhotonBesideRuns = 0, mPhotonBesideFallbacks = 0; ///< cloudStats: deferred updates beside the query / not.
+    /// Dispatches the deferred photon update (worldCacheBesideQuery); beside: right behind the dirty query, nothing transitioned.
+    void dispatchPhotonBeside(RenderContext* pRenderContext, bool beside);
     /// worldCacheSlices: each light-tracing batch spread over this many updates (frames), counted as fractions of a batch.
     /// MEASURED (slicetime1, 4K sprint 20, round-robin profiles, refill rounds): worldCache 3.34-3.62 ms (ship) -> 2.01-2.11 (4)
     /// -> 1.78-1.91 (8); HSTRCloud 4.95-5.73 -> 3.46-4.13 -> 3.25-3.79. Not 1/slices: the update is set by its longest photon walk

@@ -2248,6 +2248,37 @@ struct HSTRCloudParams
     /// update -24% parked with 2 rows restarted; path-trace excess +0.2% seed-aligned, a quarter of the seed spread. A gate arm
     /// must run the launcher beam (launcherBeam True): the exact view live through a converge timed the device out (roulettept1/2).
     float worldCacheFocusRoulette = 1.f;
+    /// worldCacheRunSkip: a photon's collision search in a zero-majorant block jumps the whole cube the layer-free distance field
+    /// (hstrDomainLayerDistance, cloudLayerRunDistance) clears: a block without layer bits has a tight majorant of exactly 0 (a
+    /// voxel's mean never exceeds its maximum), and a zero-majorant step draws no random number, so the collisions and the random
+    /// stream are the block-by-block search's. Exact. Not in the compute-queue program (HSTR_PHOTON_BUFFERS).
+    /// MEASURED, left off (4K sunset parked, 2 rows restarted, focus roulette on): runskip1 photon update 3.17-3.37 / 3.27-3.37 ms
+    /// (ship, anchor) against 3.34-3.51 - no gain. stepprobe1 (worldCacheStepProbe, ~200k photons, ~545k flights an update) says
+    /// why: per flight 3.1 empty 16-voxel jumps, 7.2 zero-majorant block steps (3.6 + 1.26 skips with it), 8.3 majorant steps -
+    /// the skip drops 12% of the steps, all of them the cheap kind (one cached load, no draw). The cost is the majorant steps:
+    /// ~7 null collisions a flight, each a density fetch and a draw.
+    uint worldCacheRunSkip = 0;
+    /// HSTR_PHOTON_FAST_WRAP (worldCacheFastWrap, the photon program only): the photon kernel's wraps without integer division.
+    /// photontrace2 (GPU Trace with source, 4K sprint 20): ~39% of traceWorldCachePhotons' samples sat on WAIT / short-scoreboard
+    /// chains of emulated integer % and / by runtime sizes (flightTouchesFocus 17%, depositSegment's cell wrap 8%, its tile
+    /// lookup's cell -> index -> cell round trip 7%) and seaVoxel's float divide (7%). Set by the host when exact, else 0 / ~0
+    /// (the division is kept): worldCacheWrapMaskX / Z = worldCacheDims.x / z - 1 when a power of two; worldCacheTileShift = log2 of
+    /// cloudTileVoxels / worldCacheCellVoxels when that is a whole power of two (cell * cellVoxels / tileVoxels == cell >> shift);
+    /// seaInverseDims = 1 / hstrExtinctionDims.xz (exact for power-of-two sizes). Scalars: the params upload is a raw copy.
+    /// MEASURED (fastwrap1, 4K sunset parked, 2 rows restarted, 4 alternating rounds of 24 frames, ~10 updates each): photon
+    /// update 3.29 / 3.36 / 3.26 / 3.20 ms dividing, 2.30 / 2.24 / 2.31 / 2.38 fast, 3.30 / 3.38 / 3.36 / 3.36 dividing again
+    /// (-30%). On by default (mWorldCacheFastWrap). Exact: fastwrappt1 (sunset_hill path trace, 4 rows restarted, seed-aligned
+    /// arms) excess 0.024567 dividing, 0.024567 fast, 0.024567 dividing again; sanity roulette 1e-4 0.024796.
+    /// Sprint (fastwrapsprint1, 4K sunset sprint 20, 2 cycles of 240-frame chunks): GPU chunk mean 3.88 / 3.90 ms dividing, 3.37 /
+    /// 3.51 fast, 3.87 / 3.82 dividing again; frames over 6 ms 21 / 28, 12 / 12, 33 / 28; desired 243,302 throughout.
+    uint worldCacheWrapMaskX = 0;
+    uint worldCacheWrapMaskZ = 0;
+    uint worldCacheTileShift = 0xffffffff;
+    float seaInverseDimsX = 0.f;
+    float seaInverseDimsZ = 0.f;
+    uint _fastWrapPad0 = 0; // Two 16-byte rows, so the struct's tail padding stays as it was.
+    uint _fastWrapPad1 = 0;
+    uint _fastWrapPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

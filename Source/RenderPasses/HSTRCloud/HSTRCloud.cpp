@@ -517,6 +517,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mSeaApplyAfterWalk = bool(value);
             continue;
         }
+        if (key == "seaApplyDuringWalk")
+        {
+            mSeaApplyDuringWalk = bool(value);
+            continue;
+        }
+        if (key == "seaApplyBatch")
+        {
+            mSeaApplyBatch = uint32_t(value);
+            continue;
+        }
         if (key == "worldCacheFocusFar")
         {
             mWorldCacheFocusFar = std::clamp(float(value), 0.f, 1.f);
@@ -535,6 +545,46 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "worldCacheFocusRouletteReach")
         {
             mWorldCacheFocusRouletteReach = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheStepProbe")
+        {
+            mWorldCacheStepProbe = uint32_t(value);
+            continue;
+        }
+        if (key == "worldCacheFastWrap")
+        {
+            mWorldCacheFastWrap = bool(value);
+            continue;
+        }
+        if (key == "worldCacheReuseMajorant")
+        {
+            mWorldCacheReuseMajorant = bool(value);
+            continue;
+        }
+        if (key == "worldCacheGateLoads")
+        {
+            mWorldCacheGateLoads = bool(value);
+            continue;
+        }
+        if (key == "worldCacheTrimSlots")
+        {
+            mWorldCacheTrimSlots = bool(value);
+            continue;
+        }
+        if (key == "worldCacheRunSkip")
+        {
+            mParams.worldCacheRunSkip = bool(value) ? 1u : 0u;
+            continue;
+        }
+        if (key == "worldCacheBesideQuery")
+        {
+            mWorldCacheBesideQuery = bool(value);
+            continue;
+        }
+        if (key == "worldCacheBesideLog")
+        {
+            mWorldCacheBesideLog = uint32_t(value);
             continue;
         }
         if (key == "cloudStagingPool")
@@ -2356,10 +2406,18 @@ Properties HSTRCloud::getProperties() const
     props["worldCacheUrgentNear"] = mWorldCacheUrgentNear;
     props["worldCacheContinueEvery"] = mWorldCacheContinueEvery;
     props["seaApplyAfterWalk"] = mSeaApplyAfterWalk;
+    props["seaApplyDuringWalk"] = mSeaApplyDuringWalk;
+    props["seaApplyBatch"] = mSeaApplyBatch;
     props["worldCacheFocusFar"] = mWorldCacheFocusFar;
     props["worldCacheFocusReach"] = mWorldCacheFocusReach;
     props["worldCacheFocusRoulette"] = mParams.worldCacheFocusRoulette;
     props["worldCacheFocusRouletteReach"] = mWorldCacheFocusRouletteReach;
+    props["worldCacheBesideQuery"] = mWorldCacheBesideQuery;
+    props["worldCacheRunSkip"] = mParams.worldCacheRunSkip != 0;
+    props["worldCacheFastWrap"] = mWorldCacheFastWrap;
+    props["worldCacheReuseMajorant"] = mWorldCacheReuseMajorant;
+    props["worldCacheGateLoads"] = mWorldCacheGateLoads;
+    props["worldCacheTrimSlots"] = mWorldCacheTrimSlots;
     props["worldCacheSlices"] = mWorldCacheSlices;
     props["worldCacheAsync"] = mWorldCacheAsync;
     props["worldCacheAsyncSpan"] = mWorldCacheAsyncSpan;
@@ -2487,6 +2545,7 @@ Properties HSTRCloud::getProperties() const
         cloud["committedCapped"] = stats.committedCapped;
         cloud["cutWalkMsTotal"] = stats.cutWalkMsTotal;
         cloud["cutBusyFrames"] = stats.cutBusyFrames;
+        cloud["walkSlotChanges"] = stats.walkSlotChanges;
         cloud["cutIdleFrames"] = stats.cutIdleFrames;
         cloud["cutParallelMsTotal"] = stats.cutParallelMsTotal;
         cloud["cutHeapMsTotal"] = stats.cutHeapMsTotal;
@@ -2670,6 +2729,8 @@ Properties HSTRCloud::getProperties() const
             cloud["seaHoldFrames"] = mSeaHoldFrames;
             cloud["seaHoldBusyFrames"] = mSeaHoldBusyFrames;
             cloud["seaHoldLongest"] = mSeaHoldLongest;
+            cloud["photonBesideRuns"] = mPhotonBesideRuns;
+            cloud["photonBesideFallbacks"] = mPhotonBesideFallbacks;
             mSeaHoldLongest = 0;
             const float3 position = mpScene->getCamera()->getPosition();
             cloud["cameraTileZ"] = int32_t(std::floor((position.z - mpCloudSea->getDesc().origin.z) / mpCloudSea->getDesc().tileWorld));
@@ -4830,8 +4891,20 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
             // 2.42 ms (HSTRCloud 2.36 / 2.40 profiled, units 0.99), urgent near 3 + span 4 3.87, + span 1 4.15, t26 sync 4.12;
             // worldCachePhotons 3.46 / 1.09 / 0.95 ms a profiled frame. Desired 243k in every arm, mapped 153-211k.
             // A busy residency update may be launching a cut: nothing touches mCutJob then (residencyBusy short-circuits).
+            // seaApplyDuringWalk (with cloudCutGpuVisibility, so the walk reads no sea density): tiles apply beside a running walk,
+            // which reads the slots from its own copy (CloudView::walkBesideTileChanges); only a busy residency update holds them.
+            // MEASURED (walkbeside1 / applybatch1, numbers beside seaApplyBatch in IntelCloudSeaHalf.py): sprint desired 243k in
+            // every chunk; applied as they come the refill ran on ~190 of 240 sprint frames (6.0-6.4 ms), batched by 32 on 63-81
+            // (3.4-3.7 ms) against the hold's 20 (2.7-2.9 ms over a view that lagged and collapsed).
+            const bool walkBeside = mSeaApplyDuringWalk && mCloudCutGpuVisibility;
+            // seaApplyBatch (tiles, with seaApplyDuringWalk): ready tiles wait until this many are ready or none are still being
+            // rasterized, so one refill (worldCacheTarget updates, which cost about the same for one row starving as for several)
+            // covers several rows, and the window's lag stays bounded by the batch instead of a walk.
+            const uint32_t ready = walkBeside && mSeaApplyBatch > 0 ? mpCloudSea->readyTiles() : 0u;
+            const bool batching = walkBeside && mSeaApplyBatch > 0 && ready < mSeaApplyBatch && mpCloudSea->pendingTiles() > ready;
             const bool hold = mpCloudResidency &&
-                              (residencyBusy || (mSeaApplyAfterWalk ? mpCloudResidency->cutRunning() : mpCloudResidency->cutInFlight()));
+                              (residencyBusy || batching ||
+                               (!walkBeside && (mSeaApplyAfterWalk ? mpCloudResidency->cutRunning() : mpCloudResidency->cutInFlight())));
             // DIAGNOSTIC (cloudStats seaHold*): frames that held finished tiles back, by the residency update or the walk, and the
             // longest run of them since the last read - a sprint's desired set collapses when the camera outruns its window.
             // FOUND (seahold1, 4K sunset sprint 20 alone, 8 x 240 frames, traced every 20): tiles held on 1564 of 1920 frames (864
@@ -5038,6 +5111,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
     view.cutRays = mCloudCutRays;
     view.cutLowPriority = mCloudCutLowPriority;
     view.cutGpuVisibility = mCloudCutGpuVisibility;
+    view.walkBesideTileChanges = mSeaApplyDuringWalk && mCloudCutGpuVisibility;
     view.fadeEndOrder = mCloudFadeEndOrder;
     view.cutAsync = mCloudCutAsync;
     bool densityChanged = false;
@@ -5639,6 +5713,42 @@ void HSTRCloud::waitPhotonSlice(RenderContext* pRenderContext)
     }
     pRenderContext->wait(mpPhotonFence.get(), mPhotonFenceValue);
     mPhotonWaitedValue = mPhotonFenceValue;
+}
+
+void HSTRCloud::dispatchPhotonBeside(RenderContext* pRenderContext, bool beside)
+{
+    if (!mPhotonBeside.pending)
+        return;
+    mPhotonBeside.pending = false;
+    ++(beside ? mPhotonBesideRuns : mPhotonBesideFallbacks);
+    std::optional<ScopedProfilerEvent> scope;
+    if (!beside)
+        scope.emplace(pRenderContext, "worldCachePhotons"); // Beside the query a timestamp would wait for it.
+    const uint32_t photons = mPhotonBeside.photons;
+    bindRenderer(pRenderContext, mpWorldCachePhotonPass);
+    bindPhotonSegments(pRenderContext, mpWorldCachePhotonPass.get(), photons);
+    if (beside)
+    {
+        // As the far sea beside the query (dispatchFarSea): the beam-sized textures the query and march write, which bound here
+        // would be transitioned to shader reads at this dispatch and so wait for the query.
+        ShaderVar var = mpWorldCachePhotonPass->getRootVar()["CB"]["gHSTRCloud"];
+        var["hstrBeamPixels"] = ref<Texture>();
+        var["hstrBeamUnitTransmittance"] = ref<Texture>();
+        var["hstrBeamPixelPrev"] = ref<Texture>();
+        var["hstrBeamDirtyArgs"] = ref<Buffer>();
+        var["hstrBeamWarpArgs"] = ref<Buffer>();
+        var["hstrBeamRepair"] = ref<Texture>();
+        var["hstrBeamPixelsSnapshot"] = ref<Texture>();
+        var["hstrBeamLattice"] = ref<Texture>();
+    }
+    mpWorldCachePhotonPass->execute(pRenderContext, uint3(photons, 1, 1));
+    // The counting the world cache step does for a dispatch of its own; the tile counts go up with the next step (before its bake).
+    ++mParams.worldCacheSamples;
+    for (size_t slot = 0; slot < mCloudTileBatches.size(); ++slot)
+        mCloudTileBatches[slot] += !mPhotonBeside.focus || mCloudTileFocus[slot] > 0.f ? mPhotonBeside.share : 0.f;
+    mTileBatchesUploadOwed = true;
+    ++mWorldCacheBakes;
+    mWorldCacheBakeDirty = true;
 }
 
 void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
@@ -9095,6 +9205,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // ParameterBlock::prepareResource puts a UAV barrier on every bound UAV, so passes serialize: overlapping it needs a
         // native D3D12 compute queue with fences. Amortize instead: stop updating once converged, or fewer, larger updates.
         FALCOR_PROFILE(pRenderContext, "worldCache");
+        // worldCacheBesideQuery: last frame's update, should it still wait (no frame since reached its dispatch), and the tile counts
+        // the last one added, before this step's bake reads them with its deposits.
+        dispatchPhotonBeside(pRenderContext, false);
+        if (mTileBatchesUploadOwed)
+        {
+            mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
+            mTileBatchesUploadOwed = false;
+        }
         // MEASURED and REVERTED (cachereg2, 4K, parked under a 0.57 deg/frame sun, the cache frozen): skipping this decay while no
         // photon updates follow saved its 0.26 ms but took the score 0.364 -> 1.753% of pixels over 0.02. It is not a no-op: the
         // bake it triggers keeps the camera's baked cache in step with what the exact frame reads.
@@ -9320,16 +9438,84 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     std::fill(mCloudTileBatches.begin(), mCloudTileBatches.end(), 0.f);
                 if (!accumulate || mParams.worldCacheSamples == 0)
                     pRenderContext->clearUAV(mpWorldCacheDeposit->getUAV().get(), uint4(0));
-                bindRenderer(pRenderContext, mpWorldCachePhotonPass);
                 // worldCacheSlices: a batch's photons over that many updates. Weights stay normalised by worldCachePhotons, so each
                 // slice is an unbiased 1 / slices of a batch and the tiles count it so (each slice draws its own seed).
                 const uint32_t slices = accumulate && !mCloudTileBatches.empty() && !urgent ? std::max(mWorldCacheSlices, 1u) : 1u;
                 batchShare = 1.f / float(slices);
                 const uint32_t photons = (mParams.worldCachePhotons + slices - 1) / slices;
+                // worldCacheFastWrap: the masks, shift and reciprocals where they are exact (else the shader keeps its division).
+                {
+                    const auto powerOfTwo = [](uint32_t n) { return n != 0 && (n & (n - 1)) == 0; };
+                    mParams.worldCacheWrapMaskX = powerOfTwo(mParams.worldCacheDims.x) ? mParams.worldCacheDims.x - 1 : 0u;
+                    mParams.worldCacheWrapMaskZ = powerOfTwo(mParams.worldCacheDims.z) ? mParams.worldCacheDims.z - 1 : 0u;
+                    const uint32_t cell = mParams.worldCacheCellVoxels, tile = mParams.cloudTileVoxels;
+                    mParams.worldCacheTileShift = 0xffffffffu;
+                    if (tile >= cell && tile % cell == 0 && powerOfTwo(tile / cell))
+                        for (mParams.worldCacheTileShift = 0; (1u << mParams.worldCacheTileShift) < tile / cell;)
+                            ++mParams.worldCacheTileShift;
+                    mParams.seaInverseDimsX = 1.f / float(mParams.hstrExtinctionDims.x);
+                    mParams.seaInverseDimsZ = 1.f / float(mParams.hstrExtinctionDims.z);
+                    if (!powerOfTwo(mParams.hstrExtinctionDims.x) || !powerOfTwo(mParams.hstrExtinctionDims.z))
+                        logWarningOnce("HSTRCloud: worldCacheFastWrap wraps the sea by a reciprocal that is not exact for its size.");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_FAST_WRAP", mWorldCacheFastWrap ? "1" : "0");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_REUSE_MAJORANT", mWorldCacheReuseMajorant ? "1" : "0");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_GATE_LOADS", mWorldCacheGateLoads ? "1" : "0");
+                    // worldCacheTrimSlots: the accumulator's slots in use (the shader's worldCacheSunExtension), all 16 when off.
+                    const uint32_t extension = mParams.worldCacheSunOrder >= 4   ? mParams.worldCacheRingCount
+                                               : mParams.worldCacheSunOrder >= 3 ? 7u
+                                               : mParams.worldCacheZonalBands > 2 ? std::min(mParams.worldCacheZonalBands, 8u) - 2u
+                                                                                  : 0u;
+                    const uint32_t slots = mWorldCacheTrimSlots ? std::min(9u + extension, 16u) : 16u;
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_DEPOSIT_SLOTS", std::to_string(slots));
+                }
+                // worldCacheBesideQuery: left for the dirty query's shadow; dispatchPhotonBeside does the counting.
+                if (mWorldCacheBesideQuery && accumulate && !mWorldCacheDeferredDeposit && mWorldCacheUpdates == 1 &&
+                    mParams.debugView == kBeamView && !mCloudTileBatches.empty())
+                {
+                    mPhotonBeside = {true, photons, batchShare, focus};
+                    continue;
+                }
+                // DIAGNOSTIC (worldCacheStepProbe N): the next N updates count their collision search's steps (a blocking read).
+                const bool stepProbe = mWorldCacheStepProbe > 0;
+                mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_STEP_PROBE", stepProbe ? "1" : "0");
+                bindRenderer(pRenderContext, mpWorldCachePhotonPass);
                 bindPhotonSegments(pRenderContext, mpWorldCachePhotonPass.get(), photons);
+                if (stepProbe)
+                {
+                    if (!mpPhotonStepProbe)
+                        mpPhotonStepProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 10);
+                    pRenderContext->clearUAV(mpPhotonStepProbe->getUAV().get(), uint4(0));
+                    mpWorldCachePhotonPass->getRootVar()["CB"]["gHSTRCloud"]["hstrPhotonStepProbe"] = mpPhotonStepProbe;
+                }
                 {
                     FALCOR_PROFILE(pRenderContext, "worldCachePhotons");
                     mpWorldCachePhotonPass->execute(pRenderContext, uint3(photons, 1, 1));
+                }
+                if (stepProbe)
+                {
+                    --mWorldCacheStepProbe;
+                    uint32_t c[10];
+                    for (uint32_t k = 0; k < 10; ++k)
+                        c[k] = mpPhotonStepProbe->getElement<uint32_t>(k);
+                    const double flights = double(std::max(c[4], 1u));
+                    // MEASURED (stepprobe2, 4K sunset parked, worldCacheRestartRows 2, 9 focused updates of ~200k photons / ~545k
+                    // flights): per flight 3.1 empty 16-voxel jumps, 7.2 zero-majorant block steps, 8.35 majorant steps = 3.1 block
+                    // exits + 4.45 null + 0.80 real collisions. A 2-voxel tight majorant (oracle by thinning) would draw 2.47 of the
+                    // 5.25 candidates, but halving the block edge roughly doubles the block crossings (+3-4 exit / zero steps a flight),
+                    // so ~18.6 iterations a flight become ~19 and the grid is 8x larger: NOT BUILT (stop rule: -10% iterations).
+                    // photontrace1 (GPU Trace, sprint 20): traceWorldCachePhotons 72 registers, 28 warps / SM cap, ~11 warps active;
+                    // top stalls WAIT 29% (fixed-latency chains), LGSB 19%; L1 hit 71%, L2 14% / DRAM 9% of peak - not memory bound,
+                    // so a narrower density texture cannot pay.
+                    const double candidates = double(c[3]) - c[6];
+                    logInfo(
+                        "HSTRCloud: photon steps (focus {}, run skip {}): {} photons, {} flights; per flight {:.2f} empty 16-voxel jumps, "
+                        "{:.2f} zero-majorant block steps, {:.2f} run skips, {:.2f} majorant steps = {:.2f} block exits + {:.2f} null "
+                        "+ {:.2f} real collisions; a 2-voxel majorant would draw {:.2f} of the {:.2f} candidates; {:.2f} held majorants "
+                        "(reuse {})",
+                        focus, mParams.worldCacheRunSkip, c[5], c[4], c[0] / flights, c[1] / flights, c[2] / flights, c[3] / flights,
+                        c[6] / flights, c[7] / flights, (candidates - c[7]) / flights, c[8] / 16.0 / flights, candidates / flights,
+                        c[9] / flights, mWorldCacheReuseMajorant
+                    );
                 }
                 if (mWorldCacheDeferredDeposit)
                 {
@@ -10619,6 +10805,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                         pRenderContext->resourceBarrier(mpFarField[mFarCurrent].get(), Resource::State::ShaderResource);
                                         pRenderContext->resourceBarrier(mpFarDistance[mFarCurrent].get(), Resource::State::ShaderResource);
                                     }
+                                    // worldCacheBesideQuery: the deposits in the state the photon pass binds them in, before the query.
+                                    if (mPhotonBeside.pending && mpWorldCacheDeposit)
+                                        pRenderContext->resourceBarrier(mpWorldCacheDeposit.get(), Resource::State::UnorderedAccess);
                                     if (compactQuery)
                                         pRenderContext->clearUAV(mpBeamQueueCounts->getUAV().get(), uint4(0));
                                     // beamQueryContinueSlices: only on the plain one-thread-a-ray query.
@@ -10764,6 +10953,26 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                             pRenderContext->setLogBarriers(false);
                                             logInfo("BARRIER --- end");
                                             --mCloudSunBesideLog;
+                                        }
+                                    }
+                                    // worldCacheBesideQuery: the frame's photon update in the query's shadow. It reads the domain, sun
+                                    // and sky, which nothing here writes, and writes only the deposits, which nothing reads before
+                                    // the next frame's bake; the rebuild after it waits for both.
+                                    if (mPhotonBeside.pending)
+                                    {
+                                        if (mWorldCacheBesideLog > 0)
+                                        {
+                                            logInfo("BARRIER --- photons beside the query (frame {})", mExecuteFrames);
+                                            pRenderContext->setLogBarriers(true);
+                                        }
+                                        pRenderContext->setAutoUavBarriers(false);
+                                        dispatchPhotonBeside(pRenderContext, true);
+                                        pRenderContext->setAutoUavBarriers(true);
+                                        if (mWorldCacheBesideLog > 0)
+                                        {
+                                            pRenderContext->setLogBarriers(false);
+                                            logInfo("BARRIER --- end");
+                                            --mWorldCacheBesideLog;
                                         }
                                     }
                                 }
@@ -11655,6 +11864,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
             mBeamPathDump.clear();
             mParams.beamPathCode = 0;
         }
+        // worldCacheBesideQuery: a frame whose beam ran no dirty query dispatches its photon update here.
+        dispatchPhotonBeside(pRenderContext, false);
     }
     else
     {

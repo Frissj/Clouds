@@ -49,6 +49,15 @@ g.addPass(createPass("HSTRCloud", {
     # tiles applied in 4 events, backlog 55-77k), sprint 20 3.76 / 3.31 (204 updates, 447 tiles); parked after either, draining
     # at the 512 bake cap, 1.46-1.81. The walk refills now: under the old apply gate it applied no tile in 240 frames.
     "worldCacheTarget": 10,
+    # Sea tiles apply beside a running residency walk (seaApplyDuringWalk, C++ default on; the walk reads its own copy of the
+    # slots), in batches of 32 ready tiles (2 rows) or whatever is left once nothing more is being rasterized. Held for the walk
+    # (seaApplyAfterWalk alone) the window trailed the camera by a walk (~200 ms of CPU, 50-60 sprint frames) and a slow walk
+    # emptied the view (seahold1; chunks of 3.6k-39k desired). MEASURED (walkbeside1 / applybatch1, 4K sunset, 2 x 240 frames,
+    # chunk GPU, photon frames, chunk mean desired): sprint 20 at once (batch 0) 6.0-6.4 ms, 183-200 photon frames - every small
+    # apply restarts a few tiles, so some tile always starves and the refill runs every frame; batch 32 3.40 / 3.73, 63 / 81,
+    # 243k / 243k; batch 64 2.98 / 3.49, 33 / 61, 243k / 205k (fewest 161k); the old hold 2.93 / 2.71, 21 / 20, 243k / 159k
+    # (fewest 62k). Walk 2: batch 32 2.14 / 2.33, hold 2.28 / 2.28. The hold's cheaper sprint was partly a lagging view.
+    "seaApplyBatch": 32,
     "worldCacheFocusFar": 0.0625,
     # Stratified photon spawn: consecutive photons side by side along a Morton curve of the face, sources in contiguous index
     # ranges, every photon still uniform. MEASURED (strattime1, 4K sunset parked, 10 rows restarted, 4 profiled rounds a arm):
@@ -78,6 +87,9 @@ g.addPass(createPass("HSTRCloud", {
     "worldCacheAsyncSpan": False,
     # 2 slices with the flight cull (cullslice1, as above): walk 2.38 / 2.97 ms (3 / 6 frames over 6 ms), sprint 3.24 / 2.84 (29
     # / 18) - fewer walk spikes, but the mean +0.1-0.4 in 3 of 4 chunks and more frames over 3 / 4 ms. Before the cull: slicespike1.
+    # Again with focus roulette and tiles applied in batches of 32 (slices2, sprint 20 chunk GPU / frames over 6 ms): 1 slice 3.68
+    # / 3.74 (25 / 30), again 3.80 / 3.60 (28 / 36); 2 slices 4.08 / 4.21 (11 / 13); 4 slices 4.25 / 4.14 (12 / 13). Walk 2: 1
+    # slice 2.17 / 2.37 (again 2.46 / 2.45), 2 slices 2.51 / 2.60. Slices halve the sprint spikes for +0.4-0.5 ms of mean.
     "worldCacheSlices": 1,
     "sunNearVoxels": 2.0,
     # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross

@@ -286,6 +286,7 @@ CloudResidency::CloudResidency(ref<Device> pDevice, const CloudSea& sea, const C
     mGpuAssetRecords = gpuAssets;
     mInstances.resize(sea.getInstanceTiles().size());
     mTileForward.resize(sea.getInstanceTiles().size(), float3x3::identity());
+    mSlotEpoch.assign(sea.getInstanceTiles().size(), 0u);
 
     const auto shaderResource = ResourceBindFlags::ShaderResource;
     mpAssets = mpDevice->createStructuredBuffer(
@@ -1086,7 +1087,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
 {
     StepClock clock(true, tWalkPriorityCycles); // DIAGNOSTIC
     const Brick& b = brick(handle);
-    const CloudSea::Tile& tile = sea.getInstanceTiles()[slot];
+    const CloudSea::Tile& tile = mWalkTiles[slot]; // As beginCut copied it: the sea may change the slot meanwhile.
     const HSTRCloudInstance& instance = tile.instance;
     const uint32_t level = b.record.level;
     const float scale = float(1u << level);
@@ -1094,7 +1095,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
     const float3 sourceLo = float3(b.record.brick() * 8u) * scale - scale;
     const float3 sourceHi = float3((b.record.brick() + 1u) * 8u) * scale + scale;
     const float3 offset(instance.row0.w, instance.row1.w, instance.row2.w);
-    const float3x3& forward = mTileForward[slot];
+    const float3x3& forward = mWalkForward[slot];
     const float3 p0 = mul(forward, sourceLo - offset);
     const float3 p1 = mul(forward, sourceHi - offset);
     const float3 tileCorner = tile.corner;
@@ -1142,7 +1143,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
             {
                 entry.requested = std::max(mCutFrame, 1u);
                 std::lock_guard lock(mVisBuildMutex);
-                mVisBuilding.push_back({handle, slot, generation, lo, hi});
+                mVisBuilding.push_back({handle, slot, generation, lo, hi, mWalkSlotEpoch[slot]});
             }
         }
         else if (stale || dot(moved, moved) > 0.01f * distance * distance + 1.f)
@@ -1186,7 +1187,7 @@ float CloudResidency::brickPriority(const CloudSea& sea, uint32_t slot, uint64_t
 
 bool CloudResidency::cutSeed(const CloudSea& sea, const CloudView& view, uint32_t slot, CutEntry& entry)
 {
-    const CloudSea::Tile& tile = sea.getInstanceTiles()[slot];
+    const CloudSea::Tile& tile = mWalkTiles[slot];
     if (!tile.occupied || mAssets[tile.instance.asset].top == kNoHandle)
         return false;
     // Instances whose proxy already projects below the pixel threshold need no fine bricks.
@@ -1363,14 +1364,56 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     // returns, nothing here that changes those runs - no pages, loads or releases - and the frame keeps the last cut; HSTRCloud holds
     // the sea's tile changes back meanwhile (cutInFlight), so changed slots mean the walk is already done. Maps, unmaps and fades do
     // run: the walk reads what they change from the snapshot it started with.
+    // CloudView::walkBesideTileChanges: changed slots are taken on beside a running walk, which reads them from beginCut's copy
+    // (mWalkTiles / mWalkForward / mWalkSunClass); only their visibility caches, which the walk writes, wait for it.
+    auto takeSlotChanges = [&](bool walkRunning)
+    {
+        for (uint32_t slot : changedSlots)
+        {
+            if (slot < mSlotEpoch.size())
+                ++mSlotEpoch[slot];
+            if (walkRunning)
+                mWalkChangedSlots.push_back(slot);
+            else if (slot < mVisibility.size())
+                for (auto& shard : mVisibility[slot])
+                    shard.clear(); // Another instance now: its bricks sit elsewhere.
+            if (mDesc.gpuSun)
+                releaseSunField(slot);
+            mInstances[slot] = tiles[slot].instance;
+            const HSTRCloudInstance& i = tiles[slot].instance;
+            if (i.asset < mAssets.size())
+            {
+                const uint3 pages = mAssetRecords[i.asset]->dims / kCloudBrickCore;
+                mInstances[slot].levelPageBase = mAssets[i.asset].levelPageBase;
+                mInstances[slot].pageDims = pages.x | (pages.y << 10) | (pages.z << 20);
+                mInstances[slot].topLevel = mAssetRecords[i.asset]->topLevel;
+            }
+            if (tiles[slot].occupied)
+            {
+                mTileForward[slot] = inverse(float3x3{i.row0.x, i.row0.y, i.row0.z, i.row1.x, i.row1.y, i.row1.z, i.row2.x, i.row2.y, i.row2.z});
+                mInstances[slot].sunClass = sunClassOf(i);
+                if (mDesc.gpuSun)
+                    acquireSunField(slot);
+            }
+            mInstancesDirty = true;
+        }
+    };
     std::optional<CutWalk> finished;
+    bool slotsTaken = false;
     if (mCutJob.valid())
     {
-        if (!changedSlots.empty() || mCutJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        const bool ready = mCutJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        if (ready || (!changedSlots.empty() && !view.walkBesideTileChanges))
             finished = mCutJob.get();
         else
         {
             ++mStats.cutBusyFrames;
+            if (!changedSlots.empty())
+            {
+                takeSlotChanges(true);
+                slotsTaken = true;
+                mStats.walkSlotChanges += uint32_t(changedSlots.size());
+            }
             // Maps, fades and unmaps run beside the walk: they change only what it reads from its snapshot (mMappedSnapshot), and
             // the merge revisits the bricks they touched. Loads, pages, releases and tile changes still wait for it.
             mStaged.clear();
@@ -1412,30 +1455,17 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
             return running;
         }
     }
-    for (uint32_t slot : changedSlots)
+    if (!slotsTaken)
+        takeSlotChanges(false);
+    // The walk is back: the slots that changed beside it drop what it cached of their earlier instances, and are cut again.
+    const bool walkSlotsChanged = finished.has_value() && !mWalkChangedSlots.empty();
+    if (finished)
     {
-        if (slot < mVisibility.size())
-            for (auto& shard : mVisibility[slot])
-                shard.clear(); // Another instance now: its bricks sit elsewhere.
-        if (mDesc.gpuSun)
-            releaseSunField(slot);
-        mInstances[slot] = tiles[slot].instance;
-        const HSTRCloudInstance& i = tiles[slot].instance;
-        if (i.asset < mAssets.size())
-        {
-            const uint3 pages = mAssetRecords[i.asset]->dims / kCloudBrickCore;
-            mInstances[slot].levelPageBase = mAssets[i.asset].levelPageBase;
-            mInstances[slot].pageDims = pages.x | (pages.y << 10) | (pages.z << 20);
-            mInstances[slot].topLevel = mAssetRecords[i.asset]->topLevel;
-        }
-        if (tiles[slot].occupied)
-        {
-            mTileForward[slot] = inverse(float3x3{i.row0.x, i.row0.y, i.row0.z, i.row1.x, i.row1.y, i.row1.z, i.row2.x, i.row2.y, i.row2.z});
-            mInstances[slot].sunClass = sunClassOf(i);
-            if (mDesc.gpuSun)
-                acquireSunField(slot);
-        }
-        mInstancesDirty = true;
+        for (uint32_t slot : mWalkChangedSlots)
+            if (slot < mVisibility.size())
+                for (auto& shard : mVisibility[slot])
+                    shard.clear();
+        mWalkChangedSlots.clear();
     }
 
 #if HSTR_CLOUD_STREAMING
@@ -1554,7 +1584,7 @@ bool CloudResidency::update(const CloudSea& sea, const CloudView& view, const st
     const bool arrivals = false;
     const bool refresh = mFrame >= mCutFrame + 30 && mToLoadNext >= mToLoad.size();
 #endif
-    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || arrivals || refresh;
+    const bool runCut = mCutFrame == 0 || viewChanged || !changedSlots.empty() || walkSlotsChanged || arrivals || refresh;
     std::vector<Request> requests;
     // With view.cutAsync the walk runs on a worker (launched at the end of this function, taken on in a later frame); otherwise here.
     const bool async = view.cutAsync && mCutFrame != 0;
@@ -1892,7 +1922,8 @@ void CloudResidency::applyVisibility()
         for (size_t i = 0; i < batch.requests.size() && i < visibility.size(); ++i)
         {
             const VisibilityRequest& request = batch.requests[i];
-            if (request.slot >= mVisibility.size())
+            // A slot that took another instance since: the result was traced for the brick's place in the earlier one.
+            if (request.slot >= mVisibility.size() || request.slot >= mSlotEpoch.size() || request.epoch != mSlotEpoch[request.slot])
             {
                 ++mStats.gpuVisDropped;
                 continue;
@@ -1923,6 +1954,13 @@ void CloudResidency::beginCut(const CloudSea& sea, const CloudView& view)
     mCutFrame = mFrame;
     mCutMarginWorld = view.cutMargin * mCutMarginScale * sea.getVoxelWorld();
     mVisibility.resize(sea.getInstanceTiles().size());
+    // What the walk reads of the slots, as of now (CloudView::walkBesideTileChanges: the sea changes them while it runs).
+    mWalkTiles = sea.getInstanceTiles();
+    mWalkForward = mTileForward;
+    mWalkSunClass.resize(mInstances.size());
+    for (size_t slot = 0; slot < mInstances.size(); ++slot)
+        mWalkSunClass[slot] = mInstances[slot].sunClass;
+    mWalkSlotEpoch = mSlotEpoch;
     // What the walk reads of the mapped bricks, as of now (a copy of a byte per GPU brick).
     std::copy(mMappedState.begin(), mMappedState.end(), mMappedSnapshot.begin());
     mWalkTouched.clear();
@@ -1946,7 +1984,7 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     // The walk's own thread (its serial parts) too; with view.cutAsync off it is the frame's, which keeps its priority.
     LowPriority low(view.cutLowPriority && view.cutAsync);
     const auto start = std::chrono::steady_clock::now();
-    const auto& tiles = sea.getInstanceTiles();
+    const auto& tiles = mWalkTiles;
     // The spare scheduler state table catches up with the live one: the entries the last cut changed.
     std::vector<uint32_t>& spareState = mSunState[mSunStateLive ^ 1u];
     for (uint32_t gpu : mSunStateSync)
@@ -2232,7 +2270,7 @@ CloudResidency::CutWalk CloudResidency::walkCut(const CloudSea& sea, const Cloud
     {
         CutState& state = brick(handle).cut[next];
         storeOf(handle).lastUsedFrame = mCutFrame;
-        const uint16_t sunClass = uint16_t(1u << mInstances[slot].sunClass);
+        const uint16_t sunClass = uint16_t(1u << mWalkSunClass[slot]);
         if (state.id != walk.id)
         {
             state = {walk.id, priority, sunClass, 0, admit};

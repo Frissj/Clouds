@@ -519,6 +519,8 @@ for speed_i, speed in enumerate(speeds):
                                                                       "cutCheckBricks", "cutCheckMismatches", "uploadBytes", "uploadRuns",
                                                                       "scatterJobs", "scatterChecks", "scatterMismatches",
                                                                       "seaTilesChanged", "residencySkips", "workerUpdateUs", "takeWaitUs",
+                                                                      "seaHoldFrames", "walkSlotChanges", "seaApplyEvents",
+                                                                      "photonBesideRuns", "photonBesideFallbacks",
                                                                       "desiredSum", "mappedSum", "desiredFrames", "gpuTimeOver2Ms",
                                                                       "gpuTimeOver3Ms", "gpuTimeOver4Ms", "gpuTimeOver6Ms")}
             gpu = float(d.get("gpuTimeSum") or 0) / max(float(d.get("gpuTimeFrames") or 0), 1.0) / 1000.0
@@ -526,7 +528,9 @@ for speed_i, speed in enumerate(speeds):
                   f"{d.get('gpuTimeOver2Ms')} / {d.get('gpuTimeOver3Ms')} / {d.get('gpuTimeOver4Ms')} / {d.get('gpuTimeOver6Ms')}, "
                   f"longest {float(now.get('gpuTimeMaxUs') or 0) / 1000.0:.2f}), wall p50 "
                   f"{sorted(walls)[len(walls) // 2]:.2f} ms mean {sum(walls[DROP:]) / max(len(walls) - DROP, 1):.2f}, tiles changed "
-                  f"{d.get('seaTilesChanged')}, skips {d.get('residencySkips')}, worker {float(d.get('workerUpdateUs') or 0) / 1e3:.0f} ms "
+                  f"{d.get('seaTilesChanged')} in {d.get('seaApplyEvents')} applies (held {d.get('seaHoldFrames')} frames, "
+                  f"{d.get('walkSlotChanges')} slots beside a walk; photons beside the query {d.get('photonBesideRuns')}, not "
+                  f"{d.get('photonBesideFallbacks')}), skips {d.get('residencySkips')}, worker {float(d.get('workerUpdateUs') or 0) / 1e3:.0f} ms "
                   f"wait {float(d.get('takeWaitUs') or 0) / 1e3:.0f} ms, desired {now.get('desired')} mapped {now.get('mapped')} backlog {now.get('mapBacklog')} "
                   f"(chunk mean desired {float(d.get('desiredSum') or 0) / max(float(d.get('desiredFrames') or 0), 1):.0f} mapped "
                   f"{float(d.get('mappedSum') or 0) / max(float(d.get('desiredFrames') or 0), 1):.0f}, fewest desired {now.get('desiredLow')}) "

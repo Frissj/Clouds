@@ -54,6 +54,34 @@ static uint gPhotonDeposited = 0;
 static uint gPhotonSteps = 0;
 static uint gPhotonFlushLanes = 0;  ///< Its cell flushes, and those that led their cell's group among the lanes flushing together
 static uint gPhotonFlushGroups = 0; ///< (one atomic set a group, were the flush summed per wave and cell).
+#ifndef HSTR_PHOTON_STEP_PROBE
+#define HSTR_PHOTON_STEP_PROBE 0 // DIAGNOSTIC (worldCacheStepProbe): the main-queue photon pass counts its collision search's steps.
+#endif
+#ifndef HSTR_PHOTON_FAST_WRAP
+#define HSTR_PHOTON_FAST_WRAP 0 // worldCacheFastWrap: the main-queue photon pass wraps without division (HSTRCloudParams).
+#endif
+#ifndef HSTR_PHOTON_REUSE_MAJORANT
+#define HSTR_PHOTON_REUSE_MAJORANT 0 // worldCacheReuseMajorant: sampleCollision keeps a null collision's block majorant (photons).
+#endif
+#ifndef HSTR_DEPOSIT_SLOTS
+// The deposit accumulator's slots in use, 9 SH coefficients plus the sun extension's (worldCacheSunExtension). The photon program
+// gets the host's count (worldCacheDepositSlots): the extension's size is a runtime parameter, so with all 16 the compiler kept the
+// unused slots' sums and basis values in registers for the photon's whole life.
+#define HSTR_DEPOSIT_SLOTS 16
+#endif
+static const uint kDepositSlots = HSTR_DEPOSIT_SLOTS;
+#ifndef HSTR_PHOTON_GATE_LOADS
+#define HSTR_PHOTON_GATE_LOADS 0 // worldCacheGateLoads: depositSegment fetches a cell's majorant and focus together (photons).
+#endif
+static uint gStepEmpty = 0;    ///< HSTR_PHOTON_STEP_PROBE: empty 16-voxel jumps, zero-majorant block steps, run skips
+static uint gStepZero = 0;     ///< (worldCacheRunSkip), and majorant steps (one draw each).
+static uint gStepSkip = 0;
+static uint gStepMajorant = 0;
+static uint gStepExit = 0;     ///< Of the majorant steps: the flight left the 4-voxel block (a block exit),
+static uint gStepNull = 0;     ///< or ended in a null collision (the rest are real collisions).
+static uint gStepHeld = 0;     ///< Iterations that kept the held majorant (worldCacheReuseMajorant): no occupancy / majorant load.
+static float gStepFine = 0.f;  ///< Over the candidate collisions: the 2-voxel block's tight majorant / the 4-voxel one's - by
+                               ///< thinning, the candidates a 2-voxel majorant grid would draw (block exits not counted).
 #if HSTR_ORDER_PROBE
 // The query's timing (hstrBeamTailProbe); only here, so no other program carries NVAPI's resource. Needs NVAPI in the build
 // (packman nvapi, FALCOR_HAS_NVAPI): without it GpuTimer returns 0 and the TAIL log lines read 0 (tail1).
@@ -671,6 +699,7 @@ struct HSTRCloudRenderer
     /// DIAGNOSTIC (worldCacheAsync): the slice's first wave start, complemented (so both are maxima over a zero clear), and last wave
     /// end, in the global timer's low 32 bits.
     RWStructuredBuffer<uint> hstrPhotonProbe;
+    RWStructuredBuffer<uint> hstrPhotonStepProbe; ///< DIAGNOSTIC (worldCacheStepProbe): HSTR_PHOTON_STEP_PROBE's sums (0-3), flights, photons, block exits, null collisions, 2-voxel candidates x 16.
     /// worldCacheDeferredDeposit: the photons' flights to deposit, three float4 each (start, weight; end, field; look) ...
     RWStructuredBuffer<float4> hstrPhotonSegments;
     RWStructuredBuffer<uint> hstrPhotonSegmentCount; ///< ... and how many were recorded (past the buffer: deposited in place).
@@ -1031,9 +1060,45 @@ struct HSTRCloudRenderer
         if (params.seaMode == 0)
             return v;
         const float3 dims = float3(params.hstrExtinctionDims);
+#if HSTR_PHOTON_FAST_WRAP
+        // The host's reciprocal instead of a divide per call (exact for the power-of-two domain).
+        v.x -= floor(v.x * params.seaInverseDimsX) * dims.x;
+        v.z -= floor(v.z * params.seaInverseDimsZ) * dims.z;
+#else
         v.x -= floor(v.x / dims.x) * dims.x;
         v.z -= floor(v.z / dims.z) * dims.z;
+#endif
         return v;
+    }
+
+    /// World cache cell column c wrapped into [0, size): a mask when the host found size a power of two, else the division.
+    int wrapCacheColumn(int c, uint size, uint mask)
+    {
+#if HSTR_PHOTON_FAST_WRAP
+        if (mask != 0u)
+            return c & int(mask);
+#endif
+        return (c % int(size) + int(size)) % int(size);
+    }
+
+    /// The sea tile column of wrapped world cache cell column c (as worldCacheTile computes it).
+    uint cacheColumnTile(uint c, uint tiles)
+    {
+#if HSTR_PHOTON_FAST_WRAP
+        if (params.worldCacheTileShift != 0xffffffffu)
+            return min(c >> params.worldCacheTileShift, tiles - 1u);
+#endif
+        return min(c * params.worldCacheCellVoxels / params.cloudTileVoxels, tiles - 1u);
+    }
+
+    /// Sea tile slot of world cache cell (worldCacheTile, without the index's round trip through % and / under the fast wrap).
+    uint cacheCellTile(uint3 cell)
+    {
+#if HSTR_PHOTON_FAST_WRAP
+        return cacheColumnTile(cell.x, params.cloudTiles.x) + params.cloudTiles.x * cacheColumnTile(cell.z, params.cloudTiles.y);
+#else
+        return worldCacheTile(worldCacheIndex(cell));
+#endif
     }
 
     /// Transport extinction: the always-resident proxy (the scene grid's extinction, or the cloud sea domain's mean density).
@@ -4312,6 +4377,10 @@ struct HSTRCloudRenderer
     bool sampleCollision(inout float3 v, float3 d, inout uint rng, float extinctionScale = 1.f, bool fine = false)
     {
         const float epsilon = 1e-3f;
+#if HSTR_PHOTON_REUSE_MAJORANT
+        int3 heldBlock = int3(-1);
+        float heldMajorant = 0.f;
+#endif
         for (uint i = 0; i < 16384; ++i)
         {
 #if HSTR_PHOTON_BUFFERS
@@ -4319,37 +4388,129 @@ struct HSTRCloudRenderer
 #endif
             if (!insideExtinctionGrid(v))
                 return false;
-            // Empty 16-voxel blocks are crossed in one jump.
-            const int3 group = clamp(int3(floor(seaVoxel(v) / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
-#if HSTR_PHOTON_BUFFERS
-            const uint3 groups = (params.hstrMajorantDims + 3u) / 4u;
-            const uint occupied = hstrPhotonOccupancy[group.x + groups.x * (group.y + groups.y * group.z)];
-#else
-            const uint occupied = hstrOccupancy.Load(int4(group, 0));
+#if HSTR_PHOTON_REUSE_MAJORANT
+            // worldCacheReuseMajorant: after a null collision v is still in the block it drew against (flight < exit). When its
+            // block index (tightMajorantAt's) is unchanged, its 16-voxel group is the occupied one and the majorant the one held:
+            // no loads. Exact - the same values as reloading them.
+            const int3 block = clamp(int3(floor(seaVoxel(v) * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+            const bool held = !fine && all(block == heldBlock);
+#if HSTR_PHOTON_STEP_PROBE
+            gStepHeld += held ? 1u : 0u;
 #endif
-            if (occupied == 0)
+#else
+            const bool held = false;
+#endif
+            if (!held)
             {
-                v += (majorantBlockExit(v, d, 16.f) + epsilon) * d;
-                continue;
+                // Empty 16-voxel blocks are crossed in one jump.
+                const int3 group = clamp(int3(floor(seaVoxel(v) / 16.f)), int3(0), int3((params.hstrMajorantDims + 3u) / 4u) - 1);
+#if HSTR_PHOTON_BUFFERS
+                const uint3 groups = (params.hstrMajorantDims + 3u) / 4u;
+                const uint occupied = hstrPhotonOccupancy[group.x + groups.x * (group.y + groups.y * group.z)];
+#else
+                const uint occupied = hstrOccupancy.Load(int4(group, 0));
+#endif
+                if (occupied == 0)
+                {
+#if HSTR_PHOTON_STEP_PROBE
+                    ++gStepEmpty;
+#endif
+                    v += (majorantBlockExit(v, d, 16.f) + epsilon) * d;
+                    continue;
+                }
             }
+#if HSTR_PHOTON_REUSE_MAJORANT
+            const float majorant = held ? heldMajorant : extinctionScale * (fine ? majorantAt(v) : tightMajorantAt(v));
+#else
             const float majorant = extinctionScale * (fine ? majorantAt(v) : tightMajorantAt(v));
+#endif
             const float exit = majorantBlockExit(v, d);
             if (majorant <= 0.f)
             {
+#if !HSTR_PHOTON_BUFFERS
+                // worldCacheRunSkip: every block within Chebyshev distance - 1 of this one is layer-free, so zero-majorant: the
+                // search leaves that cube in one jump, as it would block by block (no draw).
+                if (!fine && params.worldCacheRunSkip != 0)
+                {
+                    const int3 wrapped = clamp(int3(floor(seaVoxel(v) * 0.25f)), int3(0), int3(params.hstrMajorantDims) - 1);
+                    const uint distance = hstrDomainLayerDistance.Load(int4(wrapped, 0));
+                    if (distance >= 2u)
+                    {
+#if HSTR_PHOTON_STEP_PROBE
+                        ++gStepSkip;
+#endif
+                        const float3 lower = (floor(v * 0.25f) - float(distance - 1u)) * 4.f;
+                        v += (boxExit(v, d, lower, lower + 4.f * float(2u * distance - 1u)) + epsilon) * d;
+                        continue;
+                    }
+                }
+#endif
+#if HSTR_PHOTON_STEP_PROBE
+                ++gStepZero;
+#endif
                 v += (exit + epsilon) * d;
                 continue;
             }
+#if HSTR_PHOTON_STEP_PROBE
+            ++gStepMajorant;
+#endif
             const float flight = -log(1.f - randomFloat(rng)) / majorant;
             if (flight >= exit)
             {
+#if HSTR_PHOTON_STEP_PROBE
+                ++gStepExit;
+#endif
                 v += (exit + epsilon) * d;
                 continue;
             }
             v += flight * d;
+#if HSTR_PHOTON_STEP_PROBE && !HSTR_PHOTON_BUFFERS
+            if (!fine)
+                gStepFine += min(1.f, extinctionScale * fineMajorantProbe(v) / majorant);
+#endif
             if (randomFloat(rng) * majorant < extinctionScale * (fine ? cameraExtinctionAtVoxel(v, 0.f) : extinctionAtVoxel(v)))
                 return true;
+#if HSTR_PHOTON_STEP_PROBE
+            ++gStepNull;
+#endif
+#if HSTR_PHOTON_REUSE_MAJORANT
+            heldBlock = block;
+            heldMajorant = majorant;
+#endif
         }
         return false;
+    }
+
+#if HSTR_PHOTON_STEP_PROBE && !HSTR_PHOTON_BUFFERS
+    /// DIAGNOSTIC: the tight majorant v's 2-voxel block would have - the maximum extinction over its trilinear support (voxels
+    /// 2b .. 2b + 2, as domainBlocks takes 4b .. 4b + 4; x / z wrap, zero outside in y like the extinction's border).
+    float fineMajorantProbe(float3 v)
+    {
+        const int3 dims = int3(params.hstrExtinctionDims);
+        const int3 lower = int3(floor(seaVoxel(v) * 0.5f)) * 2;
+        float value = 0.f;
+        for (int z = 0; z <= 2; ++z)
+            for (int y = 0; y <= 2; ++y)
+                for (int x = 0; x <= 2; ++x)
+                {
+                    int3 p = lower + int3(x, y, z);
+                    if (p.y < 0 || p.y >= dims.y)
+                        continue;
+                    p.x = (p.x % dims.x + dims.x) % dims.x;
+                    p.z = (p.z % dims.z + dims.z) % dims.z;
+                    value = max(value, hstrExtinction.Load(int4(p, 0)));
+                }
+        return value;
+    }
+#endif
+
+    /// Distance along d (voxels per world unit) from v, inside the box [lower, upper], to the box's exit.
+    float boxExit(float3 v, float3 d, float3 lower, float3 upper)
+    {
+        const float3 inverse = 1.f / select(abs(d) < 1e-12f, float3(1e-12f), d);
+        const float3 t = max((lower - v) * inverse, (upper - v) * inverse);
+        const float3 far = select(t > 1e-5f, t, float3(1e30f));
+        return min(far.x, min(far.y, far.z));
     }
 
     /// Ratio-tracking transmittance estimate from v to the grid boundary.
@@ -4587,7 +4748,7 @@ struct HSTRCloudRenderer
         acc.cell = int3(-1);
         acc.field = field;
         [unroll]
-        for (uint k = 0; k < 16; ++k)
+        for (uint k = 0; k < kDepositSlots; ++k)
             acc.sums[k] = 0.f;
         return acc;
     }
@@ -4613,7 +4774,7 @@ struct HSTRCloudRenderer
             const uint coefficients = params.worldCacheBands >= 2 ? 9u : 4u;
             const uint extension = acc.field == 0 ? worldCacheSunExtension() : 0u;
             [unroll]
-            for (uint k = 0; k < 16; ++k)
+            for (uint k = 0; k < kDepositSlots; ++k)
             {
                 const bool used = k < 9 ? k < coefficients : k - 9 < extension;
                 if (used)
@@ -4642,7 +4803,7 @@ struct HSTRCloudRenderer
         const uint extension = acc.field == 0 ? worldCacheSunExtension() : 0u;
         float basis[16];
         [unroll]
-        for (uint k = 0; k < 16; ++k)
+        for (uint k = 0; k < kDepositSlots; ++k)
             basis[k] = k < 9 ? (k < coefficients ? shBasis(k, look) : 0.f) : (k - 9 < extension ? worldCacheExtensionBasis(k - 9, look) : 0.f);
         const float cellVoxels = float(params.worldCacheCellVoxels);
         const float worldLength = length((v1 - v0) * params.worldVoxelSize);
@@ -4677,14 +4838,22 @@ struct HSTRCloudRenderer
             int3 storedCell = cell;
             if (params.seaMode != 0)
             {
-                const int3 dims = int3(params.worldCacheDims);
-                storedCell.x = (cell.x % dims.x + dims.x) % dims.x;
-                storedCell.z = (cell.z % dims.z + dims.z) % dims.z;
+                storedCell.x = wrapCacheColumn(cell.x, params.worldCacheDims.x, params.worldCacheWrapMaskX);
+                storedCell.z = wrapCacheColumn(cell.z, params.worldCacheDims.z, params.worldCacheWrapMaskZ);
             }
+#if HSTR_PHOTON_GATE_LOADS
+            // worldCacheGateLoads: the cell's majorant and its tile's focus fetched together, not the focus behind the majorant's
+            // test (both addresses stay in range for any cell: majorantAt clamps, the tile column is clamped). Same test.
+            const float cellMajorant = majorantAt((float3(storedCell) + 0.5f) * cellVoxels);
+            const float cellFocus = params.worldCacheFocus != 0 ? hstrCloudTileFocus[cacheCellTile(uint3(storedCell))] : 1.f;
+            if (fraction > 0.f && all(storedCell >= 0) && all(storedCell < int3(params.worldCacheDims)) && cellMajorant > 0.f &&
+                cellFocus > 0.f) // Focused: starving tiles only.
+#else
             if (fraction > 0.f && all(storedCell >= 0) && all(storedCell < int3(params.worldCacheDims)) &&
                 majorantAt((float3(storedCell) + 0.5f) * cellVoxels) > 0.f &&
                 (params.worldCacheFocus == 0 ||
-                 hstrCloudTileFocus[worldCacheTile(worldCacheIndex(uint3(storedCell)))] > 0.f)) // Focused: starving tiles only.
+                 hstrCloudTileFocus[cacheCellTile(uint3(storedCell))] > 0.f)) // Focused: starving tiles only.
+#endif
             {
                 if (any(storedCell != acc.cell))
                 {
@@ -4711,7 +4880,7 @@ struct HSTRCloudRenderer
                 const float scale = perUnit * fraction * inverseModulation;
                 const float ringScale = extension > 0 && params.worldCacheSunOrder >= 4 ? scale / worldCacheRingFactor(middle) : scale;
                 [unroll]
-                for (uint k = 0; k < 16; ++k)
+                for (uint k = 0; k < kDepositSlots; ++k)
                     acc.sums[k] += basis[k] * (k < 9 ? scale : ringScale);
             }
             if (tNext >= 1.f)
@@ -4897,7 +5066,7 @@ struct HSTRCloudRenderer
         uint countX = 0, countZ = 0;
         for (int x = low.x; x <= high.x; ++x)
         {
-            const uint tile = min(uint((x % dims.x + dims.x) % dims.x) * params.worldCacheCellVoxels / params.cloudTileVoxels, params.cloudTiles.x - 1u);
+            const uint tile = cacheColumnTile(uint(wrapCacheColumn(x, uint(dims.x), params.worldCacheWrapMaskX)), params.cloudTiles.x);
             if (countX == 0 || tilesX[countX - 1] != tile)
             {
                 if (countX == 4)
@@ -4907,7 +5076,7 @@ struct HSTRCloudRenderer
         }
         for (int z = low.y; z <= high.y; ++z)
         {
-            const uint tile = min(uint((z % dims.y + dims.y) % dims.y) * params.worldCacheCellVoxels / params.cloudTileVoxels, params.cloudTiles.y - 1u);
+            const uint tile = cacheColumnTile(uint(wrapCacheColumn(z, uint(dims.y), params.worldCacheWrapMaskZ)), params.cloudTiles.y);
             if (countZ == 0 || tilesZ[countZ - 1] != tile)
             {
                 if (countZ == 4)
@@ -18277,6 +18446,29 @@ void traceWorldCachePhotons(uint3 dispatchThreadId: SV_DispatchThreadID)
     gPhotonFlushGroups = 0;
 #endif
     gHSTRCloud.tracePhoton(dispatchThreadId.x);
+#if HSTR_PHOTON_STEP_PROBE && !HSTR_PHOTON_BUFFERS
+    {
+        const uint4 steps = WaveActiveSum(uint4(gStepEmpty, gStepZero, gStepSkip, gStepMajorant));
+        const uint2 flights = WaveActiveSum(uint2(gPhotonBounces, gPhotonBounces > 0 ? 1u : 0u));
+        if (WaveIsFirstLane())
+        {
+            for (uint k = 0; k < 4; ++k)
+                InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[k], steps[k]);
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[4], flights.x);
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[5], flights.y);
+        }
+        const uint2 outcomes = WaveActiveSum(uint2(gStepExit, gStepNull));
+        const float fineCandidates = WaveActiveSum(gStepFine);
+        const uint held = WaveActiveSum(gStepHeld);
+        if (WaveIsFirstLane())
+        {
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[6], outcomes.x);
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[7], outcomes.y);
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[8], uint(round(fineCandidates * 16.f)));
+            InterlockedAdd(gHSTRCloud.hstrPhotonStepProbe[9], held);
+        }
+    }
+#endif
 #if HSTR_PHOTON_BUFFERS
     const uint end = WaveActiveMax(GpuTimer::getCurrentTimePoint());
     const uint traced = gPhotonBounces > 0 ? 1u : 0u;

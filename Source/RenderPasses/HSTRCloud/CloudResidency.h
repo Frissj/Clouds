@@ -137,6 +137,10 @@ struct CloudView
     /// MEASURED (gpuvis1 / gpuvis2, 4K sunset walk at 2 units a frame): walk 156 -> 91 ms, coarse 0.869 -> 0.136 G thread cycles;
     /// frame mean neutral (4.07 / 4.09 against 4.29 / 3.90), motion score over 0.02 5.40 / 5.49% against 5.53 / 5.45%.
     bool cutGpuVisibility = false;
+    /// Sea tile changes taken on while an async walk runs (with cutGpuVisibility: the walk then reads no sea density): the walk
+    /// reads the slots as beginCut copied them, a changed slot's visibility is cleared when the walk is taken (which re-cuts), and
+    /// GPU visibility traced for a slot's earlier instance is dropped (per-slot epochs). Off: changed slots wait for the walk.
+    bool walkBesideTileChanges = false;
     /// The async walk's threads below normal priority, so its parallel bursts yield to the frame and the residency worker.
     /// MEASURED (lowprio1, waves on): no help - arm mean 4.70 against 4.63 at normal priority (slot groups 4.45 / 4.21), p50 4.38
     /// against 4.48. The frame does not lose cores to the burst; what it loses is unknown (memory or cache are candidates).
@@ -187,6 +191,7 @@ public:
         uint32_t committedCapped = 0; ///< ... and frames that committed the full load cap (cumulative).
         double cutWalkMsTotal = 0.0;  ///< DIAGNOSTIC: worker milliseconds of the cuts taken on (cumulative) ...
         uint32_t cutBusyFrames = 0;   ///< ... frames that found a walk still running ...
+        uint32_t walkSlotChanges = 0; ///< DIAGNOSTIC (walkBesideTileChanges): changed slots taken on beside a running walk, cumulative.
         uint32_t cutIdleFrames = 0;   ///< ... and frames with no walk running that did not start one (cumulative).
         double cutParallelMsTotal = 0.0;   ///< DIAGNOSTIC: the walks' parallel phases (cumulative) ...
         double cutHeapMsTotal = 0.0;       ///< ... and ordered heap cuts (cumulative).
@@ -389,6 +394,7 @@ public:
         uint32_t generation;
         float3 lo; ///< The brick's world bounds.
         float3 hi;
+        uint32_t epoch = 0; ///< The slot's epoch the walk saw (mSlotEpoch).
     };
     struct VisibilityBatch
     {
@@ -939,6 +945,16 @@ private:
     void sweepFadePartition(std::vector<FadeEnd>& entries, ResidencySink& sink);
     void mergeResidencySink(ResidencySink& sink, uint32_t bucket);
     std::vector<float3x3> mTileForward; ///< Per slot: asset source voxel to tile-local domain voxel (linear part).
+    /// What the walk reads of the slots, as beginCut copied them (CloudView::walkBesideTileChanges): the sea's instance tiles, their
+    /// forward transforms, sun classes and epochs.
+    std::vector<CloudSea::Tile> mWalkTiles;
+    std::vector<float3x3> mWalkForward;
+    std::vector<uint32_t> mWalkSunClass;
+    std::vector<uint32_t> mWalkSlotEpoch;
+    /// Per slot: bumped whenever the slot takes another instance; a GPU visibility result of an earlier epoch is dropped.
+    std::vector<uint32_t> mSlotEpoch;
+    /// Slots changed while the walk ran: their visibility caches are cleared when it is taken, and that update re-cuts.
+    std::vector<uint32_t> mWalkChangedSlots;
 
     // GPU mirrors.
     std::vector<uint32_t> mDirectory;
