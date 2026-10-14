@@ -4,6 +4,7 @@
 #include "HSTRCloud.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Image/Bitmap.h"
+#include "Utils/Math/Float16.h"
 
 #include <algorithm>
 #include <array>
@@ -517,6 +518,16 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheUrgentAll = uint32_t(value);
             continue;
         }
+        if (key == "worldCacheUrgentFocus")
+        {
+            mWorldCacheUrgentFocus = bool(value);
+            continue;
+        }
+        if (key == "worldCacheAsyncFloor")
+        {
+            mWorldCacheAsyncFloor = bool(value);
+            continue;
+        }
         if (key == "worldCacheBudgetMs")
         {
             mWorldCacheBudgetMs = std::max(0.f, float(value));
@@ -759,6 +770,14 @@ void HSTRCloud::parseProperties(const Properties& props)
             if (mSunOctavesHalf != bool(value))
                 mResidualDirty = true; // The octaves are rebuilt with the field.
             mSunOctavesHalf = bool(value);
+            continue;
+        }
+        if (key == "sunOctavesSea" || key == "sunOctavesPoison")
+        {
+            bool& flag = key == "sunOctavesSea" ? mSunOctavesSea : mSunOctavesPoison;
+            if (flag != bool(value))
+                mResidualDirty = true; // The field and the octaves are rebuilt (or dropped) at once.
+            flag = bool(value);
             continue;
         }
         if (key == "beamDirtyTilesDense")
@@ -2485,6 +2504,8 @@ Properties HSTRCloud::getProperties() const
     props["beamDirtyTilesDense"] = mBeamDirtyTilesDense;
     props["sunColumns"] = mSunColumns;
     props["sunOctavesHalf"] = mSunOctavesHalf;
+    props["sunOctavesSea"] = mSunOctavesSea;
+    props["sunOctavesPoison"] = mSunOctavesPoison;
     props["sunInvalidateAngle"] = mSunInvalidateAngle;
     props["sunFieldAngle"] = mSunFieldAngle;
     props["sunOctaveAngle"] = mSunOctaveAngle;
@@ -2494,6 +2515,8 @@ Properties HSTRCloud::getProperties() const
     props["worldCacheContinueEvery"] = mWorldCacheContinueEvery;
     props["worldCacheBudgetMs"] = mWorldCacheBudgetMs;
     props["worldCacheUrgentAll"] = mWorldCacheUrgentAll;
+    props["worldCacheUrgentFocus"] = mWorldCacheUrgentFocus;
+    props["worldCacheAsyncFloor"] = mWorldCacheAsyncFloor;
     props["seaApplyAfterWalk"] = mSeaApplyAfterWalk;
     props["seaApplyDuringWalk"] = mSeaApplyDuringWalk;
     props["seaApplyBatch"] = mSeaApplyBatch;
@@ -2788,6 +2811,12 @@ Properties HSTRCloud::getProperties() const
         cloud["worldCacheAsyncFallbacks"] = mWorldCacheAsyncFallbacks;
         cloud["worldCacheUrgentRuns"] = mWorldCacheUrgentRuns;
         cloud["worldCacheBudgetSkips"] = mWorldCacheBudgetSkips;
+        cloud["sunColumnRefreshes"] = mSunColumnRefreshes;
+        cloud["sunColumnResumes"] = mSunColumnResumes;
+        cloud["sunColumnWholeField"] = mSunColumnWholeField;
+        cloud["sunColumnWholeDirty"] = mSunColumnWholeDirty;
+        cloud["sunColumnWholeSun"] = mSunColumnWholeSun;
+        cloud["sunColumnWholeNoChange"] = mSunColumnWholeNoChange;
         cloud["photonCostUs"] = uint32_t(mPhotonCostMs * 1000.f);
         cloud["frameBaseUs"] = uint32_t(mFrameBaseMs * 1000.f);
         cloud["worldCacheSliceUs"] = mPhotonSliceUs; // Async slices read back: their summed span on their queue ...
@@ -6061,7 +6090,20 @@ void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
     ShaderVar var = mpWorldCachePhotonAsyncPass->getRootVar()["CB"]["gHSTRCloud"];
     var["params"].setBlob(mParams);
     var["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
-    var["hstrCloudTileFocus"] = mpCloudTileFocus;
+    // worldCacheAsyncFloor: a focused slice reads the focus from its own CPU-written copy - the main queue rewrites mpCloudTileFocus
+    // in later frames while the slice runs on. One copy suffices: a slice starts only once the one before finished.
+    const bool sliceFocus = mWorldCacheAsyncFloor && mParams.worldCacheFocus != 0;
+    if (sliceFocus)
+    {
+        if (!mpPhotonSliceFocus || mpPhotonSliceFocus->getElementCount() != mCloudTileFocus.size())
+            mpPhotonSliceFocus = mpDevice->createStructuredBuffer(
+                sizeof(float), uint32_t(mCloudTileFocus.size()), ResourceBindFlags::ShaderResource, MemoryType::Upload, nullptr, false
+            );
+        std::memcpy(mpPhotonSliceFocus->map(), mCloudTileFocus.data(), mCloudTileFocus.size() * sizeof(float));
+        mpPhotonSliceFocus->unmap();
+    }
+    const ref<Buffer>& pSliceFocus = sliceFocus ? mpPhotonSliceFocus : mpCloudTileFocus;
+    var["hstrCloudTileFocus"] = pSliceFocus;
     var["hstrPhotonProxy"] = mpVisProxy;
     var["hstrPhotonMajorant"] = mpPhotonMajorant;
     var["hstrPhotonTightMajorant"] = mpPhotonTightMajorant;
@@ -6090,7 +6132,7 @@ void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
         ShaderVar deposit = mpDepositSegmentsAsyncPass->getRootVar()["CB"]["gHSTRCloud"];
         deposit["params"].setBlob(mParams);
         deposit["hstrWorldCacheDeposit"] = mpWorldCacheDeposit;
-        deposit["hstrCloudTileFocus"] = mpCloudTileFocus;
+        deposit["hstrCloudTileFocus"] = pSliceFocus;
         deposit["hstrPhotonProxy"] = mpVisProxy;
         deposit["hstrPhotonMajorant"] = mpPhotonMajorant;
         deposit["hstrPhotonTightMajorant"] = mpPhotonTightMajorant;
@@ -6113,8 +6155,9 @@ void HSTRCloud::dispatchAsyncPhotons(RenderContext* pRenderContext)
     }
     // As the main queue's update counts it (the worldCache block).
     ++mParams.worldCacheSamples;
-    for (float& batches : mCloudTileBatches)
-        batches += 1.f / float(slices);
+    // Focused, only the starving tiles took deposits (as the main queue's loop counts them).
+    for (size_t slot = 0; slot < mCloudTileBatches.size(); ++slot)
+        mCloudTileBatches[slot] += mParams.worldCacheFocus == 0 || mCloudTileFocus[slot] > 0.f ? 1.f / float(slices) : 0.f;
     mpCloudTileBatches->setBlob(mCloudTileBatches.data(), 0, mCloudTileBatches.size() * sizeof(float));
     ++mWorldCacheBakes;
     mWorldCacheBakeDirty = true;
@@ -8031,8 +8074,20 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
         // sunColumnsResume: only tiles changed since the field was built under this sun, so the columns resume where they first
         // read one (sunSegmentTouchesChange); anything else (a sun move, mResidualDirty, a new field) walks every column whole.
         const uint32_t tileCount = mParams.cloudTiles.x * mParams.cloudTiles.y;
-        const bool resume = mSunColumnsResume && fieldKept && !mResidualDirty && mpCloudSea && !mSunChangedSlots.empty() &&
-                            dot(normalize(mParams.sunDirection), mFieldSun) >= 0.999999f;
+        const bool sunKept = dot(normalize(mParams.sunDirection), mFieldSun) >= 0.999999f;
+        const bool resume = mSunColumnsResume && fieldKept && !mResidualDirty && mpCloudSea && !mSunChangedSlots.empty() && sunKept;
+        // Stats: refreshes, those resumed, and why the rest walked whole (first reason that applies).
+        ++mSunColumnRefreshes;
+        if (resume)
+            ++mSunColumnResumes;
+        else if (!fieldKept)
+            ++mSunColumnWholeField;
+        else if (mResidualDirty)
+            ++mSunColumnWholeDirty;
+        else if (!sunKept)
+            ++mSunColumnWholeSun;
+        else
+            ++mSunColumnWholeNoChange;
         if (resume)
         {
             std::vector<uint32_t> flagsPerTile(tileCount, 0u);
@@ -8173,6 +8228,15 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     // sunOctaveAngle: under sunColumns the multiply scattered octaves follow a moving sun only once it has turned this far from
     // their build (and whenever the cloud changed, or the sun stops); the single-scattered field above stays exact every frame.
     const float3 sun = normalize(mParams.sunDirection);
+    // sunOctavesSea off: no sea march reads the octaves (see mSunOctavesSea), so none are built. mOctaveSun still follows the sun:
+    // execute's "octaves left behind by sunOctaveAngle" check reads it. FOUND (sunres1): without it every frame refreshed the
+    // sun whole (sunColumnRefreshes 240 of 240 sprint frames, sunColumnWholeNoChange 225, chunk GPU 8.6 ms).
+    if (mParams.cloudDomain != 0 && !mSunOctavesSea)
+    {
+        mpSunOctaveField = nullptr;
+        mOctaveSun = sun;
+        return;
+    }
     if (columns && !mResidualDirty && !cloudChanged && !mSunStill && mpSunOctaveField && dot(sun, mOctaveSun) >= std::cos(mSunOctaveAngle))
         return;
     mOctaveSun = sun;
@@ -8208,6 +8272,18 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
         current ^= 1u;
     }
     mpSunOctaveField = mpSunOctaves[current];
+    if (mSunOctavesPoison)
+    {
+        pRenderContext->clearUAV(mpSunOctaveField->getUAV().get(), float4(1e4f));
+        const std::vector<uint8_t> data = pRenderContext->readTextureSubresource(mpSunOctaveField.get(), 0);
+        const size_t texel = (size_t(octaveDims.z / 2) * octaveDims.y + octaveDims.y / 2) * octaveDims.x + octaveDims.x / 2;
+        const size_t bytes = getFormatBytesPerBlock(octaveFormat);
+        float value = 0.f;
+        if (data.size() >= (texel + 1) * bytes)
+            value = bytes == 8 ? math::float16ToFloat32(*reinterpret_cast<const uint16_t*>(&data[texel * bytes]))
+                               : *reinterpret_cast<const float*>(&data[texel * bytes]);
+        logInfo("HSTRCloud: sun octaves poisoned, the centre texel's red reads {}", value);
+    }
 }
 
 /// Places the beam image for this build.
@@ -9460,85 +9536,19 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // without this its old deposits were read under the new setting and never retraced (sunset_hill_tone_sh: 0 samples).
         const bool converged = mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && !mCloudTileBatches.empty() &&
                                *std::min_element(mCloudTileBatches.begin(), mCloudTileBatches.end()) >= float(mWorldCacheTarget);
-        // worldCacheFocusFar: with only some tiles under the target (streamed in by a moving camera), the update is spent on them.
-        // Photons that could light them start over them or upwind (the sun's reach across the layer, as the sun pages take it,
-        // one tile either side and one downwind); the rest survive their spawn at worldCacheFocusFar, weighted by its inverse.
-        bool focus = false;
-        if (!converged && mWorldCacheFocusFar > 0.f && mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && mpCloudSea &&
-            mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 && mCloudTileFocus.size() == 2 * mCloudTileBatches.size())
-        {
-            const size_t tileCount = mCloudTileBatches.size();
-            uint32_t hungry = 0;
-            for (float batches : mCloudTileBatches)
-                hungry += batches < float(mWorldCacheTarget) ? 1u : 0u;
-            if (hungry < tileCount)
-            {
-                focus = true;
-                const float3 sun = normalize(mParams.sunDirection);
-                const auto& seaDesc = mpCloudSea->getDesc();
-                const float reach = std::abs(sun.y) > 1e-3f ? seaDesc.layerHeight * length(sun.xz()) / std::abs(sun.y) : 1e9f;
-                const int32_t n = int32_t(seaDesc.tiles);
-                // worldCacheFocusReach (tiles, 0: the geometric reach): at a low sun the reach spans the window, so every tile is near.
-                const int32_t geometric = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
-                const int32_t steps = mWorldCacheFocusReach > 0 ? std::min(geometric, int32_t(mWorldCacheFocusReach)) : geometric;
-                const float2 downwind = length(sun.xz()) > 1e-6f ? -normalize(sun.xz()) * (sun.y >= 0.f ? 1.f : -1.f) : float2(0.f);
-                std::vector<uint8_t> nearTile(tileCount, 0);
-                for (uint32_t slot = 0; slot < tileCount; ++slot)
-                {
-                    if (mCloudTileBatches[slot] >= float(mWorldCacheTarget))
-                        continue;
-                    for (int32_t k = -1; k <= steps; ++k)
-                        for (int32_t side = -1; side <= 1; ++side)
-                        {
-                            const float2 p = float2(float(slot % n), float(slot / n)) - downwind * float(k) +
-                                             float2(-downwind.y, downwind.x) * float(side);
-                            const int32_t x = ((int32_t(std::floor(p.x + 0.5f)) % n) + n) % n;
-                            const int32_t z = ((int32_t(std::floor(p.y + 0.5f)) % n) + n) % n;
-                            nearTile[x + n * z] = 1;
-                        }
-                }
-                // worldCacheFocusRoulette: tiles within worldCacheFocusRouletteReach of a starving tile keep every scattered photon.
-                std::vector<uint8_t> keepTile(tileCount, 0);
-                const int32_t keepReach = int32_t(mWorldCacheFocusRouletteReach);
-                for (uint32_t slot = 0; slot < tileCount; ++slot)
-                {
-                    if (mCloudTileBatches[slot] >= float(mWorldCacheTarget))
-                        continue;
-                    for (int32_t dz = -keepReach; dz <= keepReach; ++dz)
-                        for (int32_t dx = -keepReach; dx <= keepReach; ++dx)
-                            keepTile[((int32_t(slot % n) + dx) % n + n) % n + n * (((int32_t(slot / n) + dz) % n + n) % n)] = 1;
-                }
-                uint32_t nearCount = 0;
-                for (size_t slot = 0; slot < tileCount; ++slot)
-                {
-                    const bool starving = mCloudTileBatches[slot] < float(mWorldCacheTarget);
-                    mCloudTileFocus[slot] = starving ? 1.f : (nearTile[slot] ? -1.f : -mWorldCacheFocusFar);
-                    mCloudTileFocus[tileCount + slot] = keepTile[slot] ? 1.f : mParams.worldCacheFocusRoulette;
-                    nearCount += nearTile[slot];
-                }
-                waitPhotonSlice(pRenderContext);
-                mpCloudTileFocus->setBlob(mCloudTileFocus.data(), 0, mCloudTileFocus.size() * sizeof(float));
-                ++mWorldCacheFocusUpdates;
-                mWorldCacheFocusNear += nearCount;
-                mWorldCacheFocusHungry += hungry;
-            }
-        }
-        mParams.worldCacheFocus = focus ? 1u : 0u;
-        // worldCacheAsync: the update is left to dispatchAsyncPhotons (the frame's end, the compute queue) while its inputs are
-        // quiet: the fine sun not written this frame or the last, the sky baked for this sun, no domain write in the last two frame
-        // ends. One waiting too long runs here.
-        bool runHere = !converged;
         // worldCacheUrgentTarget: a tile under it is refilled here, whole batches, before any async continuation (which the sync
         // loop's waitPhotonSlice orders after a running slice).
         // worldCacheUrgentNear (tiles, 0: the whole window): only the tiles within it of the camera's count, so a tile restarted
         // ahead (seaApplyAfterWalk lands new rows at the window's edge) takes the continuation and not whole main-queue batches.
         float urgentLow = 1e30f;
+        int32_t cameraSlot = -1; // The camera's tile slot, with worldCacheUrgentNear.
         if (mWorldCacheUrgentNear > 0 && mpCloudSea && !mCloudTileBatches.empty())
         {
             const auto& seaDesc = mpCloudSea->getDesc();
             const float3 position = mpScene->getCamera()->getPosition();
             const int32_t cameraX = int32_t(std::floor((position.x - seaDesc.origin.x) / seaDesc.tileWorld));
             const int32_t cameraZ = int32_t(std::floor((position.z - seaDesc.origin.z) / seaDesc.tileWorld));
+            cameraSlot = int32_t(mpCloudSea->slotIndex(int2(cameraX, cameraZ)));
             const int32_t reach = int32_t(mWorldCacheUrgentNear);
             for (int32_t z = -reach; z <= reach; ++z)
                 for (int32_t x = -reach; x <= reach; ++x)
@@ -9555,9 +9565,105 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         const bool urgentNear = !converged && mWorldCacheUrgentTarget > 0 && mWorldCacheUrgentTarget < mWorldCacheTarget &&
                                 !mCloudTileBatches.empty() && (mParams.worldCacheSamples == 0 || urgentLow < float(mWorldCacheUrgentTarget));
         const bool urgent = urgentAll || urgentNear;
-        if (!mWorldCacheAsync || urgent)
+        const bool asyncFloor = mWorldCacheAsyncFloor && mWorldCacheAsync && mWorldCacheAsyncSpan;
+        // worldCacheUrgentFocus: a floor update is spent on the tiles under their own floor (worldCacheUrgentAll anywhere,
+        // worldCacheUrgentTarget within worldCacheUrgentNear of the camera), not on every tile under worldCacheTarget: in a sprint
+        // most of the window sits between the floor and the target, and each floor update traced photons for all of it.
+        const bool urgentFocus = urgent && mWorldCacheUrgentFocus;
+        auto starvingAt = [&](size_t slot)
+        {
+            if (!urgentFocus)
+                return mCloudTileBatches[slot] < float(mWorldCacheTarget);
+            float floor = float(mWorldCacheUrgentAll);
+            if (cameraSlot >= 0)
+            {
+                const int32_t n = int32_t(mpCloudSea->getDesc().tiles);
+                auto wrapped = [n](int32_t d) { d = std::abs(d) % n; return std::min(d, n - d); };
+                const int32_t dx = wrapped(int32_t(slot % n) - cameraSlot % n);
+                const int32_t dz = wrapped(int32_t(slot / n) - cameraSlot / n);
+                if (std::max(dx, dz) <= int32_t(mWorldCacheUrgentNear))
+                    floor = std::max(floor, float(mWorldCacheUrgentTarget));
+            }
+            else if (mWorldCacheUrgentNear == 0)
+                floor = std::max(floor, float(mWorldCacheUrgentTarget));
+            return mCloudTileBatches[slot] < floor;
+        };
+        // worldCacheFocusFar: with only some tiles under the target (streamed in by a moving camera), the update is spent on them.
+        // Photons that could light them start over them or upwind (the sun's reach across the layer, as the sun pages take it,
+        // one tile either side and one downwind); the rest survive their spawn at worldCacheFocusFar, weighted by its inverse.
+        bool focus = false;
+        if (!converged && mWorldCacheFocusFar > 0.f && mWorldCacheTarget > 0 && mParams.worldCacheSamples > 0 && mpCloudSea &&
+            mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 && mCloudTileFocus.size() == 2 * mCloudTileBatches.size())
+        {
+            const size_t tileCount = mCloudTileBatches.size();
+            uint32_t hungry = 0;
+            for (size_t slot = 0; slot < tileCount; ++slot)
+                hungry += starvingAt(slot) ? 1u : 0u;
+            if (hungry < tileCount)
+            {
+                focus = true;
+                const float3 sun = normalize(mParams.sunDirection);
+                const auto& seaDesc = mpCloudSea->getDesc();
+                const float reach = std::abs(sun.y) > 1e-3f ? seaDesc.layerHeight * length(sun.xz()) / std::abs(sun.y) : 1e9f;
+                const int32_t n = int32_t(seaDesc.tiles);
+                // worldCacheFocusReach (tiles, 0: the geometric reach): at a low sun the reach spans the window, so every tile is near.
+                const int32_t geometric = std::min(n, int32_t(std::ceil(reach / seaDesc.tileWorld)) + 1);
+                const int32_t steps = mWorldCacheFocusReach > 0 ? std::min(geometric, int32_t(mWorldCacheFocusReach)) : geometric;
+                const float2 downwind = length(sun.xz()) > 1e-6f ? -normalize(sun.xz()) * (sun.y >= 0.f ? 1.f : -1.f) : float2(0.f);
+                std::vector<uint8_t> nearTile(tileCount, 0);
+                for (uint32_t slot = 0; slot < tileCount; ++slot)
+                {
+                    if (!starvingAt(slot))
+                        continue;
+                    for (int32_t k = -1; k <= steps; ++k)
+                        for (int32_t side = -1; side <= 1; ++side)
+                        {
+                            const float2 p = float2(float(slot % n), float(slot / n)) - downwind * float(k) +
+                                             float2(-downwind.y, downwind.x) * float(side);
+                            const int32_t x = ((int32_t(std::floor(p.x + 0.5f)) % n) + n) % n;
+                            const int32_t z = ((int32_t(std::floor(p.y + 0.5f)) % n) + n) % n;
+                            nearTile[x + n * z] = 1;
+                        }
+                }
+                // worldCacheFocusRoulette: tiles within worldCacheFocusRouletteReach of a starving tile keep every scattered photon.
+                std::vector<uint8_t> keepTile(tileCount, 0);
+                const int32_t keepReach = int32_t(mWorldCacheFocusRouletteReach);
+                for (uint32_t slot = 0; slot < tileCount; ++slot)
+                {
+                    if (!starvingAt(slot))
+                        continue;
+                    for (int32_t dz = -keepReach; dz <= keepReach; ++dz)
+                        for (int32_t dx = -keepReach; dx <= keepReach; ++dx)
+                            keepTile[((int32_t(slot % n) + dx) % n + n) % n + n * (((int32_t(slot / n) + dz) % n + n) % n)] = 1;
+                }
+                uint32_t nearCount = 0;
+                for (size_t slot = 0; slot < tileCount; ++slot)
+                {
+                    const bool starving = starvingAt(slot);
+                    mCloudTileFocus[slot] = starving ? 1.f : (nearTile[slot] ? -1.f : -mWorldCacheFocusFar);
+                    mCloudTileFocus[tileCount + slot] = keepTile[slot] ? 1.f : mParams.worldCacheFocusRoulette;
+                    nearCount += nearTile[slot];
+                }
+                // worldCacheAsyncFloor: a running slice reads its own copy of the focus (mpPhotonSliceFocus), not this buffer.
+                if (!asyncFloor)
+                    waitPhotonSlice(pRenderContext);
+                mpCloudTileFocus->setBlob(mCloudTileFocus.data(), 0, mCloudTileFocus.size() * sizeof(float));
+                ++mWorldCacheFocusUpdates;
+                mWorldCacheFocusNear += nearCount;
+                mWorldCacheFocusHungry += hungry;
+            }
+        }
+        mParams.worldCacheFocus = focus ? 1u : 0u;
+        // worldCacheAsync: the update is left to dispatchAsyncPhotons (the frame's end, the compute queue) while its inputs are
+        // quiet: the fine sun not written this frame or the last, the sky baked for this sun, no domain write in the last two frame
+        // ends. One waiting too long runs here.
+        bool runHere = !converged;
+        // worldCacheAsyncFloor: the window's floor (worldCacheUrgentAll) is not the camera's - its tiles are far, so it alone takes
+        // the span queue, focused; the camera's floor (urgentNear) and the budget's continuation stay on this queue.
+        const bool toAsync = asyncFloor ? urgentAll && !urgentNear : !urgent;
+        if (!mWorldCacheAsync || !toAsync)
             mAsyncPhotonPending = false;
-        else if (mWorldCacheAsyncSpan && photonSliceRunning() && !converged && !focus)
+        else if (mWorldCacheAsyncSpan && photonSliceRunning() && !converged && (!focus || asyncFloor))
         {
             // worldCacheAsyncSpan: the running slice is this frame's update, and the next is due at this frame's end if it finished
             // by then. FOUND (spantime1, 4K sprint 20): without the pending flag here a slice started every other frame at best -
@@ -9569,7 +9675,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 mAsyncPhotonWaits = 0;
             }
         }
-        else if (!converged && !focus && mWorldCacheUpdates > 0 && mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 &&
+        else if (!converged && (!focus || asyncFloor) && mWorldCacheUpdates > 0 && mParams.worldCacheEstimator != 0 && mParams.worldCacheSegments == 0 &&
                  mParams.worldCacheTextured != 0 && mParams.worldCacheSamples > 0 && mParams.seaMode != 0 && !mCloudTileBatches.empty() &&
                  mExecuteFrames >= mFineSunWrittenFrame + 2 && mExtinctionQuietFrames >= 2 && mPhotonSkyBaked &&
                  all(mPhotonSkySun == normalize(mParams.sunDirection)))
@@ -9592,6 +9698,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
         // runs only every that many frames. slicecost1: the photon queue and slices do not hide or shrink the refill, they only
         // spread it, so the continuation is spread here, sync, and stays focused (worldCacheFocusFar).
         if (runHere && !urgent && mWorldCacheContinueEvery > 1 && mWorldCacheUrgentTarget > 0 && mExecuteFrames % mWorldCacheContinueEvery != 0)
+            runHere = false;
+        // worldCacheAsyncFloor: while a floor slice runs, a main-queue update would wait for it (waitPhotonSlice: both write the
+        // deposits); only the camera's floor does, the rest waits a frame.
+        if (runHere && asyncFloor && !urgentNear && photonSliceRunning())
             runHere = false;
         // worldCacheBudgetMs: the continuation spends the headroom only (urgent updates are the floor and always run).
         if (runHere && !urgent && mWorldCacheBudgetMs > 0.f && mGpuTiming && mFrameBaseMs > 0.f)

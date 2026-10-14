@@ -44,6 +44,9 @@ COUNTERS = ("beamDirtyBlocks", "beamDirtyOwnMarched", "beamDirtyApronMarched", "
             "worldCacheUrgentRuns", "seaApplyEvents",
             # worldCacheBudgetMs: frames whose wanted continuation waited for the frame budget's credit.
             "worldCacheBudgetSkips",
+            # Sun-column refreshes, resumed ones, and whole walks by cause (new field, residual dirty, sun moved, no changed tile).
+            "sunColumnRefreshes", "sunColumnResumes", "sunColumnWholeField", "sunColumnWholeDirty", "sunColumnWholeSun",
+            "sunColumnWholeNoChange",
             # worldCacheAsyncSpan: main-queue writes that waited for a running slice, slices that followed a running one, bakes put off.
             "worldCacheAsyncSpanWaits", "worldCacheAsyncBusy", "worldCacheBakesPutOff", "worldCacheBakes",
             # Async slices timed on their own queue (hstrPhotonProbe): summed span in us, how many, how many over 4 ms.

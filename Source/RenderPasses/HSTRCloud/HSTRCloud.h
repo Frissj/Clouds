@@ -282,6 +282,25 @@ private:
     /// worldCacheUrgentAll (0: off): updates are urgent while any tile of the window holds fewer batches than this (the floor
     /// under worldCacheBudgetMs for the tiles beyond worldCacheUrgentNear).
     uint32_t mWorldCacheUrgentAll = 0;
+    /// worldCacheUrgentFocus: a floor update (worldCacheUrgentAll / worldCacheUrgentTarget) focuses on the tiles under their own
+    /// floor only, not on every tile under worldCacheTarget (worldCacheFocusFar's starving set); the continuation keeps the full set.
+    /// MEASURED, off (focustime1, 4K sunset, 240-frame chunks, chunk GPU / photons a profiled frame / updates): sprint 20 ship 2.731
+    /// / 0.391 / 39, floor focus 2.767 / 0.498 / 51, ship again 2.848 / 0.443 / 38; walk 2 2.092 / 2.203 / 2.171. An update costs
+    /// the same either way (~2.4 ms: at the sunset's low sun every tile is within the spawn reach, so the flights, not the deposits,
+    /// are the cost), and the ship update's deposits into the tiles between the floor and the target are not waste: they hold the
+    /// window at the near floor before the camera comes near, so the narrow focus ran a third more near-floor updates.
+    bool mWorldCacheUrgentFocus = false;
+    /// worldCacheAsyncFloor (with worldCacheAsync and worldCacheAsyncSpan): the window's floor (worldCacheUrgentAll) runs on the
+    /// photon queue, focused, beside the frame (its tiles are far); the camera's floor (worldCacheUrgentTarget within
+    /// worldCacheUrgentNear) stays on the main queue. A focused slice reads mpPhotonSliceFocus, the CPU-written copy of the focus
+    /// at its dispatch, so the main queue's focus upload no longer waits for a running slice.
+    /// MEASURED, off (asyncfloor1, 4K sunset, 240-frame chunks, main-queue chunk GPU, mapped ~204-216k of 243k): sprint 20 ship 2.842,
+    /// async floor 2.865, ship again 2.910 ms. 12 floor updates went to the photon queue (main-queue updates 42 / 43 -> 29) and
+    /// took 12.35 ms each there (worldCacheSliceUs 148221 / 12) against ~2.4 on the main queue: the frame leaves the SMs no room
+    /// (gapsys2: 86% active), so a slice runs only by taking them from the frame, which was no faster for the work it shed.
+    /// Walk 2: 2.058 / 2.146 ship, 2.282 async (its one slice compiled mid-chunk: a 677 ms frame).
+    bool mWorldCacheAsyncFloor = false;
+    ref<Buffer> mpPhotonSliceFocus;
     /// worldCacheContinueEvery (0 / 1: every frame): with no tile urgent, the update on to worldCacheTarget runs every this many frames.
     /// MEASURED, left off (continue1, 4K sunset sprint 20, tiles applied after each walk, focus 1/16 sync, 3 x 240 frames an arm;
     /// chunk GPU, near-camera batches mean / frames under 26 of 720): t40 3.69 / 3.57 ms, 32.6 / 168 and 31.2 / 198; target 64
@@ -460,6 +479,15 @@ private:
     /// refreshes of 11-37 changed tiles): worst relative error 2^-10 (one R16 step; absolute 0.0625 only at depths over 32, where
     /// transmittance is 1e-14) - no missed tile; the sanity (sunColumnResumeBlind) is off at 4.3M / 5.8M texels by up to 60.
     bool mSunColumnsResume = true;
+    /// Stats (cloudStats): sun-column refreshes, those resumed, and the whole walks by first cause - a new field texture,
+    /// mResidualDirty, a sun that moved since the field, and no changed tile listed (cloud changed only in tiles mSunChangedSlots
+    /// does not carry, or nothing).
+    uint64_t mSunColumnRefreshes = 0;
+    uint64_t mSunColumnResumes = 0;
+    uint64_t mSunColumnWholeField = 0;
+    uint64_t mSunColumnWholeDirty = 0;
+    uint64_t mSunColumnWholeSun = 0;
+    uint64_t mSunColumnWholeNoChange = 0;
     std::vector<uint32_t> mSunChangedSlots; ///< Tiles whose cloud changed since the sun-column field was last built.
     ref<Buffer> mpSunChangedTiles;
     uint32_t mSunColumnResumeCheck = 0; ///< DIAGNOSTIC sunColumnResumeCheck: resumed refreshes compared with a whole walk.
@@ -1309,6 +1337,15 @@ private:
     /// The sun octaves' gather and blur textures in RGBA16F instead of RGBA32F. MEASURED (sunpages3): errors identical, parked and
     /// walk under a moving sun -0.04 to -0.05 ms (gather 0.18 -> 0.14; the blur 0.31 -> 0.30 is not bandwidth bound).
     bool mSunOctavesHalf = true;
+    /// sunOctavesSea: the sea builds the sun octaves (multiple scattering for the residual's octaves 1-3). Every sea march sets its
+    /// ray's octave weights to (1, 0, 0, 0) - the world cache carries multiple scattering - so only the HST cut path (cameraQuery,
+    /// not used by the sea) reads them. Off: the field is not built and stays unbound, so any reader would see zeros.
+    /// MEASURED (octpt1, sunset hill path trace): built / poisoned with 1e4 / skipped all 0.024675 excess, identical; the build is
+    /// 1.92 ms of a 4.77 ms sun refresh (intermit1). Off in IntelCloudSeaHalf.py.
+    bool mSunOctavesSea = true;
+    /// DIAGNOSTIC (sunOctavesPoison): every octave build is overwritten with 1e4 (one texel read back and logged), so an arm shows
+    /// whether anything reads the field.
+    bool mSunOctavesPoison = false;
     /// With sunColumns, a moving sun re-marches the beam columns of a tile only once the sun has turned this far (radians) since
     /// its last refresh, nearest first, at most mCloudSunTilesPerFrame a frame. 0: every frame the sun moves, which re-marched the
     /// same nearest tiles every frame and never reached the far ones. MEASURED (suninval3, 4K, 0.57 deg/frame sun, two steps, % of

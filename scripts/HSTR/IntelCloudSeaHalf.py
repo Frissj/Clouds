@@ -83,7 +83,7 @@ g.addPass(createPass("HSTRCloud", {
     # 960 wide, 4 rows restarted, refilled under focus, launcher beam, seeds aligned): ship / ship again 0.024521 identical, 1/8
     # 0.024568 (+0.2%), 1/4 0.024512, sanity 1e-4 0.024796; seed spread (ship misaligned) 0.024731; p99 0.4871 / p99.9 0.6889 in all.
     "worldCacheFocusRoulette": 0.125,
-    # Refill scaled by the frame's headroom (HSTRCloud.h worldCacheBudgetMs): every tile is held at 6 batches (worldCacheUrgentAll)
+    # Refill scaled by the frame's headroom (HSTRCloud.h worldCacheBudgetMs): every tile is held at 4 batches (worldCacheUrgentAll)
     # and the camera's 7 x 7 tiles too, baked at once (worldCacheUrgentTarget / Near); from 6 to the target 10 the refill spends only
     # what the frame leaves under 2 ms, so a sparse sky (or a parked camera) refills at full rate and a dense sprint does not.
     # MEASURED: targetpt1 (hill path trace, each arm converged to its own target, 262144-photon batches): 10 0.024564, 8 0.024444,
@@ -97,8 +97,15 @@ g.addPass(createPass("HSTRCloud", {
     # sprint scores, noisy - lagbudget4's ship anchors 11.8 / 15.4%), the middle distance visibly darker.
     # budgetfinal1 (these settings against the old refill, one launch): walk 2 2.111 / 2.210 against 2.363 ms (6 / 6 updates
     # against 21), sprint 20 3.415 / 3.209 against 3.462 (66 / 61 against 104; the camera's tiles 8.4 / 8.0 batches on average).
+    # worldCacheUrgentAll 4 (the window's floor; the camera's 7 x 7 tiles stay at 6): floorpt1 / floorpt2 (path trace, 4 rows
+    # restarted, every one of them - the camera's included - converged to the arm's target, so a harsher case than this floor):
+    # t10 0.024564 / 0.024368 / 0.024564 / 0.024616; t4 0.024676 (aligned), 0.025099 / 0.024917 / 0.024817 (seeds a / b / c),
+    # p99 0.4871 in all four draws (+1.5% excess); t3 0.026478 with p99 0.5793 aligned, 0.025427 seed a; t2 0.025424 here,
+    # 0.027800 / p99 0.5793 in targetpt1 - under 4 batches the gate is a lottery over the photon draw. floor4time1 (4K sunset,
+    # 240-frame chunks, chunk GPU, mapped mean of 243k desired): sprint 20 all6 3.460 (200.8k) / 3.039 (182.5k), all4 2.874
+    # (202.0k), updates 60 / 55 -> 38; walk 2 all6 2.134 / 2.236, all4 2.261 (6 / 8 / 8 updates - the walk's are near tiles).
     "worldCacheBudgetMs": 2.0,
-    "worldCacheUrgentAll": 6,
+    "worldCacheUrgentAll": 4,
     "worldCacheUrgentTarget": 6,
     "worldCacheUrgentNear": 3,
     "worldCacheAsync": False,
@@ -109,6 +116,11 @@ g.addPass(createPass("HSTRCloud", {
     # / 3.74 (25 / 30), again 3.80 / 3.60 (28 / 36); 2 slices 4.08 / 4.21 (11 / 13); 4 slices 4.25 / 4.14 (12 / 13). Walk 2: 1
     # slice 2.17 / 2.37 (again 2.46 / 2.45), 2 slices 2.51 / 2.60. Slices halve the sprint spikes for +0.4-0.5 ms of mean.
     "worldCacheSlices": 1,
+    # The sun octaves are not built: every sea march weights them 0 (HSTRCloud.h mSunOctavesSea). MEASURED (octpt1, hill path
+    # trace, launcher beam rebuilt): ship / poisoned (the field overwritten with 1e4, read back 10000) / skipped / ship again all
+    # excess 0.024675, p99 0.4871, max 0.829 - identical. intermit1 (4K sprint 20, 240 profiled frames): a sun refresh ran on 10
+    # of them at 4.77 ms, 1.92 of it the octaves (gather 1.18, blur 0.74) - 0.080 ms a sprint frame, 0.008 a walk frame.
+    "sunOctavesSea": False,
     "sunNearVoxels": 2.0,
     # Two sampled voxels per camera step, never more than one sea voxel. A 2-voxel cap let the first step into a fine brick cross
     # ~5 of its voxels with one sample: against the 4K path tracer (farside, 8x8 blocks) 0.1265 log error, 0.0998 capped, 0.0996 at
