@@ -552,6 +552,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mWorldCacheStepProbe = uint32_t(value);
             continue;
         }
+        if (key == "sunColumnsResume")
+        {
+            mSunColumnsResume = bool(value);
+            continue;
+        }
+        if (key == "sunColumnResumeBlind")
+        {
+            mSunColumnResumeBlind = bool(value);
+            continue;
+        }
+        if (key == "sunColumnResumeCheck")
+        {
+            mSunColumnResumeCheck = uint32_t(value);
+            continue;
+        }
+        if (key == "sunColumnProbe")
+        {
+            mSunColumnProbe = uint32_t(value);
+            continue;
+        }
         if (key == "worldCacheFastWrap")
         {
             mWorldCacheFastWrap = bool(value);
@@ -570,6 +590,62 @@ void HSTRCloud::parseProperties(const Properties& props)
         if (key == "worldCacheTrimSlots")
         {
             mWorldCacheTrimSlots = bool(value);
+            continue;
+        }
+        if (key == "worldCacheHoistExit")
+        {
+            mWorldCacheHoistExit = bool(value);
+            continue;
+        }
+        if (key == "worldCacheSharedSums")
+        {
+            mWorldCacheSharedSums = bool(value);
+            continue;
+        }
+        if (key == "worldCacheBasisInline")
+        {
+            mWorldCacheBasisInline = bool(value);
+            continue;
+        }
+        if (key == "worldCacheCellIndex")
+        {
+            mWorldCacheCellIndex = bool(value);
+            continue;
+        }
+        if (key == "beamFastWrap")
+        {
+            mBeamFastWrap = bool(value);
+            continue;
+        }
+        if (key == "sunColumnsFastWrap")
+        {
+            mSunColumnsFastWrap = bool(value);
+            continue;
+        }
+        if (key == "sunColumnsSkip")
+        {
+            // A switch rebuilds the field (as sunColumns), so a parked arm measures the method it names.
+            if (mSunColumnsSkip != uint32_t(value))
+                mResidualDirty = true;
+            mSunColumnsSkip = uint32_t(value);
+            continue;
+        }
+        if (key == "sunColumnStep")
+        {
+            const float step = std::max(0.05f, float(value));
+            if (mParams.sunColumnStep != step)
+                mResidualDirty = true;
+            mParams.sunColumnStep = step;
+            continue;
+        }
+        if (key == "worldCacheBlockMask")
+        {
+            mWorldCacheBlockMask = bool(value);
+            continue;
+        }
+        if (key == "worldCacheFastRng")
+        {
+            mWorldCacheFastRng = bool(value);
             continue;
         }
         if (key == "worldCacheRunSkip")
@@ -2418,6 +2494,17 @@ Properties HSTRCloud::getProperties() const
     props["worldCacheReuseMajorant"] = mWorldCacheReuseMajorant;
     props["worldCacheGateLoads"] = mWorldCacheGateLoads;
     props["worldCacheTrimSlots"] = mWorldCacheTrimSlots;
+    props["worldCacheHoistExit"] = mWorldCacheHoistExit;
+    props["worldCacheFastRng"] = mWorldCacheFastRng;
+    props["worldCacheBlockMask"] = mWorldCacheBlockMask;
+    props["worldCacheSharedSums"] = mWorldCacheSharedSums;
+    props["worldCacheBasisInline"] = mWorldCacheBasisInline;
+    props["worldCacheCellIndex"] = mWorldCacheCellIndex;
+    props["beamFastWrap"] = mBeamFastWrap;
+    props["sunColumnsFastWrap"] = mSunColumnsFastWrap;
+    props["sunColumnsSkip"] = mSunColumnsSkip;
+    props["sunColumnsResume"] = mSunColumnsResume;
+    props["sunColumnStep"] = mParams.sunColumnStep;
     props["worldCacheSlices"] = mWorldCacheSlices;
     props["worldCacheAsync"] = mWorldCacheAsync;
     props["worldCacheAsyncSpan"] = mWorldCacheAsyncSpan;
@@ -4618,6 +4705,7 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
     ensure(mpTightMajorant, blockDims, ResourceFormat::R16Float);
     ensure(mpOccupancy, occupancyDims, ResourceFormat::R8Uint);
     ensure(mpMajorantZero, occupancyDims, ResourceFormat::R8Uint);
+    ensure(mpTightMask, occupancyDims, ResourceFormat::RG32Uint);
     mParams.hstrMajorantDims = blockDims;
     if (!mpDomainRegions)
     {
@@ -4656,7 +4744,12 @@ void HSTRCloud::uploadDomainExtinction(const std::vector<uint32_t>& slots)
         bind(mpDomainLayerDistancePass[2],
              {{"hstrDomainLayerDistanceInput", mpDomainLayerDistanceTemp}, {"hstrDomainLayerDistanceOutput", mpDomainLayerDistance}});
         bind(mpDomainOccupancyPass,
-             {{"hstrDomainBlocks", mpDomainBlocks}, {"hstrMajorant", mpMajorant}, {"hstrOccupancyOutput", mpOccupancy}, {"hstrMajorantZeroOutput", mpMajorantZero}});
+             {{"hstrDomainBlocks", mpDomainBlocks},
+              {"hstrMajorant", mpMajorant},
+              {"hstrTightMajorant", mpTightMajorant},
+              {"hstrOccupancyOutput", mpOccupancy},
+              {"hstrMajorantZeroOutput", mpMajorantZero},
+              {"hstrTightMaskOutput", mpTightMask}});
         bind(mpClearWorldCacheTilesPass, {{"hstrCloudTileReset", mpCloudTileReset}});
         mpClearBoundDeposit = nullptr;
         mDomainPassesBound = true;
@@ -4996,6 +5089,7 @@ void HSTRCloud::updateCloudDomain(RenderContext* pRenderContext)
         for (uint32_t slot : mSunPageSlots)
             stale[slot] = 1;
         mSunPageChangedTotal += changed.size();
+        mSunChangedSlots.insert(mSunChangedSlots.end(), changed.begin(), changed.end());
         for (uint32_t slot : changed)
             for (int32_t k = 0; k <= steps; ++k)
                 for (int32_t side = -1; side <= 1; ++side)
@@ -6649,6 +6743,11 @@ void HSTRCloud::submitAsyncResidency(RenderContext* pRenderContext)
     mpResidencyHeaps[mResidencyHeap]->finish();
     const uint64_t done = mpResidencyContext->signal(mpResidencyFence.get());
     // Everything after - the frame's later passes, the next frame, the upload heap's and transient heaps' reuse - waits for it.
+    // MEASURED (gapsys1, nsys timeline of 60 live 4K sprint-20 frames): this wait is the spike frames' GPU idle the profiler
+    // shows as onFrameRender self time (spikes2: +2.28 ms in frames over 6 ms). The residency list (~20 copies, ~20 dispatches)
+    // ran 4.60 / 4.43 ms beside a 3.48 / 3.36 ms HSTRCloud and ended 1.34 / 1.30 ms after it; ToneMapper started 1.48 / 1.43 ms
+    // after HSTRCloud. 0.33-0.43 ms on two more frames, ~0.1 ms a frame over the 60. Which of its dispatches runs long is unknown
+    // (no profiler markers on that queue; a list of 1 copy and 1 dispatch also spanned 3.99 ms beside HSTRCloud).
     pRenderContext->wait(mpResidencyFence.get(), done);
     mpCloudResidency->setAsyncContext(nullptr);
     mAsyncResidencyActive = false;
@@ -7547,6 +7646,9 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     }
     const uint64_t paramsStart = __rdtsc();
     mBindSceneCycles += paramsStart - sceneStart;
+    // seaVoxel's reciprocals (HSTR_PHOTON_FAST_WRAP / HSTR_SEA_FAST_WRAP), current for every pass that reads them.
+    mParams.seaInverseDimsX = 1.f / float(std::max(mParams.hstrExtinctionDims.x, 1u));
+    mParams.seaInverseDimsZ = 1.f / float(std::max(mParams.hstrExtinctionDims.z, 1u));
     var["params"].setBlob(mParams);
     const uint64_t fieldsStart = __rdtsc();
     mBindParamsCycles += fieldsStart - paramsStart;
@@ -7577,6 +7679,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     }
     var["hstrOccupancy"] = mpOccupancy;
     var["hstrMajorantZero"] = mpMajorantZero;
+    var["hstrTightMask"] = mpTightMask;
     var["hstrTransferProbeOutput"] = mpTransferProbe;
     var["hstrProbeOutput"] = mpProbe;
     if (mpCloudResidency)
@@ -7809,7 +7912,7 @@ void HSTRCloud::dispatchFarSea(RenderContext* pRenderContext, uint32_t rowOffset
     {
         for (const char* name : {"HSTR_SUN_LIVE", "HSTR_SHIP", "HSTR_STRIP", "HSTR_LAYER_PROBE", "HSTR_WORKSET_PROBE", "HSTR_LAYER_WRAP_SELECT",
                                  "HSTR_LAYER_RUN_DISTANCE", "HSTR_UNIT_START", "HSTR_SUN_PACKED", "HSTR_FORM_B", "HSTR_LAYER_ORACLE",
-                                 "HSTR_PROXY_VARIATE", "HSTR_FORM_R", "HSTR_CACHE_VIEW"})
+                                 "HSTR_PROXY_VARIATE", "HSTR_FORM_R", "HSTR_CACHE_VIEW", "HSTR_SEA_FAST_WRAP"})
             pPass->getProgram()->removeDefine(name);
     }
     mFarSeaMarchDefines = mParams.seaFarBricks != 0;
@@ -7905,8 +8008,29 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     mParams.sunColumns = columns ? 1u : 0u;
     if (columns)
     {
-        if (!mpSunShear || mpSunShear->getWidth() != fineDims.x || mpSunShear->getHeight() != fineDims.y || mpSunShear->getDepth() != fineDims.z)
+        const bool fieldKept =
+            mpSunShear && mpSunShear->getWidth() == fineDims.x && mpSunShear->getHeight() == fineDims.y && mpSunShear->getDepth() == fineDims.z;
+        if (!fieldKept)
             mpSunShear = mpDevice->createTexture3D(fineDims.x, fineDims.y, fineDims.z, ResourceFormat::R16Float, 1, nullptr, flags);
+        // sunColumnsResume: only tiles changed since the field was built under this sun, so the columns resume where they first
+        // read one (sunSegmentTouchesChange); anything else (a sun move, mResidualDirty, a new field) walks every column whole.
+        const uint32_t tileCount = mParams.cloudTiles.x * mParams.cloudTiles.y;
+        const bool resume = mSunColumnsResume && fieldKept && !mResidualDirty && mpCloudSea && !mSunChangedSlots.empty() &&
+                            dot(normalize(mParams.sunDirection), mFieldSun) >= 0.999999f;
+        if (resume)
+        {
+            std::vector<uint32_t> flagsPerTile(tileCount, 0u);
+            for (uint32_t slot : mSunChangedSlots)
+                if (slot < tileCount && !mSunColumnResumeBlind)
+                    flagsPerTile[slot] = 1u;
+            if (!mpSunChangedTiles || mpSunChangedTiles->getElementCount() != tileCount)
+                mpSunChangedTiles = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), tileCount, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nullptr, false
+                );
+            mpSunChangedTiles->setBlob(flagsPerTile.data(), 0, tileCount * sizeof(uint32_t));
+        }
+        const size_t changedCount = mSunChangedSlots.size();
+        mSunChangedSlots.clear();
         mFieldSun = normalize(mParams.sunDirection);
         // The tiles whose cloud changed and those they shadow (the sun-move re-marches were chosen and invalidated in execute).
         if (!mResidualDirty && mpCloudSea)
@@ -7925,9 +8049,68 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
         mSunPageTilesTotal += mSunPageSlots.size();
         {
             FALCOR_PROFILE(pRenderContext, "sunColumns");
+            mpSunColumnsPass->getProgram()->addDefine("HSTR_SEA_FAST_WRAP", mSunColumnsFastWrap ? "1" : "0");
+            mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_SKIP", std::to_string(mpTightMask ? mSunColumnsSkip : std::min(mSunColumnsSkip, 1u)));
+            // DIAGNOSTIC (sunColumnProbe N): the next N refreshes count their samples (a blocking read).
+            const bool probe = mSunColumnProbe > 0;
+            mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_PROBE", probe ? "1" : "0");
+            mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_RESUME", resume ? "1" : "0");
             bindRenderer(pRenderContext, mpSunColumnsPass);
             bindOutput(mpSunColumnsPass, "hstrSunShearOutput", mpSunShear, "hstrSunShear");
+            if (resume)
+                mpSunColumnsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrSunChangedTiles"] = mpSunChangedTiles;
+            if (probe)
+            {
+                if (!mpSunColumnProbe)
+                    mpSunColumnProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 8);
+                pRenderContext->clearUAV(mpSunColumnProbe->getUAV().get(), uint4(0));
+                mpSunColumnsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrSunColumnProbe"] = mpSunColumnProbe;
+            }
             mpSunColumnsPass->execute(pRenderContext, uint3(fineDims.x, fineDims.z, 1));
+            if (probe)
+            {
+                --mSunColumnProbe;
+                uint32_t c[8];
+                for (uint32_t k = 0; k < 8; ++k)
+                    c[k] = mpSunColumnProbe->getElement<uint32_t>(k);
+                const double lanes = double(std::max(c[6], 1u));
+                logInfo(
+                    "HSTRCloud: sun columns (skip {}, resume {}, step {}, field {}x{}x{}, sun y {:.4f}): {} columns walked; per column "
+                    "{:.1f} samples, {:.1f} "
+                    "dense, {:.1f} zero-block jumps, {:.1f} block checks (mode 2: mask loads); wave efficiency {:.3f} (lane work over wave maxima x lanes)",
+                    mSunColumnsSkip, resume, mParams.sunColumnStep, fineDims.x, fineDims.y, fineDims.z, mFieldSun.y, c[6], c[0] / lanes,
+                    c[1] / lanes, c[2] / lanes, c[3] / lanes,
+                    c[4] / std::max(1.0, double(c[5]) * (lanes / std::max(c[7], 1u)))
+                );
+            }
+            // DIAGNOSTIC (sunColumnResumeCheck N): after the next N resumed refreshes, a whole walk compares every texel with what
+            // the resume left (a blocking read; outside the profiled time only in the sense that it follows the timed dispatch).
+            if (resume && mSunColumnResumeCheck > 0)
+            {
+                --mSunColumnResumeCheck;
+                if (!mpSunColumnProbe)
+                    mpSunColumnProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 8);
+                pRenderContext->clearUAV(mpSunColumnProbe->getUAV().get(), uint4(0));
+                mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_PROBE", "0");
+                mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_RESUME", "0");
+                mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_CHECK", "1");
+                bindRenderer(pRenderContext, mpSunColumnsPass);
+                bindOutput(mpSunColumnsPass, "hstrSunShearOutput", mpSunShear, "hstrSunShear");
+                mpSunColumnsPass->getRootVar()["CB"]["gHSTRCloud"]["hstrSunColumnProbe"] = mpSunColumnProbe;
+                mpSunColumnsPass->execute(pRenderContext, uint3(fineDims.x, fineDims.z, 1));
+                mpSunColumnsPass->getProgram()->addDefine("HSTR_SUN_COLUMN_CHECK", "0");
+                uint32_t c[4];
+                for (uint32_t k = 0; k < 4; ++k)
+                    c[k] = mpSunColumnProbe->getElement<uint32_t>(k);
+                float maxError, maxRelative;
+                std::memcpy(&maxError, &c[2], 4);
+                std::memcpy(&maxRelative, &c[3], 4);
+                logInfo(
+                    "HSTRCloud: sun column resume check ({} changed tiles): {} texels, {} off by more than 2 R16 steps; max error {:.6f} "
+                    "(relative {:.6f})",
+                    changedCount, c[0], c[1], maxError, maxRelative
+                );
+            }
         }
         // MEASURED (sunscopes1, 4K, a refresh): resampled into hstrFineSun instead of read in place, that pass cost 0.22 ms beside
         // the columns' 0.28.
@@ -7969,6 +8152,7 @@ void HSTRCloud::dispatchResidualPages(RenderContext* pRenderContext)
     }
     const bool cloudChanged = !mSunPageSlots.empty();
     mSunPageSlots.clear();
+    mSunChangedSlots.clear(); // Spent (or, without sunColumns, unused).
 
     // sunOctaveAngle: under sunColumns the multiply scattered octaves follow a moving sun only once it has turned this far from
     // their build (and whenever the cloud changed, or the sun stops); the single-scattered field above stays exact every frame.
@@ -8296,6 +8480,7 @@ void HSTRCloud::setBeamDirtyMarchDefines(const ref<ComputePass>& pPass)
     pPass->getProgram()->addDefine("HSTR_LAYER_RUN_DISTANCE", mParams.cloudLayerRunDistance != 0 ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_UNIT_START", unitStartDefine());
     pPass->getProgram()->addDefine("HSTR_CACHE_VIEW", cacheViewDefine());
+    pPass->getProgram()->addDefine("HSTR_SEA_FAST_WRAP", mBeamFastWrap ? "1" : "0");
     pPass->getProgram()->addDefine("HSTR_SUN_KNOCK", std::to_string(mBeamSunKnock));
     // formB reads the packed (density, sun) texel and hands its bake to leanSunDepth's packed branch.
     const bool formB = mFormB != 0 && mFormBValid;
@@ -9460,6 +9645,12 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                     mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_FAST_WRAP", mWorldCacheFastWrap ? "1" : "0");
                     mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_REUSE_MAJORANT", mWorldCacheReuseMajorant ? "1" : "0");
                     mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_GATE_LOADS", mWorldCacheGateLoads ? "1" : "0");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_HOIST_EXIT", mWorldCacheHoistExit ? "1" : "0");
+                    // The mask exists only for the sea domain (built with its occupancy).
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_BLOCK_MASK", mWorldCacheBlockMask && mpTightMask ? "1" : "0");
+                    // The fast RNG draws on each photon's own stream, so a patch's shared survival draw would not be shared.
+                    const bool fastRng = mWorldCacheFastRng && !(mParams.worldCachePatch > 0 && mParams.worldCachePatchSurvive != 0);
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_FAST_RNG", fastRng ? "1" : "0");
                     // worldCacheTrimSlots: the accumulator's slots in use (the shader's worldCacheSunExtension), all 16 when off.
                     const uint32_t extension = mParams.worldCacheSunOrder >= 4   ? mParams.worldCacheRingCount
                                                : mParams.worldCacheSunOrder >= 3 ? 7u
@@ -9467,6 +9658,9 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                                                                   : 0u;
                     const uint32_t slots = mWorldCacheTrimSlots ? std::min(9u + extension, 16u) : 16u;
                     mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_DEPOSIT_SLOTS", std::to_string(slots));
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_SHARED_SUMS", mWorldCacheSharedSums ? "1" : "0");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_BASIS_INLINE", mWorldCacheBasisInline ? "1" : "0");
+                    mpWorldCachePhotonPass->getProgram()->addDefine("HSTR_PHOTON_CELL_INDEX", mWorldCacheCellIndex ? "1" : "0");
                 }
                 // worldCacheBesideQuery: left for the dirty query's shadow; dispatchPhotonBeside does the counting.
                 if (mWorldCacheBesideQuery && accumulate && !mWorldCacheDeferredDeposit && mWorldCacheUpdates == 1 &&
@@ -9483,7 +9677,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 if (stepProbe)
                 {
                     if (!mpPhotonStepProbe)
-                        mpPhotonStepProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 10);
+                        mpPhotonStepProbe = mpDevice->createStructuredBuffer(sizeof(uint32_t), 11);
                     pRenderContext->clearUAV(mpPhotonStepProbe->getUAV().get(), uint4(0));
                     mpWorldCachePhotonPass->getRootVar()["CB"]["gHSTRCloud"]["hstrPhotonStepProbe"] = mpPhotonStepProbe;
                 }
@@ -9494,8 +9688,8 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 if (stepProbe)
                 {
                     --mWorldCacheStepProbe;
-                    uint32_t c[10];
-                    for (uint32_t k = 0; k < 10; ++k)
+                    uint32_t c[11];
+                    for (uint32_t k = 0; k < 11; ++k)
                         c[k] = mpPhotonStepProbe->getElement<uint32_t>(k);
                     const double flights = double(std::max(c[4], 1u));
                     // MEASURED (stepprobe2, 4K sunset parked, worldCacheRestartRows 2, 9 focused updates of ~200k photons / ~545k
@@ -9511,10 +9705,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                         "HSTRCloud: photon steps (focus {}, run skip {}): {} photons, {} flights; per flight {:.2f} empty 16-voxel jumps, "
                         "{:.2f} zero-majorant block steps, {:.2f} run skips, {:.2f} majorant steps = {:.2f} block exits + {:.2f} null "
                         "+ {:.2f} real collisions; a 2-voxel majorant would draw {:.2f} of the {:.2f} candidates; {:.2f} held majorants "
-                        "(reuse {})",
+                        "(reuse {}); {:.2f} zero steps right after another in the same 16-voxel group",
                         focus, mParams.worldCacheRunSkip, c[5], c[4], c[0] / flights, c[1] / flights, c[2] / flights, c[3] / flights,
                         c[6] / flights, c[7] / flights, (candidates - c[7]) / flights, c[8] / 16.0 / flights, candidates / flights,
-                        c[9] / flights, mWorldCacheReuseMajorant
+                        c[9] / flights, mWorldCacheReuseMajorant, c[10] / flights
                     );
                 }
                 if (mWorldCacheDeferredDeposit)

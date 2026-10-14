@@ -369,7 +369,83 @@ private:
     /// MEASURED (trimslots1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update, fast wrap on): 16 slots
     /// 2.28 / 2.41 / 2.25 / 2.27, trimmed (9) 2.16 / 2.13 / 2.15 / 2.23, 16 again 2.29 / 2.32 / 2.37 / 2.37 (-6%).
     /// Exact: trimpt1 (sunset_hill path trace, seed-aligned arms) excess 0.024568 trimmed, 16 slots, trimmed again; sanity 0.024796.
+    /// trimtrace1 (GPU Trace, sprint): still 72 registers / 28 warps (peak live 67) - the gain is fewer instructions, not occupancy.
     bool mWorldCacheTrimSlots = true;
+    /// worldCacheHoistExit (HSTR_PHOTON_HOIST_EXIT): sampleCollision's block exits from the flight's inverse direction computed
+    /// once, not three reciprocals a step (photontrace3: the block-exit lines ~5% of samples, WAIT / MIO throttle). Exact.
+    /// MEASURED, left off (hoistrng1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update): base 2.17 /
+    /// 2.10 / 2.23 / 2.13, hoist 2.09 / 2.13 / 2.34 / 2.15, base again 2.10 / 2.15 / 2.10 / 2.27 - no change (the compiler
+    /// likely hoists the loop-invariant reciprocal already).
+    bool mWorldCacheHoistExit = false;
+    /// worldCacheFastRng (HSTR_PHOTON_FAST_RNG): the photon program's randomFloat is an LCG step on a per-photon odd increment plus
+    /// a xorshift of the high bits (photontrace3: the hash chain ~7% of samples, WAIT; ~13.6 draws a flight). Not the hash's stream.
+    bool mWorldCacheFastRng = false;
+    /// worldCacheBlockMask (HSTR_PHOTON_BLOCK_MASK): sampleCollision crosses the zero-majorant 4-voxel blocks after a zero step from
+    /// its 16-voxel block's mask (mpTightMask), without the loop's two loads a block. Exact. Ceiling (stepprobe4): 4.97 of the 7.2
+    /// zero steps a flight follow another in the same 16-voxel block - ~27% of the ~18.6 loop iterations a flight.
+    /// MEASURED, left off (mask1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update): base 2.14 / 2.10 /
+    /// 2.22 / 2.13, mask 2.21 / 2.29 / 2.48 / 2.29, base again 2.15 / 2.13 / 2.09 / 2.26 - slower. Exact: its probed updates count
+    /// the same steps (7.2 zero steps a flight, 545k flights). As with worldCacheReuseMajorant, a lane walking zero blocks in
+    /// registers and a lane loading diverge within the warp, which waits for both.
+    bool mWorldCacheBlockMask = false;
+    /// worldCacheSharedSums / worldCacheBasisInline (HSTR_PHOTON_SHARED_SUMS / HSTR_PHOTON_BASIS_INLINE): register cuts for the
+    /// photon kernel, which is occupancy bound - rngtrace1 (GPU Trace): worldCacheFastRng took it from 72 to 80 registers (28 -> 24
+    /// warps) and 30% slower with ~25% fewer instructions. photontrace3's live registers peak in the deposit walk (66: 9 sums, 9
+    /// basis values, the walk) and the collision search (64: the 9 sums held through it). The sums move to group-shared memory (a
+    /// lane's column); the basis is evaluated where it is added. Both exact (the same float operations).
+    /// MEASURED (regs1, 4K sunset parked, 2 rows restarted, 4 alternating rounds, ms a photon update): base 2.18 / 2.15 / 2.27 /
+    /// 2.19, shared 2.20 / 2.23 / 2.44 / 2.26, inline 2.13 / 2.11 / 2.05 / 2.26, both 2.00 / 2.10 / 1.93 / 2.13, base again 2.14 /
+    /// 2.19 / 2.13 / 2.30 - only together (-7%). bothtrace1 (GPU Trace): 64 registers, 32 warps / SM (from 72 / 28), peak live 59,
+    /// 3,072 bytes of shared memory a group. Exact: regspt1 (sunset_hill path trace, seed-aligned) excess 0.024568 base, both,
+    /// base again; sanity 0.024796. On.
+    bool mWorldCacheSharedSums = true;
+    bool mWorldCacheBasisInline = true;
+    /// worldCacheCellIndex (HSTR_PHOTON_CELL_INDEX): the accumulator's current cell as one worldCacheIndex instead of an int3, live
+    /// through the photon's whole life (2 registers fewer; the flush no longer rebuilds the index). Exact.
+    /// MEASURED, left off (cellindex1, parked, 2 rows restarted, 4 rounds, with shared sums + inline basis): base 2.05 / 2.12 / 1.97
+    /// / 2.03, cell index 2.06 / 2.04 / 2.02 / 2.14, base again 2.01 / 2.05 / 2.10 / 2.05 - no change (peak 59 -> ~57 stays in the
+    /// 64-register allocation).
+    bool mWorldCacheCellIndex = false;
+    /// beamFastWrap (HSTR_SEA_FAST_WRAP in the beam march programs, setBeamDirtyMarchDefines): seaVoxel by the host's reciprocal
+    /// instead of a divide (exact for the power-of-two domain). marchtrace1 (GPU Trace with source, 4K walk): its two lines 2.5% of
+    /// marchBeamDirtyUnits' samples.
+    /// MEASURED, left off (beamwrap1, 4K sunset walk, 4 alternating rounds of 24 frames, ms a frame): query 0.630 / 0.641 / 0.634 /
+    /// 0.689 base, 0.664 / 0.631 / 0.680 / 0.664 fast, 0.689 / 0.648 / 0.680 / 0.633 base again; units 0.731 / 0.796 / 0.781 / 0.799,
+    /// 0.744 / 0.818 / 0.805 / 0.770, 0.797 / 0.805 / 0.791 / 0.734 - no change: the march's stalls are covered by other warps (as
+    /// hann1 found for shWindow), unlike the photon kernel's.
+    bool mBeamFastWrap = false;
+    /// sunColumnsFastWrap: computeSunColumns compiles HSTR_SEA_FAST_WRAP (seaVoxel by the host's reciprocal; exact). spikes1
+    /// (HSTR_MOTION_PROFILE_SPIKES, 4K sprint 20, slowest 10% of 240 profiled frames: 10.27 against 3.69 ms): sunColumns +2.87 ms,
+    /// photons +0.69, octGather +0.61, octBlur +0.38 over the other frames - the sprint's spikes are the tile-change sun refresh.
+    /// MEASURED, left off (suncol1, 4K sprint 20, 2 rounds of 120 profiled frames, ms a refresh run): sunColumns 5.74 / 5.75
+    /// ship, 5.79 / 5.78 fast, 5.78 / 5.76 ship again - no change. sunColumnStep 1.0: 3.13 / 3.10 (a quality trade).
+    bool mSunColumnsFastWrap = false;
+    /// sunColumnsSkip: computeSunColumn leaves out the samples that fall in a 4-voxel block whose tight majorant is zero (its
+    /// trilinear support holds no density, so each would add exactly 0) - the same sample positions, bit-identical. 1: k jumps to
+    /// the block's exit; 2: every sample tests its block's bit in the 16-voxel group's hstrTightMask, held while the group lasts.
+    /// MEASURED (suncol2, 4K sprint 20, 2 rounds of 120 profiled frames, ms a refresh run): sunColumns 5.70 / 5.71 ship, 4.99 /
+    /// 5.01 jump, 5.71 / 5.73 ship again - only -12.5%. sunprobe1 (sunColumnProbe): field 1024 x 48 x 1024, sun y 0.070, per column
+    /// 1378 samples of which 412 dense, 171 zero-block jumps from 246.5 block checks, wave efficiency 0.95: the jump is a serial
+    /// chain (position, majorant load, branch, k) where the plain loop's samples overlap; ~1.44G trilinear samples in 5.7 ms is the
+    /// texture filtering rate, so mode 2 keeps the independent loop and only drops the filtered fetches.
+    /// MEASURED, mode 2 left off (suncol3, same conditions): ship 5.73 / 5.73, jump 5.15 / 4.97, mask 8.61 / 8.62, ship again 5.71 /
+    /// 5.72 ms - with ~410 filtered fetches and 55 mask loads a column (probe) the mask is 50% SLOWER, so the plain loop is not
+    /// bound by its fetches; what bounds it is unknown (fast wrap's ALU cut did nothing either). Mode 1 is the default.
+    uint32_t mSunColumnsSkip = 1;
+    /// sunColumnsResume: when only tiles changed (the sun as when the field was built), each column re-walks from its first layer
+    /// whose segment reads a changed tile, from the depth stored at the layer above; columns that read none keep their layers.
+    /// MEASURED (resume1, 4K sprint 20, skip 1 in every arm, 2 rounds of 120 profiled frames, ms a refresh run): sunColumns whole
+    /// 4.99 / 5.05, resume 3.02 / 2.95, whole again 4.98 / 5.02 (-41%); a resumed refresh walks 383k-851k of the 1M columns at
+    /// ~56% of a whole column's samples. resumecheck1 (sunColumnResumeCheck, every texel against a whole walk, 6 resumed sprint
+    /// refreshes of 11-37 changed tiles): worst relative error 2^-10 (one R16 step; absolute 0.0625 only at depths over 32, where
+    /// transmittance is 1e-14) - no missed tile; the sanity (sunColumnResumeBlind) is off at 4.3M / 5.8M texels by up to 60.
+    bool mSunColumnsResume = true;
+    std::vector<uint32_t> mSunChangedSlots; ///< Tiles whose cloud changed since the sun-column field was last built.
+    ref<Buffer> mpSunChangedTiles;
+    uint32_t mSunColumnResumeCheck = 0; ///< DIAGNOSTIC sunColumnResumeCheck: resumed refreshes compared with a whole walk.
+    bool mSunColumnResumeBlind = false; ///< SANITY sunColumnResumeBlind: a resume told no tile changed (the check must object).
+    uint32_t mSunColumnProbe = 0; ///< DIAGNOSTIC sunColumnProbe: sun-column refreshes whose samples are counted and logged.
+    ref<Buffer> mpSunColumnProbe;
     ref<Buffer> mpPhotonStepProbe;
     uint64_t mPhotonBesideRuns = 0, mPhotonBesideFallbacks = 0; ///< cloudStats: deferred updates beside the query / not.
     /// Dispatches the deferred photon update (worldCacheBesideQuery); beside: right behind the dirty query, nothing transitioned.
@@ -1196,6 +1272,7 @@ private:
     ref<Texture> mpTightMajorant; ///< Undilated block maxima, for delta tracking.
     ref<Texture> mpOccupancy;     ///< Non-empty 16-voxel blocks, for delta tracking's empty-space skipping.
     ref<Texture> mpMajorantZero;  ///< 16-voxel blocks with any non-zero (dilated) majorant, for the camera march's zero-block skipping.
+    ref<Texture> mpTightMask;     ///< Sea domain: per 16-voxel block, a bit per 4-voxel block with a non-zero tight majorant.
     ref<Texture> mpCameraLighting;
     ref<Texture> mpCameraQueries;
     ref<Texture> mpTileCenters;

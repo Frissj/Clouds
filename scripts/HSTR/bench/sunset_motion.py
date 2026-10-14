@@ -356,6 +356,7 @@ def profile(tag, frames, speed, report=None):
     m.profiler.enabled = False
     if NSYS and report:
         nsys("stop")  # After end_capture, which has waited for the flight's GPU work.
+    spike_frames = None
     for kind in ("gpu_time", "cpu_time"):
         lanes = {name: lane for name, lane in capture["events"].items() if name.endswith("/" + kind)}
         paths = [name.rsplit("/", 1)[0] for name in lanes]
@@ -378,6 +379,44 @@ def profile(tag, frames, speed, report=None):
                     selfs.append((value - sum(children), path))
             for value, path in sorted(selfs, reverse=True)[:12]:
                 print(f"MOTION {tag}   self {value:6.3f} ms  {path.split('/onFrameRender/')[-1]}", flush=True)
+        # HSTR_MOTION_PROFILE_SPIKES=<ms>: the frames whose GPU frame time exceeds ms against the rest - each leaf's mean over the
+        # spike frames less its mean over the others, the largest first: what a spike spends that a normal frame does not. Records
+        # are aligned from the end (a scope first seen mid-capture has fewer). Under 1 it is the slowest fraction of the frames
+        # instead (0.1: the slowest 10%) - profiled frames run slower than unprofiled ones, so a fixed threshold misleads.
+        # The GPU's spike frames are reused for cpu_time. Beside the leaves, the self time of every scope with children per frame
+        # (recorded outside any child scope - a wait, a gap between dispatches, untimed work): the part of a spike no leaf shows
+        # (the frame's gpu_time includes the GPU's wait for the CPU's recording).
+        spike_ms = float(os.environ.get("HSTR_MOTION_PROFILE_SPIKES", "0"))
+        if spike_ms > 0.0:
+            totals = next((l["records"] for n, l in lanes.items() if n.endswith("/onFrameRender/" + kind)), [])
+            count = len(totals)
+            if kind == "gpu_time":
+                if 0.0 < spike_ms < 1.0 and count:
+                    spike_ms = sorted(totals)[min(count - 1, int((1.0 - spike_ms) * count))] - 1e-9
+                spikes = [i for i in range(count) if totals[i] > spike_ms]
+                others = [i for i in range(count) if totals[i] <= spike_ms]
+                spike_frames = (spikes, others, count)
+            elif spike_frames and spike_frames[2] == count:
+                spikes, others, _ = spike_frames
+            else:
+                spikes, others = [], []
+            if spikes and others:
+                def at(records, i):
+                    j = i - (count - len(records))
+                    return records[j] if 0 <= j < len(records) else 0.0
+                series = {n.rsplit("/", 1)[0]: (lambda i, r=l["records"]: at(r, i)) for n, l in leaves.items()}
+                records_of = {n.rsplit("/", 1)[0]: l["records"] for n, l in lanes.items()}
+                for path, records in records_of.items():
+                    children = [r for p, r in records_of.items() if p.rsplit("/", 1)[0] == path]
+                    if children:
+                        series[path + " (self)"] = (lambda i, r=records, c=children: at(r, i) - sum(at(x, i) for x in c))
+                excess = sorted(((sum(f(i) for i in spikes) / len(spikes) - sum(f(i) for i in others) / len(others), n)
+                                 for n, f in series.items()), reverse=True)
+                print(f"MOTION {tag} spikes over {spike_ms:g} ms ({kind}): {len(spikes)} of {count} frames, frame "
+                      f"{sum(totals[i] for i in spikes) / len(spikes):.2f} against {sum(totals[i] for i in others) / len(others):.2f} ms; "
+                      f"leaves over the other frames:", flush=True)
+                for value, name in excess[:14]:
+                    print(f"MOTION {tag}   spike +{value:6.3f} ms  {name.split('/onFrameRender/')[-1]}", flush=True)
         # HSTR_MOTION_PROFILE_MATCH (a regex): these scopes always, with the frames they ran in and their mean over all frames - a
         # pass that runs on some frames only (the sun stamp) drops out of the top list or reads its mean over its own frames.
         # Any scope, not only leaves: the profiler keeps every event it has seen, so a scope whose children stopped running in

@@ -2276,8 +2276,18 @@ struct HSTRCloudParams
     uint worldCacheTileShift = 0xffffffff;
     float seaInverseDimsX = 0.f;
     float seaInverseDimsZ = 0.f;
-    uint _fastWrapPad0 = 0; // Two 16-byte rows, so the struct's tail padding stays as it was.
-    uint _fastWrapPad1 = 0;
+    /// computeSunColumn's longest sample along the sun, in domain voxels (was kSunColumnStep 0.5). At the sunset elevation (sun y
+    /// 0.070) a ray crosses 689 voxels of path through the 48 layers: 1378 samples a column at 0.5 (sunprobe1).
+    /// MEASURED (suncol1, 4K sprint 20, ms a refresh run, before sunColumnsSkip / Resume): 0.5 5.74 / 5.75, 1.0 3.13 / 3.10.
+    /// sunstep_pt1 (4K sunset hill against the 326 spp path trace, seed-aligned arms, excess squared log error): 0.5 0.024568,
+    /// 1.0 0.024564, 0.75 0.024572; sanity (focus roulette 1e-4) 0.024796; 0.5 again 0.024568 - the step is below what the
+    /// gate resolves, so 1.0.
+    /// sunnew1 (4K sprint 20, 2 rounds of 120 profiled frames, ms a frame; mapped 225-228k of 243k desired): sunColumns old (step
+    /// 0.5, no skip / resume) 0.287 / 0.241, new (1.0, skip 1, resume) 0.097 / 0.104, old again 0.240 / 0.288; leaves 3.12 / 2.76
+    /// old, 2.63 / 2.74 new, 2.94 / 3.18 old again; spike frames (over 6 ms) 11.37 / 9.80 old, 9.49 / 9.23 new, the sun columns'
+    /// share of them 2.87 -> 0.82 / 1.13 ms. Step 2.0 0.090 / 0.102 ms - no further gain, not taken.
+    float sunColumnStep = 1.0f;
+    uint _fastWrapPad1 = 0; // With sunColumnStep, two 16-byte rows, so the struct's tail padding stays as it was.
     uint _fastWrapPad2 = 0;
 };
 /// beamPushProbe counters (hstrPushCounts).
