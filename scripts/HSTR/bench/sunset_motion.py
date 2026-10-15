@@ -688,6 +688,14 @@ for speed_i, speed in enumerate(speeds):
               f"{d['worldCacheBakes']:.0f}, starving {s.get('worldCacheStarving')} empty {s.get('worldCacheEmpty')} near low "
               f"{s.get('worldCacheNearLow')} bake low {s.get('worldCacheBakeLowBatches')}; churn { {k: int(d[k]) for k in churn} }; "
               f"{summary(walls)} {levels(s)}", flush=True)
+        # beamRefineStep: what the parked sweep did in the window (builds, blocks, finished and restarted sweeps, why it restarted).
+        r = {k: float(s.get(k) or 0) - float(before.get(k) or 0) for k in (
+            "beamRefineFrames", "beamRefineBlocks", "beamRefineSweeps", "beamRefineRestarts", "beamInvalidatedBuilds",
+            "beamInvalidateAllBuilds", "beamPolicyRestores", "beamRefineRewinds")}
+        print(f"MOTION {tag} parkedAfter{window} refine: { {k: int(v) for k, v in r.items()} } cursor {s.get('beamRefineCursor')}/"
+              f"{s.get('beamRefineBoxBlocks')} left {s.get('beamRefineLeft')} slice {s.get('beamRefineSlice')} base "
+              f"{s.get('beamRefineBaseUs')} us ({s.get('beamRefineBaseSamples')}) build {s.get('beamRefineBuildUs')} us credit "
+              f"{s.get('beamRefineCreditUs')} us", flush=True)
         # HSTR_MOTION_PARK_PROFILE=N: each parked window followed by N profiled frames (what the drain after a flight costs).
         if int(os.environ.get("HSTR_MOTION_PARK_PROFILE", "0")):
             profile(f"{tag} parkedAfter{window}", int(os.environ["HSTR_MOTION_PARK_PROFILE"]), 0.0)

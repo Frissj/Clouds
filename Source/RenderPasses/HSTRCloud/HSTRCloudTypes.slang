@@ -2289,6 +2289,12 @@ struct HSTRCloudParams
     float sunColumnStep = 1.0f;
     uint _fastWrapPad1 = 0; // With sunColumnStep, two 16-byte rows, so the struct's tail padding stays as it was.
     uint _fastWrapPad2 = 0;
+    /// The beam's lean march step (marchBeamLean, its pair and refill): minStepVoxels, or beamRefineStep in a parked build that
+    /// refines (HSTRCloud::mBeamRefineStep). Set every frame before any beam pass binds.
+    float beamStepVoxels = 2.f;
+    uint beamRefineFirst = 0; ///< refineBeamBlocks: the first entry of this build's slice of hstrBeamRefineList.
+    uint beamRefineCount = 0; ///< And how many.
+    uint beamRefineMarch = 0; ///< beamRefineStep: this build listed a refine slice, so its dirty points march (no hold, no carry).
 };
 /// beamPushProbe counters (hstrPushCounts).
 static const uint kPushCandidates = 0;     ///< Occupied cells listed (27-voxel occupancy), by the last listing.

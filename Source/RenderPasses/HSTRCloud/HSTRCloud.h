@@ -824,7 +824,8 @@ private:
     /// group but the cost probe (509) is faster everywhere: near 12.5, farside 9.9, sea 5.5, flying 2 units 7.9 -> 5.8, 20 units
     /// 10.0 -> 8.0.
     /// 509 | 1024 | 2048 | 8192: the lean march (marchBeamLean) on the resolved level pages and sun slots, crossing zero 4-voxel
-    /// majorant blocks whole (lean_march.py).
+    /// majorant blocks whole (lean_march.py). 524288: the lean march's skips resume on one lattice of camera-distance shells
+    /// (leanResume).
     uint32_t mBeamShipMask = 11773 | 32768; // With the transmittance-scaled steps (CloudSea.py).
     /// Whether every switch HSTR_SHIP folds holds its shipping value, so that the folded program renders the same frame.
     bool beamShipping() const;
@@ -914,6 +915,101 @@ private:
     LazyComputePass mpBeamDirtyMarchStripPass; ///< The colour output: 0 RGBA32Float, 1 RGBA16Float, 2 R11G11B10Float (see reflect).
     LazyComputePass mpBeamWarpArgsPass;
     LazyComputePass mpBeamPolicyPass; ///< decideBeamPolicy: the warp decision and beamPolicy's step scale and tolerance.
+    LazyComputePass mpBeamPolicyRestoreBlocksPass; ///< restoreBeamPolicyBlocks: on stopping, re-lists what a loosened tolerance held.
+    LazyComputePass mpBeamPolicyRestorePass;       ///< restoreBeamPolicy: then the stationary tolerance is beamTolerance again.
+    bool mBeamPolicyDecided = false; ///< decideBeamPolicy ran since the last restore (the tolerance may be above beamTolerance).
+    uint32_t mBeamPolicyRestores = 0; ///< cloudStats beamPolicyRestores: stationary builds that ran the restore.
+    /// beamTolerance at the last restore; the args buffer starts at the tolerance it was created with, so a later change restores.
+    float mBeamPolicyRestoredTolerance = -1.f;
+    /// beamRefineStep (sea voxels, 0: off): a parked camera's builds march the lean march at this step instead of minStepVoxels,
+    /// and sweep the on-screen guard blocks into the classification a slice a build, as many as the frame's headroom under the
+    /// budget (worldCacheBudgetMs, else 2 ms) pays for, so the parked image converges to the short step's quadrature while moving
+    /// frames keep minStepVoxels. Any translation, turn, policy restore or whole-image invalidation restarts the sweep.
+    float mBeamRefineStep = 0.f;
+    LazyComputePass mpBeamRefineBlocksPass; ///< refineBeamBlocks.
+    LazyComputePass mpBeamRefineListPass;   ///< listBeamRefineBlocks: the on-screen blocks, at the start of a sweep.
+    ref<Buffer> mpBeamRefineList;           ///< hstrBeamRefineList: [0] count, then the sweep's blocks.
+    /// The next entry of hstrBeamRefineList the parked sweep lists. The sweep is cyclic: a whole-image invalidation while parked
+    /// re-marches every block at minStepVoxels, so it sets mBeamRefineLeft to every block again but keeps the cursor - restarting
+    /// from 0 re-refined the same first blocks after each one (refinelive2: the cursor never past 704 after the sprint).
+    uint32_t mBeamRefineCursor = 0;
+    uint32_t mBeamRefineLeft = ~0u;          ///< cloudStats beamRefineLeft: blocks the sweep still has to refine; ~0 until listed.
+    uint32_t mBeamRefineRewinds = 0;         ///< cloudStats beamRefineRewinds: whole-image invalidations while parked.
+    /// cloudStats beamRefineBoxBlocks: the sweep's on-screen blocks, ~0 until known. The count is copied to mpBeamRefineReadback
+    /// when the list is made and read once that frame's GPU timer has been read: getElement's flush and wait stalled the frame.
+    uint32_t mBeamRefineBoxBlocks = ~0u;
+    ref<Buffer> mpBeamRefineReadback;          ///< The list's count, read without a stall (mBeamRefineListFrame).
+    uint32_t mBeamRefineListFrame = ~0u;       ///< mGpuTimerFrame of the build that listed the sweep; ~0 when no count is pending.
+    /// The slice: kBeamRefineSlice blocks, the knee of refine13's cost curve (below) - a build pays a fixed ~0.5 ms however few
+    /// blocks it takes, so the sweep runs fewer, larger builds and paces how often instead of how big. Every parked build earns
+    /// credit, the budget's headroom over the parked base (worldCacheBudgetMs, else 2 ms), at least kBeamRefineMinRateMs so a view
+    /// whose base is already at the budget still converges, held up to one build's cost; a slice runs once the credit pays for
+    /// it. The cost is a full slice's timed build (query to unit march), smoothed (mBeamRefineBuildMs).
+    /// The base is the parked frame alone (mBeamRefineBaseMs), not mFrameBaseMs: right after stopping that still holds the moving
+    /// frames (refine1: 1.36 ms against 0.78 parked), so frame minus base read ~0 a block and one slice took all 78,400 blocks.
+    /// REPLACED: a linear model, slice = headroom / cost a block, at least 16 blocks (refine12, refine13 below); then a fixed +
+    /// per-block fit sizing the slice (refine14, refine15 below).
+    /// REMOVED: beamRefineSweepFrames, a floor of the sweep's blocks / 60 a build. refine11: 132 blocks a build at 3.7-4.3 ms.
+    /// MEASURED (refine12, 4K sunset parked, frozen residency): converged to the camera-step-2 rebuild (0.01% of pixels over
+    /// 8/255, p99.9 1/255) in 465 builds against refine11's 62, the slice at the 16 floor nearly throughout: the parked base read
+    /// 1.37-2.48 ms (clock drift), at or over the budget, so no headroom. A build's cost is not linear in its blocks - 16-block
+    /// builds read 9-155 us a block against ~17 at 132 (the dirty query's latency, not its work) - so small slices waste the frame.
+    /// Sweep frames 2.1-4.4 ms (10-frame means), 1.3-2.3 after it. Moving (refinelive1, 20-frame chunks alternating): walk ship /
+    /// refine / ship again 2.83 / 2.44 / 2.53 ms, sprint 3.92 / 3.59 / 3.91 (step-2 sanity arm 3.37 / 4.86), mapped alike.
+    /// MEASURED (refine13, profiled whole sweeps at a fixed slice, parked ship 0.86 / 0.91 ms before / after): extra over ship
+    /// for the same 7,867 blocks 76 / 71 ms at 132 blocks a build (59 builds), 124 at 64 (120), 290 at 16 (489) - 0.59 ms a
+    /// build at 16, 1.04 at 64, 1.29 at 132: a fixed ~0.5 ms a build, the dirty query (~0.25 ms at 16 blocks) and the unit
+    /// march (~0.3) waiting on their longest rays. refinelive2 (live residency, parked after the flights): after the walk the
+    /// sweep ran 52 builds a window at 16 blocks (base 2.3-3.2 ms) and was at 3,664 of 7,867 after 300 frames; after the sprint
+    /// whole-image invalidations (beamChangeOverflows, 1-2 a window while residency still churned) restarted it every window,
+    /// the cursor never past 704 in 300 frames.
+    float mBeamRefineSlice = 0.f;            ///< cloudStats beamRefineSlice: the last slice's blocks.
+    static constexpr uint32_t kBeamRefineSlice = 132;
+    static constexpr float kBeamRefineMinRateMs = 0.25f; ///< Credit a parked build earns at least (ms).
+    float mBeamRefineCreditMs = 0.f;         ///< cloudStats beamRefineCreditUs.
+    /// cloudStats beamRefineBuildUs: a full slice's timed build, smoothed 0.8 / 0.2; seeded with refine13's 132-block build.
+    float mBeamRefineBuildMs = 1.29f;
+    /// MEASURED (refine16, 4K sunset parked, frozen residency): timed builds 1.24-3.05 ms (smoothed), the base 1.55-2.6 ms, so
+    /// the credit ran at its 0.25 ms floor: a 132-block build every ~8 frames. A parked beamReset mid-sweep rewound it (cursor
+    /// 2,772 kept); the cycle then finished 495 frames later in 60 builds (refine12: 489 builds) and the image matched the
+    /// camera-step-2 rebuild exactly (0.00%, max 0; ship 1.57%). 10-frame means 1.8-3.0 ms sweeping, 2.0-2.4 after it; timed
+    /// build frames 2.8-6.9 ms. Live (refinelive4, 20-frame chunks alternating, ship / refine / ship again): walk 2.49 / 2.42 /
+    /// 2.21 ms, sprint 3.19 / 3.53 / 4.02, mapped alike (one sprint refine chunk 144k against 177-260k). Parked after the walk
+    /// (base 2.5-3.2 ms): 7-8 builds a 60-frame window, 4,752 of 7,867 blocks in 300 frames. After the sprint, 1-2 whole-image
+    /// invalidations a window rewound the count each time while the cursor went on (792 -> 4,620 in 300 frames).
+    /// MEASURED and REPLACED: the fixed + per-block fit (least squares over decayed sums, odd slices at 0.6 of the size so it
+    /// saw two). MEASURED (refine15, parked, frozen residency; refinelive3, live): the fit does not hold. Timed directly it still read fixed
+    /// 0.3-3.05 ms and 0.01-38 us a block within one sweep, and once fixed >= the cap the slice drops to 16, where 0.6 of it is 16
+    /// again: no spread, no slope, stuck. 750 parked frames swept ~4,800 of 7,867 blocks (0.95% of pixels off c2 at the end, ship
+    /// 1.57%); live, parked after the flights, one 16-block build every 4 frames (the 0.25 ms rate floor, base 1.95-3.54 ms):
+    /// 240 blocks a 60-frame window. The cyclic sweep works: a parked beamReset rewound it with the cursor kept (817 -> on), and
+    /// after the sprint the cursor advanced 224 -> 1,168 through 1-2 whole-image invalidations a window (refinelive2: stuck under
+    /// 704). Moving, ship / refine / ship again: walk 2.25 / 2.48 / 2.40 ms, sprint 3.54 / 3.37 / 3.64, mapped alike.
+    /// A refine build's cost, its dirty query to the end of its unit march, timed directly (GPU timestamps on refine builds only).
+    /// Frame minus parked base is too noisy for it: refine14's fit off it read fixed 0-2.7 ms and 0.01-81 us a block within one
+    /// sweep, the base itself 1.5-3.6 ms, more than the 0.5-1.3 ms a build adds; the two scopes are ~0.02 ms on a parked build
+    /// without a slice (refine13: query 0.011, units 0.007).
+    ref<GpuTimer> mpBeamRefineTimers[3];
+    bool mBeamRefineTimed[3] = {};           ///< Per GPU timer slot: that frame's refine build was timed.
+    bool mBeamRefineTimerOpen = false;       ///< The current build's timer has begun and not yet ended.
+    /// beamRefineSliceFixed (DIAGNOSTIC, 0: off): every parked build refines this many blocks, with no base builds, so a whole
+    /// sweep can be profiled at one slice size.
+    uint32_t mBeamRefineSliceFixed = 0;
+    static constexpr uint32_t kBeamRefineBaseEvery = 8; ///< Every this many parked sweep builds lists no slice: a base sample.
+    float mBeamRefineBaseMs = 0.f;           ///< cloudStats beamRefineBaseUs: smoothed parked frames without a slice, since the restart.
+    uint32_t mBeamRefineBaseSamples = 0;     ///< Parked base samples since the restart; the sweep starts at kBeamRefineBaseStart.
+    static constexpr uint32_t kBeamRefineBaseStart = 2;
+    uint32_t mBeamRefineParkedBuilds = 0;    ///< Parked builds since the restart (kBeamRefineBaseEvery).
+    bool mBeamRefineBaseSlot[3] = {};        ///< Per GPU timer slot: a parked build without a slice, a sample of the parked base.
+    /// beamStepOverride (ORACLE, 0: off): every build's lean march at this step and nothing else changed - minStepVoxels also
+    /// sizes computeFineSun's sun steps, so a minStepVoxels arm is not a camera-step arm.
+    float mBeamStepOverride = 0.f;
+    float mBeamRefineFrameMs = 0.f;          ///< cloudStats beamRefineFrameUs: the GPU time of the last timed refine frame.
+    uint32_t mBeamRefineTimedBlocks[3] = {}; ///< Per GPU timer slot: blocks that frame's build refined (timed like photon updates).
+    uint32_t mBeamRefineFrames = 0;          ///< cloudStats beamRefineFrames: builds that refined a slice.
+    uint32_t mBeamRefineBlocks = 0;          ///< cloudStats beamRefineBlocks: guard blocks swept (on-screen or not).
+    uint32_t mBeamRefineSweeps = 0;          ///< cloudStats beamRefineSweeps: sweeps that reached the last block.
+    uint32_t mBeamRefineRestarts = 0;        ///< cloudStats beamRefineRestarts: sweeps cut short by a move, turn or rebuild.
     /// beamPolicy (see HSTRCloudParams): what a build holding few guard blocks spends on a looser tile test (and could on longer
     /// steps, which fail on harder content: policy3). Shipped tolerance-only, 0.01 -> 0.05 as the held share falls 0.25 -> 0.05.
     bool mBeamPolicy = true;

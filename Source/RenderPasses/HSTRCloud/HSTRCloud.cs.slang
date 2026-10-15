@@ -820,6 +820,8 @@ struct HSTRCloudRenderer
     RWTexture2D<float4> hstrBeamGuardCamera;
     /// The blocks whose certificate failed this build, compacted, with the count and the indirect arguments that dispatch them.
     RWStructuredBuffer<uint> hstrBeamDirty;
+    /// beamRefineStep's sweep: [0] the count, then the guard blocks on screen when the sweep started (listBeamRefineBlock).
+    RWStructuredBuffer<uint> hstrBeamRefineList;
     /// beamOrderProbe, over the rays the dirty query marched this build: [0] rays, [1] steps, [2] longest ray's steps, [3] rays with
     /// no stored step count, [4] sum |stored - actual| and [5] sum actual over the others, [6..17] rays by log2(steps) (1, 2-3, 4-7,
     /// ..., 2048+), [18] rays at least the threshold, [19] rays predicted at least it, [20] both.
@@ -6867,7 +6869,14 @@ struct HSTRCloudRenderer
         float opacityDistance = 0.f;
 #if HSTR_UNIT_START
         if (startDistance > 0.f)
+        {
+#if (HSTR_SHIP & 524288) != 0
+            // The hinted start on the step lattice's last shell before it, like every skip (leanResume).
+            const float spacing = leanLatticeSpacing(ray);
+            startDistance = floor(startDistance / spacing) * spacing;
+#endif
             segment.x = max(segment.x, (startDistance - ray.entryDistance) / ray.worldLength);
+        }
 #endif
 #if (HSTR_SHIP & 1024) != 0
         marchBeamLean(ray, segment, beamWithCache(), beamWithSingle(), result.cache, result.single, transmittance, steps, opacityDistance);
@@ -10139,11 +10148,66 @@ struct HSTRCloudRenderer
     /// from the page, before the empty-cell test, and the brick record only decoded it - one dependent round trip off every
     /// density sample. Walk 1.88 / 1.85 -> 1.98 ms, sprint 2.06 / 2.06 -> 2.16. The texel held live across the cell test and the
     /// wasted fetches of empty samples cost more than the latency saved: the chain is occupancy-bound, not latency-bound.
+
+    /// Step lattice (HSTR_SHIP bit 524288): the world distance from the camera between the shells every skip resumes on, one
+    /// minStepVoxels step of sea voxels (the step a sample at full transmittance outside the fine bricks takes).
+    float leanLatticeSpacing(CutRay ray)
+    {
+        return params.beamStepVoxels * ray.worldLength / max(length(ray.direction) * float(params.hstrCellWidth), 1e-6f);
+    }
+
+    /// Where the lean march goes after a step from t ending at next whose skip (an empty box or a zero majorant block) reaches skipTo.
+    /// A skip ends on a block face, so a ray resumed there samples at that face + k * dt: every block face its neighbours leave
+    /// through starts its own sample phase, and with the long shipped step (7 voxels x up to 4 for transmittance) the quadrature
+    /// error of each phase drew straight-edged facets across near cloud interiors (facets, 4K parked per-pixel march: gone at
+    /// minStepVoxels 1 or at 4 density taps a step, untouched by worldCacheView and sunColumns). With bit 524288 the skip
+    /// instead resumes on the last camera-distance shell (a multiple of leanLatticeSpacing) before skipTo, so neighbouring rays
+    /// share one sample phase across every face. Rounding down re-crosses at most one step of empty space and never jumps density.
+    /// MEASURED (lattice1, 4K parked sunset, full rebuild every frame, one settle): march 3.13 / 3.11 -> 8.14 ms (HSTRCloud 6.68 /
+    /// 6.64 -> 19.16). Rounding down to a 7-voxel shell lands before t + dt whenever the skip was shorter than a step (the 4-voxel
+    /// zero majorant blocks), so those skips became plain steps.
+    /// Bit 1048576 instead: the skip resumes at skipTo itself and the step from there ends on the next shell (shellEnd), so the
+    /// lattice holds from the second sample on. Continuous in skipTo: a face just before a shell gives a vanishing first step, just
+    /// past it a full one ending a spacing later - the sample the ray at the shell would take. A first step under a quarter
+    /// spacing is merged into the next (its sample moves by at most an eighth of a spacing). No empty space is crossed twice.
+    /// MEASURED (lattice2, same view, the lean march per pixel: screen beam at beamTolerance 0, scored against minStepVoxels 1 as
+    /// the share of pixels > 8/255 off): ship 1.65%, floor lattice 1.67% - one sample phase for every ray did not move the facets,
+    /// so the skips' re-phasing is not what draws them; the long step's own quadrature is (beamRimTaps, taps1). Shell lattice
+    /// 4.96% with holes (cause unknown, not chased), march 3.24 against 3.22 / 3.12 ms. Neither bit is in the shipped mask.
+    float leanResume(CutRay ray, float next, float skipTo, float spacing, inout float shellEnd)
+    {
+#if (HSTR_SHIP & 524288) != 0
+        if (skipTo > next)
+        {
+            const float shell = floor((ray.entryDistance + skipTo * ray.worldLength) / spacing) * spacing;
+            return max(next, (shell - ray.entryDistance) / ray.worldLength);
+        }
+#endif
+#if (HSTR_SHIP & 1048576) != 0
+        if (skipTo > next)
+            shellEnd = leanShellEnd(ray, skipTo, spacing);
+#endif
+        return max(next, skipTo);
+    }
+
+    /// Bit 1048576: the ray parameter of the first camera-distance shell at least a quarter spacing past t.
+    float leanShellEnd(CutRay ray, float t, float spacing)
+    {
+        const float d = ray.entryDistance + t * ray.worldLength;
+        const float shell = ceil((d + 0.25f * spacing) / spacing) * spacing;
+        return (shell - ray.entryDistance) / ray.worldLength;
+    }
+
 #if HSTR_QUERY_PAIR
     /// marchBeamLean's step length at t, as its loop sizes it.
-    float leanStepLength(CutRay ray, float t, float majorant, float fineVoxels, float transmittance, float unitsPerVoxel, float end)
+    float leanStepLength(CutRay ray, float t, float majorant, float fineVoxels, float transmittance, float unitsPerVoxel, float end,
+                         float shellEnd)
     {
-        const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.minStepVoxels;
+#if (HSTR_SHIP & 1048576) != 0
+        if (shellEnd > t)
+            return min(shellEnd - t, end - t);
+#endif
+        const float minimumStep = clamp(fineVoxels, params.cloudFineMinVoxels, 1.f) * params.beamStepVoxels;
         const float stepVoxels =
             clamp(params.stepOpticalDepth / max(1e-6f, majorant * ray.worldLength * unitsPerVoxel), minimumStep, params.maxStepVoxels);
 #if (HSTR_SHIP & (16384 | 32768)) != 0
@@ -10185,12 +10249,14 @@ struct HSTRCloudRenderer
         const bool second = (WaveGetLaneIndex() & 1u) != 0u;
         float fineVoxels = 1.f;
         float t = segment.x;
+        const float spacing = (HSTR_SHIP & (524288 | 1048576)) != 0 ? leanLatticeSpacing(ray) : 0.f;
+        float shellEnd = (HSTR_SHIP & 1048576) != 0 ? leanShellEnd(ray, t, spacing) : -1.f;
         [loop]
         while (t < segment.y && transmittance > params.cloudMinTransmittance && steps < maxSteps)
         {
             // Lane 0's step; lane 1 needs its length to place its own step after it.
             const float majorant0 = majorantAt((ray.position + t * ray.direction) * cellWidth);
-            const float dt0 = leanStepLength(ray, t, majorant0, fineVoxels, transmittance, unitsPerVoxel, segment.y);
+            const float dt0 = leanStepLength(ray, t, majorant0, fineVoxels, transmittance, unitsPerVoxel, segment.y, shellEnd);
             const float t1 = t + dt0;
             float myT = t, myDt = dt0, myMajorant = majorant0;
             bool valid = true;
@@ -10199,8 +10265,10 @@ struct HSTRCloudRenderer
                 myT = t1;
                 valid = t1 < segment.y && steps + 1u < maxSteps;
                 myMajorant = valid ? majorantAt((ray.position + t1 * ray.direction) * cellWidth) : 0.f;
-                myDt = valid ? leanStepLength(ray, t1, myMajorant, fineVoxels, transmittance, unitsPerVoxel, segment.y) : 0.f;
+                myDt = valid ? leanStepLength(ray, t1, myMajorant, fineVoxels, transmittance, unitsPerVoxel, segment.y, shellEnd) : 0.f;
             }
+            // Bit 1048576: the shell this lane's skip resumes toward (unchanged without one).
+            float myShellEnd = shellEnd;
             // This lane's sample: its alpha and its lighting and distance before the serial march's T * alpha weight (applied in
             // that order, so the sums round as the serial march's do).
             float alpha = 0.f;
@@ -10230,13 +10298,13 @@ struct HSTRCloudRenderer
                 }
                 distance = ray.entryDistance + tSample * ray.worldLength;
                 if (skipTo >= 0.f)
-                    myNext = min(max(myNext, skipTo), segment.y);
+                    myNext = min(leanResume(ray, myNext, skipTo, spacing, myShellEnd), segment.y);
             }
             else if (valid)
 #if (HSTR_SHIP & 8192) != 0
-                myNext = min(max(myNext, majorantZeroExitFine(ray, myT)), segment.y);
+                myNext = min(leanResume(ray, myNext, majorantZeroExitFine(ray, myT), spacing, myShellEnd), segment.y);
 #else
-                myNext = min(max(myNext, majorantZeroExit(ray, myT)), segment.y);
+                myNext = min(leanResume(ray, myNext, majorantZeroExit(ray, myT), spacing, myShellEnd), segment.y);
 #endif
             // leanExtinction sets fineVoxels from the sample alone (1 on entry); an air step leaves the carried value.
             const bool touched = valid && myMajorant > 0.f;
@@ -10251,6 +10319,8 @@ struct HSTRCloudRenderer
             const bool touchedP = WaveReadLaneAt(touched, partner);
             const float majorantP = WaveReadLaneAt(myMajorant, partner);
             const float dtP = WaveReadLaneAt(myDt, partner);
+            const float shellP = (HSTR_SHIP & 1048576) != 0 ? WaveReadLaneAt(myShellEnd, partner) : -1.f;
+            const float shell0 = second ? shellP : myShellEnd, shell1 = second ? myShellEnd : shellP;
             const float alpha0 = second ? alphaP : alpha, alpha1 = second ? alpha : alphaP;
             const float next0 = second ? nextP : myNext, next1 = second ? myNext : nextP;
             const bool touched0 = second ? touchedP : touched, touched1 = second ? touched : touchedP;
@@ -10272,9 +10342,10 @@ struct HSTRCloudRenderer
             ++steps;
             t = next0;
             fineVoxels = fine0;
+            shellEnd = shell0;
             // Lane 1 sized its step from the state before lane 0's sample; the serial march sizes it from the state after. Taken only
             // where the two agree (lane 0 empty, or the transmittance boost at its cap), so the result is the serial march's.
-            const bool sameStep = leanStepLength(ray, t1, majorant1, fine0, transmittance, unitsPerVoxel, segment.y) == dt1;
+            const bool sameStep = leanStepLength(ray, t1, majorant1, fine0, transmittance, unitsPerVoxel, segment.y, shell0) == dt1;
             if (valid1 && next0 <= t1 && transmittance > params.cloudMinTransmittance && sameStep)
             {
                 if (alpha1 > 1e-6f)
@@ -10291,6 +10362,7 @@ struct HSTRCloudRenderer
                 ++steps;
                 t = next1;
                 fineVoxels = fine1;
+                shellEnd = shell1;
             }
         }
     }
@@ -10338,7 +10410,8 @@ struct HSTRCloudRenderer
         // The step bounds as set. MEASURED and REMOVED (sunhit3, 4K, errors identical): beamPolicy scaling them per build (a
         // scale read from a buffer, so both bounds became live registers instead of constant-buffer values) cost walk 0.02-0.03
         // and sprint 0.07 ms at scale 1 - and longer steps had already failed on jog's content (policy3).
-        const float minStepVoxels = params.minStepVoxels;
+        // beamStepVoxels: minStepVoxels, or beamRefineStep in a parked build (still a constant-buffer value, set per build).
+        const float minStepVoxels = params.beamStepVoxels;
         const float maxStepVoxels = params.maxStepVoxels;
         // The sunset launcher sets minStepVoxels 4 over maxStepVoxels 2, so the clamp below returns 2: every step is two sea voxels
         // (times the transmittance boost) and the majorant term never acts. MEASURED and REMOVED (sunset_hill_fpstep, centreless
@@ -10352,6 +10425,9 @@ struct HSTRCloudRenderer
         // sprint units 3.06 -> 5.56 / 7.52, query 2.69 -> 4.20 / 6.34. In dense cloud the optical-depth step falls under two voxels.
         float fineVoxels = 1.f;
         float t = segment.x;
+        const float spacing = (HSTR_SHIP & (524288 | 1048576)) != 0 ? leanLatticeSpacing(ray) : 0.f;
+        // Bit 1048576: the start (box entry or beamUnitStart's hint) is a resume like any skip.
+        float shellEnd = (HSTR_SHIP & 1048576) != 0 ? leanShellEnd(ray, t, spacing) : -1.f;
 #if (HSTR_SHIP & 4096) != 0
         // Step classes (probe, pushShare's counters): all, majorant zero, empty box, proxy, contributing (alpha > 1e-6).
         uint countSteps = 0, countZero = 0, countEmpty = 0, countProxy = 0, countLit = 0;
@@ -10495,9 +10571,13 @@ struct HSTRCloudRenderer
             // steps 2.49 ms 1.650%, 3x 2.32 ms 2.481%; sprint 2.90 ms 0.283% -> 3.16 ms 0.238%. The error falls 16-25% but the
             // extra steps cost ~0.25 ms, and the unjittered shorter step dominates on both axes.
             const float boost = min((HSTR_SHIP & 32768) != 0 ? 4.f : 2.f, rsqrt(max(transmittance, 1e-6f)));
-            const float dt = min(boost * stepVoxels * unitsPerVoxel, segment.y - t);
+            float dt = min(boost * stepVoxels * unitsPerVoxel, segment.y - t);
 #else
-            const float dt = min(stepVoxels * unitsPerVoxel, segment.y - t);
+            float dt = min(stepVoxels * unitsPerVoxel, segment.y - t);
+#endif
+#if (HSTR_SHIP & 1048576) != 0
+            if (shellEnd > t)
+                dt = min(shellEnd - t, segment.y - t);
 #endif
             float next = t + dt;
 #if (HSTR_SHIP & 4096) != 0
@@ -10525,6 +10605,9 @@ struct HSTRCloudRenderer
                 // brick's own voxels - and one midpoint read of a steep backlit rim lands inside or outside it per pixel, drawn as
                 // hair along every sunset silhouette. Such a step reads its density at one evenly spaced point per brick voxel it
                 // spans, up to beamRimTaps; the midpoint's hit still lights it. Empty boxes, the proxy and air keep one read.
+                // MEASURED (taps1, 4K parked sunset, minStepVoxels 7): what draws the straight-edged facets inside near clouds.
+                // The lean march per pixel (screen beam, beamTolerance 0) against minStepVoxels 1, pixels > 8/255 off: taps 1 / 2
+                // / 4 1.65 / 0.78 / 0.55% (sanity step 14: 4.33%); full-rebuild march 3.13 / 4.05 / 4.94 ms (anchor 3.12).
                 if (params.beamRimTaps > 1u && hit.entry != kCloudRefNone)
                 {
                     const uint taps = min(params.beamRimTaps, uint(ceil(dt * voxelsPerUnit / max(fineVoxels, 1e-3f))));
@@ -10655,13 +10738,13 @@ struct HSTRCloudRenderer
                 opacityDistance += transmittance * alpha * (ray.entryDistance + tSample * ray.worldLength);
                 transmittance *= 1.f - alpha;
                 if (skipTo >= 0.f)
-                    next = min(max(next, skipTo), segment.y);
+                    next = min(leanResume(ray, next, skipTo, spacing, shellEnd), segment.y);
             }
             else
 #if (HSTR_SHIP & 8192) != 0
-                next = min(max(next, majorantZeroExitFine(ray, t)), segment.y);
+                next = min(leanResume(ray, next, majorantZeroExitFine(ray, t), spacing, shellEnd), segment.y);
 #else
-                next = min(max(next, majorantZeroExit(ray, t)), segment.y);
+                next = min(leanResume(ray, next, majorantZeroExit(ray, t), spacing, shellEnd), segment.y);
 #endif
 #if HSTR_UNIT_START
             if (gFirstDistance < 0.f && transmittance < 1.f)
@@ -14934,7 +15017,14 @@ struct HSTRCloudRenderer
         // content changing under it (invalidateBeamGuardBlock), and a parked camera's certificate is then all that says so.
         const bool stationary = (params.beamStationary != 0 && params.beamGuard == 0) || params.beamAssumeCarry != 0 ||
                                 beamBlockCertified(position);
-        if (persistent && stationary && params.beamRefValid != 0 && !beamRefreshes(point, centre) &&
+        // beamRefineMarch: a refine build re-marches its points at the parked step. Held or carried, a refined block kept its
+        // minStepVoxels corners and only its failed tiles' units were re-marched, so the sweep plateaued at 0.56% of pixels over 8/255
+        // against the camera-step-2 rebuild (refine10: c2; ship 1.06%), the remainder in the interpolated cloud interiors.
+        // MEASURED (refine11, 4K sunset parked, frozen residency): with it the sweep ends identical to c2 (0.00%, max diff 0; ship
+        // 1.57%, vs c1 1.72 -> 0.28%) after ~62 builds of 132 blocks. Those builds cost 3.7-4.3 ms a frame (1.5-1.8 parked), as the
+        // re-marched points come on top of the units: the sweepFrames floor (60) holds the slice over the 2 ms budget.
+        const bool refreshing = params.beamRefineMarch != 0 || beamRefreshes(point, centre);
+        if (persistent && stationary && params.beamRefValid != 0 && !refreshing &&
             beamLatticeValid(position))
         {
             uint held;
@@ -14943,7 +15033,7 @@ struct HSTRCloudRenderer
         }
         float4 depthCache;
         float4 single;
-        if (!beamRefreshes(point, centre) && beamReprojectQuery(position, depthCache, single))
+        if (!refreshing && beamReprojectQuery(position, depthCache, single))
         {
             // The carried value keeps the cost last measured here, so the prediction survives until the point is marched again.
             const float carriedSteps =
@@ -15713,7 +15803,7 @@ struct HSTRCloudRenderer
         const bool withSource = beamWithCache();
         const bool residual = beamWithSingle();
         const bool cached = params.debugView == kWorldCacheView || params.debugView == kBeamView;
-        const float minStepVoxels = params.minStepVoxels;
+        const float minStepVoxels = params.beamStepVoxels;
         const float maxStepVoxels = params.maxStepVoxels;
         const uint maxSteps = params.maxMarchSteps;
         bool live = false;
@@ -15958,6 +16048,60 @@ struct HSTRCloudRenderer
             return;
         hstrBeamGuardCamera[cell] = float4(verified.xyz, 0.f);
         beamGuardDropCoarse(cell);
+    }
+
+    /// beamPolicy, first stationary build after the camera stops (or after beamTolerance changed while parked): when the tile
+    /// tolerance in force is not beamTolerance, every block is unverified, so the classification lists it and its tiles are tested
+    /// again at beamTolerance (restoreBeamPolicy then writes it). Without this a stationary build kept the last translating build's
+    /// decision - a sprint's 1.4 - for as long as the camera stayed parked, the guard held the tiles it had accepted, and a parked
+    /// beamTolerance change never reached the tile test.
+    void restoreBeamPolicyBlock(uint2 cell)
+    {
+        if (any(cell >= params.beamGuardDims) || asfloat(hstrBeamWarpArgs[11]) == params.beamTolerance)
+            return;
+        const float4 verified = hstrBeamGuardCamera[cell];
+        if (verified.w < 0.5f)
+            return;
+        hstrBeamGuardCamera[cell] = float4(verified.xyz, 0.f);
+        beamGuardDropCoarse(cell);
+    }
+
+    /// beamRefineStep, the start of a sweep: every guard block on screen (as listBeamRefreshBlock tests it) into hstrBeamRefineList.
+    /// The screen's box in the octahedral image covers the whole grid at the sunset view (78,400 blocks, refine4), so a row-major
+    /// sweep of the box spent its first 120 frames in off-screen rows.
+    void listBeamRefineBlock(uint2 cell)
+    {
+        if (any(cell >= params.beamGuardDims) || !beamGuardBlockOnScreen(cell, beamGuardReachBlocks()))
+            return;
+        uint at;
+        InterlockedAdd(hstrBeamRefineList[0], 1u, at);
+        hstrBeamRefineList[1u + at] = (cell.y << 16) | (cell.x & 0xFFFFu);
+    }
+
+    /// beamRefineStep, a parked build: the blocks of this build's slice of the sweep (entries beamRefineFirst .. + beamRefineCount
+    /// of hstrBeamRefineList) go straight onto the dirty list, as the refresh phase's do (listBeamRefreshBlock): the dirty query
+    /// re-marches their points and the tile pass every unit of their failed tiles, all at beamStepVoxels (the parked step). No
+    /// classification: unverifying the blocks and letting it list them made every refine build classify the whole domain, 1.5-2 ms
+    /// over a 1.7 ms parked frame (refine4), which pinned the slice at its floor.
+    void refineBeamBlock(uint slot)
+    {
+        // The sweep is cyclic (a parked whole-image invalidation sends it round again from where it was), so a slice can wrap.
+        const uint total = hstrBeamRefineList[0];
+        if (slot >= params.beamRefineCount || slot >= total)
+            return;
+        const uint index = (params.beamRefineFirst + slot) % total;
+        const uint packed = hstrBeamRefineList[1u + index];
+        const uint2 cell = uint2(packed & 0xFFFFu, packed >> 16);
+        uint at;
+        InterlockedAdd(hstrBeamDirtyCount[0], 1u, at);
+        if (at < params.beamDirtyCapacity)
+        {
+            hstrBeamDirty[at] = (cell.y << 16) | (cell.x & 0xFFFFu);
+            uint first;
+            InterlockedMin(hstrBeamDirtyMark[cell], at, first);
+        }
+        if (params.beamCoarseShift != 0)
+            beamQueueRebuild(cell >> params.beamCoarseShift);
     }
 
     /// Whether a guard block's cone of directions (axis, half-angle cone), from the camera its values were marched from or from the
@@ -16854,6 +16998,31 @@ void testBeamTiles(uint3 dispatchThreadId: SV_DispatchThreadID)
 void invalidateBeamGuardBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     gHSTRCloud.invalidateBeamGuardBlock(dispatchThreadId.xy);
+}
+
+[numthreads(8, 8, 1)]
+void restoreBeamPolicyBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.restoreBeamPolicyBlock(dispatchThreadId.xy);
+}
+
+[numthreads(64, 1, 1)]
+void refineBeamBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.refineBeamBlock(dispatchThreadId.x);
+}
+
+[numthreads(8, 8, 1)]
+void listBeamRefineBlocks(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    gHSTRCloud.listBeamRefineBlock(dispatchThreadId.xy);
+}
+
+/// After restoreBeamPolicyBlocks has read the decision: the stationary tolerance is the set one.
+[numthreads(1, 1, 1)]
+void restoreBeamPolicy()
+{
+    gHSTRCloud.hstrBeamWarpArgs[11] = asuint(gHSTRCloud.params.beamTolerance);
 }
 
 /// x: the change (residency changes, then sun bake jobs), y: the sea slot.

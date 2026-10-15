@@ -815,6 +815,26 @@ void HSTRCloud::parseProperties(const Properties& props)
             mBeamQueryPair = bool(value);
             continue;
         }
+        if (key == "beamRefineStep")
+        {
+            mBeamRefineStep = std::max(0.f, float(value));
+            // A new sweep from the start, the list made again.
+            mBeamRefineCursor = 0;
+            mBeamRefineLeft = ~0u;
+            mBeamRefineBoxBlocks = ~0u;
+            mBeamRefineListFrame = ~0u;
+            continue;
+        }
+        if (key == "beamRefineSliceFixed")
+        {
+            mBeamRefineSliceFixed = uint32_t(value);
+            continue;
+        }
+        if (key == "beamStepOverride")
+        {
+            mBeamStepOverride = std::max(0.f, float(value));
+            continue;
+        }
         if (key == "beamQueryPairCheck")
         {
             mBeamQueryPairCheck = bool(value);
@@ -2491,6 +2511,9 @@ Properties HSTRCloud::getProperties() const
     props["beamStripProbe"] = mBeamStripProbe;
     props["beamDirtySegments"] = mParams.beamDirtySegments;
     props["beamQueryPair"] = mBeamQueryPair;
+    props["beamRefineStep"] = mBeamRefineStep;
+    props["beamRefineSliceFixed"] = mBeamRefineSliceFixed;
+    props["beamStepOverride"] = mBeamStepOverride;
     props["beamQueryPairCheck"] = mBeamQueryPairCheck;
     props["beamOrderProbe"] = mParams.beamOrderProbe;
     props["beamQueryCompact"] = mBeamQueryCompact;
@@ -3407,6 +3430,25 @@ Properties HSTRCloud::getProperties() const
             cloud["beamFusedDiag" + std::to_string(i)] = mBeamFusedDiag[i];
         cloud["beamWarpOn"] = mBeamWarpOn;
         cloud["beamPolicyToleranceNow"] = mBeamPolicyToleranceNow;
+        // The tolerance the resolve uses now, read on demand (the one above is only refreshed under compareReference).
+        cloud["beamPolicyRestores"] = mBeamPolicyRestores;
+        cloud["beamRefineFrames"] = mBeamRefineFrames;
+        cloud["beamRefineBlocks"] = mBeamRefineBlocks;
+        cloud["beamRefineSweeps"] = mBeamRefineSweeps;
+        cloud["beamRefineRestarts"] = mBeamRefineRestarts;
+        cloud["beamRefineCursor"] = mBeamRefineCursor;
+        cloud["beamRefineSlice"] = uint32_t(mBeamRefineSlice);
+        cloud["beamRefineFrameUs"] = uint32_t(mBeamRefineFrameMs * 1000.f);
+        cloud["beamRefineBaseUs"] = uint32_t(mBeamRefineBaseMs * 1000.f);
+        cloud["beamRefineBaseSamples"] = mBeamRefineBaseSamples;
+        cloud["beamRefineBuildUs"] = uint32_t(mBeamRefineBuildMs * 1000.f);
+        cloud["beamRefineCreditUs"] = uint32_t(mBeamRefineCreditMs * 1000.f);
+        cloud["beamRefineLeft"] = mBeamRefineLeft;
+        cloud["beamRefineRewinds"] = mBeamRefineRewinds;
+        cloud["beamGuardBlocks"] = mParams.beamGuardDims.x * mParams.beamGuardDims.y;
+        cloud["beamRefineBoxBlocks"] = mBeamRefineBoxBlocks;
+        cloud["beamPolicyToleranceLive"] =
+            mpBeamWarpArgs && mBeamPolicy ? math::asfloat(mpBeamWarpArgs->getElement<uint32_t>(11)) : mParams.beamTolerance;
         cloud["densityChanged"] = mDensityChangedFrame ? 1u : 0u;
         cloud["densityChangedFrames"] = mDensityChangedFrames;
         cloud["sunBakeFrames"] = mSunBakeFrames;
@@ -3536,6 +3578,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamResidualArgsPass = nullptr;
     mpBeamWarpArgsPass = nullptr;
     mpBeamPolicyPass = nullptr;
+    mpBeamPolicyRestoreBlocksPass = nullptr;
+    mpBeamPolicyRestorePass = nullptr;
+    mpBeamRefineBlocksPass = nullptr;
+    mpBeamRefineListPass = nullptr;
     mpBeamResolveWarpPass = nullptr;
     mpBeamHalfShadePass = nullptr;
     mpBeamHalfShadeWarpPass = nullptr;
@@ -3638,6 +3684,10 @@ void HSTRCloud::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpBeamWarpCoverPass = createPass("coverBeamWarpField");
     mpBeamWarpArgsPass = createPass("writeBeamWarpArgs");
     mpBeamPolicyPass = createPass("decideBeamPolicy");
+    mpBeamPolicyRestoreBlocksPass = createPass("restoreBeamPolicyBlocks");
+    mpBeamPolicyRestorePass = createPass("restoreBeamPolicy");
+    mpBeamRefineBlocksPass = createPass("refineBeamBlocks");
+    mpBeamRefineListPass = createPass("listBeamRefineBlocks");
     mpBeamResolveWarpPass = createPass("resolveBeam");
     mpBeamHalfShadePass = createPass("resolveBeamHalf");
     mpBeamHalfShadeWarpPass = createPass("resolveBeamHalf");
@@ -7887,6 +7937,7 @@ void HSTRCloud::bindRenderer(RenderContext* pRenderContext, const ref<ComputePas
     var["hstrBeamPathCode"] = mpBeamPathCode;
     var["hstrBeamProbeAccept"] = mpBeamProbeAccept;
     var["hstrBeamDirty"] = mpBeamDirty;
+    var["hstrBeamRefineList"] = mpBeamRefineList;
     var["hstrBeamOrderProbe"] = mpBeamOrderProbe;
     var["hstrBeamTailProbe"] = mpBeamTailProbe;
     var["hstrBeamDirtyCount"] = mpBeamDirtyCount;
@@ -9015,6 +9066,15 @@ void HSTRCloud::updateAtmosphere(RenderContext* pRenderContext)
 
 void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    // The lean march's step until a parked build that refines says otherwise (beamRefineStep).
+    mParams.beamStepVoxels = mBeamStepOverride > 0.f ? mBeamStepOverride : mParams.minStepVoxels;
+    mParams.beamRefineMarch = 0;
+    if (mBeamRefineTimerOpen)
+    {
+        // A refine build that never reached its unit march: its timer is closed and not read.
+        mpBeamRefineTimers[(mGpuTimerFrame + 2u) % 3u]->end();
+        mBeamRefineTimerOpen = false;
+    }
     // The pass's GPU time from two timestamps alone (gpuTimeSum / gpuTimeFrames): every profiler scope inside writes timestamps
     // that wait for all earlier work, so with the profiler on no two dispatches overlap. Three timers, read two frames late.
     GpuTimer* pTimer = nullptr;
@@ -9033,14 +9093,42 @@ void HSTRCloud::execute(RenderContext* pRenderContext, const RenderData& renderD
             // what it adds to the frame is what the budget pays anyway.
             {
                 const float frameMs = float(us) * 1e-3f;
-                if (mPhotonTimedUpdates[ready] == 0)
+                // beamRefineStep: a build that refined a slice (never one with photon updates) times its blocks the same way.
+                if (mPhotonTimedUpdates[ready] == 0 && mBeamRefineTimedBlocks[ready] == 0)
+                {
                     mFrameBaseMs = mFrameBaseMs > 0.f ? 0.9f * mFrameBaseMs + 0.1f * frameMs : frameMs;
-                else if (mFrameBaseMs > 0.f)
+                    if (mBeamRefineBaseSlot[ready])
+                    {
+                        mBeamRefineBaseMs = mBeamRefineBaseSamples > 0 ? 0.8f * mBeamRefineBaseMs + 0.2f * frameMs : frameMs;
+                        ++mBeamRefineBaseSamples;
+                    }
+                }
+                else if (mFrameBaseMs > 0.f && mPhotonTimedUpdates[ready] != 0)
                 {
                     const float perUpdate = std::max(0.05f, frameMs - mFrameBaseMs) / float(mPhotonTimedUpdates[ready]);
                     mPhotonCostMs = mPhotonCostMs > 0.f ? 0.8f * mPhotonCostMs + 0.2f * perUpdate : perUpdate;
                 }
+                else if (mPhotonTimedUpdates[ready] == 0)
+                {
+                    // beamRefineStep: a full slice's timed build (query to unit march) into its smoothed cost; the sweep's last,
+                    // shorter slice is not one.
+                    if (mBeamRefineTimed[ready] && mBeamRefineTimedBlocks[ready] == kBeamRefineSlice)
+                        mBeamRefineBuildMs = 0.8f * mBeamRefineBuildMs + 0.2f * float(mpBeamRefineTimers[ready]->getElapsedTime());
+                    mBeamRefineFrameMs = frameMs;
+                }
                 mPhotonTimedUpdates[ready] = 0;
+                mBeamRefineTimedBlocks[ready] = 0;
+                mBeamRefineBaseSlot[ready] = false;
+                mBeamRefineTimed[ready] = false;
+                // The sweep's block count, copied when the list was made: that frame's work is done once its timer is read.
+                if (mBeamRefineListFrame != ~0u && mGpuTimerFrame - 2u >= mBeamRefineListFrame)
+                {
+                    mBeamRefineBoxBlocks = *static_cast<const uint32_t*>(mpBeamRefineReadback->map());
+                    mpBeamRefineReadback->unmap();
+                    mBeamRefineListFrame = ~0u;
+                    mBeamRefineLeft = mBeamRefineBoxBlocks;
+                    mBeamRefineCursor = 0;
+                }
             }
             mGpuTimeSumUs += us;
             ++mGpuTimeFrames;
@@ -10282,6 +10370,10 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                 // reason there is no fallback path here: a list that cannot overflow has no wrong answer to give.
                 const uint32_t cells = guardDims.x * guardDims.y;
                 mpBeamDirty = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
+                mpBeamRefineList = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells + 1u);
+                mBeamRefineBoxBlocks = ~0u;
+                mBeamRefineListFrame = ~0u;
+                mBeamRefineLeft = ~0u;
                 // Blocks listed, units to march, blocks held, beamSubTiles' second units.
                 mpBeamDirtyCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), 4);
                 if (!mpBeamWarpArgs)
@@ -10848,6 +10940,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                             const bool turned = any(cameraTarget != mBeamCameraTarget);
                             mBeamDirtyActive = false;
                             mParams.beamHistoryLive = 0;
+                            // beamRefineStep: a build the guard does not drive (the history dropped: beamReset, a resize) re-marches
+                            // everything at minStepVoxels, so the sweep goes round again. refine14: a parked beamReset left the
+                            // sweep counting on (rewinds 0) while the image fell back from 1.21% to 1.47% of pixels off c2.
+                            if (!guardDriven && mBeamRefineStep > 0.f && mBeamRefineBoxBlocks != ~0u)
+                            {
+                                ++mBeamRefineRewinds;
+                                mBeamRefineLeft = mBeamRefineBoxBlocks;
+                            }
                             if (guardDriven)
                             {
                                 FALCOR_PROFILE(pRenderContext, "beamDirty");
@@ -10878,7 +10978,27 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     mBeamInvalidations.clear(); // A/B only: the image keeps what it marched through old content.
                                     mBeamInvalidateAll = false;
                                 }
+                                // beamPolicy: the first stationary build after a translating one that decided the tolerance, or after
+                                // beamTolerance changed, re-lists every block if the tolerance in force differs from beamTolerance (on
+                                // the GPU, no readback), then restores it. A sprint decides 1.4 and nothing undid it: stopped 240
+                                // frames after a 4K sprint 20, the live tolerance still read 1.4 and the parked view kept the sprint's
+                                // smeared tiles (stale_policy, against the same view rebuilt at 0.6). A parked beamTolerance change
+                                // read 0.6 live in every arm (render_now6).
+                                const bool restored = mParams.beamStationary != 0 &&
+                                                      (mBeamPolicyDecided || mParams.beamTolerance != mBeamPolicyRestoredTolerance);
+                                if (restored)
+                                {
+                                    FALCOR_PROFILE(pRenderContext, "policyRestore");
+                                    bindRenderer(pRenderContext, mpBeamPolicyRestoreBlocksPass);
+                                    mpBeamPolicyRestoreBlocksPass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
+                                    bindRenderer(pRenderContext, mpBeamPolicyRestorePass);
+                                    mpBeamPolicyRestorePass->execute(pRenderContext, uint3(1));
+                                    mBeamPolicyDecided = false;
+                                    mBeamPolicyRestoredTolerance = mParams.beamTolerance;
+                                    ++mBeamPolicyRestores;
+                                }
                                 const bool invalidated = !mBeamInvalidations.empty() || mBeamInvalidateAll || mBeamChangesPending;
+                                const bool invalidatedAll = mBeamInvalidateAll || mBeamInvalidations.size() > 256u;
                                 if (invalidated)
                                 {
                                     FALCOR_PROFILE(pRenderContext, "invalidate");
@@ -10937,10 +11057,104 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     mBeamInvalidateAll = false;
                                     ++mBeamInvalidatedBuilds;
                                 }
+                                // beamRefineStep: a parked build marches at the parked step, and lists a slice of the sweep's
+                                // on-screen blocks straight onto the dirty list (refineBeamBlock) when the credit pays for one (see
+                                // mBeamRefineSlice). A build that moved, turned or restored the policy marches at minStepVoxels and
+                                // restarts the sweep; one that lost every block while parked does too, and the sweep goes round again
+                                // from where it was. Re-listing the whole image at the parked step in one frame is what the sweep
+                                // exists to avoid.
+                                if (mBeamRefineStep > 0.f && mpBeamRefineList)
+                                {
+                                    if (mParams.beamStationary == 0 || turned || restored)
+                                    {
+                                        mBeamRefineRestarts += mBeamRefineLeft != ~0u && mBeamRefineLeft > 0 ? 1u : 0u;
+                                        mBeamRefineCursor = 0;
+                                        mBeamRefineLeft = ~0u;
+                                        mBeamRefineBoxBlocks = ~0u;
+                                        mBeamRefineListFrame = ~0u;
+                                        mBeamRefineBaseSamples = 0;
+                                        mBeamRefineParkedBuilds = 0;
+                                        mBeamRefineCreditMs = 0.f;
+                                        for (bool& base : mBeamRefineBaseSlot)
+                                            base = false;
+                                    }
+                                    else if (invalidatedAll)
+                                    {
+                                        ++mBeamRefineRewinds;
+                                        if (mBeamRefineBoxBlocks != ~0u)
+                                            mBeamRefineLeft = mBeamRefineBoxBlocks;
+                                    }
+                                    else
+                                    {
+                                        mParams.beamStepVoxels = mBeamRefineStep;
+                                        const uint32_t slot = mGpuTimerFrame % 3u;
+                                        // The first parked build of a sweep lists the blocks on screen; the count is read two frames on.
+                                        const bool listing = mBeamRefineBoxBlocks == ~0u && mBeamRefineListFrame == ~0u;
+                                        if (listing)
+                                        {
+                                            FALCOR_PROFILE(pRenderContext, "refineList");
+                                            // The whole buffer (79k words): a one-element view of it failed the next dispatch (refine6).
+                                            pRenderContext->clearUAV(mpBeamRefineList->getUAV().get(), uint4(0));
+                                            bindRenderer(pRenderContext, mpBeamRefineListPass);
+                                            mpBeamRefineListPass->execute(pRenderContext, uint3(mParams.beamGuardDims, 1));
+                                            if (!mpBeamRefineReadback)
+                                                mpBeamRefineReadback =
+                                                    mpDevice->createBuffer(sizeof(uint32_t), ResourceBindFlags::None, MemoryType::ReadBack);
+                                            pRenderContext->copyBufferRegion(mpBeamRefineReadback.get(), 0, mpBeamRefineList.get(), 0, sizeof(uint32_t));
+                                            mBeamRefineListFrame = mGpuTimerFrame;
+                                        }
+                                        const uint32_t blocks = mBeamRefineBoxBlocks;
+                                        // Every kBeamRefineBaseEvery-th parked build, and the first ones until the base is measured, list
+                                        // no slice: their frames are the parked base the slice is sized against.
+                                        const bool baseBuild = mBeamRefineSliceFixed == 0 &&
+                                                               (mBeamRefineBaseSamples < kBeamRefineBaseStart ||
+                                                                mBeamRefineParkedBuilds % kBeamRefineBaseEvery == kBeamRefineBaseEvery - 1u);
+                                        ++mBeamRefineParkedBuilds;
+                                        // The listing build is not a base sample: it carries the list pass.
+                                        mBeamRefineBaseSlot[slot] = baseBuild && !listing;
+                                        const bool sweeping = blocks != ~0u && mBeamRefineLeft != ~0u && mBeamRefineLeft > 0;
+                                        // The credit: the budget's headroom over the parked base, at least kBeamRefineMinRateMs, held
+                                        // up to one build's cost.
+                                        const float budget = mWorldCacheBudgetMs > 0.f ? mWorldCacheBudgetMs : 2.f;
+                                        const float headroom = mBeamRefineBaseSamples > 0 ? std::max(0.f, budget - mBeamRefineBaseMs) : 0.f;
+                                        if (sweeping)
+                                            mBeamRefineCreditMs =
+                                                std::min(mBeamRefineCreditMs + std::max(headroom, kBeamRefineMinRateMs), mBeamRefineBuildMs);
+                                        // Never beside photon updates: the frame timer attributes a frame's time to one of them.
+                                        if (!baseBuild && sweeping && mPhotonTimedUpdates[slot] == 0 && mGpuTiming &&
+                                            (mBeamRefineSliceFixed > 0 || mBeamRefineCreditMs >= mBeamRefineBuildMs - 1e-4f))
+                                        {
+                                            const uint32_t size = mBeamRefineSliceFixed > 0 ? mBeamRefineSliceFixed : kBeamRefineSlice;
+                                            // At most the dirty list's capacity: a block listed past it would be dropped yet swept.
+                                            const uint32_t count = std::min({size, mBeamRefineLeft, mParams.beamDirtyCapacity});
+                                            mBeamRefineSlice = float(count);
+                                            if (count > 0)
+                                            {
+                                                FALCOR_PROFILE(pRenderContext, "refine");
+                                                mParams.beamRefineFirst = mBeamRefineCursor;
+                                                mParams.beamRefineCount = count;
+                                                bindRenderer(pRenderContext, mpBeamRefineBlocksPass);
+                                                mpBeamRefineBlocksPass->execute(pRenderContext, uint3(count, 1, 1));
+                                                mParams.beamRefineCount = 0;
+                                                mParams.beamRefineMarch = 1;
+                                                mBeamRefineCursor = (mBeamRefineCursor + count) % blocks;
+                                                mBeamRefineLeft -= count;
+                                                mBeamRefineCreditMs = std::max(0.f, mBeamRefineCreditMs - mBeamRefineBuildMs);
+                                                mBeamRefineTimedBlocks[slot] = count;
+                                                mBeamRefineBlocks += count;
+                                                mBeamRefineSweeps += mBeamRefineLeft == 0 ? 1u : 0u;
+                                                ++mBeamRefineFrames;
+                                            }
+                                        }
+                                        // A parked build without a slice is a base sample too (most are, while the credit builds up).
+                                        if (!listing && mBeamRefineTimedBlocks[slot] == 0)
+                                            mBeamRefineBaseSlot[slot] = true;
+                                    }
+                                }
                                 // A camera that neither moved nor turned, over content that did not change, cannot have
                                 // invalidated or uncovered anything, so only the refresh phase is listed and the classification
                                 // is skipped.
-                                const bool classify = mParams.beamStationary == 0 || turned || invalidated;
+                                const bool classify = mParams.beamStationary == 0 || turned || invalidated || restored;
                                 // MEASURED TWICE and REVERTED: bounding this domain. First to the screen's block box, then to that
                                 // box unioned with the regions the query dispatch had just covered. Both take the rectangle's walk
                                 // from 0.33 ms to 2.4 and above, with the level-0 query pass at 1.35. A block left out is never
@@ -11027,6 +11241,7 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                     {
                                         bindRenderer(pRenderContext, mpBeamPolicyPass);
                                         mpBeamPolicyPass->execute(pRenderContext, uint3(1));
+                                        mBeamPolicyDecided = mBeamPolicy;
                                     }
                                 }
                                 if (mSpanProbe)
@@ -11061,6 +11276,15 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                                 // of beside the unit march, with no barrier between them.
                                 // seaFarBeside 2: its even rows there, its odd rows beside the unit march.
                                 const bool farBesideQuery = !mBeamFusedBuild && mFarRunDeferred && mSeaFarBeside >= 1u;
+                                // beamRefineStep: a refine build is timed from its dirty query to the end of its unit march.
+                                if (mParams.beamRefineMarch != 0 && mGpuTiming && !mBeamRefineTimerOpen)
+                                {
+                                    const uint32_t slot = mGpuTimerFrame % 3u;
+                                    if (!mpBeamRefineTimers[slot])
+                                        mpBeamRefineTimers[slot] = GpuTimer::create(mpDevice);
+                                    mpBeamRefineTimers[slot]->begin();
+                                    mBeamRefineTimerOpen = true;
+                                }
                                 if (!mBeamFusedBuild)
                                 {
                                     std::optional<ScopedProfilerEvent> queryScope;
@@ -12145,6 +12369,14 @@ void HSTRCloud::executeFrame(RenderContext* pRenderContext, const RenderData& re
                         else
                             pUnits->executeIndirect(pRenderContext, mpBeamDirtyArgs.get(), 60); // Bytes: fifteen uints in.
                         pRenderContext->setAutoUavBarriers(true);
+                        if (mBeamRefineTimerOpen)
+                        {
+                            const uint32_t slot = mGpuTimerFrame % 3u;
+                            mpBeamRefineTimers[slot]->end();
+                            mpBeamRefineTimers[slot]->resolve();
+                            mBeamRefineTimed[slot] = true;
+                            mBeamRefineTimerOpen = false;
+                        }
                         if (mBeamHistoryBlendOracle > 0.f)
                         {
                             // DIAGNOSTIC (blocking, oracle only): kBeamHistoryProbe's three counts into running totals.
